@@ -32,7 +32,7 @@ struct DeviceInfo {
   gctSIZE_T contiguous_bytes = 0;
 };
 
-struct SmokeData {
+struct ConvolutionData {
   std::vector<float> input, weights, bias;
   // Keep tensor initialization buffers alive until the graph is released.
   std::vector<uint8_t> input_fp16, weights_fp16, bias_fp16;
@@ -162,7 +162,8 @@ static void parse_options(int argc, char **argv, Options &options) {
       }
       options.repeats = n;
     } else {
-      throw std::runtime_error("usage: np101_smoke --output report.json [--repeats 10]");
+      throw std::runtime_error(
+          "usage: np101_conv_relu_pool_test --output report.json [--repeats 10]");
     }
   }
   if (options.output.empty()) {
@@ -193,7 +194,7 @@ static DeviceInfo query_device_info(const specferry::np101::Context &context) {
   return info;
 }
 
-static SmokeData make_test_data() {
+static ConvolutionData make_test_data() {
   std::srand(42);
   auto random_data = [](size_t n) {
     std::vector<float> values(n);
@@ -203,7 +204,7 @@ static SmokeData make_test_data() {
     return values;
   };
 
-  SmokeData data;
+  ConvolutionData data;
   data.input = random_data(192);
   data.weights = random_data(108);
   data.bias = random_data(4);
@@ -213,7 +214,7 @@ static SmokeData make_test_data() {
   return data;
 }
 
-static GraphIO build_smoke_graph(vsi_nn_graph_t *graph, SmokeData &data) {
+static GraphIO build_convolution_graph(vsi_nn_graph_t *graph, ConvolutionData &data) {
   // Allocate input, constant weights, intermediate tensors, and output.
   auto input = tensor(graph, {8, 8, 3, 1});
   auto weight = tensor(graph, {3, 3, 3, 4}, true, data.weights_fp16.data());
@@ -270,7 +271,7 @@ static GraphIO build_smoke_graph(vsi_nn_graph_t *graph, SmokeData &data) {
   return {input, output};
 }
 
-static void run_iterations(vsi_nn_graph_t *graph, const GraphIO &io, const SmokeData &data,
+static void run_iterations(vsi_nn_graph_t *graph, const GraphIO &io, const ConvolutionData &data,
                            unsigned repeats, std::string &phase, std::ostringstream &records) {
   records << std::setprecision(10);
   for (unsigned iteration = 0; iteration < repeats; ++iteration) {
@@ -368,7 +369,7 @@ int main(int argc, char **argv) {
     auto device = query_device_info(context);
     auto data = make_test_data();
     specferry::np101::Graph graph(context, 6, 3);
-    auto io = build_smoke_graph(graph.get(), data);
+    auto io = build_convolution_graph(graph.get(), data);
     timings.initialize_ms = elapsed(start);
 
     // Prepare and verify once; every iteration reuses this graph.

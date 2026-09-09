@@ -137,7 +137,7 @@ def main():
         f"- Host: `{result['hostname']}` / `{result['machine']}`.\n"
         f"- PCI device(s): `{json.dumps(result['pci_devices'])}`.\n"
         f"- galcore loaded: `{result['galcore_module_loaded']}`; device node: `{json.dumps(result['device_node'])}`.\n"
-        "- Run `scripts/run_np101_smoke.py` with a freshly built binary to collect SDK output and device IO trace.\n"
+        "- Run `scripts/check_np101_conv_relu_pool.py` with a freshly built binary to collect SDK output and device IO trace.\n"
         "- Hardware presence, HAL pool size, and a target label are not proof that every node ran on the NPU.\n"
         "- This environment check does not measure available model allocation capacity; do not substitute the advertised 4 GB.\n"
         "- No driver loading, reboot, root-only counter access, or onboard CPU deployment is performed.\n"
