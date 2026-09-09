@@ -1,0 +1,4 @@
+BasedOnStyle: LLVM
+ColumnLimit: 100
+SeparateDefinitionBlocks: Always
+InsertBraces: true

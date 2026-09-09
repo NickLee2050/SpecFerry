@@ -1,0 +1,20 @@
+{
+  "status": "frozen_before_holdout_validation",
+  "fixed_input_fp16_output": {"atol": 0.01, "rtol": 0.02},
+  "fixed_input_fp32_state": {"atol": 0.0001, "rtol": 0.001},
+  "fp32_pipeline": {"atol": 0.0001, "rtol": 0.001},
+  "fp16_pipeline": {"atol": 0.08, "rtol": 0.02},
+  "fp32_state_from_fp16_pipeline": {"atol": 0.008, "rtol": 0.001},
+  "calibration": {
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "transformers": "5.16.1",
+    "torch": "2.10.0+cpu",
+    "prompt": "请用一句话介绍北京。",
+    "lengths": [1, 2, 4, 8],
+    "observed_max_fp16_logit_error": 0.04052734375,
+    "observed_max_fp32_state_error_in_fp16_pipeline": 0.0038074254989624023,
+    "initial_pipeline_thresholds_passed": false,
+    "reason": "CPU batched/chunk prefill versus sequential FP16 rounding; pipeline absolute budgets are rounded upward from twice the observed maxima. Fixed-input operator budgets are unchanged. No device measurements were used.",
+    "raw_evidence": ".cache/runs/first-build/s0-s3/initial-calibration/"
+  }
+}
