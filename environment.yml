@@ -7,5 +7,6 @@ dependencies:
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
       - clang-format==18.1.8
+      - ruff==0.16.6
       - -r requirements-reference.txt
       - -r requirements-download.txt

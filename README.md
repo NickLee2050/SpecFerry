@@ -153,6 +153,20 @@ untracked files while respecting Git ignore rules. `--check` reports formatting
 differences and returns nonzero without modifying files. Use `--clang-format`
 to select an executable at a custom path. The script works from any directory.
 
+## Format and lint Python code
+
+The repository uses [Ruff](https://docs.astral.sh/ruff/) with a 100-column format
+target, Python 3.12 syntax, standard error checks, unused-code checks, and import
+sorting. The version is pinned in `environment.yml`. Safe lint fixes run before
+formatting; unresolved diagnostics return a failure and require review.
+
+```bash
+python scripts/format_python.py
+python scripts/format_python.py --check
+```
+
+The script works from any directory and respects the exclusions in `ruff.toml`.
+
 ## Regression checks
 
 ```bash

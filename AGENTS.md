@@ -1,5 +1,8 @@
 # SpecFerry project constraints
 
+- Write human-readable, high-quality code. Use descriptive names, focused functions, explicit ownership and error handling, and comments that explain non-obvious decisions. Separate logical blocks and keep formatting consistent; do not compress code at the expense of readability.
+- Format C++ with the repository LLVM-based, 100-column clang-format rules, including braces for every control-statement body. Format Python with Ruff at 100 columns, apply safe lint fixes, and sort imports using `scripts/format_python.py`; verify with `--check` before delivery.
+
 - Use the Conda environment `SpecFerry` with Python 3.12 for project Python tools, downloads, references, and tests. Define its dependencies in `environment.yml` and the referenced requirements files; do not create or configure venv environments.
 - Use Qwen3.5 for the active model roadmap. The first and only enabled download is `Qwen/Qwen3.5-0.8B`; keep other model downloads commented out until their phase starts.
 - Permanently exclude all Llama model generations and known Llama-derived checkpoints from recommendations, downloads, and experiments in this project, unless the user explicitly reverses this preference. This does not prohibit the unrelated `llama.cpp` software project. OPT is a separate model family; discussion does not authorize adding it to the active download list.

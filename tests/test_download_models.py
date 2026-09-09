@@ -2,10 +2,10 @@ import contextlib
 import hashlib
 import io
 import json
-from pathlib import Path
-from types import SimpleNamespace
 import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import download_models as downloader
@@ -17,8 +17,9 @@ class DownloadModelsTests(unittest.TestCase):
             destination = Path(root) / "not-created"
             stream = io.StringIO()
             with contextlib.redirect_stdout(stream):
-                result = downloader.main(["--dry-run", "--output", str(destination),
-                                          "--parallel-models", "8"])
+                result = downloader.main(
+                    ["--dry-run", "--output", str(destination), "--parallel-models", "8"]
+                )
             plan = json.loads(stream.getvalue())
             self.assertEqual(result, 0)
             self.assertEqual([model["repo_id"] for model in plan["models"]], ["Qwen/Qwen3.5-0.8B"])
@@ -43,11 +44,17 @@ class DownloadModelsTests(unittest.TestCase):
 
         def model_info(repo_id, revision, files_metadata):
             metadata_requests.append(revision)
-            return SimpleNamespace(sha=sha, siblings=[
-                SimpleNamespace(rfilename=name, size=len(content),
-                                lfs=SimpleNamespace(sha256=hashlib.sha256(content).hexdigest()))
-                for name, content in contents.items()
-            ])
+            return SimpleNamespace(
+                sha=sha,
+                siblings=[
+                    SimpleNamespace(
+                        rfilename=name,
+                        size=len(content),
+                        lfs=SimpleNamespace(sha256=hashlib.sha256(content).hexdigest()),
+                    )
+                    for name, content in contents.items()
+                ],
+            )
 
         def snapshot_download(**kwargs):
             download_requests.append(kwargs["revision"])
@@ -58,10 +65,15 @@ class DownloadModelsTests(unittest.TestCase):
             for name, content in contents.items():
                 (destination / name).write_bytes(content)
 
-        fake_hub = SimpleNamespace(HfApi=lambda: SimpleNamespace(model_info=model_info),
-                                   snapshot_download=snapshot_download)
-        with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"huggingface_hub": fake_hub}), \
-                patch.object(downloader.importlib.metadata, "version", return_value="test"):
+        fake_hub = SimpleNamespace(
+            HfApi=lambda: SimpleNamespace(model_info=model_info),
+            snapshot_download=snapshot_download,
+        )
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.dict("sys.modules", {"huggingface_hub": fake_hub}),
+            patch.object(downloader.importlib.metadata, "version", return_value="test"),
+        ):
             model = downloader.ModelSpec("Qwen/Qwen3.5-0.8B")
             destination = Path(root) / model.repo_id
             with self.assertRaises(OSError):
@@ -79,8 +91,13 @@ class DownloadModelsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             destination = Path(root)
             (destination / "weights.safetensors").write_bytes(b"bad!")
-            expected = [{"path": "weights.safetensors", "size": 4,
-                         "sha256": hashlib.sha256(b"good").hexdigest()}]
+            expected = [
+                {
+                    "path": "weights.safetensors",
+                    "size": 4,
+                    "sha256": hashlib.sha256(b"good").hexdigest(),
+                }
+            ]
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 downloader.verify_files(destination, expected)
 
