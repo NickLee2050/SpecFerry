@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe DLM operators and state feedback using isolated, bounded SDK processes."""
+"""Probe DLM operators using isolated, bounded SDK processes."""
 
 import argparse
 import shutil
@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.export.weights import verify_export
 from specferry.validation.capabilities import check_case
-from specferry.validation.device import device_lock, write_json
+from specferry.validation.device import device_lock, fingerprint, host_boot_id, write_json
 from specferry.validation.operator_cases import catalog
 from specferry.validation.reference_cases import reference_catalog
 
@@ -23,6 +23,12 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--binary", type=Path, default=ROOT / "build/tests/np101_op_check")
     parser.add_argument("--sdk-lib", type=Path, default=Path("/usr/lib/ljmicro"))
+    parser.add_argument(
+        "--shader-header",
+        type=Path,
+        default=Path("/usr/inc/CL/cl_viv_vx_ext.h"),
+        help="unmodified SDK header needed by the runtime shader compiler",
+    )
     parser.add_argument("--scale", choices=("small", "model", "all"), default="small")
     parser.add_argument("--case", action="append", default=[], help="select a case; repeatable")
     parser.add_argument("--list", action="store_true", help="list available cases without running")
@@ -36,6 +42,16 @@ def main() -> int:
         "--prepare-only", action="store_true", help="write fixtures without device IO"
     )
     parser.add_argument("--timeout", type=int, default=300, help="maximum seconds per case")
+    parser.add_argument("--readback", choices=("each-step", "final"), default="each-step")
+    parser.add_argument(
+        "--cycles", type=int, default=1, help="complete graph lifetimes per case (1-20)"
+    )
+    parser.add_argument(
+        "--max-payload-mib",
+        type=int,
+        default=768,
+        help="per-case tensor payload cap; SDK overhead is additional",
+    )
     parser.add_argument(
         "--diagnostic",
         action="store_true",
@@ -49,10 +65,17 @@ def main() -> int:
         for case in cases.values():
             print(f"{case.name:32} {case.scale:8} {case.family}")
         return 0
-    if args.output is None or args.timeout < 1:
-        parser.error("--output and a positive timeout are required")
+    if (
+        args.output is None
+        or args.timeout < 1
+        or not 1 <= args.cycles <= 20
+        or args.max_payload_mib < 1
+    ):
+        parser.error("require --output, positive timeout/budget, and 1-20 cycles")
     if unknown := set(args.case) - cases.keys():
         parser.error(f"unknown cases: {sorted(unknown)}")
+    if len(args.case) != len(set(args.case)):
+        parser.error("case names must not be repeated")
     if args.reference_trace:
         verify_export(args.model)
     selected = (
@@ -75,9 +98,17 @@ def main() -> int:
         "status": "running",
         "cases": results,
         "hardware_acceptance": "unverified",
+        "state_reuse_acceptance": "not_implemented",
         "full_catalog": len(selected) == len(cases),
         "pending_cases": sorted(set(cases) - {case.name for case in selected}),
+        "selected_cases": [case.name for case in selected],
+        "boot_id": host_boot_id(),
+        "binary_sha256": fingerprint(binary) if binary.is_file() else None,
+        "readback_mode": args.readback,
+        "cycles": args.cycles,
+        "tensor_payload_limit_bytes": args.max_payload_mib * 1024**2,
     }
+    write_json(output / "op-capabilities.json", summary)
     try:
         with nullcontext() if args.prepare_only else device_lock(ROOT / ".cache/runs"):
             for case in selected:
@@ -90,10 +121,15 @@ def main() -> int:
                         args.sdk_lib,
                         args.timeout,
                         args.prepare_only,
+                        args.readback,
+                        args.cycles,
+                        args.max_payload_mib * 1024**2,
+                        args.shader_header,
                     )
                 except (OSError, ValueError, RuntimeError) as error:
                     result = {"name": case.name, "status": "failed", "error": str(error)}
                 results.append(result)
+                summary["pending_cases"] = sorted(set(cases) - {item["name"] for item in results})
                 write_json(output / "op-capabilities.json", summary)
                 print(f"  {result['status']}", flush=True)
                 if "device_recovery_required" in result.get("blockers", []):
@@ -116,6 +152,18 @@ def main() -> int:
     )
     summary["status"] = "prepared" if args.prepare_only and prepared else "blocked"
     summary["numeric_pass"] = numeric_pass
+    required_for_allocation = {
+        "matmul_fp16_small",
+        "weights_constant_fp16",
+        "weights_mutable_fp16",
+        "weights_mixed_fp16",
+    }
+    passed_names = {item["name"] for item in results if item["status"] == "numerical_pass"}
+    summary["allocation_experiment_gate"] = {
+        "ready": required_for_allocation <= passed_names,
+        "missing_or_failed": sorted(required_for_allocation - passed_names),
+        "note": "Small functional/lifecycle gate only; memory pool and residency remain unverified.",
+    }
     write_json(output / "op-capabilities.json", summary)
     print(f"Capability status: {summary['status']}; report: {output / 'op-capabilities.json'}")
     if args.prepare_only:

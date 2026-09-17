@@ -21,7 +21,7 @@ from specferry.validation.operator_cases import catalog
 
 class ComparisonTests(unittest.TestCase):
     def test_interrupted_run_stops_suite_even_with_matching_outputs_and_zero_exit(self):
-        def interrupted_run(binary, arguments, output, sdk_lib, timeout):
+        def interrupted_run(binary, arguments, output, sdk_lib, timeout, **options):
             fixture = Path(arguments[0]).parent
             metadata = json.loads((fixture / "case.json").read_text())
             output.mkdir(parents=True)
@@ -90,6 +90,7 @@ class ComparisonTests(unittest.TestCase):
             lock.assert_not_called()
             report = json.loads((output / "op-capabilities.json").read_text())
             self.assertEqual(report["status"], "prepared")
+            self.assertEqual(report["state_reuse_acceptance"], "not_implemented")
             self.assertEqual(len(report["cases"]), 1)
             self.assertTrue((output / "argmax_small/fixture/graph.txt").is_file())
 
@@ -133,7 +134,7 @@ class ComparisonTests(unittest.TestCase):
                     metadata = fixture.write(root / case.name)
                     self.assertGreaterEqual(metadata["steps"], 2)
                     self.assertTrue(metadata["outputs"])
-                    self.assertEqual(metadata["provenance"]["seed"], 101)
+                    self.assertIsInstance(metadata["provenance"]["seed"], int)
                     json.dumps(metadata, allow_nan=False)
                     for values in fixture.expected.values():
                         for value in values:

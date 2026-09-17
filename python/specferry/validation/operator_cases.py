@@ -6,6 +6,7 @@ from typing import Callable
 
 import numpy as np
 
+from .extended_cases import extend_catalog
 from .fixtures import Fixture, array
 
 
@@ -100,24 +101,9 @@ def gather(name, rows, width):
     indices = [np.array([0, rows - 1], np.int32), np.array([rows - 1, rows // 2], np.int32)]
     fixture.constant("table", table)
     fixture.input("indices", indices, "I32")
+    fixture.integer_bounds["indices"] = (0, rows - 1)
     fixture.node("GATHER", ["table", "indices"], "y", (2, width), parameters=(1,))
     fixture.output("y", [table[index] for index in indices])
-    return fixture
-
-
-def state_feedback(name, width, dtype, handle):
-    fixture = Fixture(name, "state_feedback", steps=3, reset_after=2)
-    shape = (1, width) if isinstance(width, int) else width
-    initial = array(np.full(shape, 0.125), dtype)
-    updates = [array(np.full(shape, value), dtype) for value in (0.25, 0.5, 0.25)]
-    fixture.input("update", updates, dtype)
-    fixture.tensor("state", initial, dtype, "handle" if handle else "mutable", initialize=True)
-    fixture.node("ADD", ["state", "update"], "next", initial.shape, dtype)
-    fixture.tensors["next"]["storage"] = "handle" if handle else "mutable"
-    fixture.feedback = ("next", "state")
-    fixture.output(
-        "next", [initial + updates[0], initial + updates[0] + updates[1], initial + updates[2]]
-    )
     return fixture
 
 
@@ -156,6 +142,7 @@ def masked_softmax(name, length):
     lengths = [np.array([[1]], np.int32), np.array([[length - 1]], np.int32)]
     fixture.input("scores", scores, "F32")
     fixture.input("length", lengths, "I32")
+    fixture.integer_bounds["length"] = (1, length)
     fixture.constant("positions", np.arange(length, dtype=np.int32).reshape(1, -1), "I32")
     fixture.constant("negative", [[-1e9]], "F32")
     fixture.node("LESS", ["positions", "length"], "mask", (1, length), "BOOL")
@@ -177,6 +164,7 @@ def scatter(name, length, width):
     updates = [array(np.full((1, width), value), "F16") for value in (-0.5, 0.25)]
     fixture.input("cache", [cache, cache])
     fixture.input("positions", positions, "I32")
+    fixture.integer_bounds["positions"] = (0, length - 1)
     fixture.input("updates", updates)
     fixture.node("SCATTER_ND_UPDATE", ["cache", "positions", "updates"], "y", cache.shape)
     results = []
@@ -272,6 +260,8 @@ def catalog() -> dict[str, Case]:
     for operation, dtype in (
         ("SWISH", "F16"),
         ("SIGMOID", "F16"),
+        ("SIGMOID", "F32"),
+        ("SWISH", "F32"),
         ("EXP", "F32"),
         ("SOFTRELU", "F32"),
     ):
@@ -296,17 +286,6 @@ def catalog() -> dict[str, Case]:
             source,
             target,
         )
-    for handle in (False, True):
-        for dtype in ("F16", "F32"):
-            add(
-                f"state_{dtype.lower()}_{'handle' if handle else 'ordinary'}",
-                "state_feedback",
-                "small",
-                state_feedback,
-                16,
-                dtype,
-                handle,
-            )
     for name, k, n in (
         ("qkv", 1024, 6144),
         ("z", 1024, 2048),
@@ -330,4 +309,6 @@ def catalog() -> dict[str, Case]:
         dynamic=True,
         batch=16,
     )
+    add("projection_head_tail", "linear", "model", matrix, 1024, 2560)
+    extend_catalog(cases, Case)
     return cases

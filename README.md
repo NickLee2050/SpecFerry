@@ -139,7 +139,7 @@ individual node execution on NPU. Generic driver IO and a target label alone
 do not meet the latter requirement; review the execution evidence before
 concluding that the tested operations ran on the NPU.
 
-## Check DLM operator and state capabilities
+## Check DLM operator capabilities
 
 Native diagnostics live in `tests/native/np101/`; reusable SDK code lives in
 `native/np101/`. CMake places diagnostic executables under `build/tests/` and
@@ -154,9 +154,18 @@ python scripts/check_np101_graph_sharing.py --output .cache/runs/graph-sharing
 
 Cases cover FP16 projections, dynamic FP32 matrix inputs, normalization, activations,
 embedding lookup, short convolution, masking, cache writes, layouts, conversions,
-argmax ties, and state feedback/reset. Every graph receives changing inputs across
-at least two executions. Use repeatable `--case NAME` options to isolate a failure;
+argmax ties, mixed constant/mutable weights, and individual FP32 state-update
+operations. There are 49 synthetic cases and four optional captured-reference
+projections. Every graph receives changing inputs across multiple executions;
+these runs do not feed an output back into the next execution. Use repeatable
+`--case NAME` options to isolate a failure;
 `--prepare-only` writes fixtures without opening the device.
+
+SDK RNN feedback and temporary buffer experiments have been retired. Their
+[investigation record](tests/state-feedback-investigation.md) links the archived
+source and evidence. Device-resident state reuse and reset remain unaccepted
+(`NP101-STATE-001`); they will be tested with the actual DeltaNet/Attention modules.
+Suite reports explicitly retain `state_reuse_acceptance: not_implemented`.
 
 Each case retains its readable `graph.txt`, exact input/expected bytes, tensor shapes,
 source hashes, SDK execution report, logs, and driver trace. The suite snapshots its
@@ -164,12 +173,28 @@ executable and records pending cases. It writes `op-capabilities.json` increment
 The default 300-second timeout applies to each process, including SDK teardown.
 Hardware diagnostics are serialized through a repository-local lock.
 
+The runner stages the installed `cl_viv_vx_ext.h` in each execution directory for
+the SDK's runtime shader compiler. Its source and hash are recorded; use
+`--shader-header PATH` when the SDK header is installed elsewhere. The default
+per-case tensor payload limit is 768 MiB (`--max-payload-mib`); SDK overhead is
+additional, so this limit is not a guarantee of available board memory. Invalid
+declared token/cache indices are rejected before SDK context creation.
+
+Use `--readback final` to read only the last output, and `--cycles 20` to repeat
+complete graph creation/execution/release within one process. Final-only checks
+do not replace comparison of each execution's output. Reports separate numerical comparison,
+completed lifecycle, hardware evidence, and state residency, and include phase
+timing, application read counts, host RSS, and file descriptor samples.
+
+See [the operator acceptance record](tests/np101-operator-acceptance.md) for measured
+results, remaining gates, and commands for targeted rechecks.
+
 Fixed-input errors use the frozen reference tolerances. Exit code 2 means the
 capability gate is blocked, including when individual node execution is unverified.
 `--diagnostic` permits exit 0 for numeric passes while retaining the hardware blocker.
 Header availability, graph verification, numeric agreement, and device residency
-are distinct evidence. Copy-backed RNN state and an explicitly selected software
-argmax path are reported as blockers. Cross-graph attachment is checked as an
+are distinct evidence. An explicitly selected software argmax path is reported
+as a blocker. Cross-graph attachment is checked as an
 optional SDK symbol because some library builds declare it without exporting it.
 
 ## Export text weights and check memory allocation
@@ -178,7 +203,8 @@ optional SDK symbol because some library builds declare it without exporting it.
 python scripts/export_np101_dlm.py --output .cache/np101/Qwen3.5-0.8B
 python scripts/export_np101_dlm.py --verify-only
 python scripts/check_np101_export.py --output .cache/runs/export/torch-verification.json
-python scripts/check_np101_allocation.py --output .cache/runs/weight-allocation
+python scripts/check_np101_allocation.py --weight-storage mutable \
+  --output .cache/runs/weight-allocation-mutable
 ```
 
 The exporter validates the fixed checkpoint and exact 320-tensor text contract,
@@ -200,9 +226,21 @@ costs remain unknown unless supplied as explicit estimates with
 `--sdk-overhead-bytes` and `--workspace-bytes`. No estimate establishes memory fit.
 
 The allocation diagnostic verifies the native pack, uploads bounded weight blocks,
-and keeps all weight and state tensors alive together. It records allocation failures
-and host peak RSS. It does not include full model graphs or their workspace, and
-an SDK allocation alone does not prove physical board residency.
+and keeps all weight and state tensors alive together. `--weight-storage mutable`
+sets every weight to `is_const=false`, creates it with `vsi_nn_AddTensor`, then
+uploads its bytes with `vsi_nn_CopyDataToTensor`. The existing `constant` mode
+remains the default; the flag does not establish which physical pool is used.
+After all allocations, the check reads every weight block back and compares its
+bytes with the export. Both modes retain the same chunk sizes and state buffers.
+Reports record completed weights, uploaded/verified bytes, the current chunk,
+allocation failures, and host peak RSS. The executable is snapshotted per run.
+The test does not include full model graphs or their workspace, and an SDK
+allocation alone does not prove physical board residency.
+
+The [2026-09-17 all-mutable experiment](tests/np101-mutable-allocation.md) failed
+at the same 1,070,874,144-byte upload boundary as the constant baseline. Changing
+`is_const` alone does not resolve `NP101-MEM-001`; do not repeat the full-capacity
+probe without a relevant change or vendor guidance.
 
 The independent export check compares all 320 tensors, byte for byte, with PyTorch's
 conversion of the original checkpoint. It uses bounded chunks and no NPU.
@@ -221,7 +259,8 @@ After exporting, test captured reference inputs against actual exported weights:
 ```bash
 python scripts/check_np101_operators.py \
   --reference-trace .cache/runs/local/reference-trace/deployment-fp16/layer-0-3-sequential.npz \
-  --case reference_delta_qkv --case reference_attention_q_gate \
+  --case reference_delta_qkv --case reference_delta_gate \
+  --case reference_attention_q_gate --case reference_mlp_up \
   --output .cache/runs/operators-reference
 ```
 

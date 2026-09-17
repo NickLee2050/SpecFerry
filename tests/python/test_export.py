@@ -13,6 +13,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
+from scripts.check_np101_allocation import allocation_complete
+
 from specferry.export.memory import memory_budget
 from specferry.export.schema import expected_text_tensors, validate_text_entries
 from specferry.export.weights import (
@@ -56,6 +58,35 @@ def complete_manifest(root, records):
     }
     (root / "deployment-manifest.json").write_text(json.dumps(manifest))
     return manifest
+
+
+class AllocationReportTests(unittest.TestCase):
+    def test_partial_or_wrong_storage_reports_cannot_pass(self):
+        complete = {
+            "status": "allocation_pass",
+            "phase": "complete",
+            "weight_storage": "mutable",
+            "is_const": False,
+            "expected_weights": 2,
+            "completed_weights": 2,
+            "expected_weight_bytes": 16,
+            "uploaded_weight_bytes": 16,
+            "verified_weight_bytes": 16,
+            "state_allocation_complete": True,
+        }
+        self.assertTrue(allocation_complete(complete, "mutable"))
+        self.assertFalse(allocation_complete(complete, "constant"))
+        self.assertFalse(allocation_complete({}, "mutable"))
+        for incomplete in (
+            {"status": "running", "phase": "release"},
+            {"is_const": True},
+            {"completed_weights": 1},
+            {"uploaded_weight_bytes": 8},
+            {"verified_weight_bytes": 8},
+            {"state_allocation_complete": False},
+        ):
+            with self.subTest(incomplete=incomplete):
+                self.assertFalse(allocation_complete(complete | incomplete, "mutable"))
 
 
 class PrecisionTests(unittest.TestCase):

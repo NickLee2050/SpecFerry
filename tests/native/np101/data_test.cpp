@@ -102,6 +102,37 @@ void case_validation() {
           "wrong file size");
   rejects([&] { specferry::testing::read_bytes(directory.path, "../data.bin", 16); },
           "path escape");
+
+  // Archived feedback fixtures must fail before device initialization, rather
+  // than silently running independent steps after their feedback path is removed.
+  const std::string legacy = "specferry-np101-case 2\nsteps 2\n"
+                             "tensor x F32 mutable 4,1 data.bin\n"
+                             "tensor y F32 mutable 4,1 -\nnode ADD x,x y -\noutput y\n";
+  for (const auto &directive : {"feedback y x\n", "feedback y x\nreset_after 1\n",
+                                "tensor old F32 handle 4,1 data.bin\n"}) {
+    write(path, legacy + directive);
+    rejects([&] { specferry::testing::load_case(path); }, "retired feedback fixture");
+  }
+  write(path, valid + "bounds x 0 511\n");
+  rejects([&] { specferry::testing::load_case(path); }, "bounds on non-integer data");
+
+  const std::string bounded =
+      "specferry-np101-case 2\nsteps 1\n"
+      "tensor index I32 mutable 1 -\ntensor result I32 mutable 1 -\n"
+      "node ADD index,index result -\ninput index index.bin\noutput result\n"
+      "bounds index 0 511\n";
+  write(path, bounded);
+  auto indexed = specferry::testing::load_case(path);
+  for (std::int32_t index : {-1, 512, 513}) {
+    write(directory.path / "index.bin",
+          std::string(reinterpret_cast<const char *>(&index), sizeof(index)));
+    rejects([&] { specferry::testing::validate_case_data(indexed); },
+            "out-of-capacity index rejected before SDK initialization");
+  }
+  std::int32_t last = 511;
+  write(directory.path / "index.bin",
+        std::string(reinterpret_cast<const char *>(&last), sizeof(last)));
+  specferry::testing::validate_case_data(indexed);
 }
 } // namespace
 

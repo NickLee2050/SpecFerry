@@ -8,8 +8,7 @@
 namespace specferry::np101 {
 // Graph owns the SDK tensor. These helpers never release an individual tensor.
 vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constant = false,
-                              const std::vector<std::uint8_t> &initial = {},
-                              bool from_handle = false);
+                              const std::vector<std::uint8_t> &initial = {});
 
 void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::uint8_t> &data);
 

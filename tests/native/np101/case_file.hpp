@@ -26,19 +26,26 @@ struct InputSequence {
   std::vector<std::string> files;
 };
 
+struct IntegerBounds {
+  std::string tensor;
+  std::int32_t minimum;
+  std::int32_t maximum;
+};
+
 struct CaseDefinition {
   std::filesystem::path root;
   std::vector<TensorDefinition> tensors;
   std::vector<NodeDefinition> nodes;
   std::vector<InputSequence> inputs;
   std::vector<std::string> outputs;
-  std::string feedback_output;
-  std::string feedback_input;
-  std::size_t reset_after = 0;
   std::size_t steps = 1;
+  std::vector<IntegerBounds> integer_bounds;
 };
 
 CaseDefinition load_case(const std::filesystem::path &path);
+
+// Validate every supplied byte buffer and dynamic index before opening the device.
+void validate_case_data(const CaseDefinition &test);
 
 std::vector<std::uint8_t> read_bytes(const std::filesystem::path &root, const std::string &name,
                                      std::size_t expected_bytes);

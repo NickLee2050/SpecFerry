@@ -2,6 +2,8 @@
 
 - Write human-readable, high-quality code. Use descriptive names, focused functions, explicit ownership and error handling, and comments that explain non-obvious decisions. Separate logical blocks and keep formatting consistent; do not compress code at the expense of readability.
 - Format C++ with the repository LLVM-based, 100-column clang-format rules, including braces for every control-statement body. Format Python with Ruff at 100 columns, apply safe lint fixes, and sort imports using `scripts/format_python.py`; verify with `--check` before delivery.
+- Use the chip team's `demo/ref_op_api_guide.md` as a reference when operator or API semantics are unclear, together with `demo/main.c` and the installed SDK headers. An operator's presence in the guide is not a complete specification of its parameters or proof that a particular configuration executes on hardware.
+- Prefer the APIs and operators documented in that guide. Avoid undocumented APIs/operators unless the required semantics substantially exceed the documented interfaces or the documented approach has a significant, predictable performance cost. Explain the specific limitation or cost and validate the alternative before adopting it; a successful diagnostic alone does not make an undocumented path the default implementation.
 - Preserve SDK-owned node state initialized by `vsi_nn_AddNode`. Set individual public parameters; never zero or replace the entire `nn_param` structure or overwrite/free `pool.local`.
 - Do not use sudo without explicit authorization for the particular action. The one-time authorization for `sudo journalctl -xe` on 2026-09-09 has been consumed; passwordless sudo is not continuing authorization.
 

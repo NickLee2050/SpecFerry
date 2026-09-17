@@ -1,10 +1,10 @@
 # Engineering follow-up
 
-Updated: 2026-09-09. Target: resident text inference of Qwen3.5-0.8B on NP101.
+Updated: 2026-09-17. Target: resident text inference of Qwen3.5-0.8B on NP101.
 
 ## NP101-MEM-001: Enable full-model resident weight allocation
 
-- [ ] Resolve the effective constant-tensor allocation limit and validate the
+- [ ] Resolve the effective tensor allocation/upload limit and validate the
   vendor-supported allocation path.
 
 Status: waiting for the NP101 development team. The user has sent the findings
@@ -14,7 +14,7 @@ Integration and verification belong to SpecFerry after that response arrives.
 ### Working constraint and evidence
 
 Use **1 GiB (1,073,741,824 bytes)** as the provisional ceiling for the current
-constant-tensor allocation path. It is a planning constraint, not a verified
+tested constant and mutable allocation/upload paths. It is a planning constraint, not a verified
 description of all board memory or proof of which pool backs the tensors.
 Allow room below it for SDK allocations, alignment, and any duplicated layouts.
 
@@ -24,6 +24,16 @@ Allow room below it for SDK allocations, alignment, and any duplicated layouts.
 - The same allocation boundary reproduced after a cold restart. The second
   run closed the device and exited with code 1 without timeout or residual
   children; the previous run remained in a driver mutex wait.
+- On 2026-09-17, all weights were created with `is_const=false` and explicitly
+  uploaded. The first 266 chunks uploaded 1,070,874,144 bytes, exactly matching
+  the constant-mode boundary. The next tensor object was created, but uploading
+  its 7,340,032 bytes failed in `vsi_nn_CopyDataToTensor` with status -5
+  (`VX_ERROR_NOT_ALLOCATED`). It was the same layer-20 MLP down-projection weight.
+  Full weight readback and state allocation were not reached. The process exited
+  normally with code 1, without a timeout or residual child. A bounded follow-up
+  passed mutable FP16/FP32 weight readback and state allocation/release.
+  Changing `is_const` alone therefore does not bypass the observed limit; the
+  evidence no longer supports treating it as necessarily exclusive to constants.
 - Live driver parameters report `exclusiveSize=1,073,741,824` and
   `externalSize=2,008,023,040`. The selected constant-tensor pool is unconfirmed.
 - The exported text weights contain 1,504,791,232 payload bytes. Weights plus
@@ -38,10 +48,12 @@ Local evidence is retained under
 `.cache/runs/weight-allocation-after-reboot-20260909/`: `recheck-report.md`,
 `comparison.json`, `driver-parameters.json`, `sdk.log`, and `driver.strace`.
 The original run is under `.cache/runs/weight-allocation-first/`.
+The mutable experiment is under `.cache/runs/weight-allocation-mutable-20260917/`;
+see [the allocation comparison](tests/np101-mutable-allocation.md).
 
 ### Required follow-up and closure
 
-1. Obtain the team's explanation of constant-tensor pool selection and a
+1. Obtain the team's explanation of constant/mutable tensor pool selection and a
    supported driver configuration, driver build, or alternative allocation API.
    Record affected versions, limits, ownership, and lifetime requirements.
 2. Review and integrate that solution. Any sudo action or system configuration
@@ -68,6 +80,72 @@ changed allocation path or new vendor guidance. Keep the model, precision policy
 and full-device target fixed. Per-token host weight streaming is outside the
 resident-inference acceptance criteria.
 
+The small constant, mutable, and mixed-weight graphs now pass numerical and
+lifecycle checks with changing inputs/weights. This permits a separate, bounded
+comparison of allocation paths before a full-model retry. It does not demonstrate
+different physical pools, extra capacity, or device residency. See the
+[operator acceptance record](tests/np101-operator-acceptance.md).
+The all-mutable comparison has now been performed once and reproduced the same
+upload boundary. Do not repeat either full-capacity path without another concrete
+change or vendor guidance. Actual DeltaNet/Attention state reuse remains a
+separate unresolved item below.
+
+## NP101-STATE-001: Validate device-resident state reuse
+
+- [ ] Implement and validate state reuse/reset without a per-token host state copy.
+
+Status on 2026-09-16: state reuse is **not implemented in the active runtime and
+remains unaccepted**. The 22 SDK RNN feedback cases and temporary buffer tests
+were retired after preserving their source and evidence in the
+[investigation archive](tests/state-feedback-investigation.md). Handle feedback
+failed numerically; ordinary feedback used host state buffers. Fixed OpenVX ADD
+graphs passed their diagnostic controls, but are not an accepted implementation.
+Removing these tests does not resolve this item.
+
+Required implementation and acceptance:
+
+1. Use the chip team's `demo/ref_op_api_guide.md` as the interface baseline for
+   actual DeltaNet/Attention state. If it cannot express the required reuse or
+   incurs a significant predictable performance cost, document that specific
+   limitation before adopting and validating an alternative.
+2. Verify a representative changing-input trajectory for recurrent state,
+   convolution history, and KV storage against independent references. Preserve
+   necessary FP32 state precision, check intermediate results, and ensure KV
+   writes retain untouched rows and reject out-of-capacity positions.
+3. Reset to a defined initial state and compare the subsequent outputs with
+   both the reference and a fresh instance using the same input sequence.
+4. Run continuously with final-only application readback and establish that the
+   SDK does not transfer the state through the host between steps. Matching the
+   final result or having no application copy alone is insufficient. Check normal
+   release/recreation and retain separate hardware/residency evidence.
+
+Implement these checks with the real modules rather than restoring a generic
+matrix of delays, flushes, and SDK feedback variants. Use representative
+configurations for trajectory, reset, and transfer-free execution.
+
+This gates acceptance of device-resident sequential DeltaNet, Attention/KV,
+four-layer decoder groups, and full generation. Isolated operator checks,
+selected-weight projections, MLP, and bounded allocation experiments can continue;
+DeltaNet/Attention implementation can proceed while establishing their state path.
+
+## NP101-OBS-001: Obtain execution and device-memory evidence
+
+- [ ] Correlate graph nodes with actual NP101 execution/completion and observe
+  device allocation/release through a supported profiler or diagnostic API.
+
+The installed target-query headers describe available targets and kernel support,
+not the selected execution backend of every node. Driver IO, successful output,
+`argmax.execute_on_sw=false`, and a swappable tensor flag do not establish full
+hardware execution or residency. All current operator reports retain these gates.
+
+Four representative cases each complete 20 graph lifetimes. File descriptors
+stabilize after initialization and host RSS settles after early growth, but board
+memory counters are unavailable. Do not infer leak-free device allocation or use
+traced diagnostic timings as performance benchmarks.
+
+This blocks hardware acceptance and trustworthy device memory/performance claims
+for all modules; it does not block host implementation or numerical diagnostics.
+
 ## Dependencies and work that can continue
 
 Split the existing weight-preparation prerequisite into three independently
@@ -78,7 +156,7 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
 
 | Work item | Implementation while waiting | Device validation while waiting | Dependencies |
 |---|---|---|---|
-| Operator and state capability checks | Existing diagnostics can be completed and corrected. | Small and individual model-shape cases can run after device access/health checks. | Required FP32 math, feedback/reset, cache operations, and hardware evidence remain unresolved. |
+| Operator and state capability checks | Retain operator checks; implement state reuse/reset checks with the actual DeltaNet/Attention modules. | Targeted operator regressions can run after device health checks; state acceptance remains pending. | NP101-STATE-001 for state reuse/reset; NP101-OBS-001 for hardware evidence. |
 | Weight export, integrity, layouts, and memory accounting | Host export and independent byte comparisons already pass; layout and accounting work can continue. | Validate selected weight tensors and their projections. Full-model simultaneous allocation remains blocked. | Selected-operator checks; NP101-MEM-001 for full resident allocation. |
 | DeltaNet subgraph | Implement projections, short convolution, gates, FP32 recurrence, normalization, and reset. | Load one layer's weights and state; compare 1/2/4/8/32-token output and state traces, including nonzero initialization. | Its operators, state feedback, selected-weight layouts, and measured subgraph memory. |
 | Attention subgraph | Implement Q/gate splitting, Q/K norm, partial RoPE, GQA, KV writes, masking, and output gate. | Load one layer; test positions 0/1/3/7/255/511, invalid-slot masking, and capacity rejection. | Its operators, persistent KV, layouts, and measured subgraph memory. |
@@ -90,15 +168,17 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
 
 ### Other capability gates remain independent
 
-- FP32 state matrix operations, same-graph feedback/reset, and model-sized cases
-  still need successful numerical and hardware validation. Host-buffer-backed
-  state feedback does not meet device-residency acceptance.
+- Model-sized FP32 matrix operations and the four real-weight projections now
+  pass numerical checks. Resident feedback/reset remains blocked by
+  NP101-STATE-001, and hardware proof by NP101-OBS-001.
 - `vsi_nn_AttachTensorToGraph` is declared but not exported by the current SDK.
   An exported alternative or composition within one graph must be validated
   before relying on connections between subgraphs. Resolving NP101-MEM-001
   alone does not provide that capability.
-- Device execution of argmax/selection and full-vocabulary gather/head remains
-  unverified. CPU selection cannot satisfy the complete DLM requirement.
+- Full-vocabulary gather, individual head blocks/tail, and block token selection
+  pass their numerical probes. The complete blocked head is not yet integrated;
+  device execution remains unverified. CPU selection cannot satisfy the complete
+  DLM requirement.
 
 ### Weight footprints for isolated tests
 
@@ -124,8 +204,8 @@ weight aliases prove sharing inside the SDK.
 
 ## Recommended next implementation order
 
-1. Complete the required small operator/state cases, then their individual real
-   shapes and selected-weight layout checks. Stop on a failed capability gate.
+1. Reuse the validated operator results; check changed operators and selected-weight
+   layouts as needed. Do not restore the retired SDK RNN diagnostic matrix.
 2. Implement and validate one DeltaNet layer with persistent state and reset.
 3. Implement and validate one Attention layer with persistent KV and boundaries.
 4. Implement MLP/residuals and validate one four-layer decoder group.

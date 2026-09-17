@@ -29,11 +29,12 @@ class Fixture:
     nodes: list = field(default_factory=list)
     inputs: dict = field(default_factory=dict)
     expected: dict = field(default_factory=dict)
-    feedback: tuple[str, str] | None = None
-    reset_after: int = 0
+    integer_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
     provenance: dict = field(default_factory=lambda: {"kind": "synthetic", "seed": 101})
 
     def tensor(self, name, value, dtype="F16", storage="mutable", initialize=False):
+        if storage not in {"constant", "mutable"}:
+            raise ValueError(f"unsupported tensor storage: {storage}")
         if name in self.tensors:
             raise ValueError(f"duplicate tensor: {name}")
         data = array(value, dtype)
@@ -74,7 +75,7 @@ class Fixture:
 
     def write(self, directory: Path) -> dict:
         directory.mkdir(parents=True, exist_ok=False)
-        lines = ["specferry-np101-case 1", f"steps {self.steps}"]
+        lines = ["specferry-np101-case 2", f"steps {self.steps}"]
         for name, tensor in self.tensors.items():
             data = tensor["data"]
             filename = f"{name}.initial.bin" if tensor["initialize"] else "-"
@@ -97,10 +98,8 @@ class Fixture:
             lines.append(f"output {name}")
             for step, value in enumerate(values):
                 value.tofile(directory / f"{name}.expected.{step}.bin")
-        if self.feedback:
-            lines.append(f"feedback {self.feedback[0]} {self.feedback[1]}")
-        if self.reset_after:
-            lines.append(f"reset_after {self.reset_after}")
+        for name, (minimum, maximum) in self.integer_bounds.items():
+            lines.append(f"bounds {name} {minimum} {maximum}")
         (directory / "graph.txt").write_text("\n".join(lines) + "\n")
         return {
             "name": self.name,
@@ -117,5 +116,12 @@ class Fixture:
                 for name, tensor in self.tensors.items()
             },
             "outputs": list(self.expected),
-            "feedback": self.feedback,
+            "integer_bounds": self.integer_bounds,
+            "tensor_payload_bytes": sum(value["data"].nbytes for value in self.tensors.values()),
+            "constant_payload_bytes": sum(
+                value["data"].nbytes
+                for value in self.tensors.values()
+                if value["storage"] == "constant"
+            ),
+            "memory_note": "Payload only; SDK copies, packing and workspace are unmeasured.",
         }

@@ -87,6 +87,15 @@ def collect(include, libraries):
         "machine": platform.machine(),
         "python": sys.version,
         "python_executable": sys.executable,
+        "boot_id": read("/proc/sys/kernel/random/boot_id"),
+        "git_revision": command(["git", "-C", str(root), "rev-parse", "HEAD"]),
+        "git_status": command(["git", "-C", str(root), "status", "--short"]),
+        "source_sha256": {
+            str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for folder in ("native", "python", "scripts", "tests")
+            for path in sorted((root / folder).rglob("*"))
+            if path.is_file() and path.suffix in (".py", ".cpp", ".hpp")
+        },
         "cpu_count": os.cpu_count(),
         "cpu": command(["lscpu"]),
         "memory": read("/proc/meminfo"),
@@ -111,7 +120,14 @@ def collect(include, libraries):
         "galcore_module_loaded": Path("/sys/module/galcore").exists(),
         "driver_parameters": {
             name: read(Path("/sys/module/galcore/parameters") / name)
-            for name in ("contiguousSize", "externalSize", "physSize", "enableNN", "type")
+            for name in (
+                "contiguousSize",
+                "exclusiveSize",
+                "externalSize",
+                "physSize",
+                "enableNN",
+                "type",
+            )
         },
         "runtime_options": {
             name: os.environ.get(name)

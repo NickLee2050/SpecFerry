@@ -1,6 +1,8 @@
 #include "case_file.hpp"
 
+#include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -47,7 +49,8 @@ std::uint32_t unsigned_value(const std::string &text) {
 CaseDefinition load_case(const std::filesystem::path &path) {
   std::ifstream file(path);
   std::string line;
-  if (!std::getline(file, line) || line != "specferry-np101-case 1") {
+  if (!std::getline(file, line) ||
+      (line != "specferry-np101-case 1" && line != "specferry-np101-case 2")) {
     throw std::invalid_argument("invalid case header");
   }
   CaseDefinition result;
@@ -64,8 +67,7 @@ CaseDefinition load_case(const std::filesystem::path &path) {
       std::string name, dtype, storage, shape, initial;
       fields >> name >> dtype >> storage >> shape >> initial;
       require_name(name);
-      if (!names.insert(name).second ||
-          (storage != "constant" && storage != "mutable" && storage != "handle")) {
+      if (!names.insert(name).second || (storage != "constant" && storage != "mutable")) {
         throw std::invalid_argument("duplicate tensor or invalid storage: " + name);
       }
       np101::TensorSpec spec{np101::parse_dtype(dtype), np101::parse_shape(shape)};
@@ -94,20 +96,20 @@ CaseDefinition load_case(const std::filesystem::path &path) {
       std::string name;
       fields >> name;
       result.outputs.push_back(name);
-    } else if (command == "feedback") {
-      if (!result.feedback_input.empty()) {
-        throw std::invalid_argument("only one feedback connection is supported per fixture");
+    } else if (command == "bounds") {
+      std::string tensor, minimum, maximum;
+      fields >> tensor >> minimum >> maximum;
+      auto low = unsigned_value(minimum);
+      auto high = unsigned_value(maximum);
+      if (low > high || high > INT32_MAX) {
+        throw std::invalid_argument("invalid integer bounds");
       }
-      fields >> result.feedback_output >> result.feedback_input;
-    } else if (command == "steps" || command == "reset_after") {
+      result.integer_bounds.push_back(
+          {tensor, static_cast<std::int32_t>(low), static_cast<std::int32_t>(high)});
+    } else if (command == "steps") {
       std::string value;
       fields >> value;
-      auto number = unsigned_value(value);
-      if (command == "steps") {
-        result.steps = number;
-      } else {
-        result.reset_after = number;
-      }
+      result.steps = unsigned_value(value);
     } else {
       throw std::invalid_argument("unknown case directive: " + command);
     }
@@ -120,7 +122,7 @@ CaseDefinition load_case(const std::filesystem::path &path) {
     }
   }
   if (result.tensors.empty() || result.nodes.empty() || result.outputs.empty() ||
-      result.steps == 0 || result.steps > 32 || result.reset_after >= result.steps) {
+      result.steps == 0 || result.steps > 32) {
     throw std::invalid_argument("incomplete fixture or invalid step count");
   }
   auto require_tensor = [&](const std::string &name) {
@@ -129,14 +131,39 @@ CaseDefinition load_case(const std::filesystem::path &path) {
     }
   };
   std::set<std::string> produced;
+  std::map<std::string, const TensorDefinition *> definitions;
+  std::set<std::string> available;
+  for (const auto &tensor : result.tensors) {
+    definitions.emplace(tensor.name, &tensor);
+    if (tensor.initial_file != "-") {
+      available.insert(tensor.name);
+    }
+    if (tensor.storage == "constant" && tensor.initial_file == "-") {
+      throw std::invalid_argument("constant tensor lacks initialization: " + tensor.name);
+    }
+  }
+  std::set<std::string> input_names;
+  for (const auto &input : result.inputs) {
+    require_tensor(input.tensor);
+    if (!input_names.insert(input.tensor).second ||
+        definitions.at(input.tensor)->storage == "constant") {
+      throw std::invalid_argument("duplicate or constant graph input: " + input.tensor);
+    }
+    available.insert(input.tensor);
+  }
   for (const auto &node : result.nodes) {
     require_tensor(node.output);
-    if (!produced.insert(node.output).second) {
-      throw std::invalid_argument("tensor has multiple producers: " + node.output);
+    if (!produced.insert(node.output).second || input_names.count(node.output) ||
+        definitions.at(node.output)->storage == "constant") {
+      throw std::invalid_argument("invalid or multiple tensor producers: " + node.output);
     }
     for (const auto &input : node.inputs) {
       require_tensor(input);
+      if (!available.count(input)) {
+        throw std::invalid_argument("node reads an uninitialized tensor: " + input);
+      }
     }
+    available.insert(node.output);
   }
   for (const auto &input : result.inputs) {
     require_tensor(input.tensor);
@@ -146,10 +173,19 @@ CaseDefinition load_case(const std::filesystem::path &path) {
   }
   for (const auto &output : result.outputs) {
     require_tensor(output);
+    if (!produced.count(output)) {
+      throw std::invalid_argument("output is not produced by a node: " + output);
+    }
   }
-  if (!result.feedback_input.empty()) {
-    require_tensor(result.feedback_input);
-    require_tensor(result.feedback_output);
+  std::set<std::string> bounded;
+  for (const auto &bounds : result.integer_bounds) {
+    require_tensor(bounds.tensor);
+    const auto &tensor = *definitions.at(bounds.tensor);
+    if (!bounded.insert(bounds.tensor).second || tensor.spec.type != np101::DataType::Int32 ||
+        produced.count(bounds.tensor) ||
+        (tensor.initial_file == "-" && !input_names.count(bounds.tensor))) {
+      throw std::invalid_argument("bounds require an initialized INT32 input");
+    }
   }
   return result;
 }
@@ -169,5 +205,35 @@ std::vector<std::uint8_t> read_bytes(const std::filesystem::path &root, const st
     throw std::runtime_error("cannot read fixture: " + name);
   }
   return data;
+}
+
+void validate_case_data(const CaseDefinition &test) {
+  auto validate = [&](const TensorDefinition &tensor, const std::string &filename) {
+    auto data = read_bytes(test.root, filename, tensor.spec.bytes());
+    for (const auto &bounds : test.integer_bounds) {
+      if (bounds.tensor != tensor.name) {
+        continue;
+      }
+      for (std::size_t offset = 0; offset < data.size(); offset += sizeof(std::int32_t)) {
+        std::int32_t value;
+        std::memcpy(&value, data.data() + offset, sizeof(value));
+        if (value < bounds.minimum || value > bounds.maximum) {
+          throw std::invalid_argument("index outside declared bounds: " + tensor.name);
+        }
+      }
+    }
+  };
+  for (const auto &tensor : test.tensors) {
+    if (tensor.initial_file != "-") {
+      validate(tensor, tensor.initial_file);
+    }
+    for (const auto &input : test.inputs) {
+      if (input.tensor == tensor.name) {
+        for (const auto &filename : input.files) {
+          validate(tensor, filename);
+        }
+      }
+    }
+  }
 }
 } // namespace specferry::testing

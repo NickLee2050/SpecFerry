@@ -42,7 +42,7 @@ std::size_t tensor_bytes(vsi_nn_tensor_t *tensor) {
 } // namespace
 
 vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constant,
-                              const std::vector<std::uint8_t> &initial, bool from_handle) {
+                              const std::vector<std::uint8_t> &initial) {
   auto bytes = spec.bytes();
   if ((!initial.empty() && initial.size() != bytes) || (constant && initial.empty())) {
     throw std::invalid_argument("tensor initialization size mismatch");
@@ -68,19 +68,13 @@ vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constan
     break;
   }
 
-  // AddTensor copies initialization bytes. FromHandle owns its aligned allocation;
-  // never hand it a vector's storage or infer device residency from this API.
-  auto id = from_handle
-                ? vsi_nn_AddTensorFromHandle(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr, nullptr)
-                : vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr,
-                                   initial.empty() ? nullptr
-                                                   : const_cast<std::uint8_t *>(initial.data()));
+  // AddTensor copies initialization bytes; the graph owns the resulting tensor.
+  auto id =
+      vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr,
+                       initial.empty() ? nullptr : const_cast<std::uint8_t *>(initial.data()));
   if (id == VSI_NN_TENSOR_ID_NA || !vsi_nn_GetTensor(graph.get(), id)) {
     throw std::runtime_error("AddTensor failed: dtype=" + dtype_name(spec.type) +
                              " bytes=" + std::to_string(bytes));
-  }
-  if (from_handle && !initial.empty()) {
-    upload_tensor(graph, id, initial);
   }
   return id;
 }

@@ -104,10 +104,21 @@ def run_device(
     sdk_lib: Path,
     timeout: int,
     artifact_prefix: str | None = None,
+    shader_header: Path | None = None,
 ) -> dict:
     require_recovered_device(RECOVERY_ROOT)
     binary = binary.resolve(strict=True)
     output.mkdir(parents=True, exist_ok=True)
+    shader_headers = []
+    if shader_header is not None:
+        header = shader_header.resolve(strict=True)
+        if header.name != "cl_viv_vx_ext.h":
+            raise ValueError("expected the installed SDK cl_viv_vx_ext.h header")
+        # This SDK's shader compiler searches its working directory. Stage the
+        # unmodified vendor header next to the run, never into the SDK installation.
+        destination = output / header.name
+        shutil.copy2(header, destination)
+        shader_headers.append({"source": str(header), "sha256": fingerprint(destination)})
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(sdk_lib.resolve(strict=True))
     env["VIV_VX_ENABLE_PRINT_TARGET"] = "1"
@@ -140,6 +151,7 @@ def run_device(
         "binary_sha256": fingerprint(binary),
         "linked_libraries": libraries,
         "sdk_library_dir": str(sdk_lib.resolve()),
+        "shader_headers": shader_headers,
         "timeout": False,
         "boot_id": host_boot_id(),
         "sdk_sha256": {
