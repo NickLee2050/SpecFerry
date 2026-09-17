@@ -98,7 +98,7 @@ def main() -> int:
         "status": "running",
         "cases": results,
         "hardware_acceptance": "unverified",
-        "state_reuse_acceptance": "not_implemented",
+        "state_reuse_acceptance": "not_evaluated_by_operator_suite",
         "full_catalog": len(selected) == len(cases),
         "pending_cases": sorted(set(cases) - {case.name for case in selected}),
         "selected_cases": [case.name for case in selected],

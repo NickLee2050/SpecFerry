@@ -8,6 +8,7 @@
 | `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
 | `native/np101/graph_sharing_check.cpp` | Cross-graph tensor attachment and execution | Yes, when the SDK exports the API |
 | `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, state coexistence, and full weight readback | Yes |
+| `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 
 Run host tests from the repository root with the `SpecFerry` Conda environment:
 
@@ -42,8 +43,11 @@ device residency. The current catalog contains 49 synthetic operator cases plus
 four optional captured-reference projections, with no cross-execution feedback.
 The [operator acceptance record](np101-operator-acceptance.md) preserves historical
 results, and the [state investigation record](state-feedback-investigation.md)
-documents the retired experiments. State reuse/reset acceptance remains pending
-for the actual DeltaNet/Attention implementations (`NP101-STATE-001`).
+documents the retired experiments. The [DeltaNet module check](np101-delta-net.md)
+now covers numerical state reuse/reset. Device-residency evidence and the later
+Attention implementation remain pending (`NP101-STATE-001`). `test_delta_net.py`
+protects reference-input contracts and rejects incorrect or incomplete trajectory,
+reset, final-only and lifecycle results without opening the device.
 
 Keep host unit tests small and independent of downloaded weights. Hardware failures,
 timeouts, unsupported APIs, and missing execution evidence must remain visible;

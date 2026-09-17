@@ -36,6 +36,10 @@ set(CMAKE_BUILD_RPATH "${LJMICRO_SDK_LIBRARY_DIR}")
 
 target_compile_options(np101_context PRIVATE -Wall -Wextra -Wpedantic)
 
+add_library(np101_delta_net native/np101/delta_net.cpp)
+target_link_libraries(np101_delta_net PUBLIC np101_context)
+target_compile_options(np101_delta_net PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(tests/native)

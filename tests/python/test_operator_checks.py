@@ -90,7 +90,7 @@ class ComparisonTests(unittest.TestCase):
             lock.assert_not_called()
             report = json.loads((output / "op-capabilities.json").read_text())
             self.assertEqual(report["status"], "prepared")
-            self.assertEqual(report["state_reuse_acceptance"], "not_implemented")
+            self.assertEqual(report["state_reuse_acceptance"], "not_evaluated_by_operator_suite")
             self.assertEqual(len(report["cases"]), 1)
             self.assertTrue((output / "argmax_small/fixture/graph.txt").is_file())
 

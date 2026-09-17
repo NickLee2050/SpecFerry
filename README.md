@@ -3,12 +3,13 @@ A testbed for speculative decoding across heterogeneous edge devices and a local
 
 The initial deployment target is full text inference of `Qwen/Qwen3.5-0.8B`
 on NP101 as the draft language model (DLM). The repository currently provides
-environment capture, checkpoint download, CPU references, operator capability probes, streamed text-weight export, and native SDK
+environment capture, checkpoint download, CPU references, operator capability probes,
+streamed text-weight export, a C++ single-layer DeltaNet mixer, and native SDK
 validation tests. Full DLM inference on NP101 is not yet implemented. Project constraints are in
 [AGENTS.md](AGENTS.md).
 
 Full-model resident weight allocation is currently blocked by an effective limit
-near 1 GiB in the tested constant-tensor path. The NP101 team is evaluating the
+near 1 GiB in both tested constant and mutable tensor paths. The NP101 team is evaluating the
 allocation mechanism. [Engineering follow-up](TODO.md) records the evidence,
 closure criteria, dependencies, and isolated component work that can continue.
 
@@ -163,9 +164,9 @@ these runs do not feed an output back into the next execution. Use repeatable
 
 SDK RNN feedback and temporary buffer experiments have been retired. Their
 [investigation record](tests/state-feedback-investigation.md) links the archived
-source and evidence. Device-resident state reuse and reset remain unaccepted
-(`NP101-STATE-001`); they will be tested with the actual DeltaNet/Attention modules.
-Suite reports explicitly retain `state_reuse_acceptance: not_implemented`.
+source and evidence. Operator suite reports mark state reuse as
+`not_evaluated_by_operator_suite`. The separate DeltaNet module now tests state
+reuse/reset numerically; hardware residency remains unaccepted (`NP101-STATE-001`).
 
 Each case retains its readable `graph.txt`, exact input/expected bytes, tensor shapes,
 source hashes, SDK execution report, logs, and driver trace. The suite snapshots its
@@ -196,6 +197,30 @@ Header availability, graph verification, numeric agreement, and device residency
 are distinct evidence. An explicitly selected software argmax path is reported
 as a blocker. Cross-graph attachment is checked as an
 optional SDK symbol because some library builds declare it without exporting it.
+
+## Validate one DeltaNet layer
+
+The C++ `np101_delta_net` library implements layer 0's mixer with fixed A-to-B and
+B-to-A graphs, FP32 recurrent state and FP16 convolution history. Its computation
+and step scheduling stay in C++; Python prepares an independent Transformers
+reference and compares results. Decoder input normalization, residual and MLP
+are not part of this mixer.
+
+```bash
+cmake --build build --target np101_delta_net_check -j 4
+python scripts/check_np101_delta_net.py \
+  --trace PATH/TO/deployment-fp16/layer-0-3-sequential.npz \
+  --output .cache/runs/delta-net --steps 32 --diagnostic
+```
+
+Use the `layer-0-3-sequential.npz` produced by the CPU reference. The runner checks
+zero/nonzero initial states, reset, a fresh instance, and final-only readback.
+`--prepare-only` prepares fixtures without device access. `--diagnostic` permits
+exit 0 for numerical/lifecycle agreement; otherwise missing hardware evidence
+returns 2. Fixed tensor sharing is a narrowly scoped exception to the vendor
+guide, explained with ownership, precision and results in the
+[DeltaNet validation record](tests/np101-delta-net.md). SDK matrix-node creation
+warnings and unknown execution/residency evidence remain visible.
 
 ## Export text weights and check memory allocation
 

@@ -94,13 +94,18 @@ separate unresolved item below.
 
 - [ ] Implement and validate state reuse/reset without a per-token host state copy.
 
-Status on 2026-09-16: state reuse is **not implemented in the active runtime and
-remains unaccepted**. The 22 SDK RNN feedback cases and temporary buffer tests
-were retired after preserving their source and evidence in the
-[investigation archive](tests/state-feedback-investigation.md). Handle feedback
-failed numerically; ordinary feedback used host state buffers. Fixed OpenVX ADD
-graphs passed their diagnostic controls, but are not an accepted implementation.
-Removing these tests does not resolve this item.
+Status on 2026-09-17: a C++ layer-0 DeltaNet mixer now implements fixed A-to-B and
+B-to-A graph execution with shared ordinary tensors. Two-step and 32-step
+real-weight tests passed numerical/lifecycle checks, including nonzero initial
+state, reset, recreation and final-only readback. There are no application state
+uploads between steps. **SDK-internal transfers and physical residency remain
+unverified; Attention/KV state has not been implemented. This item stays open.**
+See the [DeltaNet validation record](tests/np101-delta-net.md) for the isolated
+API exception, duplicate graph weights, SDK warnings and acceptance evidence.
+
+The 22 SDK RNN feedback cases and temporary buffer tests remain retired in the
+[investigation archive](tests/state-feedback-investigation.md). Handle swapping
+has not been restored. Their removal did not resolve this item.
 
 Required implementation and acceptance:
 
@@ -158,7 +163,7 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
 |---|---|---|---|
 | Operator and state capability checks | Retain operator checks; implement state reuse/reset checks with the actual DeltaNet/Attention modules. | Targeted operator regressions can run after device health checks; state acceptance remains pending. | NP101-STATE-001 for state reuse/reset; NP101-OBS-001 for hardware evidence. |
 | Weight export, integrity, layouts, and memory accounting | Host export and independent byte comparisons already pass; layout and accounting work can continue. | Validate selected weight tensors and their projections. Full-model simultaneous allocation remains blocked. | Selected-operator checks; NP101-MEM-001 for full resident allocation. |
-| DeltaNet subgraph | Implement projections, short convolution, gates, FP32 recurrence, normalization, and reset. | Load one layer's weights and state; compare 1/2/4/8/32-token output and state traces, including nonzero initialization. | Its operators, state feedback, selected-weight layouts, and measured subgraph memory. |
+| DeltaNet subgraph | Layer-0 C++ mixer and fixed state routing implemented. | Numerical trajectories through 32 steps, nonzero state, reset and recreation pass; actual backend, SDK state transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; graph composition must revisit duplicated weights. |
 | Attention subgraph | Implement Q/gate splitting, Q/K norm, partial RoPE, GQA, KV writes, masking, and output gate. | Load one layer; test positions 0/1/3/7/255/511, invalid-slot masking, and capacity rejection. | Its operators, persistent KV, layouts, and measured subgraph memory. |
 | MLP and four-layer decoder group | Implement MLP, trunk normalization, residuals, and layers 0-3. | Test individual layers, then one complete four-layer group with state retained across tokens. | Validated DeltaNet and Attention; device-resident connections between operators/layers. |
 | Embedding, LM head, and token selection | Implement lookup, fixed row blocks, valid tail rows, tie handling, and device-wide selection. | Test embedding and the full-vocabulary head in isolation using captured hidden states. Shared-table integration needs a validated storage/view strategy. | Gather, projection, device argmax/selection, supported sharing/layout, and measured memory. |
@@ -206,7 +211,9 @@ weight aliases prove sharing inside the SDK.
 
 1. Reuse the validated operator results; check changed operators and selected-weight
    layouts as needed. Do not restore the retired SDK RNN diagnostic matrix.
-2. Implement and validate one DeltaNet layer with persistent state and reset.
+2. Retain the implemented DeltaNet mixer and its numerical state/reset checks;
+   obtain the missing hardware/residency evidence without repeating the retired
+   diagnostic matrix.
 3. Implement and validate one Attention layer with persistent KV and boundaries.
 4. Implement MLP/residuals and validate one four-layer decoder group.
 5. Implement and validate standalone embedding, full-vocabulary head, and device
