@@ -1,10 +1,20 @@
+#include "np101/context.hpp"
 #include "np101/kv_cache.hpp"
+#include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
+#include "vsi_nn_pub.h"
 
 #include <array>
-#include <cstring>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <ostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 using namespace specferry::np101;

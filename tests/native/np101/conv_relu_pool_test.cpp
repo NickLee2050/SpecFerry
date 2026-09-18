@@ -1,17 +1,26 @@
-#include "np101/context.hpp"
-
 #include "gc_hal.h"
+#include "np101/context.hpp"
+#include "vsi_nn_pub.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <initializer_list>
 #include <iomanip>
+#include <ios>
 #include <iostream>
 #include <memory>
+#include <ratio>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 using specferry::np101::check;

@@ -1,10 +1,22 @@
+#include "np101/context.hpp"
 #include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
+#include "sys/resource.h"
+#include "vsi_nn_pub.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <ios>
 #include <iostream>
-#include <sys/resource.h>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 using namespace specferry::np101;

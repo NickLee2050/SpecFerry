@@ -323,6 +323,14 @@ The repository's `.clang-format` uses LLVM style with a 100-column line limit
 and a blank line between function definitions. Control statements (`if`, `else`,
 `for`, `while`, and `do`) require braces even for a single-statement body;
 clang-format inserts missing braces automatically.
+Includes are sorted alphabetically within two groups separated by a blank line:
+quoted project/SDK/third-party/platform headers first, angle-bracket C/C++ standard
+headers second.
+For a matching `.hpp`/`.cpp` pair, dependencies required by the header belong in
+`.hpp`; implementation-only dependencies belong in `.cpp`. The source includes
+its matching header without repeating that header's direct includes. SDK headers
+follow the same rule; unrelated headers must not supply SDK declarations implicitly.
+Remove unused includes. The matching header has no special sort priority.
 The Conda environment includes clang-format 18.1.8 for consistent formatting.
 
 ```bash

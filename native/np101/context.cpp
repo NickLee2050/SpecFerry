@@ -1,5 +1,8 @@
 #include "np101/context.hpp"
 
+#include <stdexcept>
+#include <string>
+
 namespace specferry::np101 {
 void check(vsi_status status, const char *operation) {
   if (status != VSI_SUCCESS) {

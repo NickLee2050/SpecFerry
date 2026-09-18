@@ -1,7 +1,9 @@
 #include "operators.hpp"
 
 #include <algorithm>
-#include <map>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 
 namespace specferry::testing {
 namespace {

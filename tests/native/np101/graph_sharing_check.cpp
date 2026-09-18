@@ -1,11 +1,19 @@
+#include "dlfcn.h"
+#include "np101/context.hpp"
 #include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
+#include "vsi_nn_pub.h"
 
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <dlfcn.h>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 using namespace specferry::np101;

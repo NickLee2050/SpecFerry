@@ -1,8 +1,12 @@
 #pragma once
 
-#include "np101/tensor.hpp"
+#include "np101/context.hpp"
+#include "vsi_nn_pub.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace specferry::np101 {
 // Fixed layer storage: one FP16 K and V tensor, each [2, capacity, 256].

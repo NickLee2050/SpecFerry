@@ -1,10 +1,16 @@
 #include "np101/attention.hpp"
+#include "np101/kv_cache.hpp"
+#include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
+#include "vsi_nn_pub.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <deque>
-#include <map>
+#include <initializer_list>
+#include <stdexcept>
+#include <utility>
 
 namespace specferry::np101 {
 namespace {

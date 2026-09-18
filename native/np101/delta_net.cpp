@@ -1,11 +1,16 @@
 #include "np101/delta_net.hpp"
+#include "np101/tensor.hpp"
+#include "vsi_nn_pub.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <map>
+#include <stdexcept>
+#include <utility>
 
 namespace specferry::np101 {
 namespace {

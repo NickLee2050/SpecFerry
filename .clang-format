@@ -2,3 +2,13 @@ BasedOnStyle: LLVM
 ColumnLimit: 100
 SeparateDefinitionBlocks: Always
 InsertBraces: true
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+# Do not promote a source file's matching header ahead of alphabetical order.
+IncludeIsMainRegex: '$^'
+IncludeCategories:
+  # Project, SDK, third-party and platform headers form one non-standard block.
+  - Regex: '^"'
+    Priority: 1
+  - Regex: '^<'
+    Priority: 2

@@ -1,9 +1,12 @@
+#include "dlfcn.h"
 #include "np101/tensor.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
-#include <dlfcn.h>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 namespace specferry::np101 {
 namespace {

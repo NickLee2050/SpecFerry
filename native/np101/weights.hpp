@@ -2,6 +2,8 @@
 
 #include "np101/tensor_spec.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>

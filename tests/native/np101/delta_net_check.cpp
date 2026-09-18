@@ -1,9 +1,16 @@
+#include "np101/context.hpp"
 #include "np101/delta_net.hpp"
+#include "np101/weights.hpp"
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 

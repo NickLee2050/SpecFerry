@@ -1,7 +1,9 @@
 #include "np101/kv_cache.hpp"
+#include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
 
 #include <array>
-#include <vector>
+#include <stdexcept>
 
 namespace specferry::np101 {
 namespace {

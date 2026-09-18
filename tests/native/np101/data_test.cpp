@@ -1,11 +1,19 @@
 #include "case_file.hpp"
+#include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
 
 #include <chrono>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <functional>
+#include <ios>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <system_error>
+#include <vector>
 
 namespace {
 using namespace specferry::np101;

@@ -1,10 +1,12 @@
 #include "np101/weights.hpp"
+#include "openssl/evp.h"
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <iomanip>
+#include <ios>
 #include <memory>
-#include <openssl/evp.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>

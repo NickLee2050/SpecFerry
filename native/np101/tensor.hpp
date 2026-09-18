@@ -2,7 +2,9 @@
 
 #include "np101/context.hpp"
 #include "np101/tensor_spec.hpp"
+#include "vsi_nn_pub.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace specferry::np101 {

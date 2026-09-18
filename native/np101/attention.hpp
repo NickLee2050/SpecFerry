@@ -1,10 +1,13 @@
 #pragma once
 
-#include "np101/kv_cache.hpp"
+#include "np101/context.hpp"
 #include "np101/weights.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace specferry::np101 {
 // Qwen3.5-0.8B layer-3 attention mixer, excluding decoder input norm/residual.
