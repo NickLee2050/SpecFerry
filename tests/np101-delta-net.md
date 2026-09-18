@@ -115,6 +115,7 @@ because the QKV read exceeded the existing 8 MiB chunk limit. The implementation
 now splits the 6,144-row projection into 4,096- and 2,048-row blocks; the failure
 is not included among the successful results above.
 
-Next implementation: Attention/KV. Remaining DeltaNet acceptance work is
+Attention/KV is now implemented and numerically validated separately; see the
+[Attention record](np101-attention.md). Remaining DeltaNet acceptance work is
 supported backend/state-transfer observation and later graph composition,
 including weight sharing and actual device-memory accounting.

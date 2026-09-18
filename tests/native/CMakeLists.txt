@@ -11,6 +11,10 @@ specferry_native_test(np101_weight_allocation_check np101/weight_allocation_chec
 specferry_native_test(np101_graph_sharing_check np101/graph_sharing_check.cpp)
 specferry_native_test(np101_delta_net_check np101/delta_net_check.cpp)
 target_link_libraries(np101_delta_net_check PRIVATE np101_delta_net)
+specferry_native_test(np101_kv_cache_check np101/kv_cache_check.cpp)
+target_link_libraries(np101_kv_cache_check PRIVATE np101_attention)
+specferry_native_test(np101_attention_check np101/attention_check.cpp np101/case_file.cpp)
+target_link_libraries(np101_attention_check PRIVATE np101_attention)
 
 add_executable(np101_data_test np101/data_test.cpp np101/case_file.cpp)
 target_link_libraries(np101_data_test PRIVATE np101_data)

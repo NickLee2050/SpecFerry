@@ -99,6 +99,33 @@ std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
   return {data.get(), data.get() + bytes};
 }
 
+vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver) {
+  auto *source = get_tensor(owner, id);
+  if (owner.get()->ctx != receiver.get()->ctx || !source->t || source->attr.vtl ||
+      source->attr.is_created_from_handle || source->attr.is_const) {
+    throw std::invalid_argument("sharing requires an ordinary mutable tensor in one context");
+  }
+  // The SDK's AttachTensorToGraph symbol is unavailable. As in DeltaNet, use
+  // public tensor wrappers and explicit OpenVX reference ownership instead.
+  auto attr = source->attr;
+  auto shared = vsi_nn_AddTensor(receiver.get(), VSI_NN_TENSOR_ID_AUTO, &attr, nullptr);
+  if (shared == VSI_NN_TENSOR_ID_NA) {
+    throw std::runtime_error("AddTensor failed for retained tensor");
+  }
+  auto *destination = get_tensor(receiver, shared);
+  check(vxRetainReference(reinterpret_cast<vx_reference>(source->t)), "retain tensor");
+  if (destination->t) {
+    auto status = vxReleaseTensor(&destination->t);
+    if (status != VX_SUCCESS) {
+      auto retained = source->t;
+      vxReleaseTensor(&retained);
+      check(status, "release unused retained-tensor allocation");
+    }
+  }
+  destination->t = source->t;
+  return shared;
+}
+
 TensorAttachment::TensorAttachment(Graph &owner, vsi_nn_tensor_id_t tensor, Graph &receiver)
     : receiver_(receiver), id_(VSI_NN_TENSOR_ID_NA) {
   if (owner.get() == receiver.get() || owner.get()->ctx != receiver.get()->ctx) {

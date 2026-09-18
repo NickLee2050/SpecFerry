@@ -4,7 +4,7 @@ A testbed for speculative decoding across heterogeneous edge devices and a local
 The initial deployment target is full text inference of `Qwen/Qwen3.5-0.8B`
 on NP101 as the draft language model (DLM). The repository currently provides
 environment capture, checkpoint download, CPU references, operator capability probes,
-streamed text-weight export, a C++ single-layer DeltaNet mixer, and native SDK
+streamed text-weight export, C++ single-layer DeltaNet and Attention mixers, and native SDK
 validation tests. Full DLM inference on NP101 is not yet implemented. Project constraints are in
 [AGENTS.md](AGENTS.md).
 
@@ -221,6 +221,31 @@ returns 2. Fixed tensor sharing is a narrowly scoped exception to the vendor
 guide, explained with ownership, precision and results in the
 [DeltaNet validation record](tests/np101-delta-net.md). SDK matrix-node creation
 warnings and unknown execution/residency evidence remain visible.
+
+## Validate Attention and single-buffer KV storage
+
+The layer-3 Attention mixer uses one preallocated FP16 K/V cache with capacity
+512. It writes only the current token's 2 KiB K/V into slot views and reads the
+same parent storage from a fixed Attention graph. Cache payload is 1 MiB per
+layer. Reset and truncation change the valid prefix without copying the cache.
+
+```bash
+cmake -S . -B build
+cmake --build build --target np101_attention_check np101_kv_cache_check -j 4
+python scripts/check_np101_attention.py --storage-only \
+  --output .cache/runs/kv-storage --diagnostic
+python scripts/check_np101_attention.py \
+  --trace PATH/TO/deployment-fp16/layer-0-3-sequential.npz \
+  --output .cache/runs/attention --steps 512 --timeout 1200 --diagnostic
+```
+
+The real-weight capacity suite passed 1,042 appends across initial, truncated,
+reset, final-only and fresh trajectories, with 207 successful checks. The runner
+also supports `--steps 2`, `8` or `32`, and `--prepare-only`. As with DeltaNet,
+numerical success does not establish hardware execution or physical residency.
+The SDK reverifies the small slot-copy graph when its destination changes; that
+overhead remains. See the [Attention validation record](tests/np101-attention.md)
+for ownership, API exceptions, the Softmax layout correction and acceptance limits.
 
 ## Export text weights and check memory allocation
 

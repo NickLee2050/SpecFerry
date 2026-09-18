@@ -14,6 +14,10 @@ void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::u
 
 std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id);
 
+// Retain one materialized ordinary tensor in a second SDK wrapper before setup.
+// Each graph owns its own OpenVX reference. This does not copy tensor contents.
+vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver);
+
 // Attach a graph-owned tensor without taking ownership of its C wrapper. This
 // object must die before either graph. Attachment alone does not prove zero-copy.
 class TensorAttachment {

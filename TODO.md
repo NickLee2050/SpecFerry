@@ -98,10 +98,17 @@ Status on 2026-09-17: a C++ layer-0 DeltaNet mixer now implements fixed A-to-B a
 B-to-A graph execution with shared ordinary tensors. Two-step and 32-step
 real-weight tests passed numerical/lifecycle checks, including nonzero initial
 state, reset, recreation and final-only readback. There are no application state
-uploads between steps. **SDK-internal transfers and physical residency remain
-unverified; Attention/KV state has not been implemented. This item stays open.**
+uploads between steps. Layer-3 Attention now uses one preallocated FP16 K/V cache
+with slot views; its 512-token suite passed 1,042 appends and 207 checks, including
+truncate/overwrite, reset, fresh-instance comparison, final-only readback and
+capacity rejection. KV payload is 1 MiB per layer, with only the new 2 KiB token
+submitted to the slot-copy graph on each step. **SDK-internal transfers and
+physical residency remain unverified. This item stays open.**
 See the [DeltaNet validation record](tests/np101-delta-net.md) for the isolated
 API exception, duplicate graph weights, SDK warnings and acceptance evidence.
+The [Attention validation record](tests/np101-attention.md) documents its view/
+ownership API exception, tested Softmax layout and the small copy graph's
+per-append revalidation overhead. Dynamic KV allocation remains deferred.
 
 The 22 SDK RNN feedback cases and temporary buffer tests remain retired in the
 [investigation archive](tests/state-feedback-investigation.md). Handle swapping
@@ -164,7 +171,7 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
 | Operator and state capability checks | Retain operator checks; implement state reuse/reset checks with the actual DeltaNet/Attention modules. | Targeted operator regressions can run after device health checks; state acceptance remains pending. | NP101-STATE-001 for state reuse/reset; NP101-OBS-001 for hardware evidence. |
 | Weight export, integrity, layouts, and memory accounting | Host export and independent byte comparisons already pass; layout and accounting work can continue. | Validate selected weight tensors and their projections. Full-model simultaneous allocation remains blocked. | Selected-operator checks; NP101-MEM-001 for full resident allocation. |
 | DeltaNet subgraph | Layer-0 C++ mixer and fixed state routing implemented. | Numerical trajectories through 32 steps, nonzero state, reset and recreation pass; actual backend, SDK state transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; graph composition must revisit duplicated weights. |
-| Attention subgraph | Implement Q/gate splitting, Q/K norm, partial RoPE, GQA, KV writes, masking, and output gate. | Load one layer; test positions 0/1/3/7/255/511, invalid-slot masking, and capacity rejection. | Its operators, persistent KV, layouts, and measured subgraph memory. |
+| Attention subgraph | Layer-3 C++ mixer and single-buffer KV append/reset/truncate implemented. | Real-weight 512-token trajectories, invalid-slot masking, capacity rejection and lifecycle pass; actual backend, SDK transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; copy-graph revalidation remains a performance concern. |
 | MLP and four-layer decoder group | Implement MLP, trunk normalization, residuals, and layers 0-3. | Test individual layers, then one complete four-layer group with state retained across tokens. | Validated DeltaNet and Attention; device-resident connections between operators/layers. |
 | Embedding, LM head, and token selection | Implement lookup, fixed row blocks, valid tail rows, tie handling, and device-wide selection. | Test embedding and the full-vocabulary head in isolation using captured hidden states. Shared-table integration needs a validated storage/view strategy. | Gather, projection, device argmax/selection, supported sharing/layout, and measured memory. |
 | Full 24-layer generation | Interfaces, sequencing, consumed-length semantics, EOS handling, and host-only contract tests can be prepared. | Full prompt/decode execution with all weights/state resident is blocked. | All subgraphs and head validated; NP101-MEM-001 resolved; final workspace allocation verified. |
@@ -177,9 +184,9 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
   pass numerical checks. Resident feedback/reset remains blocked by
   NP101-STATE-001, and hardware proof by NP101-OBS-001.
 - `vsi_nn_AttachTensorToGraph` is declared but not exported by the current SDK.
-  An exported alternative or composition within one graph must be validated
-  before relying on connections between subgraphs. Resolving NP101-MEM-001
-  alone does not provide that capability.
+  Retained ordinary tensors passed DeltaNet and Attention numerical sharing
+  checks. New composed graphs still need their own integration and residency
+  checks; resolving NP101-MEM-001 alone does not provide that evidence.
 - Full-vocabulary gather, individual head blocks/tail, and block token selection
   pass their numerical probes. The complete blocked head is not yet integrated;
   device execution remains unverified. CPU selection cannot satisfy the complete
@@ -214,7 +221,9 @@ weight aliases prove sharing inside the SDK.
 2. Retain the implemented DeltaNet mixer and its numerical state/reset checks;
    obtain the missing hardware/residency evidence without repeating the retired
    diagnostic matrix.
-3. Implement and validate one Attention layer with persistent KV and boundaries.
+3. Retain the implemented Attention layer and its single-buffer KV/boundary
+   checks. Investigate copy-graph revalidation cost and obtain hardware/residency
+   evidence during later integration; do not add dynamic allocation yet.
 4. Implement MLP/residuals and validate one four-layer decoder group.
 5. Implement and validate standalone embedding, full-vocabulary head, and device
    token selection; validate their sharing strategy before combining them.
