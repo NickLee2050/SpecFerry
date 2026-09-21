@@ -15,6 +15,8 @@ specferry_native_test(np101_kv_cache_check np101/kv_cache_check.cpp)
 target_link_libraries(np101_kv_cache_check PRIVATE np101_attention)
 specferry_native_test(np101_attention_check np101/attention_check.cpp np101/case_file.cpp)
 target_link_libraries(np101_attention_check PRIVATE np101_attention)
+specferry_native_test(np101_decoder_check np101/decoder_check.cpp np101/case_file.cpp)
+target_link_libraries(np101_decoder_check PRIVATE np101_decoder)
 
 add_executable(np101_data_test np101/data_test.cpp np101/case_file.cpp)
 target_link_libraries(np101_data_test PRIVATE np101_data)

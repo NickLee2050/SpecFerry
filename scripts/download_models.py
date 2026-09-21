@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download the enabled Qwen3.5 checkpoints, with pinned revisions and resume support."""
+"""Download the enabled checkpoints, with pinned revisions and resume support."""
 
 from __future__ import annotations
 
@@ -26,15 +26,19 @@ class ModelSpec:
 
 # Only the first DLM is enabled. Uncomment individual TLMs when their phase starts.
 MODELS = (
-    ModelSpec("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
-    # ModelSpec("Qwen/Qwen3.5-4B"),       # First two-machine experiment.
-    # ModelSpec("Qwen/Qwen3.5-9B"),       # Medium dense experiment.
-    # ModelSpec("Qwen/Qwen3.5-27B"),      # Large dense experiment.
-    # ModelSpec("Qwen/Qwen3.5-35B-A3B"),  # MoE experiment; all experts are downloaded.
+    ModelSpec("facebook/opt-350m", "08ab08cc4b72ff5593870b5d527cf4230323703c"),
+    # ModelSpec("facebook/opt-13b"),  # Prospective TLM; enable only after selection.
+    # ModelSpec("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
+    # ModelSpec("Qwen/Qwen3.5-4B"),
+    # ModelSpec("Qwen/Qwen3.5-9B"),
+    # ModelSpec("Qwen/Qwen3.5-27B"),
+    # ModelSpec("Qwen/Qwen3.5-35B-A3B"),
 )
-ALLOWED_REPOS = frozenset(f"Qwen/Qwen3.5-{size}" for size in ("0.8B", "4B", "9B", "27B", "35B-A3B"))
+ALLOWED_REPOS = frozenset(
+    {"facebook/opt-350m", "facebook/opt-13b"}
+    | {f"Qwen/Qwen3.5-{size}" for size in ("0.8B", "4B", "9B", "27B", "35B-A3B")}
+)
 FILE_PATTERNS = (
-    "*.safetensors",
     "*.json",
     "*.txt",
     "*.model",
@@ -55,7 +59,7 @@ def validate_models(models: tuple[ModelSpec, ...]) -> None:
         if "llama" in model.repo_id.casefold():
             raise ValueError(f"Llama models are excluded by project policy: {model.repo_id}")
         if model.repo_id not in ALLOWED_REPOS:
-            raise ValueError(f"Model is outside the Qwen3.5 download allowlist: {model.repo_id}")
+            raise ValueError(f"Model is outside the download allowlist: {model.repo_id}")
         if model.repo_id in seen:
             raise ValueError(f"Duplicate model: {model.repo_id}")
         if not model.revision:
@@ -89,10 +93,26 @@ def sha256_file(path: Path) -> str:
 
 
 def expected_files(info) -> list[dict]:
+    # Prefer safetensors when available; older official OPT releases provide only
+    # PyTorch weights. Select one format rather than downloading duplicate weights.
+    safe_weights = {
+        item.rfilename for item in info.siblings if item.rfilename.endswith(".safetensors")
+    }
+    pytorch_weights = {
+        item.rfilename for item in info.siblings if fnmatch(item.rfilename, "pytorch_model*.bin")
+    }
+    weight_files = safe_weights or pytorch_weights
+    excluded_index = (
+        "pytorch_model.bin.index.json" if safe_weights else "model.safetensors.index.json"
+    )
     files = []
     for item in info.siblings:
         name = item.rfilename
-        if not any(fnmatch(name, pattern) for pattern in FILE_PATTERNS):
+        if name == excluded_index:
+            continue
+        if name not in weight_files and not any(
+            fnmatch(name, pattern) for pattern in FILE_PATTERNS
+        ):
             continue
         if Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name:
             raise ValueError(f"Unsafe repository path: {name}")
@@ -100,10 +120,10 @@ def expected_files(info) -> list[dict]:
         digest = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
         files.append({"path": name, "size": getattr(item, "size", None), "sha256": digest})
     names = {item["path"] for item in files}
-    if "config.json" not in names or not any(name.endswith(".safetensors") for name in names):
-        raise ValueError("The repository does not contain config.json and safetensors weights.")
-    if "tokenizer.json" not in names:
-        raise ValueError("The repository does not contain tokenizer.json.")
+    if "config.json" not in names or not weight_files:
+        raise ValueError("The repository does not contain config.json and supported weights.")
+    if "tokenizer.json" not in names and not {"vocab.json", "merges.txt"} <= names:
+        raise ValueError("The repository requires tokenizer.json or vocab.json with merges.txt.")
     return sorted(files, key=lambda item: item["path"])
 
 
@@ -117,7 +137,7 @@ def verify_files(destination: Path, files: list[dict]) -> None:
             raise ValueError(f"Download size mismatch: {path}")
         if item["sha256"] and sha256_file(path) != item["sha256"]:
             raise ValueError(f"Download SHA256 mismatch: {path}")
-        if item["path"].endswith(".safetensors.index.json"):
+        if item["path"].endswith((".safetensors.index.json", ".bin.index.json")):
             index = json.loads(path.read_text(encoding="utf-8"))
             if not set(index["weight_map"].values()).issubset(names):
                 raise ValueError(f"Weight index refers to an unselected shard: {path}")
@@ -158,7 +178,7 @@ def download_one(model: ModelSpec, output: Path, file_workers: int, range_worker
         from range_download import download_ranges
 
         for item in files:
-            if item["path"].endswith(".safetensors") and item["sha256"] and item["size"]:
+            if item["path"].endswith((".safetensors", ".bin")) and item["sha256"] and item["size"]:
                 download_ranges(
                     hf_hub_url(model.repo_id, item["path"], revision=info.sha),
                     destination / item["path"],

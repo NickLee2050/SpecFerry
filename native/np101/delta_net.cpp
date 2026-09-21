@@ -1,5 +1,4 @@
 #include "np101/delta_net.hpp"
-#include "np101/tensor.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -9,6 +8,7 @@
 #include <deque>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -18,37 +18,14 @@ using Id = vsi_nn_tensor_id_t;
 using Shape = std::vector<std::uint32_t>;
 constexpr auto f16 = DataType::Float16;
 constexpr auto f32 = DataType::Float32;
-const std::string prefix = "model.layers.0.linear_attn.";
 
 struct Tensor {
   Id id;
   TensorSpec spec;
 };
 
-// One narrowly scoped exception to ref_op_api_guide.md: retain a fixed OpenVX
-// tensor in a second SDK wrapper. AddTensor only creates graph-owned tensors;
-// the installed SDK does not export AttachTensorToGraph. Autoregressive state
-// must cross executions without host copies. No handle is swapped or rebound
-// after graph compilation. Each wrapper owns exactly one retained reference.
 Tensor share_state(Graph &source, Tensor tensor, Graph &destination) {
-  auto *original = vsi_nn_GetTensor(source.get(), tensor.id);
-  if (!original || !original->t || original->attr.vtl || original->attr.is_const ||
-      original->attr.is_created_from_handle) {
-    throw std::runtime_error("state sharing requires a materialized ordinary mutable tensor");
-  }
-  Tensor shared{add_tensor(destination, tensor.spec), tensor.spec};
-  auto *wrapper = vsi_nn_GetTensor(destination.get(), shared.id);
-  check(vxRetainReference(reinterpret_cast<vx_reference>(original->t)), "retain shared state");
-  if (wrapper->t) {
-    auto status = vxReleaseTensor(&wrapper->t);
-    if (status != VX_SUCCESS) {
-      auto retained = original->t;
-      vxReleaseTensor(&retained);
-      check(status, "release unused state tensor");
-    }
-  }
-  wrapper->t = original->t;
-  return shared;
+  return {retain_tensor(source, tensor.id, destination), tensor.spec};
 }
 
 class StepGraph {
@@ -56,15 +33,34 @@ public:
   // Parameter arrays must outlive graph destruction, hence declared first.
   std::deque<Shape> parameters;
   Graph graph;
+  std::string prefix;
   Tensor input;
+  Tensor result;
   Tensor recurrent_input;
   Tensor convolution_input;
   Tensor recurrent_output;
   Tensor convolution_output;
   std::map<std::string, Tensor> outputs;
 
-  StepGraph(Context &context, const WeightStore &weights, StepGraph *previous = nullptr)
-      : graph(context, 160, 128), input(make({f16, {1024, 1}})) {
+  StepGraph(Context &context, const WeightStore &weights, unsigned layer,
+            std::optional<TensorBinding> input_binding, std::optional<TensorBinding> output_binding,
+            StepGraph *previous = nullptr)
+      : graph(context, 160, 128),
+        prefix("model.layers." + std::to_string(layer) + ".linear_attn.") {
+    if (layer > 2) {
+      throw std::invalid_argument("DeltaNet currently supports layers 0-2");
+    }
+    const TensorSpec hidden{f16, {1024, 1}};
+    if (input_binding && output_binding) {
+      input = {bind_hidden(*input_binding, graph), hidden};
+      result = {bind_hidden(*output_binding, graph), hidden};
+    } else if (previous) {
+      input = share_state(previous->graph, previous->input, graph);
+      result = share_state(previous->graph, previous->result, graph);
+    } else {
+      input = make(hidden);
+      result = make(hidden);
+    }
     if (previous) {
       recurrent_input = share_state(previous->graph, previous->recurrent_output, graph);
       recurrent_output = share_state(previous->graph, previous->recurrent_input, graph);
@@ -246,7 +242,10 @@ private:
     auto correction = binary(VSI_NN_OP_MULTIPLY, error, beta);
     auto update = matmul(key, correction, {128, 128, 16}, true);
     node(VSI_NN_OP_ADD, {decayed, update}, recurrent_output);
-    return convert(matmul(query, recurrent_output, {128, 1, 16}), f16);
+    // This SDK flushes FP16 subnormals to zero. Core values can be much smaller
+    // than 2^-14; losing them before RMS normalization amplifies the error across
+    // decoder layers. Keep this sensitive dot product in FP32 through reduction.
+    return matmul(query, recurrent_output, {128, 1, 16});
   }
 
   void build(const WeightStore &weights) {
@@ -264,13 +263,16 @@ private:
     auto beta = convert(unary(VSI_NN_OP_SIGMOID, b, f16), f32);
     auto core = recurrence(convolved, reshape(decay, {1, 1, 16}), reshape(beta, {1, 1, 16}));
 
-    auto normalized = normalize(convert(reshape(core, {128, 16}), f32), true);
+    auto normalized = normalize(reshape(core, {128, 16}), true);
     normalized = convert(convert(normalized, f16), f32);
     auto scale = reshape(weight(weights, "norm.weight", {f32, {128}}), {128, 1});
     auto scaled = binary(VSI_NN_OP_MULTIPLY, normalized, scale);
     auto activated_gate = unary(VSI_NN_OP_SWISH, convert(reshape(gate, {128, 16}), f32), f32);
     auto gated = convert(binary(VSI_NN_OP_MULTIPLY, scaled, activated_gate), f16);
-    auto result = project(weights, reshape(gated, {2048, 1}), "out_proj", 1024);
+    auto matrix = weight(weights, "out_proj.weight", {f16, {2048, 1024}});
+    auto *projection = node(VSI_NN_OP_MATRIXMUL, {reshape(gated, {2048, 1}), matrix}, result);
+    projection->nn_param.matrixmul.transpose[0] = false;
+    projection->nn_param.matrixmul.transpose[1] = true;
     outputs = {{"output", result},
                {"recurrent", recurrent_output},
                {"convolution", convolution_output},
@@ -278,7 +280,9 @@ private:
                {"convolved", convolved},
                {"decay", decay},
                {"beta", beta},
-               {"core", core}};
+               {"core", core},
+               {"gate", gate},
+               {"gated", gated}};
   }
 };
 } // namespace
@@ -289,14 +293,21 @@ struct DeltaNet::Impl {
   std::size_t completed_steps = 0;
   bool failed = false;
 
-  Impl(Context &context, const WeightStore &weights) {
-    forward = std::make_unique<StepGraph>(context, weights);
-    backward = std::make_unique<StepGraph>(context, weights, forward.get());
+  Impl(Context &context, const WeightStore &weights, unsigned layer = 0,
+       std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {}) {
+    forward = std::make_unique<StepGraph>(context, weights, layer, input, output);
+    backward = std::make_unique<StepGraph>(context, weights, layer, input, output, forward.get());
   }
 };
 
 DeltaNet::DeltaNet(Context &context, const WeightStore &weights)
     : impl_(std::make_unique<Impl>(context, weights)) {
+  reset();
+}
+
+DeltaNet::DeltaNet(Context &context, const WeightStore &weights, unsigned layer,
+                   TensorBinding input, TensorBinding output)
+    : impl_(std::make_unique<Impl>(context, weights, layer, input, output)) {
   reset();
 }
 
@@ -314,7 +325,9 @@ TensorSpec DeltaNet::output_spec(const std::string &name) {
                                                 {"convolved", {f16, {6144, 1}}},
                                                 {"decay", {f32, {16, 1}}},
                                                 {"beta", {f32, {16, 1}}},
-                                                {"core", {f16, {128, 1, 16}}}};
+                                                {"core", {f32, {128, 1, 16}}},
+                                                {"gate", {f16, {2048, 1}}},
+                                                {"gated", {f16, {128, 16}}}};
   return specs.at(name);
 }
 
@@ -353,6 +366,16 @@ void DeltaNet::step(const std::vector<std::uint8_t> &hidden_fp16) {
   auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
   impl_->failed = true;
   upload_tensor(step.graph, step.input.id, hidden_fp16);
+  impl_->failed = false;
+  this->step();
+}
+
+void DeltaNet::step() {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("DeltaNet must be initialized/reset before stepping");
+  }
+  auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
+  impl_->failed = true;
   check(vsi_nn_RunGraph(step.graph.get()), "DeltaNet RunGraph");
   ++impl_->completed_steps;
   impl_->failed = false;

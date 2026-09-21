@@ -1,6 +1,56 @@
 # Engineering follow-up
 
-Updated: 2026-09-17. Target: resident text inference of Qwen3.5-0.8B on NP101.
+Updated: 2026-09-21. Active target: resident text inference of OPT-350M on NP101.
+
+## NP101-MODEL-001: Decouple model composition and adapt OPT-350M
+
+- [ ] Separate shared NP101 operators/storage from model-specific composition,
+  then validate complete OPT-350M text generation.
+
+The user selected `facebook/opt-350m` on 2026-09-21. The active download changes
+to that checkpoint; existing Qwen3.5 caches, code and evidence remain available
+for regression. The [implementation checklist](docs/model-decoupling-plan.md)
+is pending review. Download and independent CPU FP16 import validation passed:
+388 tensors, 331,196,416 unique parameters, 662,392,832 weight payload bytes;
+three short generations and an eight-token cache comparison passed. Evidence
+and a rerun script are in `.cache/runs/opt-350m-import-20260921/`.
+The inference refactor, reusable OPT reference/export path and NP101 adaptation
+have not started.
+
+The Qwen weight, layer and allocation figures below describe the retained
+baseline. OPT requires its own export, memory accounting, numerical validation
+and execution/residency evidence. Its smaller weights do not establish that a
+complete graph fits, but the Qwen weight-size blocker does not automatically
+block OPT either. NP101-OBS-001 and the KV-related NP101-STATE-001 checks remain
+applicable. Deferred DeltaNet weight duplication (NP101-MEM-002) is not an OPT
+prerequisite.
+
+## NP101-MEM-002: Share DeltaNet weights across alternating state graphs
+
+- [ ] Eliminate duplicate weight storage between the A-to-B and B-to-A graphs.
+
+Status: explicitly deferred by the user on 2026-09-21. Record the issue only;
+do not implement graph fusion or change weight ownership in the current task.
+
+Each `StepGraph` currently creates its own constant weight tensors. The first
+four complete layers therefore load 218.68 MiB of weight payload instead of
+158.35 MiB, including 60.33 MiB duplicated by the three DeltaNet mixers.
+The duplication follows from separate allocation, not an inherent requirement
+of using two graphs. Combining graphs alone does not establish weight sharing.
+
+When resumed, validate a supported shared read-only allocation/packing path,
+including both graph directions, numerical agreement, owner/consumer lifetimes,
+reset and release. Measure SDK copies/layouts rather than inferring savings from
+shared wrapper pointers. Evaluate graph consolidation only if necessary for a
+validated storage/execution strategy.
+
+Dependencies: existing two-graph execution and four-layer numerical validation
+provide the baseline. This optimization does not block isolated component work
+or the implemented decoder checks. Before full-model resident integration,
+account for duplication across every DeltaNet layer or remove it through a
+validated path. Resolving this item does not resolve NP101-MEM-001: unique text
+weights alone still exceed the provisional 1 GiB allocation ceiling. Physical
+memory savings and residency require NP101-OBS-001 evidence.
 
 ## NP101-MEM-001: Enable full-model resident weight allocation
 
@@ -110,6 +160,15 @@ The [Attention validation record](tests/np101-attention.md) documents its view/
 ownership API exception, tested Softmax layout and the small copy graph's
 per-append revalidation overhead. Dynamic KV allocation remains deferred.
 
+Decoder composition now uses fixed shared inputs/outputs across all four complete
+layers, including both DeltaNet graph directions. Initial integration exposed
+FP16 core subnormal loss; the sensitive core dot product now stays FP32 through
+gated RMS reduction. Independent CPU arithmetic and frozen tolerances are unchanged.
+The group validates positions before execution and requires recreation after a
+partial SDK failure. It does not claim recurrent-state rollback through KV truncation.
+See the [decoder validation record](tests/np101-decoder.md) for current trajectories,
+transfer counters, known memory payload and timing observations.
+
 The 22 SDK RNN feedback cases and temporary buffer tests remain retired in the
 [investigation archive](tests/state-feedback-investigation.md). Handle swapping
 has not been restored. Their removal did not resolve this item.
@@ -158,7 +217,7 @@ traced diagnostic timings as performance benchmarks.
 This blocks hardware acceptance and trustworthy device memory/performance claims
 for all modules; it does not block host implementation or numerical diagnostics.
 
-## Dependencies and work that can continue
+## Qwen baseline dependencies and work that can continue
 
 Split the existing weight-preparation prerequisite into three independently
 tracked results: verified host export, validated layouts for the tensors used by
@@ -172,7 +231,7 @@ be resident. The full-model allocation result remains blocked by NP101-MEM-001.
 | Weight export, integrity, layouts, and memory accounting | Host export and independent byte comparisons already pass; layout and accounting work can continue. | Validate selected weight tensors and their projections. Full-model simultaneous allocation remains blocked. | Selected-operator checks; NP101-MEM-001 for full resident allocation. |
 | DeltaNet subgraph | Layer-0 C++ mixer and fixed state routing implemented. | Numerical trajectories through 32 steps, nonzero state, reset and recreation pass; actual backend, SDK state transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; graph composition must revisit duplicated weights. |
 | Attention subgraph | Layer-3 C++ mixer and single-buffer KV append/reset/truncate implemented. | Real-weight 512-token trajectories, invalid-slot masking, capacity rejection and lifecycle pass; actual backend, SDK transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; copy-graph revalidation remains a performance concern. |
-| MLP and four-layer decoder group | Implement MLP, trunk normalization, residuals, and layers 0-3. | Test individual layers, then one complete four-layer group with state retained across tokens. | Validated DeltaNet and Attention; device-resident connections between operators/layers. |
+| MLP and four-layer decoder group | Complete layers 0-3 and fixed shared activation bindings implemented. | Complete Attention layer and four-layer 2/32/512-step numerical/lifecycle checks pass, including capacity rejection, reset/fresh/final-only equality and explicit-transfer limits. | NP101-STATE-001 and NP101-OBS-001 still gate resident hardware acceptance. |
 | Embedding, LM head, and token selection | Implement lookup, fixed row blocks, valid tail rows, tie handling, and device-wide selection. | Test embedding and the full-vocabulary head in isolation using captured hidden states. Shared-table integration needs a validated storage/view strategy. | Gather, projection, device argmax/selection, supported sharing/layout, and measured memory. |
 | Full 24-layer generation | Interfaces, sequencing, consumed-length semantics, EOS handling, and host-only contract tests can be prepared. | Full prompt/decode execution with all weights/state resident is blocked. | All subgraphs and head validated; NP101-MEM-001 resolved; final workspace allocation verified. |
 | First complete DLM acceptance | Prepare fixed prompts, teacher-forcing cases, result schema, and benchmark collection. | Complete correctness, repeated reset/generation, full-model memory, and latency acceptance are blocked. | Working full 24-layer generation on NP101. |
@@ -214,7 +273,10 @@ Head row blocking limits individual operations; it does not reduce total residen
 weight bytes when all blocks remain allocated. Avoid assuming that manifest-level
 weight aliases prove sharing inside the SDK.
 
-## Recommended next implementation order
+## Retained Qwen follow-up order
+
+The active OPT implementation order is in the model-decoupling checklist above.
+The following sequence describes the previous Qwen scope and its allocation gate.
 
 1. Reuse the validated operator results; check changed operators and selected-weight
    layouts as needed. Do not restore the retired SDK RNN diagnostic matrix.
@@ -223,8 +285,13 @@ weight aliases prove sharing inside the SDK.
    diagnostic matrix.
 3. Retain the implemented Attention layer and its single-buffer KV/boundary
    checks. Investigate copy-graph revalidation cost and obtain hardware/residency
-   evidence during later integration; do not add dynamic allocation yet.
-4. Implement MLP/residuals and validate one four-layer decoder group.
+   evidence during later integration; do not add dynamic allocation yet. The complete four-layer untraced
+   observation averaged 447.4 ms per group step, including 2.30 ms of KV graph
+   revalidation. These are host times with an unknown SDK backend; establish
+   execution evidence before drawing device-performance conclusions.
+4. Retain the complete MLP/residual/normalization and four-layer decoder group,
+   with its numerical, state, boundary and explicit-transfer checks. See the
+   [decoder validation record](tests/np101-decoder.md).
 5. Implement and validate standalone embedding, full-vocabulary head, and device
    token selection; validate their sharing strategy before combining them.
 6. Stop before full resident 24-layer device integration until NP101-MEM-001 is

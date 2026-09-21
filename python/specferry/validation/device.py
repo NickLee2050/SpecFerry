@@ -105,6 +105,7 @@ def run_device(
     timeout: int,
     artifact_prefix: str | None = None,
     shader_header: Path | None = None,
+    trace_driver: bool = True,
 ) -> dict:
     require_recovered_device(RECOVERY_ROOT)
     binary = binary.resolve(strict=True)
@@ -128,7 +129,7 @@ def run_device(
         f"{artifact_prefix}-evidence.json" if artifact_prefix else "execution-evidence.json"
     )
     command = [str(binary), *arguments]
-    tracer = shutil.which("strace")
+    tracer = shutil.which("strace") if trace_driver else None
     if tracer:
         command = [
             tracer,
@@ -148,6 +149,7 @@ def run_device(
     evidence = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "command": command,
+        "driver_traced": tracer is not None,
         "binary_sha256": fingerprint(binary),
         "linked_libraries": libraries,
         "sdk_library_dir": str(sdk_lib.resolve()),

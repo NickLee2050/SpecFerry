@@ -1,17 +1,21 @@
 # SpecFerry
 A testbed for speculative decoding across heterogeneous edge devices and a local inference hub.
 
-The initial deployment target is full text inference of `Qwen/Qwen3.5-0.8B`
-on NP101 as the draft language model (DLM). The repository currently provides
-environment capture, checkpoint download, CPU references, operator capability probes,
-streamed text-weight export, C++ single-layer DeltaNet and Attention mixers, and native SDK
-validation tests. Full DLM inference on NP101 is not yet implemented. Project constraints are in
-[AGENTS.md](AGENTS.md).
+The active deployment target is full text inference of `facebook/opt-350m`
+on NP101 as the draft language model (DLM). The existing CPU reference, exporter,
+DeltaNet/Attention mixers and four-layer decoder still implement Qwen3.5-0.8B;
+they remain a regression baseline while model composition is separated from
+reusable NP101 operators and storage. OPT download and CPU import validation do
+not make those inference paths compatible with OPT. Full DLM inference on NP101
+is not yet implemented. See the [implementation checklist](docs/model-decoupling-plan.md)
+and [project constraints](AGENTS.md).
 
-Full-model resident weight allocation is currently blocked by an effective limit
-near 1 GiB in both tested constant and mutable tensor paths. The NP101 team is evaluating the
-allocation mechanism. [Engineering follow-up](TODO.md) records the evidence,
-closure criteria, dependencies, and isolated component work that can continue.
+The Qwen full-model allocation experiment encountered an effective limit near
+1 GiB in both tested constant and mutable tensor paths. The NP101 team is
+evaluating the allocation mechanism. OPT's smaller weight payload needs its own
+full-graph allocation, workspace and residency checks; it is not automatically
+blocked or validated by the Qwen result. [Engineering follow-up](TODO.md) records
+the evidence and remaining acceptance gates.
 
 ## Set up the Conda environment
 
@@ -36,7 +40,7 @@ For a shell without activation, prefix a command with
 conda run --no-capture-output -n SpecFerry python scripts/download_models.py --dry-run
 ```
 
-## Download the Qwen3.5 draft model
+## Download the OPT draft model
 
 ```bash
 conda activate SpecFerry
@@ -44,12 +48,13 @@ python scripts/download_models.py --dry-run
 python scripts/download_models.py
 ```
 
-Only Qwen3.5-0.8B is enabled. The script downloads the original checkpoint and
-tokenizer under `.cache/models/Qwen/Qwen3.5-0.8B`, pins the revision, resumes
+Only OPT-350M is enabled. The script downloads the original checkpoint and
+tokenizer under `.cache/models/facebook/opt-350m`, pins the revision, resumes
 interrupted transfers, and writes `download-manifest.json` only after validating
-the files. This does not convert or deploy the model. The original checkpoint
-also contains vision/MTP tensors; the NP101 text exporter must select the text
-model tensors later.
+the files. It selects one weight format: safetensors when available, otherwise
+official PyTorch weights. OPT-350M uses `pytorch_model.bin`; TensorFlow and Flax
+copies are excluded. This does not convert or deploy the model. Existing Qwen
+downloads and cached validation artifacts are preserved.
 
 Future target language model (TLM) entries are commented out in `scripts/download_models.py`. After
 enabling a required entry, `--parallel-models 2 --file-workers 4` allows two model
@@ -85,10 +90,11 @@ binding and memory-pool parameters. `hardware-evidence.md` states the limits of
 this evidence. A sandbox that hides device nodes cannot validate board access.
 No driver or system configuration is changed by these tools.
 
-## Run CPU reference inference and validation
+## Run the retained Qwen CPU reference and validation
 
-The model download must finish and write its verified `download-manifest.json`
-before running these commands.
+This reference path still requires the existing Qwen3.5-0.8B checkpoint and its
+verified `download-manifest.json`. It does not yet accept the newly selected
+OPT model; that adaptation is in the implementation checklist.
 Use the same activated `SpecFerry` Conda environment for the CPU reference.
 CUDA and FLA are not required.
 
@@ -247,7 +253,35 @@ The SDK reverifies the small slot-copy graph when its destination changes; that
 overhead remains. See the [Attention validation record](tests/np101-attention.md)
 for ownership, API exceptions, the Softmax layout correction and acceptance limits.
 
-## Export text weights and check memory allocation
+## Validate complete decoder layers
+
+The `np101_decoder` library composes real-weight layers 0-3, including input/post-mixer
+RMS normalization, residuals, and MLP. Fixed shared tensors connect the graphs; only
+the group input crosses the host boundary during a step. DeltaNet keeps separate
+state for each layer, while Attention retains one 512-token KV allocation. Partial
+SDK failure invalidates the whole group; reset is supported after successful steps,
+but group truncation is not a substitute for restoring recurrent state.
+
+```bash
+cmake --build build --target np101_decoder_check -j 4
+python scripts/check_np101_decoder.py \
+  --trace PATH/TO/deployment-fp16/layer-0-3-sequential.npz \
+  --output .cache/runs/decoder --steps 32 --diagnostic
+```
+
+Use `--first-layer 3 --steps 2` to isolate the complete Attention decoder, and
+`--steps 512 --timeout 900` to check the full group at capacity. Each suite includes
+reset, recreation, and a final-only trajectory of up to 32 steps. It checks that
+normal steps upload only 2,048 input bytes plus eight Attention control bytes,
+with no explicit activation/state readback. `--no-trace` disables driver tracing
+for separate host timing observations; it does not establish NPU-only execution.
+See the [decoder validation record](tests/np101-decoder.md) for precision, ownership,
+results, memory accounting, and the remaining hardware evidence gates.
+
+## Export retained Qwen text weights and check memory allocation
+
+These tools still enforce the Qwen checkpoint contract. OPT weight export and
+full-model allocation are pending the model-decoupling implementation.
 
 ```bash
 python scripts/export_np101_dlm.py --output .cache/np101/Qwen3.5-0.8B

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "np101/context.hpp"
+#include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 
 #include <cstddef>
@@ -17,17 +18,22 @@ namespace specferry::np101 {
 class Attention {
 public:
   Attention(Context &context, const WeightStore &weights);
+  Attention(Context &context, const WeightStore &weights, TensorBinding input,
+            TensorBinding output);
   ~Attention();
   Attention(const Attention &) = delete;
   Attention &operator=(const Attention &) = delete;
 
   void step(const std::vector<std::uint8_t> &hidden_fp16);
+  void step();
   void reset();
   void truncate(unsigned length);
   unsigned length() const;
   std::vector<std::uint8_t> read(const std::string &name);
   std::size_t cache_writes() const;
   std::size_t cache_revalidations() const;
+  double cache_write_seconds() const;
+  double cache_revalidation_seconds() const;
   void close();
 
 private:

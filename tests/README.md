@@ -10,6 +10,7 @@
 | `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, state coexistence, and full weight readback | Yes |
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 | `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
+| `native/np101/decoder_check.cpp` | Complete layers 0-3, shared activation bindings, state/reset, transfer counts and capacity | Yes |
 | `native/np101/attention_check.cpp` | Real-weight Attention, single-buffer KV, capacity, truncation, reset and final-only readback | Yes |
 
 Run host tests from the repository root with the `SpecFerry` Conda environment:
@@ -51,7 +52,10 @@ covers single-buffer KV. Device-residency evidence remains pending (`NP101-STATE
 protects reference-input contracts and rejects incorrect or incomplete trajectory,
 reset, final-only and lifecycle results without opening the device.
 `test_attention.py` additionally protects cache-prefix comparison and exact
-masked-suffix rejection. Both hardware suites use the same serialized runner.
+masked-suffix rejection. `test_decoder.py` checks pre-normalization fixture inputs,
+independent per-layer reference state, exact repeat checks and lifecycle rejection.
+The [decoder group check](np101-decoder.md) validates complete layers using the same
+serialized device runner; it remains separate from the small mixer regressions.
 
 Keep host unit tests small and independent of downloaded weights. Hardware failures,
 timeouts, unsupported APIs, and missing execution evidence must remain visible;

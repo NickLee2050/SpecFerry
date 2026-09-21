@@ -17,8 +17,8 @@
 namespace {
 namespace fs = std::filesystem;
 using namespace specferry::np101;
-const std::array<std::string, 8> outputs{"output",    "recurrent", "convolution", "qkv",
-                                         "convolved", "decay",     "beta",        "core"};
+const std::array<std::string, 10> outputs{"output", "recurrent", "convolution", "qkv",  "convolved",
+                                          "decay",  "beta",      "core",        "gate", "gated"};
 
 std::vector<std::uint8_t> read_bytes(const fs::path &path, std::size_t size) {
   if (fs::file_size(path) != size) {

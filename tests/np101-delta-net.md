@@ -1,8 +1,8 @@
 # Single-layer DeltaNet validation
 
-The C++ module implements Qwen3.5-0.8B layer 0's linear-attention mixer.
-Input normalization, decoder residuals and MLP belong to the later decoder-group
-integration. This is not full-model inference.
+The C++ module implements Qwen3.5-0.8B linear-attention mixers for layers 0-2.
+The standalone regression uses layer 0; normalization, residuals and MLP are
+provided by the [decoder group](np101-decoder.md). This is not full-model inference.
 
 ## Computation and precision
 
@@ -10,8 +10,11 @@ integration. This is not full-model inference.
 convolution, SiLU, Q/K L2 normalization, decay/beta gates, FP32 recurrent update,
 gated RMS normalization and output projection. Convolution products and their
 reduction use FP32, with one FP16 boundary before SiLU. Q/K normalize in FP32,
-round to FP16, then enter the FP32 recurrence. Gated RMS normalization also
-preserves the reference's intermediate FP16 boundary. No tolerances are calibrated
+round to FP16, then enter the FP32 recurrence. The core dot product stays FP32
+through gated RMS reduction because the installed SDK flushes FP16 subnormals.
+After normalization, the original FP16 boundary is retained before FP32 weighting
+and gating. The CPU reference remains unchanged; its core snapshot is only
+serialized as FP32 for comparison with the revised device diagnostic. No tolerances are calibrated
 from device results; the existing reference policy supplies the limits.
 
 The independent reference executes the installed Transformers mixer using real
@@ -33,7 +36,7 @@ does not export AttachTensorToGraph. A static feed-forward graph cannot express
 the next execution as an ordinary acyclic edge; a per-token host state roundtrip
 would violate the resident-inference requirement.
 
-The isolated `share_state` helper therefore retains an existing `vx_tensor` using
+The common `retain_tensor` helper therefore retains an existing `vx_tensor` using
 `vxRetainReference`, releases the receiver wrapper's unused tensor if present,
 and assigns the retained object to that wrapper before graph setup. This goes
 beyond the guide's interfaces. It uses public SDK tensor fields and OpenVX
@@ -76,7 +79,7 @@ requires a supported per-node execution and SDK state-transfer observation path.
 
 ## Results
 
-Validated on 2026-09-17 with the installed SDK and exported Qwen3.5-0.8B weights:
+Historical validation on 2026-09-17, before the FP32-core correction, with the installed SDK and exported Qwen3.5-0.8B weights:
 
 | Check | Result |
 |---|---|
@@ -119,3 +122,27 @@ Attention/KV is now implemented and numerically validated separately; see the
 [Attention record](np101-attention.md). Remaining DeltaNet acceptance work is
 supported backend/state-transfer observation and later graph composition,
 including weight sharing and actual device-memory accounting.
+
+## Decoder integration correction
+
+On 2026-09-18, complete decoder composition exposed an error hidden by the
+isolated mixer's absolute tolerance. In the first captured core output, all 943
+nonzero FP16 subnormal reference values became zero in the SDK output. Feeding
+that SDK core into the CPU gated norm/output projection reproduced the approximately
+0.03662 mixer-output error. Subsequent decoder normalization amplified it.
+
+The core dot product now remains FP32 until normalization. Model weights, state
+precision, independent CPU arithmetic and tolerance thresholds are unchanged.
+The regression additionally records the projected gate and gated output to locate
+this failure before accepting a composed decoder. Its `core` diagnostic is now
+FP32; older FP16 fixtures must be regenerated. The bound interface shares one
+fixed input/output between both state graphs and supports layer-specific weights.
+See the current decoder validation record for the corrected integration results.
+
+The corrected 32-step standalone suite passed all 1,940 reference/repeat checks
+on 2026-09-18, including nonzero state and both graph directions. Maximum mixer output error
+was 0.00048828125, compared with 0.04541015625 in the historical suite. Evidence:
+`.cache/runs/decoder-20260918-delta-regression-32/`. The initial gated-output
+failure is retained in `.cache/runs/decoder-20260918-delta-gated-diagnostic/`.
+The 12 matrix-node creation warnings persisted in the corrected standalone suite;
+numerical success does not close the hardware execution/residency gates.

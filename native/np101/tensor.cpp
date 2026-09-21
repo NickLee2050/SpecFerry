@@ -2,7 +2,6 @@
 #include "np101/tensor.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -10,6 +9,8 @@
 
 namespace specferry::np101 {
 namespace {
+thread_local TensorTransfers transfers;
+
 vsi_nn_tensor_t *get_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
   auto *tensor = vsi_nn_GetTensor(graph.get(), id);
   if (!tensor) {
@@ -89,6 +90,8 @@ void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::u
   }
   check(vsi_nn_CopyDataToTensor(graph.get(), tensor, const_cast<std::uint8_t *>(data.data())),
         "CopyDataToTensor");
+  ++transfers.uploads;
+  transfers.upload_bytes += data.size();
 }
 
 std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
@@ -99,8 +102,12 @@ std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
   if (!data) {
     throw std::runtime_error("ConvertTensorToData returned null");
   }
+  ++transfers.reads;
+  transfers.read_bytes += bytes;
   return {data.get(), data.get() + bytes};
 }
+
+TensorTransfers tensor_transfers() { return transfers; }
 
 vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver) {
   auto *source = get_tensor(owner, id);
@@ -127,6 +134,16 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
   }
   destination->t = source->t;
   return shared;
+}
+
+vsi_nn_tensor_id_t bind_hidden(TensorBinding binding, Graph &receiver) {
+  auto *tensor = get_tensor(binding.owner, binding.id);
+  const auto &attr = tensor->attr;
+  if (attr.dim_num != 2 || attr.size[0] != 1024 || attr.size[1] != 1 ||
+      attr.dtype.vx_type != VSI_NN_TYPE_FLOAT16 || attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE) {
+    throw std::invalid_argument("bound hidden tensor must be ordinary FP16 [1024, 1]");
+  }
+  return retain_tensor(binding.owner, binding.id, receiver);
 }
 
 TensorAttachment::TensorAttachment(Graph &owner, vsi_nn_tensor_id_t tensor, Graph &receiver)

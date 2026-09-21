@@ -22,7 +22,7 @@ class DownloadModelsTests(unittest.TestCase):
                 )
             plan = json.loads(stream.getvalue())
             self.assertEqual(result, 0)
-            self.assertEqual([model["repo_id"] for model in plan["models"]], ["Qwen/Qwen3.5-0.8B"])
+            self.assertEqual([model["repo_id"] for model in plan["models"]], ["facebook/opt-350m"])
             self.assertEqual(plan["parallel_models"], 1)
             self.assertFalse(destination.exists())
 
@@ -100,6 +100,32 @@ class DownloadModelsTests(unittest.TestCase):
             ]
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 downloader.verify_files(destination, expected)
+
+    def test_opt_download_selects_only_pytorch_weights_and_bpe_tokenizer(self):
+        names = {
+            "config.json",
+            "vocab.json",
+            "merges.txt",
+            "pytorch_model.bin",
+            "flax_model.msgpack",
+            "tf_model.h5",
+        }
+        info = SimpleNamespace(siblings=[SimpleNamespace(rfilename=name) for name in names])
+        selected = {entry["path"] for entry in downloader.expected_files(info)}
+        self.assertEqual(selected, names - {"flax_model.msgpack", "tf_model.h5"})
+
+    def test_safetensors_preferred_without_pytorch_weights_or_index(self):
+        names = {
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        }
+        info = SimpleNamespace(siblings=[SimpleNamespace(rfilename=name) for name in names])
+        selected = {entry["path"] for entry in downloader.expected_files(info)}
+        self.assertEqual(selected, names - {"pytorch_model.bin", "pytorch_model.bin.index.json"})
 
 
 if __name__ == "__main__":

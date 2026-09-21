@@ -1,6 +1,5 @@
 #include "np101/attention.hpp"
 #include "np101/kv_cache.hpp"
-#include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
 
@@ -9,6 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -189,8 +189,10 @@ class ProjectionGraph : public AttentionGraph {
 public:
   Tensor hidden, position, query, key, value, gate;
 
-  ProjectionGraph(Context &context, const WeightStore &weights) : AttentionGraph(context) {
-    hidden = tensor({f16, {1024, 1}});
+  ProjectionGraph(Context &context, const WeightStore &weights, std::optional<TensorBinding> input)
+      : AttentionGraph(context) {
+    hidden =
+        input ? Tensor{bind_hidden(*input, graph), {f16, {1024, 1}}} : tensor({f16, {1024, 1}});
     position = tensor({i32, {1}});
     auto packed = reshape(project(weights, hidden, "q_proj", 4096), {512, 8});
     query = rms_norm(weights, slice(packed, {0, 0}, {256, 8}), "q_norm");
@@ -237,7 +239,7 @@ public:
   Tensor valid_length, output, probabilities;
 
   ReaderGraph(Context &context, const WeightStore &weights, ProjectionGraph &producer,
-              KvCache &cache)
+              KvCache &cache, std::optional<TensorBinding> destination)
       : AttentionGraph(context) {
     auto query = share(producer, producer.query);
     auto gate = share(producer, producer.gate);
@@ -270,7 +272,12 @@ public:
     probabilities = reshape(convert(probability_fp32, f16), {capacity, 4, 2});
     auto attended = reshape(matmul(probabilities, values, {256, 4, 2}, false), {256, 8});
     auto gated = binary(VSI_NN_OP_MULTIPLY, attended, unary(VSI_NN_OP_SIGMOID, gate, f16));
-    output = project(weights, reshape(gated, {2048, 1}), "o_proj", 1024);
+    output = destination ? Tensor{bind_hidden(*destination, graph), {f16, {1024, 1}}}
+                         : tensor({f16, {1024, 1}});
+    auto matrix = weight(weights, "o_proj.weight", {2048, 1024});
+    auto *projection = node(VSI_NN_OP_MATRIXMUL, {reshape(gated, {2048, 1}), matrix}, output);
+    projection->nn_param.matrixmul.transpose[0] = false;
+    projection->nn_param.matrixmul.transpose[1] = true;
     compile({query, gate, keys, values, valid_length}, {output, probabilities});
   }
 };
@@ -284,14 +291,19 @@ struct Attention::Impl {
   bool failed = false;
   bool has_output = false;
 
-  Impl(Context &context, const WeightStore &weights)
-      : producer(context, weights),
+  Impl(Context &context, const WeightStore &weights, std::optional<TensorBinding> input = {},
+       std::optional<TensorBinding> output = {})
+      : producer(context, weights, input),
         cache(context, producer.graph, producer.key.id, producer.value.id),
-        reader(context, weights, producer, cache) {}
+        reader(context, weights, producer, cache, output) {}
 };
 
 Attention::Attention(Context &context, const WeightStore &weights)
     : impl_(std::make_unique<Impl>(context, weights)) {}
+
+Attention::Attention(Context &context, const WeightStore &weights, TensorBinding input,
+                     TensorBinding output)
+    : impl_(std::make_unique<Impl>(context, weights, input, output)) {}
 
 Attention::~Attention() = default;
 
@@ -309,6 +321,20 @@ void Attention::step(const std::vector<std::uint8_t> &hidden_fp16) {
   impl_->has_output = false;
   auto &producer = impl_->producer;
   upload_tensor(producer.graph, producer.hidden.id, hidden_fp16);
+  impl_->failed = false;
+  step();
+}
+
+void Attention::step() {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("attention is closed or must be recreated after failure");
+  }
+  if (impl_->length >= capacity) {
+    throw std::out_of_range("attention KV capacity exhausted");
+  }
+  impl_->failed = true;
+  impl_->has_output = false;
+  auto &producer = impl_->producer;
   upload_tensor(producer.graph, producer.position.id, integer_bytes(impl_->length));
   check(vsi_nn_RunGraph(producer.graph.get()), "attention projections");
   impl_->cache.write(impl_->length);
@@ -367,6 +393,12 @@ std::size_t Attention::cache_writes() const { return impl_ ? impl_->cache.writes
 
 std::size_t Attention::cache_revalidations() const {
   return impl_ ? impl_->cache.revalidations() : 0;
+}
+
+double Attention::cache_write_seconds() const { return impl_ ? impl_->cache.write_seconds() : 0; }
+
+double Attention::cache_revalidation_seconds() const {
+  return impl_ ? impl_->cache.revalidation_seconds() : 0;
 }
 
 void Attention::close() {

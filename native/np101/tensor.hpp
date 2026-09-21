@@ -4,10 +4,31 @@
 #include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace specferry::np101 {
+// A borrowed graph/tensor pair. The owner must outlive every bound consumer.
+struct TensorBinding {
+  Graph &owner;
+  vsi_nn_tensor_id_t id;
+};
+
+// Successful explicit helper transfers on this thread, excluding SDK-internal IO
+// and AddTensor initialization. Diagnostics use deltas around a complete step.
+struct TensorTransfers {
+  std::size_t uploads = 0;
+  std::size_t upload_bytes = 0;
+  std::size_t reads = 0;
+  std::size_t read_bytes = 0;
+};
+
+TensorTransfers tensor_transfers();
+
+// Validate the fixed hidden-vector contract before retaining its storage.
+vsi_nn_tensor_id_t bind_hidden(TensorBinding binding, Graph &receiver);
+
 // Graph owns the SDK tensor. These helpers never release an individual tensor.
 vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constant = false,
                               const std::vector<std::uint8_t> &initial = {});

@@ -19,7 +19,18 @@ from .capabilities import compare_arrays
 from .device import fingerprint, write_json
 
 PREFIX = "model.layers.0.linear_attn."
-OUTPUTS = ("output", "recurrent", "convolution", "qkv", "convolved", "decay", "beta", "core")
+OUTPUTS = (
+    "output",
+    "recurrent",
+    "convolution",
+    "qkv",
+    "convolved",
+    "decay",
+    "beta",
+    "core",
+    "gate",
+    "gated",
+)
 
 
 class ReferenceState:
@@ -100,7 +111,9 @@ def reference_sequence(mixer, inputs, recurrent, convolution, destination, name)
             convolved=torch.cat([x.reshape(1, 1, -1) for x in (query, key, value)], dim=-1),
             decay=kwargs["g"].exp(),
             beta=kwargs["beta"].float(),
-            core=result[0],
+            # Keep the official rounded values; only serialize them in the
+            # device diagnostic's FP32 format. Do not alter the CPU arithmetic.
+            core=result[0].float(),
         )
         return result
 
@@ -108,6 +121,12 @@ def reference_sequence(mixer, inputs, recurrent, convolution, destination, name)
         captured["qkv"] = output
 
     handle = mixer.in_proj_qkv.register_forward_hook(projection_hook)
+    gate_handle = mixer.in_proj_z.register_forward_hook(
+        lambda module, args, output: captured.update(gate=output)
+    )
+    norm_handle = mixer.norm.register_forward_hook(
+        lambda module, args, output: captured.update(gated=output)
+    )
     specs = {}
     try:
         with (
@@ -126,6 +145,8 @@ def reference_sequence(mixer, inputs, recurrent, convolution, destination, name)
                     )
     finally:
         handle.remove()
+        gate_handle.remove()
+        norm_handle.remove()
     return specs
 
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "np101/context.hpp"
+#include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
 
@@ -11,7 +12,7 @@
 #include <vector>
 
 namespace specferry::np101 {
-// Qwen3.5-0.8B's layer-0 mixer, excluding decoder input norm, residual and MLP.
+// Qwen3.5-0.8B mixer, excluding decoder input norm, residual and MLP.
 // Context must outlive this object. All graph execution and state routing is C++.
 class DeltaNet {
 public:
@@ -22,6 +23,8 @@ public:
   static constexpr unsigned convolution_width = 4;
 
   DeltaNet(Context &context, const WeightStore &weights);
+  DeltaNet(Context &context, const WeightStore &weights, unsigned layer, TensorBinding input,
+           TensorBinding output);
   ~DeltaNet();
 
   DeltaNet(const DeltaNet &) = delete;
@@ -32,6 +35,8 @@ public:
   void reset(const std::vector<std::uint8_t> &recurrent = {},
              const std::vector<std::uint8_t> &convolution = {});
   void step(const std::vector<std::uint8_t> &hidden_fp16);
+  // Execute the construction-time input/output bindings without host activation IO.
+  void step();
   std::vector<std::uint8_t> read(const std::string &name);
   std::size_t steps() const;
   void close();

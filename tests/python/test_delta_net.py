@@ -51,7 +51,7 @@ class DeltaNetAcceptanceTests(unittest.TestCase):
                 "completed_sequences": 5,
                 "completed_steps": 2,
                 "per_step_host_state_uploads": 0,
-                "application_readbacks": 72,
+                "application_readbacks": 9 * len(OUTPUTS),
             }
             report = device / "execution.json"
             report.write_text(json.dumps(execution))

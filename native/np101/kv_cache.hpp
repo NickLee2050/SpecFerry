@@ -31,6 +31,8 @@ public:
   unsigned capacity() const;
   std::size_t writes() const;
   std::size_t revalidations() const;
+  double write_seconds() const;
+  double revalidation_seconds() const;
   void close();
 
 private:
