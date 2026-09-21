@@ -9,7 +9,7 @@ set(LJMICRO_SDK_LIBRARY_DIR "/usr/lib/ljmicro" CACHE PATH "NP101 SDK library dir
 find_package(Threads REQUIRED)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-add_library(np101_data native/np101/tensor_spec.cpp native/np101/weights.cpp)
+add_library(np101_data native/np101/tensor_spec.cpp native/np101/weights.cpp native/np101/component_spec.cpp)
 target_compile_features(np101_data PUBLIC cxx_std_17)
 target_include_directories(np101_data PUBLIC native)
 target_link_libraries(np101_data PUBLIC OpenSSL::Crypto)
@@ -36,15 +36,27 @@ set(CMAKE_BUILD_RPATH "${LJMICRO_SDK_LIBRARY_DIR}")
 
 target_compile_options(np101_context PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_delta_net native/np101/delta_net.cpp)
-target_link_libraries(np101_delta_net PUBLIC np101_context)
+add_library(qwen_data native/models/qwen3_5/config.cpp)
+target_link_libraries(qwen_data PUBLIC np101_data)
+target_compile_options(qwen_data PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(np101_ops native/np101/ops/graph_builder.cpp native/np101/ops/mixers.cpp)
+target_link_libraries(np101_ops PUBLIC np101_context)
+target_compile_options(np101_ops PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(np101_kv_cache native/np101/kv_cache.cpp)
+target_link_libraries(np101_kv_cache PUBLIC np101_context)
+target_compile_options(np101_kv_cache PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(np101_delta_net native/models/qwen3_5/delta_net.cpp)
+target_link_libraries(np101_delta_net PUBLIC np101_ops qwen_data)
 target_compile_options(np101_delta_net PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_attention native/np101/kv_cache.cpp native/np101/attention.cpp)
-target_link_libraries(np101_attention PUBLIC np101_context)
+add_library(np101_attention native/models/qwen3_5/attention.cpp)
+target_link_libraries(np101_attention PUBLIC np101_ops np101_kv_cache qwen_data)
 target_compile_options(np101_attention PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_decoder native/np101/decoder.cpp)
+add_library(np101_decoder native/models/qwen3_5/decoder.cpp)
 target_link_libraries(np101_decoder PUBLIC np101_delta_net np101_attention)
 target_compile_options(np101_decoder PRIVATE -Wall -Wextra -Wpedantic)
 

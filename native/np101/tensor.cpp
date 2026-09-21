@@ -136,12 +136,18 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
   return shared;
 }
 
-vsi_nn_tensor_id_t bind_hidden(TensorBinding binding, Graph &receiver) {
+vsi_nn_tensor_id_t bind_tensor(TensorBinding binding, Graph &receiver, const TensorSpec &expected) {
   auto *tensor = get_tensor(binding.owner, binding.id);
   const auto &attr = tensor->attr;
-  if (attr.dim_num != 2 || attr.size[0] != 1024 || attr.size[1] != 1 ||
-      attr.dtype.vx_type != VSI_NN_TYPE_FLOAT16 || attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE) {
-    throw std::invalid_argument("bound hidden tensor must be ordinary FP16 [1024, 1]");
+  const auto type = expected.type == DataType::Float16   ? VSI_NN_TYPE_FLOAT16
+                    : expected.type == DataType::Float32 ? VSI_NN_TYPE_FLOAT32
+                    : expected.type == DataType::Int32   ? VSI_NN_TYPE_INT32
+                                                         : VSI_NN_TYPE_BOOL8;
+  if (attr.dim_num != expected.shape.size() ||
+      !std::equal(expected.shape.begin(), expected.shape.end(), attr.size) ||
+      attr.dtype.vx_type != type || attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE ||
+      expected.bytes() != tensor_bytes(tensor)) {
+    throw std::invalid_argument("bound tensor does not match the requested shape/dtype");
   }
   return retain_tensor(binding.owner, binding.id, receiver);
 }

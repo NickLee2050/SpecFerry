@@ -9,7 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.export.weights import verify_export
+from specferry.models.qwen3_5.export import verify_export
+from specferry.models.qwen3_5.memory import write_allocation_states
 from specferry.validation.device import device_lock, run_device
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,8 @@ def main() -> int:
         output = args.output.resolve()
         with device_lock(ROOT / ".cache/runs"):
             output.mkdir(parents=True)
+            states = output / "allocation-states.txt"
+            write_allocation_states(states)
             binary = output / "np101_weight_allocation_check"
             shutil.copy2(args.binary.resolve(), binary)
             result = run_device(
@@ -45,6 +48,8 @@ def main() -> int:
                 [
                     str(args.model.resolve()),
                     str(output / "allocation.json"),
+                    "--state-spec",
+                    str(states),
                     "--weight-storage",
                     args.weight_storage,
                 ],

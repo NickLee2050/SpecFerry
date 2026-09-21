@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/config.hpp"
 #include "np101/context.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
@@ -11,20 +12,19 @@
 #include <string>
 #include <vector>
 
-namespace specferry::np101 {
-// Qwen3.5-0.8B mixer, excluding decoder input norm, residual and MLP.
+namespace specferry::models::qwen3_5 {
+// Configured Qwen DeltaNet mixer, excluding decoder input norm, residual and MLP.
 // Context must outlive this object. All graph execution and state routing is C++.
+using np101::Context;
+using np101::TensorBinding;
+using np101::TensorSpec;
+using np101::WeightStore;
+
 class DeltaNet {
 public:
-  static constexpr unsigned hidden_size = 1024;
-  static constexpr unsigned heads = 16;
-  static constexpr unsigned head_size = 128;
-  static constexpr unsigned convolution_channels = 6144;
-  static constexpr unsigned convolution_width = 4;
-
-  DeltaNet(Context &context, const WeightStore &weights);
-  DeltaNet(Context &context, const WeightStore &weights, unsigned layer, TensorBinding input,
-           TensorBinding output);
+  DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
+  DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
+           TensorBinding input, TensorBinding output);
   ~DeltaNet();
 
   DeltaNet(const DeltaNet &) = delete;
@@ -41,12 +41,12 @@ public:
   std::size_t steps() const;
   void close();
 
-  static TensorSpec recurrent_spec();
-  static TensorSpec convolution_spec();
-  static TensorSpec output_spec(const std::string &name);
+  TensorSpec recurrent_spec() const;
+  TensorSpec convolution_spec() const;
+  TensorSpec output_spec(const std::string &name) const;
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-} // namespace specferry::np101
+} // namespace specferry::models::qwen3_5

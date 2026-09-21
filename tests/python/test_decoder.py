@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from specferry.reference.runner import TOLERANCES
+from specferry.models.qwen3_5.precision import TOLERANCES
 from specferry.validation.decoder import DecoderCache, captured_inputs, evaluate
 
 
@@ -38,15 +38,15 @@ class DecoderAcceptanceTests(unittest.TestCase):
 
     def test_reference_reset_clears_each_recurrence_but_preserves_stale_kv(self):
         cache = DecoderCache()
-        for index, layer in enumerate(cache.layers):
+        for index, layer in enumerate(cache.layers.values()):
             layer.recurrent_states[0].fill_(index + 1)
             layer.conv_states[0].fill_(index + 1)
-        cache.keys.fill_(7)
+        cache.attention[3].keys.fill_(7)
         cache.length = 12
         cache.reset()
         self.assertEqual(cache.length, 0)
-        self.assertTrue(bool((cache.keys == 7).all()))
-        for layer in cache.layers:
+        self.assertTrue(bool((cache.attention[3].keys == 7).all()))
+        for layer in cache.layers.values():
             self.assertEqual(layer.recurrent_states[0].count_nonzero().item(), 0)
             self.assertEqual(layer.conv_states[0].count_nonzero().item(), 0)
         cache.layers[0].recurrent_states[0].fill_(9)
@@ -64,6 +64,7 @@ class DecoderAcceptanceTests(unittest.TestCase):
                     (parent / f"{sequence}.layer.3.output.1.bin").write_bytes(value.tobytes())
             metadata = {
                 "steps": 2,
+                "layers": [3],
                 "tolerances": TOLERANCES,
                 "memory_payload": {},
                 "observations": [

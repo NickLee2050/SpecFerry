@@ -4,11 +4,15 @@ A testbed for speculative decoding across heterogeneous edge devices and a local
 The active deployment target is full text inference of `facebook/opt-350m`
 on NP101 as the draft language model (DLM). The existing CPU reference, exporter,
 DeltaNet/Attention mixers and four-layer decoder still implement Qwen3.5-0.8B;
-they remain a regression baseline while model composition is separated from
-reusable NP101 operators and storage. OPT download and CPU import validation do
-not make those inference paths compatible with OPT. Full DLM inference on NP101
-is not yet implemented. See the [implementation checklist](docs/model-decoupling-plan.md)
-and [project constraints](AGENTS.md).
+they remain a regression baseline. Shared NP101 graph construction, projections,
+normalization, Attention/DeltaNet arithmetic, SwiGLU, tensor bindings and KV storage
+now take explicit contracts. Model configuration, checkpoint names and decoder
+composition live in `native/models/qwen3_5/` and `python/specferry/models/qwen3_5/`.
+OPT download and CPU import validation do not make those inference paths compatible
+with OPT. Full DLM inference on NP101 is not yet implemented.
+See the [completed-module decoupling checklist](docs/model-decoupling-plan.md),
+[component contracts and checks](tests/np101-components.md), and
+[project constraints](AGENTS.md).
 
 The Qwen full-model allocation experiment encountered an effective limit near
 1 GiB in both tested constant and mutable tensor paths. The NP101 team is
@@ -94,7 +98,8 @@ No driver or system configuration is changed by these tools.
 
 This reference path still requires the existing Qwen3.5-0.8B checkpoint and its
 verified `download-manifest.json`. It does not yet accept the newly selected
-OPT model; that adaptation is in the implementation checklist.
+OPT model. This refactor separates reusable reference utilities from Qwen policy;
+adding an OPT reference workflow remains separate work.
 Use the same activated `SpecFerry` Conda environment for the CPU reference.
 CUDA and FLA are not required.
 
@@ -280,8 +285,10 @@ results, memory accounting, and the remaining hardware evidence gates.
 
 ## Export retained Qwen text weights and check memory allocation
 
-These tools still enforce the Qwen checkpoint contract. OPT weight export and
-full-model allocation are pending the model-decoupling implementation.
+These CLI defaults enforce the retained Qwen checkpoint contract. The shared pack
+reader/writer, integrity checks and memory accounting are model independent; the
+Qwen adapter selects names, aliases and target dtypes. OPT checkpoint export and
+full-model allocation remain separate, pending work.
 
 ```bash
 python scripts/export_np101_dlm.py --output .cache/np101/Qwen3.5-0.8B
@@ -316,6 +323,9 @@ uploads its bytes with `vsi_nn_CopyDataToTensor`. The existing `constant` mode
 remains the default; the flag does not establish which physical pool is used.
 After all allocations, the check reads every weight block back and compares its
 bytes with the export. Both modes retain the same chunk sizes and state buffers.
+The Python wrapper writes an explicit versioned `allocation-states.txt`; direct
+native invocation requires `--state-spec FILE`. The historical allocation-only KV
+shape is retained for reproduction and is distinct from the execution layout.
 Reports record completed weights, uploaded/verified bytes, the current chunk,
 allocation failures, and host peak RSS. The executable is snapshotted per run.
 The test does not include full model graphs or their workspace, and an SDK

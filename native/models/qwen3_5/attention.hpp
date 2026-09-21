@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/config.hpp"
 #include "np101/context.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
@@ -10,16 +11,20 @@
 #include <string>
 #include <vector>
 
-namespace specferry::np101 {
-// Qwen3.5-0.8B layer-3 attention mixer, excluding decoder input norm/residual.
+namespace specferry::models::qwen3_5 {
+// Configured Qwen attention mixer, excluding decoder input norm/residual.
 // A single sequence owns one fixed-capacity KV allocation. Context outlives it.
 // Calls are synchronous; reset/truncate change the valid prefix without clearing
 // storage. A failed SDK step invalidates the instance, which must be recreated.
+using np101::Context;
+using np101::TensorBinding;
+using np101::WeightStore;
+
 class Attention {
 public:
-  Attention(Context &context, const WeightStore &weights);
-  Attention(Context &context, const WeightStore &weights, TensorBinding input,
-            TensorBinding output);
+  Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
+  Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
+            TensorBinding input, TensorBinding output);
   ~Attention();
   Attention(const Attention &) = delete;
   Attention &operator=(const Attention &) = delete;
@@ -40,4 +45,4 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-} // namespace specferry::np101
+} // namespace specferry::models::qwen3_5

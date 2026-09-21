@@ -14,9 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from scripts import check_np101_operators
 
+from specferry.models.qwen3_5.operator_cases import catalog
+from specferry.models.qwen3_5.precision import TOLERANCES
 from specferry.validation import capabilities
 from specferry.validation.capabilities import compare_arrays, compare_outputs
-from specferry.validation.operator_cases import catalog
 
 
 class ComparisonTests(unittest.TestCase):
@@ -114,12 +115,12 @@ class ComparisonTests(unittest.TestCase):
             metadata = fixture.write(root / "fixture")
             execution = root / "execution"
             execution.mkdir()
-            result = compare_outputs(metadata, root / "fixture", execution)
+            result = compare_outputs(metadata, root / "fixture", execution, TOLERANCES)
             self.assertTrue(all(not item["passed"] for item in result.values()))
             first = (root / "fixture/y.expected.0.bin").read_bytes()
             (execution / "y.0.bin").write_bytes(first[:-1])
             (execution / "y.1.bin").write_bytes(first)
-            result = compare_outputs(metadata, root / "fixture", execution)
+            result = compare_outputs(metadata, root / "fixture", execution, TOLERANCES)
             self.assertFalse(result["y.0"]["passed"])
             self.assertFalse(result["y.1"]["passed"])
 

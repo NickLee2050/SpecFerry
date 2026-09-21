@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from specferry.reference.runner import TOLERANCES
+from specferry.models.qwen3_5.precision import TOLERANCES
 from specferry.validation.delta_net import OUTPUTS, captured_inputs, evaluate
 
 

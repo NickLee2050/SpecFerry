@@ -2,20 +2,33 @@
 
 Updated: 2026-09-21. Active target: resident text inference of OPT-350M on NP101.
 
-## NP101-MODEL-001: Decouple model composition and adapt OPT-350M
+## NP101-MODEL-001: Decouple completed data, reference and NP101 paths
 
-- [ ] Separate shared NP101 operators/storage from model-specific composition,
-  then validate complete OPT-350M text generation.
+- [x] Audit all completed modules and record which need separation, parameterization
+  or no structural change.
+- [x] Separate reusable checkpoint/reference tools, weight preparation, operators
+  and storage from Qwen contracts and composition. Retain already independent
+  infrastructure and the validated numerical behavior.
 
 The user selected `facebook/opt-350m` on 2026-09-21. The active download changes
 to that checkpoint; existing Qwen3.5 caches, code and evidence remain available
-for regression. The [implementation checklist](docs/model-decoupling-plan.md)
-is pending review. Download and independent CPU FP16 import validation passed:
+for regression. The [completed decoupling checklist](docs/model-decoupling-plan.md)
+records the retain/change decision and implementation for all completed modules,
+from environment/download tools through CPU references, SDK checks, weight export,
+mixers and decoder slices. Reusable mechanisms are extracted from existing paths;
+new OPT checkpoint-format support, an OPT decoder and complete device generation
+remain separate follow-up work under the original construction sequence.
+Download and independent CPU FP16 import validation passed:
 388 tensors, 331,196,416 unique parameters, 662,392,832 weight payload bytes;
 three short generations and an eight-token cache comparison passed. Evidence
 and a rerun script are in `.cache/runs/opt-350m-import-20260921/`.
-The inference refactor, reusable OPT reference/export path and NP101 adaptation
-have not started.
+The refactor is complete. Shared data/NP101 operators now accept explicit contracts;
+Qwen policy, official references and layer composition live in model modules.
+55 Python tests, host CTest/build, original CPU traces/export, alternate component
+sizes, mixers, short slices and four-layer 32/512-step numerical regressions passed.
+See [the acceptance record](tests/np101-components.md#decoupling-acceptance-record).
+The integrated OPT reference/export workflow and NP101 adaptation remain
+unimplemented and outside this checklist. Existing hardware evidence gates stay open.
 
 The Qwen weight, layer and allocation figures below describe the retained
 baseline. OPT requires its own export, memory accounting, numerical validation
@@ -275,8 +288,9 @@ weight aliases prove sharing inside the SDK.
 
 ## Retained Qwen follow-up order
 
-The active OPT implementation order is in the model-decoupling checklist above.
-The following sequence describes the previous Qwen scope and its allocation gate.
+The immediate task is the refactor of completed implementations in the checklist above.
+After that, resume the original construction sequence; the following record
+describes the retained Qwen scope and its allocation gate, not a new OPT plan.
 
 1. Reuse the validated operator results; check changed operators and selected-weight
    layouts as needed. Do not restore the retired SDK RNN diagnostic matrix.

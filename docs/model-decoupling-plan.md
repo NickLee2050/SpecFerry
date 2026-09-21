@@ -1,252 +1,262 @@
-# 模型解耦与 OPT-350M 适配施工清单
+# 已有实现全面解耦施工清单
 
-更新日期：2026-09-21。状态：步骤 0 已完成；步骤 1–7 待审阅，尚未实施。
+更新日期：2026-09-21。状态：R1–R8 已实施，host 检查与约定的设备数值回归通过。
+审查和改造范围为 **S0–S8 已完成的全部内容**，包括外围工具、CPU 基线、SDK、
+权重准备、算子与状态验证、DeltaNet、Attention、MLP 和 decoder 切片。
 
-## 目标与边界
+## 范围与验收边界
 
-- 当前 DLM 改为 `facebook/opt-350m`，只启用这一模型的下载。
-- 将模型结构、权重映射与 NP101 通用算子/存储分开；以 OPT 和已有 Qwen3.5
-  两个实际使用方验证解耦，不以“类已经参数化”代替复用验收。
-- 保留 Qwen3.5 已有实现、缓存和验证证据；其支持范围仍是已经验证的部分。
-- 首次 OPT 部署仍要求完整文本计算在 NP101 上执行。CPU 只承担初始化、
-  tokenizer、调度和显示；CPU 导入通过不等于 NP101 部署通过。
-- 本轮不实施下述推理重构，不引入新测试框架、MLIR、量化、训练或动态 KV 分配。
-  双图 DeltaNet 权重去重继续暂缓；TLM 下载和两机联动保留到后续阶段。
+本次拆开“可复用机制”和“Qwen 模型契约”，保留已有计算语义及验证能力。
+已有通用模块直接保留；模型专属逻辑集中到明确的 Qwen 模块；只有两者混在一起的
+部分才拆分。测试样例的固定输入、硬件限制和模型配置值不作同等处理。
 
-## 必须固定的 OPT-350M 计算契约
+设备验收上限仍是已经实现的 mixer、完整单层和四层 decoder 切片。
+既有完整 CPU 参考属于本次维护范围，但不新增完整设备推理。
+OPT 下载/CPU 导入结果保留，不要求新增 OPT decoder、PyTorch bin 导出或完整生成。
+S9 及之后按原施工计划继续，不在本清单中施工。
 
-以下载的固定 revision、实际 tensor 和当前 Conda 环境中的官方 Transformers 实现为准。
+## 全面检查结果与处置
 
-| 项目 | 适配要求 |
-|---|---|
-| 层数与维度 | 24 层；hidden=1024，FFN=4096，词嵌入维度=512 |
-| Attention | 16 个 Q/K/V 头，head_dim=64；标准 MHA，保留投影 bias |
-| 位置编码 | 学习式位置嵌入；按 attention mask 计算位置，表索引有 +2 偏移；无 RoPE |
-| 归一化 | `do_layer_norm_before=false`；两个残差相加后分别做 LayerNorm |
-| LayerNorm | 包含均值消去、方差、gamma 和 beta；核验 epsilon；不能沿用 Qwen 的 RMSNorm 或 `1 + weight` |
-| FFN | 带 bias 的 Linear → ReLU → Linear；不是 SwiGLU |
-| 输入 | token embedding[512] → project_in[1024] → 加位置嵌入 |
-| 输出 | 24 层后 project_out[512] → 与 embedding 绑定的 LM head；该配置无额外 decoder final LayerNorm |
-| 词表与特殊 token | 模型输出 50272 行，tokenizer 实际 50265 项；BOS=EOS=2、PAD=1，默认添加 BOS，无 chat template |
-| 推理模式 | eval、关闭 dropout；batch=1；首次上下文容量为 512，之后按能力验证扩展 |
-| 精度 | 原始 FP16 权重按位保留；Softmax、归一化等累加精度单独规定和验证 |
+下表记录改造前的全面审查结论及已执行的处置；“保留”表示未新增抽象层。
+实施后的模块边界、fixture 格式和复现入口见 [组件验证说明](../tests/np101-components.md)。
 
-## 现有耦合点与拟定归属
-
-| 当前文件 | 需要调整的内容 | 归属 |
+| 已实现内容与文件 | 检查结果 | 本次处置 |
 |---|---|---|
-| `python/specferry/reference/checkpoint.py` | 固定模型/revision、safetensors index、Qwen tensor 分组 | 通用读取/完整性检查 + 模型适配器 |
-| `python/specferry/reference/model.py`、`trace.py` | 固定 Qwen 类、聊天模板、0/3 层 hook | 每个模型独立的官方参考适配器 |
-| `python/specferry/export/schema.py`、`weights.py`、`memory.py` | 固定形状、只接受 BF16/F32、固定 alias 与 Qwen 内存公式 | 通用打包器 + 模型提供的契约/预算 |
-| `native/np101/weights.cpp` | 固定名称前缀和 embedding/head alias | 由部署包显式描述 |
-| `native/np101/tensor.cpp` | `bind_hidden` 写死 `[1024,1]` | 按调用方 TensorSpec 检查的通用绑定 |
-| `native/np101/kv_cache.*` | 固定 2 个 KV 头、head_dim=256、token_bytes | 参数化单缓冲 KV 存储 |
-| `native/np101/attention.cpp` | 固定第 3 层、Qwen Q/K norm、RoPE、gate | 通用 attention 核心 + Qwen 模型组合 |
-| `native/np101/decoder.cpp` | 固定四层排列、RMSNorm、SwiGLU | 独立 OPT/Qwen decoder 组合 |
-| `native/np101/delta_net.*` | Qwen DeltaNet 形状与双图调度 | 保留为独立模型组件，复用必要的底层算子 |
+| Conda、requirements、格式脚本、`.clang-format`、`ruff.toml`、环境采集 | 依赖与工具规则独立于模型；NP101 库名、设备路径属于平台配置 | **保留**。不改 Python 3.12、格式规范、系统配置或采集机制 |
+| 根/测试 `CMakeLists.txt` | 已分离不含 SDK 的 `np101_data` 与 SDK context；后续计算库按具体组件链接 | **小改**。随职责提取调整 target 和依赖，保留编译数据库、SDK 路径配置和 host-only CTest |
+| `scripts/download_models.py`、`range_download.py` | 已有 ModelSpec、独立传输、格式选择、锁定 revision、摘要验证；启用列表是项目策略 | **保留**。继续只启用 OPT-350M，不将下载配置扩建成模型框架 |
+| `reference/checkpoint.py` | 文件校验/safetensors 解析与固定 Qwen repo、revision、text/vision/mtp 分类混合 | **拆分**。通用文件检查与张量盘点独立；模型分类、名称映射和 revision 检查留给 Qwen，见 R2 |
+| `reference/model.py`、`runner.py`、`trace.py`、`tolerances.json` | 官方类、chat template、精度补丁、层 0/3 hook 和参考场景明确属于 Qwen；数组保存、比较与报告部分可复用 | **局部拆分**。保留 Qwen 参考算法/场景，提取公共工具和调用边界，不建设通用生成器，见 R2/R8 |
+| `native/np101/context.*`、`tensor_spec.*` | SDK 生命周期、dtype、shape 和溢出检查无模型绑定 | **保留**。不增加设备后端接口或改写所有权机制 |
+| `tensor.*` | tensor 创建/传输/retain 通用；只有 `bind_hidden` 固定 FP16 `[1024,1]` | **局部参数化**。修改绑定契约，保留其余机制和 SDK 例外说明，见 R5 |
+| 厂商 `demo/`、卷积/ReLU/Pool 回归及脚本 | 独立 SDK 基线，固定形状和误差预算是用例定义 | **保留**。不模型化、不为减少重复而替换成待测 DLM 算子实现 |
+| `validation/fixtures.py`、native `case_file.*`、`operators.*`、`op_check.cpp` | 已按文件描述任意测试 tensor/node；属于 SDK 能力探针，不是模型执行器 | **保留协议与职责**。不升格为生产推理 IR；不强迫原始 SDK 探针依赖生产算子 |
+| `operator_cases.py`、`extended_cases.py`、`reference_cases.py`、算子检查脚本 | 基础生成函数多已参数化；模型尺寸目录、`layers.0/3` 和 trace 名称映射仍是 Qwen | **局部拆分**。通用小图和 Qwen 测试配置分离，见 R8；已有 Gather/head/Argmax 探针仍仅是探针 |
+| `export/schema.py` | 严格规定完整 Qwen 权重集合、24 层结构和 dtype | **归入 Qwen 契约**。保留已验证 checkpoint 的严格检查；不把限制复制到通用打包器，见 R1/R3 |
+| `export/weights.py`、`verification.py`、导出/校验脚本 | 对齐、分块、摘要已通用；dtype 策略、固定模型身份和 embedding/head alias 混入打包/校验 | **拆分**。物理格式、模型契约和精度选择分开，见 R3 |
+| `native/np101/weights.*` | 有界读取/完整性检查通用；名称必须以 `model.` 开头，`find` 特判 LM head | **局部解耦**。移出名称语义和 alias 特判，保留安全边界，见 R3 |
+| `export/memory.py`、分配诊断及脚本 | 权重求和通用；18/6 层、状态副本数、KV/词表尺寸和原生诊断状态表写死 | **拆分数据与机制**。模型提供资源条目，通用代码计数/执行；旧复现配置保留，见 R3 |
+| `delta_net.*` | 基础构图与 Qwen 投影、维度、权重路径、递推及双图调度混合 | **拆分并参数化**，见 R4/R6；保留 FP32 修正和当前两图策略 |
+| `kv_cache.*` | 单父缓冲/slot view 可复用；KV 头数、head_dim、字节数和容量常量绑定当前模型 | **参数化**，见 R5；不改存储方案 |
+| `attention.*` | 基础构图、Attention 核心与第 3 层权重、Q/K norm、RoPE、gate 混合 | **拆分并参数化**，见 R4/R6 |
+| `decoder.*` | 重复构图、RMSNorm/SwiGLU、模型层排列和组执行管理混合 | **拆分并参数化**，见 R4/R7 |
+| Python mixer/decoder 验证与 native 对应测试 | 固定状态形状/层号/字节数；Attention/Decoder 为比较文件而依赖 DeltaNet 模块 | **局部拆分**。公共比较工具独立，模型参考和测试配置显式化，见 R8 |
+| `validation/device.py`、`capabilities.py`、设备检查 CLI | 设备锁、超时、恢复标记、日志和硬件证据判定已独立；CLI 默认模型与容差选择需要明确归属 | **保留调度机制**。只改参数/配置接线，不引入测试框架或统一万能 runner，见 R8 |
+| 共享诊断、历史内存/状态报告、README/TODO/测试说明 | 包含仍有效的限制和复现证据，不是应删除的模型耦合 | **保留证据并同步说明**。不重启已退役实验，不因重构关闭硬件验收代办 |
 
-拟定目录边界如下；只在对应步骤落地时迁移，不单独进行全仓库目录改名。
+## 目标依赖边界
 
-```text
-native/model/                 模型描述、权重角色等普通 C++ 数据契约
-native/np101/                 Context、Tensor、Graph、权重读取、KV 存储
-native/np101/ops/             SDK 算子构图及可复用计算片段
-native/models/opt/            OPT 输入、decoder、输出组合
-native/models/qwen3_5/        已有 Qwen 组合及专有组件
-python/specferry/models/      模型配置/权重映射/官方参考适配器
-python/specferry/export/      通用部署包写入与校验
-tests/native/np101/           继续使用现有 CTest/诊断目录
-tests/python/                继续使用现有 unittest 目录
-```
+- Python 公共文件/数据工具不导入 Qwen 官方类或 Qwen 校验策略；
+  `python/specferry/models/qwen3_5/` 持有模型配置、权重映射、精度策略和专属参考逻辑。
+  现有脚本保持薄入口，公共参考/校验工具由调用方传入策略。
+- `native/np101/` 保留 SDK 与存储；`native/np101/ops/` 提供实际复用的构图函数和
+  计算片段；`native/models/qwen3_5/` 负责模型组合。CMake 依赖只从模型层指向公共层。
+- 普通参数结构、TensorSpec 和权重引用足够表达当前需求；不建设统一模型描述语言、
+  后端注册系统或一算子一类的包装体系。目录移动随职责拆分完成。
+- 通用层依然允许存在有依据的 SDK/实现限制，例如读取块上限和已验证 shape 范围；
+  模型尺寸和层顺序由适配代码提供，测试固定值留在具名用例中。
 
-通用算子接收 tensor 和显式参数，不读取 Hugging Face 名称，不判断模型品牌。
-模型组合调用这些算子。避免一个 Decoder 类积累大量互斥开关，也不为每个 SDK
-函数增加一层无实际职责的类。暂不增加第二套后端抽象。
+以下 R1–R8 是本次重构顺序，不替代原 S 阶段编号。
 
-## 0. 下载与 CPU 导入验证（已完成）
+## R1. 固定模型边界、组件参数和兼容要求
 
-- [x] 锁定 OPT-350M 官方 revision，下载 config、tokenizer 和单套官方权重；
-  记录文件大小、校验和、完整下载 manifest；保留 Qwen 缓存。
-- [x] 在独立导入验证中安全读取官方 PyTorch bin；不依赖 safetensors index，
-  不启用远程代码或不受限 pickle 加载。
-- [x] 核验实际 dtype、tensor 名称/形状、独占存储字节和 embedding/head 别名。
-- [x] 在 SpecFerry Conda 环境中以官方 OPT 类进行离线 CPU 导入和固定输入前向/
-  短文本生成；记录 token IDs、非有限值、版本和结构参数。
-- [x] 明确区分 CPU 导入已验证与 NP101 exporter/runtime 尚未适配。
+依赖：无。
 
-交付：下载器必要修改、最小回归测试、下载 manifest、`.cache/runs/` 下的导入报告。
-验收：校验通过且官方 CPU 模型可加载和运行；不得因此标记设备部署完成。
+- [x] 将 Qwen 身份/revision、配置解析、权重命名、tensor 分类、层类型列表及
+  `export/schema.py` 的严格 checkpoint 契约集中到 Qwen 模块。
+- [x] 区分“受验证的 Qwen checkpoint 配置”和“公共组件接受的参数”：前者继续严格
+  限定原 checkpoint，后者允许独立的小尺寸合成用例，不以放宽模型校验实现复用。
+- [x] 定义小型组件参数：hidden/intermediate、Q/KV 头数/head_dim、rotary_dim/theta、
+  DeltaNet key/value 维度/卷积宽度、epsilon、dtype/舍入边界、容量和层列表。
+  从配置/权重形状推导 shape、slice 偏移及字节数。
+- [x] 确定 Python → native 的组件参数传递：利用现有部署/测试元数据，只增加实际
+  使用的字段和必要读取代码；缺失或不支持的配置明确报错，不默认为 Qwen 尺寸。
+- [x] 保持旧权重包和历史 fixture 可解释，保留 Qwen 旧 CLI 默认路径与回归入口。
+  若必须修改 fixture 字段语义，同步版本检查；不静默改变旧文件含义。
 
-已完成记录：
+交付/验收：Qwen 配置入口、组件参数结构、旧入口兼容说明；原配置得到相同的
+shape/字节数，非法形状、头分组和权重错配在对应组件分配/建图前失败。
 
-- revision：`08ab08cc4b72ff5593870b5d527cf4230323703c`；9 个下载文件校验通过。
-- 模型目录：`.cache/models/facebook/opt-350m/`。
-- 388 个 tensor 全部为 FP16；331,196,416 个独立参数，payload 为 662,392,832 字节
-  （631.707 MiB）。checkpoint 无单独 `lm_head.weight`，官方加载后与 embedding 共享存储。
-- 官方 CPU FP16 模型无缺失/多余/形状不匹配权重，3 组提示各生成 20 token，logits 有限。
-  8-token 测例的缓存增量与整段前向最终 logits 最大绝对差为 0，cache 覆盖 24 层。
-- 下载相关 8 项测试及 Ruff 检查通过。报告、tensor 清单和可重跑验证脚本位于
-  `.cache/runs/opt-350m-import-20260921/`；运行 `verify_import.py` 使用 SpecFerry Conda。
-- 验证报告的 scope 仅为 CPU 导入/推理；现有 Qwen exporter 和 NP101 runtime 尚未适配。
+## R2. 解耦 checkpoint 检查与既有 CPU 参考
 
-## 1. 固定模型描述与适配器边界
+依赖：R1。无需设备。
 
-依赖：步骤 0。无设备依赖。
+- [x] 从 `checkpoint.py` 提取路径约束、摘要/大小验证、safetensors header/index
+  解析和范围检查；公共盘点接收身份契约，模型包装函数补充分类，不内置 Qwen repo/revision。
+- [x] 保留所有重复 tensor、缺失 shard、重叠/越界 payload 和未分类权重检查。
+  当前仅维护已实现的 safetensors 盘点路径，不新增 OPT bin 导入到这条流水线。
+- [x] Qwen 官方模型构造、text-only 筛选、tied weight、RoPE 恢复、chat template、
+  `precision()` 和 functional hook 留在 Qwen 参考模块，继续使用官方计算实现。
+- [x] 数组序列化、有限值检查和比较等工具独立；通用文件/导出工具不能为获取
+  摘要或容差而导入整个 Qwen 模型运行器。
+- [x] trace 的层选择/名称映射由 Qwen 测试配置提供，原层 0/3 场景保留默认值。
+  现有 CPU prefill、逐 token、teacher forcing 和短生成流程维持行为，不改写为
+  支持所有模型的生成框架。
+- [x] 保留参考来源、源码 hash、精度说明及冻结阈值；Qwen 的两种精度模式不作为
+  其他模型的默认策略。
 
-- [ ] 定义版本化模型描述，包含架构、实际维度、层配置、词表、位置编码、精度策略、
-  权重角色/别名及 checkpoint 标识。embedding_dim 与 hidden_size 必须分开。
-- [ ] OPT/Qwen 分别解析配置和映射权重；移出通用层中的固定 repo、revision、
-  tensor 前缀、层号、聊天模板及模型尺寸。
-- [ ] 通用入口从模型描述分派适配器；支持范围外的结构在建图前明确报错。
-- [ ] Python 和 C++ 使用同一份序列化契约；如修改包格式，同步更新两端版本校验，
-  明确旧 Qwen 包的兼容/再导出方式，禁止静默按新格式解释旧包。
+交付/验收：通用盘点/比较工具与明确的 Qwen 参考入口。小型伪 checkpoint 能独立
+校验；原 Qwen 身份拒绝测试、固定输入参考与关键 trace 对齐仍通过。
 
-交付：模型描述 schema、两个适配器骨架、迁移入口。
-验收：OPT 与 Qwen 的真实配置，以及一个不同尺寸的小型合成配置均能正确解析；
-缺失权重、错误 bias/维度、未知版本在 SDK 初始化前失败。
+## R3. 解耦权重包、内存预算及分配诊断
 
-## 2. 通用权重导出与独立 CPU 参考
+依赖：R1–R2。格式与预算检查无需设备。
 
-依赖：步骤 1。无设备依赖。
+- [x] 将导出拆为“模型选择 tensor/目标 dtype/alias”与“按清单有界读取、转换、
+  对齐写出及记录摘要”。保留现有 64 字节对齐、8 MiB 有界读取和逐 tensor 校验。
+- [x] `convert_bytes` 显式接受目标精度；保留 Qwen BF16→F16、原生 F32 保留策略，
+  补齐公共 F16 原样写入。只支持本轮明确验证的转换，不引入新的精度优化。
+- [x] 将 `verify_weight_pack` 的物理格式检查与 `verify_export` 的模型契约检查分开。
+  generic 校验不强制存在 Qwen embedding；alias 仅允许直接指向已有物理记录，
+  拒绝悬空、覆盖物理名称和链式/循环 alias。
+- [x] C++ `WeightStore` 按物理名称精确查找，移除 `model.` 前缀要求和 LM head 特判；
+  名称仍需满足索引语法。alias 由模型适配器解析，生产算子接收显式 WeightRecord/
+  tensor 引用。优先保持 weights.index v1 不变，旧 Qwen alias 由适配器兼容。
+- [x] 独立导出验证器继续以 PyTorch 转换结果检查字节，不调用待测转换函数计算
+  expected；模型身份、选择规则和目标 dtype 由 Qwen 契约提供。
+- [x] `memory_budget` 汇总物理权重和具名资源字节数；模型侧计算副本数。Qwen 的
+  18/6 层、双图副本与既有 head 预算移到 Qwen 资源描述，保留原估算场景。
+  区分历史全模型预算、所选切片预算和实测分配；未知 SDK/workspace 继续标为未知。
+- [x] 分配诊断的固定状态列表移为显式具名测试配置；常量/可写权重加载与回读流程
+  保留。原 Qwen 故障复现配置的 shape、数量、顺序原样保存，不冒充当前 KV 执行布局。
+  新切片诊断使用实际组件规格，不再在分配器中写死模型状态。
 
-- [ ] 将 checkpoint 读取与物理打包分开，支持单文件/分片 safetensors 及安全读取
-  官方 PyTorch bin；保留流式写出、完整性校验和有界 host 内存使用。
-- [ ] 增加 F16 原样导出，逐 tensor 验证数值字节不变；Qwen BF16/F32 策略保持独立。
-- [ ] alias 由模型描述提供；记录唯一物理数据及逻辑引用，检测悬空/循环 alias，
-  去掉 `WeightStore::find` 中对 LM head 名称的特判。
-- [ ] 将权重大小、每层 KV、激活和已知复制成本按真实配置计算；SDK 私有开销保留未知，
-  不将导出包大小当作设备占用。超过 8 MiB 的 embedding 不能绕过现有有界读取检查。
-- [ ] OPT 使用原始文本续写输入，不套用 Qwen chat template；固定 BOS/EOS/pad 行为。
-  分别记录 tokenizer token 集合与模型输出行数，不自行裁剪 head 的额外行。
-- [ ] 用官方 eager 实现生成 embedding、Q/K/V、Attention、两次残差/LayerNorm、
-  FFN、project_out 和 logits 参考；捕获节点可配置，不再固定层 0/3。
-- [ ] 固定精度边界及验收阈值。先核验 CPU 整段前向与逐 token 缓存前向，
-  再制作设备测试数据；参考计算不能复用待测设备实现。
+交付/验收：模型无关的权重读写/完整性检查和预算汇总；旧 Qwen 包可读且导出 payload
+保持一致，小型非 `model.*` 名称/无 embedding 包及 F16 原样字节测试通过。
+常量/可写分配只作有界小样本回归，不重新触发已知约 1 GiB 的全量失败实验。
 
-交付：OPT 部署包、内存预算、独立 CPU fixtures；Qwen 旧参考仍可运行。
-验收：全部 OPT 权重映射闭合、FP16 按位一致、alias 正确；参考前向/缓存路径一致，
-损坏包和模型/权重错配被拒绝。
+## R4. 提取公共 SDK 构图和基础算子
 
-## 3. 提取通用算子与图构建设施
+依赖：R1/R3。
 
-依赖：步骤 1–2；硬件数值检查使用现有串行设备 runner。
+- [x] 从 `AttentionGraph`、`StepGraph`、`DecoderGraph` 合并重复的 tensor/常量/node、
+  reshape/slice、转换、图 IO 声明和参数数组持有机制；保留 Context/Graph 实现。
+- [x] 提取现有 MatMul/无 bias 投影、逐元素、归约、激活与归一化函数；参数化 shape、
+  轴、转置和精度。集中核对逻辑维度与 SDK 轴序，不增加当前未用的算子路径。
+- [x] 明确区分 RMSNorm 和基于平方和的 L2 归一化。`1 + weight` 由调用方显式指定，
+  保留原 FP32 加法及舍入位置，不在 FP16 权重上预折叠。
+- [x] 保留现有投影分块和有界读取策略；实现限制与模型参数分开表达，拒绝尚未支持
+  的组合。节点参数数组活到图释放之后，不覆盖 `vsi_nn_AddNode` 初始化的私有状态。
+- [x] 构图函数向调用方已有图添加节点；代码拆分不增加执行图、host 中转、复制或
+  权重加载。公共库不依赖任何模型模块或测试 case 协议。
 
-- [ ] 提取重复的 tensor/node/参数生命周期管理及 shape/layout 检查；保留
-  `vsi_nn_AddNode` 初始化的内部状态，错误时按所有权顺序清理。
-- [ ] 复用 Linear/MatMul、可选 bias、Add、ReLU/SiLU、reshape/slice、Gather、
-  masked Softmax、dtype conversion；逻辑维度与 SDK 轴序的转换集中处理。
-- [ ] LayerNorm 和 RMSNorm 使用不同的显式契约；优先核验文档中的 `LAYER_NORM`
-  对实际形状/精度的支持，必要时用文档中的基础算子组合并说明原因。
-- [ ] 参数化归一化 epsilon、gamma 约定、Softmax 轴与累加/输出精度；
-  不因权重是 FP16 就强制所有中间结果为 FP16。
-- [ ] 抽取无位置编码、无 Q/K norm、无输出 gate 的 Attention 核心：接收已投影
-  Q/K/V，处理缩放、因果 mask、Softmax 和 V 加权；分别验证 MHA/GQA 头映射。
-- [ ] 将 Qwen 专有 Q/K norm、RoPE、gate 与 DeltaNet 算法留在模型组合中。
-  迁移时保留 FP32 recurrent/core 的现有修正，不处理双图权重去重。
+交付/验收：现有三个计算模块实际调用公共算子；小尺寸投影、归一化和轴/布局对照通过。
+原始 SDK 能力探针独立保留，公共函数另由实际调用路径验证，避免只测试未被调用的旧代码。
 
-交付：由 OPT 与 Qwen 实际调用的通用算子模块。
-验收：小型非 1024 维样例和真实 OPT 形状通过；覆盖 bias、非零均值 LayerNorm、
-Softmax 轴/无效位置。被迁移的 Qwen 路径以既有阈值回归，不扩大临时诊断矩阵。
+## R5. 参数化绑定、KV 与状态规格
 
-## 4. 参数化 KV 与推理状态
+依赖：R1/R4。
 
-依赖：步骤 3。
+- [x] `bind_hidden` 改为按调用方 TensorSpec 检查，保留同 context、普通可写且已物化
+  tensor 的约束与消费者先释放顺序；`add/upload/read/retain` 无须改写。
+- [x] `KvCache` 按 KV 头数、head_dim 和实例容量生成父 tensor、slot view 及字节统计；
+  首版仍支持既有 FP16 布局，当前验收容量上限保持 512。
+- [x] 保留单套 K/V、只追加当前槽、读取图直接引用父缓冲、有效前缀 reset/truncate；
+  保留 copy 图重验证与耗时计数，不恢复句柄交换、整段复制或 KV 双缓冲。
+- [x] DeltaNet recurrent/卷积状态大小由已检查的组件配置推导；精度、双 bank 与
+  初始化行为保持现状。避免在 native、Python reference、预算中分别写同一组常数。
+- [x] 保留容量/输入先检查再执行，部分失败使实例失效；不给递推状态增加按长度回滚。
 
-- [ ] `KvCache` 接收 KV 头数、head_dim、dtype、capacity 和明确布局；
-  `bind_hidden` 改为验证调用方提供的 TensorSpec。
-- [ ] 保持每层一套预分配 K/V，通过 slot view 写入当前 token，后续计算直接读取
-  同一存储；不复制历史缓存，不恢复句柄交换或 KV 双缓冲。
-- [ ] OPT 使用 16×64 的 K/V 头布局；512 容量时每层约 2 MiB，24 层合计 48 MiB。
-  每层每次只写新 token 的 K/V，共 4 KiB；将计数按描述计算。
-- [ ] 序列对象统一管理已消费 token 数；执行前检查全模型容量/位置边界，全部层成功后
-  才提交长度。部分层执行失败时实例失效并要求重建，不宣称自动回滚。
-- [ ] reset/truncate 仅改变有效前缀；覆盖无效槽、truncate 后重新追加及 fresh/reset
-  等价性。Qwen recurrent state 不提供虚假的长度回滚能力。
-- [ ] 保留 slot-copy 图重验证的显式统计及跨图引用的所有权/释放顺序。
+交付/验收：原布局和一组不同头数/维度的小配置通过绑定、槽位写入、历史内容保持、
+边界与生命周期检查；原状态规格与资源计数保持一致。
 
-交付：通用单缓冲 KV、参数化绑定与序列状态契约。
-验收：OPT 与原 Qwen 两种真实布局均通过追加/边界/生命周期检查；
-无历史 KV host 回传或整段复制，应用计数与设备驻留证据分开报告。
+## R6. 分离 mixer/MLP 计算与 Qwen 组合
 
-## 5. 组合 OPT Decoder 并验收层间连接
+依赖：R4–R5。
 
-依赖：步骤 2–4。
+- [x] Attention 核心只接收处理后的 Q、缓存 K/V、有效长度和缩放参数，构建 score、
+  mask、Softmax、V 加权；投影、Q/K norm、RoPE、输出 gate/投影由 Qwen 组件组合。
+- [x] 头分组、旋转维度和 slice 范围从参数推导；保留缩放顺序、FP32 masked Softmax
+  及已验证二维布局，不恢复有问题的三维 Softmax 或展开整份 KV 的路径。
+- [x] DeltaNet 拆出无 checkpoint 路径依赖的递推和卷积/归一化片段；投影拆分、
+  decay/beta 构造、gate 和权重映射归 Qwen 组装。保留 FP32 recurrent/core 修正。
+- [x] 保留固定 A→B/B→A 调度和图间引用；不处理暂缓的双图权重去重，不增加副本。
+- [x] 提取已有 `down(SiLU(gate(x)) * up(x))` 片段，权重与维度显式传入；
+  外部 norm/residual 放置留给模型层，不将 SwiGLU 作为所有 FFN 的默认结构。
 
-- [ ] 实现带 bias 的 Q/K/V 与输出投影；保留官方实现先缩放 Q 的运算顺序，
-  不以实数等价为由任意移动 FP16 舍入位置。
-- [ ] 单层严格按以下顺序组合：
+交付/验收：公共计算片段无模型名、权重前缀或绝对层号；原 Attention/DeltaNet
+参考轨迹、精度阈值及少量不同尺寸小图检查通过。此步不新增 OPT 专属算子。
 
-  ```text
-  a = LayerNorm(x + Attention(x))
-  y = LayerNorm(a + Linear2(ReLU(Linear1(a))))
-  ```
+## R7. 解耦 decoder 层排列与执行管理
 
-- [ ] 层号、权重角色、输入输出绑定均显式传入；用同一实现构建任意已验证层区间，
-  不保留“只有第 3 层是 Attention”或“只支持 0–3 层”的通用限制。
-- [ ] 依次验证独立真实层、连续四层、24 层 decoder；层间保持固定 tensor 引用，
-  不以 host 读回再上传连接各层。
-- [ ] 在 2/32 token 轨迹中检查关键中间值及 KV，另用一次完整容量检查覆盖边界；
-  保留 reset/fresh/final-only 和失败失效检查，避免每层重复全部长轨迹。
+依赖：R6。
 
-交付：OPT decoder 组合、独立参考对照及实际权重/状态/传输计数。
-验收：逐层和层间数值检查均通过；原 Qwen 已支持的组合调用共享设施后保持通过。
+- [x] Qwen 层组装持有 pre-norm、mixer、residual、post-norm、SwiGLU、residual 顺序。
+- [x] mixer 类型由层描述提供，移除计算代码中的 `layer == 3`、`layer > 2`；
+  层组按显式列表连接，去除 `first=0/3` 和 `layer<4` 的执行器限制。
+- [x] 保留既有“完整第 3 层”和“第 0–3 层组合”默认验证配置；新增一个不同层号/
+  长度的短切片验证列表执行，不扩展到全模型。
+- [x] 保留固定层间 tensor 绑定、全组执行前检查、全部层成功后提交长度，以及中途
+  失败使整组失效；指标按所选层和配置求和。
 
-## 6. 接通 OPT 完整文本生成
+交付/验收：Qwen 专属层组合调用公共算子；旧单层/四层组及短切片通过，
+未验证模型或结构仍明确拒绝。
 
-依赖：步骤 5；实际常驻内存和新增算子验收。
+## R8. 整理验证依赖并完成回归
 
-- [ ] 输入侧在设备完成 token Gather、512→1024 投影、学习式位置 Gather 和相加；
-  测试位置 0/1/容量末尾及 +2 偏移，声明首版不支持的 padding/batch 情况。
-- [ ] 输出侧完成 1024→512 投影、全词表 LM head 和设备 greedy 选择；
-  不添加该 OPT 配置不存在的最终 LayerNorm。
-- [ ] embedding/head 的逻辑绑定与设备物理共享分别验收。优先尝试支持的单份只读
-  存储/view；无法共享时记录必要复制及预算，禁止把 manifest alias 当作 SDK 共享证明。
-  本项不扩大到暂缓的 DeltaNet 双图去重。
-- [ ] 若 LM head 分块，验证完整覆盖、尾块、全局 token ID、最大值和相同值时的
-  选择规则；不得遗漏词表行或在 host 计算 head/argmax。
-- [ ] 首版 prompt processing 可逐 token 复用 decode 路径；批量 prefill 优化另列后续。
-  明确已消费长度、待消费新 token、EOS、最大输出数及上下文耗尽语义。
-- [ ] 在建图前预算唯一权重、SDK 复制、KV、工作区；按单层→多层→完整模型逐级验证，
-  不重跑之前已知失败的 Qwen 容量压力实验。
+依赖：随 R2–R7 迁移同步修改，最后统一验收；不等待此步才修复测试调用方。
 
-交付：完整 OPT-350M C++ 生成入口与 host tokenizer/显示脚本。
-验收：embedding、24 层、状态更新、输出投影、head、greedy 均纳入执行证据；
-固定输入 teacher forcing logits 对齐，固定提示生成可复现，reset/重复生成正常。
-出现首个 token 分歧时定位 logits/中间值，不靠放宽阈值宣布通过。
+- [x] 将 `compare_file`、数组保存等公共工具移出 `validation/delta_net.py`，
+  Attention/Decoder 不再因文件比较而导入 DeltaNet 官方参考。
+- [x] 保留官方模型参考与设备实现的独立性；共享配置/文件格式，不共享待测算术来
+  生成 expected。Qwen 精度补丁、cache 协议和 hook 放在模型参考模块。
+- [x] 将模型尺寸 operator catalog 和真实 trace 投影映射归 Qwen 测试配置；
+  通用小图生成函数接收参数。固定随机种子、诊断 shape 和边界常数可留在用例中。
+- [x] 通用比较器接收明确容差；模型误差预算由 fixture/参考策略携带。维持当前数值、
+  生命周期、执行后端和驻留证据的独立判定，不合并具有不同语义的比较函数。
+- [x] CLI 只负责选择已有配置、参数校验和调度；保留设备锁、超时/恢复标记、
+  `--prepare-only` 与显式设备运行方式，不修改 `validation/device.py` 的工作机制。
+- [x] 更新 CMake 依赖、公开头文件和所有受影响 CLI/import；host 数据测试不链接 SDK，
+  普通 CTest 不打开设备。沿用 unittest/CTest，不引入 lit 或统一测试框架改造。
 
-## 7. 解耦与交付验收
+最小验收矩阵：
 
-依赖：步骤 1–6。
+| 范围 | 本次需要的验证 |
+|---|---|
+| 保留的环境/下载 | 原 host 测试与 CLI 导入检查；不重新下载或改系统环境 |
+| checkpoint/CPU 参考 | 伪 checkpoint 的格式/身份拒绝；固定 Qwen 8-token prefill/逐步与关键 trace 回归，保留原阈值 |
+| 导出/读取/预算 | 小包完整性、损坏/alias/非 Qwen 名称、F16 原样及原 BF16/F32 策略；旧 Qwen 包/资源计数兼容 |
+| SDK 与算子 | 受影响的既有探针和生产公共函数小图；Context/tensor 公共路径变动时补一次卷积基线 |
+| 状态与模型切片 | 不同尺寸 KV/递推小例、独立 mixer 短轨迹、完整 Attention 层、四层组 32 步及短切片 |
+| 长度与传输 | 一次四层组 512 容量检查及第 513 次拒绝；沿用 reset/fresh/final-only；旧组每步 2,056 字节显式上传、零中间读回 |
+| 工程质量 | 必要 host 单测、构建/CTest、公共头自包含、C++ 格式/include、Ruff `--check`、文档命令一致性 |
 
-- [ ] OPT 与保留的 Qwen 测试通过同一组通用算子/存储；通用层不包含 checkpoint
-  名称、固定层号或模型规模常量。使用至少一个不同隐藏维度的小配置防止假参数化。
-- [ ] 测试继续放现有 Python/native 目录，按真实功能命名；不引入 lit 等框架，
-  不恢复已经删除的句柄交换或临时探针。
-- [ ] 通过必要的单元测试、目标 CTest、对应设备数值回归；执行 Ruff 与 C++ 格式检查，
-  保持 100 列、控制语句花括号及既有 include 规则。
-- [ ] 报告分别列出下载完整性、CPU 导入、导出完整性、SDK 数值、执行后端、设备驻留、
-  实际内存和端到端生成；缺少硬件证据时保留阻塞，不把数值通过写成纯 NPU 部署通过。
-- [ ] 更新 README、TODO 和模型支持表，给出可复现命令；按上述步骤分次提交，
-  避免将目录迁移、语义变化和完整模型接线压进一个不可审阅的大提交。
+交付/验收：全部迁移路径确实使用公共模块；原行为保留；不同名称/尺寸的小用例证明
+解耦有效。测试只覆盖迁移风险，不建立每个包装函数的镜像测试或重复长轨迹矩阵。
 
-## 依赖与停止条件
+## 执行顺序与停止条件
 
-- 下载/CPU 导入可立即执行；步骤 1–2 不依赖设备或驱动内存扩容。
-- 步骤 3–5 可先用小图/模型切片实施和验证；新的真实形状仍需算子能力验收。
-- OPT 权重预计低于当前约 1 GiB 限制，但不保证完整图可常驻。步骤 6 应依据 OPT
-  自身的权重、复制、KV 和工作区实测决定是否被 `NP101-MEM-001` 阻塞。
-- `NP101-MEM-002` 只涉及暂缓的 DeltaNet 双图权重去重，不是 OPT 主线前置条件。
-- `NP101-OBS-001` 以及 KV 路径相关的 `NP101-STATE-001` 继续约束硬件/驻留验收。
-  模型切换不能自动关闭这些代办。
+- 顺序：R1 → R2 → R3 → R4 → R5 → R6 → R7；R8 随每步同步，最后收口。
+  每步交付可构建/可验证结果，再迁移下一层，避免一次改完整条链后才定位误差。
+- 全部源代码提取及 host 检查不依赖驱动扩容；设备检查仅加载有界小图或原有切片。
+  约 1 GiB 分配限制不阻止这次解耦，但实际分配失败仍需停止对应设备验证。
+- `NP101-MEM-002` 权重去重继续暂缓；`NP101-OBS-001` 和 `NP101-STATE-001`
+  不因数值回归通过而关闭。报告不把 SDK 成功当作完整 NPU/驻留证明。
+- 不新增未经论证的 SDK 接口、不改变计算顺序或放宽误差阈值来完成重构；
+  新形状触及 SDK 限制时明确记录支持范围，不扩展成性能优化或新模型适配项目。
+- 完成后更新 README、TODO 和测试说明，说明本次已解耦能力及保留的模型专属部分，
+  然后回到原施工计划。未新增的模型适配与完整设备生成不计入本次验收。
 
-## 核对依据
+依据：[芯片团队 API 文档](../demo/ref_op_api_guide.md)、[demo](../demo/main.c)、
+[验证目录](../tests/README.md)、[算子](../tests/np101-operator-acceptance.md)、
+[DeltaNet](../tests/np101-delta-net.md)、[Attention/KV](../tests/np101-attention.md)、
+[Decoder](../tests/np101-decoder.md)、[工程代办](../TODO.md)及当前 SDK 头文件。
 
-- [芯片团队算子/API 文档](../demo/ref_op_api_guide.md)、[卷积 demo](../demo/main.c)
-  及本机 SDK 头文件；文档列出算子不等于特定参数已在硬件上验证。
-- [OPT-350M 官方配置](https://huggingface.co/facebook/opt-350m/blob/main/config.json)；
-  下载报告记录实际固定 revision。
-- 当前 SpecFerry Conda 环境的 `transformers/models/opt/modeling_opt.py`，重点核对
-  `OPTLearnedPositionalEmbedding`、`OPTAttention`、`OPTDecoderLayer` 和 `OPTDecoder`；
-  制作参考时记录版本及源码 hash。
-- [既有 Qwen decoder 验证](../tests/np101-decoder.md)、
-  [Attention/KV 验证](../tests/np101-attention.md)、[工程代办](../TODO.md)。
+## 本次验收结果
+
+- Host：55 项 Python 单测、C++ 全量构建与 CTest 通过；公共头自包含、同名文件
+  include 检查、LLVM 100 列格式、Ruff lint/import/format 和 diff 空白检查通过。
+- CPU：original-fp32 / deployment-fp16 的 1/2/4/8-token prefill/逐步对齐通过；
+  两种模式各 718 项历史 trace 比较通过，冻结容差保持不变。
+- 权重：原 Qwen 320 张量逐字节通过独立 PyTorch 转换验证，旧 1,504,791,808 字节
+  权重包通过格式/摘要检查；新增非 Qwen 名称、无 embedding、F16 原样和 alias 拒绝检查。
+- 设备数值回归：独立 DeltaNet 4 步、Attention 2 步、完整 Attention 层、两层 DeltaNet
+  切片、四层组 32/512 步、不同尺寸合成 decoder/KV、卷积基线及 3 个受影响原始探针通过。
+- 四层 512 步组包含 reset/final-only/fresh，共执行 560 步、801 项比较通过；第 513 次
+  提交拒绝。每步显式上传 2,056 字节，零中间读回，原状态复用方案与重复权重开销保留。
+- 分配：同一 118,156 字节合成权重包在 constant/mutable 两种模式下，与显式状态
+  同时分配并完成逐字节回读。未重跑已知约 1 GiB 的全量失败实验。
+
+详细结果与路径见 [组件验收记录](../tests/np101-components.md#decoupling-acceptance-record)。
+SDK 数值通过仍未解决 NPU 后端证明、物理驻留、全模型内存或完整生成验收；
+`NP101-MEM-001/002`、`NP101-OBS-001`、`NP101-STATE-001` 保持原状态。

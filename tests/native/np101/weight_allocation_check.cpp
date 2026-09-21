@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <ios>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -134,20 +135,40 @@ void verify_weights(Graph &graph, const WeightStore &weights,
   }
 }
 
-void allocate_state(Graph &graph, AllocationProgress &progress) {
-  struct StateAllocation {
-    TensorSpec spec;
-    unsigned copies;
-  };
+struct StateAllocation {
+  TensorSpec spec;
+  unsigned copies;
+};
 
-  // Explicit double buffers and compact 512-token KV. Activations and SDK graph
-  // packing are unknown until full model graphs exist and are deliberately excluded.
-  const std::vector<StateAllocation> states{
-      {{DataType::Float32, {128, 128, 16}}, 36},
-      {{DataType::Float16, {4, 6144}}, 36},
-      {{DataType::Float16, {256, 2, 512}}, 12},
-      {{DataType::Float32, {64, 512}}, 2},
-  };
+std::vector<StateAllocation> read_states(const std::filesystem::path &path) {
+  std::ifstream input(path);
+  std::string line;
+  if (!std::getline(input, line) || line != "specferry-allocation-states 1") {
+    throw std::invalid_argument("missing or unsupported allocation state specification");
+  }
+  std::vector<StateAllocation> states;
+  while (std::getline(input, line)) {
+    std::istringstream fields(line);
+    std::string dtype, shape, copies, extra;
+    if (!(fields >> dtype >> shape >> copies) || fields >> extra || copies.empty() ||
+        copies.find_first_not_of("0123456789") != std::string::npos) {
+      throw std::invalid_argument("invalid allocation state record");
+    }
+    auto count = std::stoul(copies);
+    TensorSpec spec{parse_dtype(dtype), parse_shape(shape)};
+    if (!count || count > 1024 || spec.bytes() > 8 * 1024 * 1024) {
+      throw std::invalid_argument("state fixture exceeds bounded allocation parameters");
+    }
+    states.push_back({spec, static_cast<unsigned>(count)});
+  }
+  if (states.empty()) {
+    throw std::invalid_argument("empty allocation state specification");
+  }
+  return states;
+}
+
+void allocate_state(Graph &graph, AllocationProgress &progress,
+                    const std::vector<StateAllocation> &states) {
   for (const auto &state : states) {
     std::vector<std::uint8_t> zeros(state.spec.bytes());
     for (unsigned copy = 0; copy < state.copies; ++copy) {
@@ -168,15 +189,19 @@ void allocate_state(Graph &graph, AllocationProgress &progress) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3 && argc != 5) {
+  if (argc != 5 && argc != 7) {
     std::cerr << "usage: np101_weight_allocation_check DEPLOYMENT_DIRECTORY REPORT_JSON "
-                 "[--weight-storage constant|mutable]\n";
+                 "--state-spec STATE_FILE [--weight-storage constant|mutable]\n";
     return 2;
   }
   AllocationProgress progress;
   progress.output = argv[2];
-  if (argc == 5) {
-    const std::string option = argv[3], storage = argv[4];
+  if (std::string(argv[3]) != "--state-spec") {
+    std::cerr << "explicit --state-spec is required\n";
+    return 2;
+  }
+  if (argc == 7) {
+    const std::string option = argv[5], storage = argv[6];
     if (option != "--weight-storage" || (storage != "constant" && storage != "mutable")) {
       std::cerr << "invalid weight storage option\n";
       return 2;
@@ -193,12 +218,13 @@ int main(int argc, char **argv) {
     }
     progress.phase = "initialize";
     progress.save("running");
+    const auto states = read_states(argv[4]);
     Context context;
     Graph graph(context, 1024, 1);
     const auto chunks = allocate_weights(graph, weights, progress);
     progress.current_weight.clear();
     progress.chunk_offset = 0;
-    allocate_state(graph, progress);
+    allocate_state(graph, progress, states);
     verify_weights(graph, weights, chunks, progress);
     progress.phase = "release";
     progress.save("running");

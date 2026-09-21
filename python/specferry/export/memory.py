@@ -3,31 +3,25 @@
 
 def memory_budget(
     records: list[dict],
-    capacity=512,
+    resources: dict[str, int],
+    *,
+    capacity: int,
     pool_bytes=None,
     sdk_overhead_bytes=None,
     workspace_bytes=None,
-    duplicate_head=False,
 ) -> dict:
-    if not 1 <= capacity <= 512:
-        raise ValueError("initial context capacity must be in [1, 512]")
+    if not isinstance(capacity, int) or capacity < 1:
+        raise ValueError("context capacity must be positive")
     for value in (pool_bytes, sdk_overhead_bytes, workspace_bytes):
         if value is not None and (not isinstance(value, int) or value < 0):
             raise ValueError("memory counts must be nonnegative integers")
-    weight_bytes = sum(record["bytes"] for record in records)
-    embedding = next(record for record in records if record["name"] == "model.embed_tokens.weight")
-    known = {
-        "text_weights": weight_bytes,
-        "recurrent_state_double_buffer": 2 * 18 * 16 * 128 * 128 * 4,
-        "conv_state_double_buffer": 2 * 18 * 6144 * 4 * 2,
-        "compact_kv_cache": 6 * 2 * capacity * 2 * 256 * 2,
-        "rope_cos_sin_fp32": 2 * capacity * 64 * 4,
-        "position_ids_int32": capacity * 4,
-        "attention_mask_fp32": capacity * 4,
-        "head_block_logits_fp16": 4096 * 2,
-        "head_block_winners": ((248320 + 4095) // 4096) * (4 + 4),
-        "optional_second_embedding_layout": embedding["bytes"] if duplicate_head else 0,
-    }
+    if any(type(value) is not int or value < 0 for value in resources.values()):
+        raise ValueError("resource bytes must be nonnegative integers")
+    if any(type(record["bytes"]) is not int or record["bytes"] < 0 for record in records):
+        raise ValueError("weight bytes must be nonnegative integers")
+    if "text_weights" in resources:
+        raise ValueError("weight payload is counted separately from resource buffers")
+    known = {"text_weights": sum(record["bytes"] for record in records), **resources}
     unknown = []
     estimates = {}
     for name, value in (
@@ -57,7 +51,6 @@ def memory_budget(
         "notes": [
             "Allocation and graph verification must measure SDK copies and workspace.",
             "An SDK tensor allocation does not establish physical device residency.",
-            "The tied embedding/head is counted once; alternate layouts must be explicit.",
-            "No per-token host weight streaming is included in this design.",
+            "Physical weight records are counted once; additional copies must be explicit.",
         ],
     }

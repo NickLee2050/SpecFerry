@@ -8,8 +8,6 @@ import numpy as np
 from .device import fingerprint, run_device, write_json
 from .fixtures import DTYPES
 
-TOLERANCE_FILE = Path(__file__).parents[1] / "reference/tolerances.json"
-
 
 def compare_arrays(actual: np.ndarray, expected: np.ndarray, atol: float, rtol: float) -> dict:
     if actual.shape != expected.shape:
@@ -29,8 +27,10 @@ def compare_arrays(actual: np.ndarray, expected: np.ndarray, atol: float, rtol: 
     }
 
 
-def compare_outputs(metadata: dict, fixture: Path, output: Path) -> dict:
-    policy = json.loads(TOLERANCE_FILE.read_text())
+def compare_outputs(
+    metadata: dict, fixture: Path, output: Path, policy: dict | None = None
+) -> dict:
+    policy = metadata["tolerances"] if policy is None else policy
     results = {}
     for name in metadata["outputs"]:
         tensor = metadata["tensors"][name]
@@ -78,6 +78,9 @@ def check_case(
 ) -> dict:
     fixture_dir = directory / "fixture"
     metadata = case.build().write(fixture_dir)
+    if case.tolerances is None:
+        raise ValueError("operator case requires an explicit tolerance policy")
+    metadata["tolerances"] = case.tolerances
     metadata["scale"] = case.scale
     metadata["readback_mode"] = readback
     metadata["cycles"] = cycles
@@ -184,7 +187,7 @@ def check_case(
             "comparisons": comparisons,
             "blockers": blockers,
             "driver_activity_observed": evidence["driver_activity_observed"],
-            "tolerances_sha256": fingerprint(TOLERANCE_FILE),
+            "tolerances": case.tolerances,
         }
     )
     write_json(directory / "result.json", result)

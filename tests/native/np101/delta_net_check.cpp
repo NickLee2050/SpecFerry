@@ -1,5 +1,5 @@
+#include "models/qwen3_5/delta_net.hpp"
 #include "np101/context.hpp"
-#include "np101/delta_net.hpp"
 #include "np101/weights.hpp"
 
 #include <array>
@@ -17,6 +17,7 @@
 namespace {
 namespace fs = std::filesystem;
 using namespace specferry::np101;
+using namespace specferry::models::qwen3_5;
 const std::array<std::string, 10> outputs{"output", "recurrent", "convolution", "qkv",  "convolved",
                                           "decay",  "beta",      "core",        "gate", "gated"};
 
@@ -110,22 +111,23 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("steps must be in [1, 32]");
     }
     progress.enter("validate");
+    const auto config = read_config(fs::path(argv[2]) / "components.txt");
     WeightStore weights(argv[1]);
     weights.verify();
     const fs::path fixture = argv[2];
     std::vector<std::vector<std::uint8_t>> inputs;
     for (unsigned step = 0; step < count; ++step) {
       inputs.push_back(read_bytes(fixture / ("input." + std::to_string(step) + ".bin"),
-                                  DeltaNet::hidden_size * 2));
+                                  config.hidden_spec().bytes()));
     }
     const auto initial_state =
-        read_bytes(fixture / "initial.recurrent.bin", DeltaNet::recurrent_spec().bytes());
+        read_bytes(fixture / "initial.recurrent.bin", config.delta.recurrent().bytes());
     const auto initial_conv =
-        read_bytes(fixture / "initial.convolution.bin", DeltaNet::convolution_spec().bytes());
+        read_bytes(fixture / "initial.convolution.bin", config.delta.convolution().bytes());
 
     progress.enter("initialize");
     Context context;
-    DeltaNet model(context, weights);
+    DeltaNet model(context, weights, config, 0);
     run_sequence(model, inputs, "zero", false, progress);
 
     progress.enter("reset_nonzero");
@@ -143,7 +145,7 @@ int main(int argc, char **argv) {
     model.close();
 
     progress.enter("recreate");
-    DeltaNet fresh(context, weights);
+    DeltaNet fresh(context, weights, config, 0);
     run_sequence(fresh, inputs, "fresh", false, progress);
     progress.enter("release");
     fresh.close();

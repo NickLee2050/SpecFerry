@@ -28,19 +28,20 @@ void expose_output(Graph &graph, vx_node node) {
   check(status, "expose KV copy destination");
 }
 
-vx_tensor source_tensor(Graph &producer, vsi_nn_tensor_id_t id) {
+vx_tensor source_tensor(Graph &producer, vsi_nn_tensor_id_t id, const KvSpec &spec) {
   auto *tensor = vsi_nn_GetTensor(producer.get(), id);
   if (!tensor || !tensor->t || tensor->attr.vtl || tensor->attr.is_const ||
       tensor->attr.is_created_from_handle || tensor->attr.dtype.vx_type != VSI_NN_TYPE_FLOAT16 ||
-      tensor->attr.dim_num != 3 || tensor->attr.size[0] != 256 || tensor->attr.size[1] != 1 ||
-      tensor->attr.size[2] != 2) {
-    throw std::invalid_argument("KV producer must expose ordinary FP16 [2, 1, 256] tensors");
+      tensor->attr.dim_num != 3 || tensor->attr.size[0] != spec.head_dim ||
+      tensor->attr.size[1] != 1 || tensor->attr.size[2] != spec.heads) {
+    throw std::invalid_argument("KV producer shape/dtype differs from the configured slot");
   }
   return tensor->t;
 }
 } // namespace
 
 struct KvCache::Impl {
+  KvSpec spec;
   unsigned capacity;
   Graph storage;
   vsi_nn_tensor_id_t keys;
@@ -55,17 +56,18 @@ struct KvCache::Impl {
   double revalidation_seconds = 0;
 
   Impl(Context &context, Graph &producer, vsi_nn_tensor_id_t key, vsi_nn_tensor_id_t value,
-       unsigned requested_capacity)
-      : capacity(requested_capacity), storage(context, 2, 0), copy(context, 0, 0) {
-    if (capacity < 1 || capacity > maximum_capacity || producer.get()->ctx != context.get()) {
-      throw std::invalid_argument("KV cache requires one context and capacity in [1, 512]");
+       KvSpec requested_spec)
+      : spec(requested_spec), capacity(spec.capacity), storage(context, 2, 0), copy(context, 0, 0) {
+    spec.validate();
+    if (producer.get()->ctx != context.get()) {
+      throw std::invalid_argument("KV cache requires one context");
     }
-    auto source_key = source_tensor(producer, key);
-    auto source_value = source_tensor(producer, value);
-    const TensorSpec spec{DataType::Float16, {256, capacity, 2}};
-    const std::vector<std::uint8_t> zeros(spec.bytes());
-    keys = add_tensor(storage, spec, false, zeros);
-    values = add_tensor(storage, spec, false, zeros);
+    auto source_key = source_tensor(producer, key, spec);
+    auto source_value = source_tensor(producer, value, spec);
+    const auto tensor_spec = spec.tensor();
+    const std::vector<std::uint8_t> zeros(tensor_spec.bytes());
+    keys = add_tensor(storage, tensor_spec, false, zeros);
+    values = add_tensor(storage, tensor_spec, false, zeros);
     for (unsigned position = 0; position < capacity; ++position) {
       key_views.push_back(view(keys, position));
       value_views.push_back(view(values, position));
@@ -97,7 +99,7 @@ struct KvCache::Impl {
 
   std::unique_ptr<TensorView> view(vsi_nn_tensor_id_t parent, unsigned position) {
     std::array<vsi_size_t, 3> start{0, position, 0};
-    std::array<vsi_size_t, 3> end{256, position + 1, 2};
+    std::array<vsi_size_t, 3> end{spec.head_dim, position + 1, spec.heads};
     auto result = std::make_unique<TensorView>();
     result->tensor = vsi_nn_CreateViewTensor(storage.get(), start.data(), end.data(),
                                              vsi_nn_GetTensor(storage.get(), parent));
@@ -107,8 +109,8 @@ struct KvCache::Impl {
 };
 
 KvCache::KvCache(Context &context, Graph &producer, vsi_nn_tensor_id_t key,
-                 vsi_nn_tensor_id_t value, unsigned capacity)
-    : impl_(std::make_unique<Impl>(context, producer, key, value, capacity)) {}
+                 vsi_nn_tensor_id_t value, KvSpec spec)
+    : impl_(std::make_unique<Impl>(context, producer, key, value, spec)) {}
 
 KvCache::~KvCache() = default;
 
@@ -163,6 +165,13 @@ std::vector<std::uint8_t> KvCache::read_values() {
     throw std::logic_error("closed KV cache");
   }
   return read_tensor(impl_->storage, impl_->values);
+}
+
+KvSpec KvCache::spec() const {
+  if (!impl_) {
+    throw std::logic_error("closed KV cache");
+  }
+  return impl_->spec;
 }
 
 unsigned KvCache::capacity() const { return impl_ ? impl_->capacity : 0; }

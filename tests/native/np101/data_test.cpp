@@ -1,4 +1,6 @@
 #include "case_file.hpp"
+#include "models/qwen3_5/config.hpp"
+#include "np101/component_spec.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
 
@@ -67,14 +69,14 @@ void tensor_boundaries() {
 void weight_integrity() {
   TemporaryDirectory directory;
   const std::string payload("\1\2\3\4\5\6\7\10", 8);
-  const std::string record = "model.embed_tokens.weight F16 2,2 0 8 "
+  const std::string record = "block.projection.weight F16 2,2 0 8 "
                              "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n";
   write(directory.path / "weights.bin", payload);
   write(directory.path / "weights.index", "specferry-np101-weights 1\n" + record);
   WeightStore store(directory.path);
   store.verify();
-  const auto &embedding = store.find("model.embed_tokens.weight");
-  require(&embedding == &store.find("lm_head.weight"), "tied head must resolve to the same record");
+  const auto &embedding = store.find("block.projection.weight");
+  rejects([&] { store.find("lm_head.weight"); }, "reader must not infer model aliases");
   require(store.read(embedding, 4, 4) == std::vector<std::uint8_t>({5, 6, 7, 8}),
           "bounded row read");
   rejects([&] { store.read(embedding, 7, 2); }, "cross-record read");
@@ -88,6 +90,34 @@ void weight_integrity() {
   write(directory.path / "weights.bin", payload);
   write(directory.path / "weights.index", "specferry-np101-weights 1\n" + record + record);
   rejects([&] { WeightStore duplicate(directory.path); }, "duplicate tensor and overlap");
+}
+
+void component_contracts() {
+  KvSpec cache{3, 16, 8};
+  cache.validate();
+  require(cache.tensor().bytes() == 768 && cache.token_bytes() == 192,
+          "alternate KV dimensions and slot accounting");
+  rejects([] { KvSpec{2, 16, 513}.validate(); }, "unsupported KV capacity");
+  rejects([] { DeltaSpec{64, UINT32_MAX, 8, 8, 3, 1e-6f}.validate(); },
+          "overflowing DeltaNet dimensions");
+
+  TemporaryDirectory directory;
+  const auto path = directory.path / "components.txt";
+  const std::string parameters = "64 96 4 2 16 8 8 10000 1e-6 2 8 8 3";
+  write(path, "specferry-qwen-components 1\n" + parameters + "\ndelta attention\n");
+  auto config = specferry::models::qwen3_5::read_config(path);
+  require(config.hidden_spec().bytes() == 128 && config.delta.channels() == 48,
+          "component parser must preserve dimensions");
+  require(config.mixer(1) == specferry::models::qwen3_5::MixerKind::Attention,
+          "explicit layer order");
+  rejects([&] { config.mixer(2); }, "unconfigured layer");
+  for (const auto &record : {"-1" + parameters.substr(2), parameters + " extra",
+                             std::string("64 96 3 2 16 8 8 10000 1e-6 2 8 8 3")}) {
+    write(path, "specferry-qwen-components 1\n" + record + "\ndelta attention\n");
+    rejects([&] { specferry::models::qwen3_5::read_config(path); }, "invalid component record");
+  }
+  write(path, "specferry-qwen-components 1\n" + parameters + "\nunknown\n");
+  rejects([&] { specferry::models::qwen3_5::read_config(path); }, "unknown mixer");
 }
 
 void case_validation() {
@@ -148,6 +178,7 @@ int main() {
   try {
     tensor_boundaries();
     weight_integrity();
+    component_contracts();
     case_validation();
     std::cout << "Tensor boundaries, weight integrity, and fixture validation passed.\n";
     return 0;

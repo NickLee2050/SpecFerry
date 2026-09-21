@@ -26,8 +26,8 @@ struct TensorTransfers {
 
 TensorTransfers tensor_transfers();
 
-// Validate the fixed hidden-vector contract before retaining its storage.
-vsi_nn_tensor_id_t bind_hidden(TensorBinding binding, Graph &receiver);
+// Validate the caller's shape and dtype before retaining its storage.
+vsi_nn_tensor_id_t bind_tensor(TensorBinding binding, Graph &receiver, const TensorSpec &expected);
 
 // Graph owns the SDK tensor. These helpers never release an individual tensor.
 vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constant = false,

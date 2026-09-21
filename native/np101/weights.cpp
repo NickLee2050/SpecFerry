@@ -46,7 +46,11 @@ WeightStore::WeightStore(const std::filesystem::path &directory) {
     if (!(fields >> name >> dtype >> shape >> offset >> bytes >> digest) || fields >> extra) {
       throw std::invalid_argument("invalid weight index record");
     }
-    if (name.rfind("model.", 0) != 0 || !names.insert(name).second || !valid_digest(digest)) {
+    if (name.empty() ||
+        name.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-/") !=
+            std::string::npos ||
+        !names.insert(name).second || !valid_digest(digest)) {
       throw std::invalid_argument("invalid or duplicate weight name/digest: " + name);
     }
     auto type = parse_dtype(dtype);
@@ -71,9 +75,8 @@ WeightStore::WeightStore(const std::filesystem::path &directory) {
 }
 
 const WeightRecord &WeightStore::find(const std::string &name) const {
-  const auto &resolved = name == "lm_head.weight" ? std::string("model.embed_tokens.weight") : name;
   for (const auto &record : records_) {
-    if (record.name == resolved) {
+    if (record.name == name) {
       return record;
     }
   }

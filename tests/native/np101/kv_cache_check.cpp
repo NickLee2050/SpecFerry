@@ -1,3 +1,4 @@
+#include "np101/component_spec.hpp"
 #include "np101/context.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/tensor.hpp"
@@ -18,7 +19,6 @@
 
 namespace {
 using namespace specferry::np101;
-constexpr unsigned capacity = 512;
 
 std::vector<std::uint8_t> fp16(const std::vector<float> &values) {
   vsi_nn_dtype_t dtype{};
@@ -43,20 +43,34 @@ void require_equal(const std::vector<std::uint8_t> &actual, const std::vector<fl
   }
 }
 
-void run(const std::filesystem::path &directory) {
+void run(const std::filesystem::path &directory, KvSpec spec) {
+  spec.validate();
+  const auto capacity = spec.capacity;
   Context context;
   Graph producer(context, 2, 0);
-  TensorSpec token{DataType::Float16, {256, 1, 2}};
+  const auto token = spec.slot();
   auto key = add_tensor(producer, token, false, std::vector<std::uint8_t>(token.bytes()));
   auto value = add_tensor(producer, token, false, std::vector<std::uint8_t>(token.bytes()));
-  KvCache cache(context, producer, key, value, capacity);
+  KvCache cache(context, producer, key, value, spec);
 
   // Compile this reader once, before any write. Reading its output first avoids
   // accidentally making parent-tensor host readback a coherency prerequisite.
   Graph reader(context, 3, 1);
+  for (const TensorSpec &wrong : {TensorSpec{DataType::Float16, {spec.head_dim * spec.heads, 1}},
+                                  TensorSpec{DataType::Float32, token.shape}}) {
+    bool rejected = false;
+    try {
+      bind_tensor({producer, key}, reader, wrong);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw std::runtime_error("binding accepted an incompatible shape or dtype");
+    }
+  }
   auto keys = cache.retain_keys(reader);
   auto values = cache.retain_values(reader);
-  auto output = add_tensor(reader, {DataType::Float16, {256, capacity, 2}});
+  auto output = add_tensor(reader, spec.tensor());
   auto *add = vsi_nn_AddNode(reader.get(), VSI_NN_OP_ADD, 2, 1, nullptr);
   if (!add) {
     throw std::runtime_error("cannot create fixed KV reader");
@@ -72,21 +86,22 @@ void run(const std::filesystem::path &directory) {
   check(vsi_nn_SetupGraph(reader.get(), FALSE), "setup fixed KV reader");
   check(vsi_nn_VerifyGraph(reader.get()), "verify fixed KV reader");
 
-  std::vector<float> expected_keys(2 * capacity * 256, 0.0f);
+  std::vector<float> expected_keys(spec.tensor().elements(), 0.0f);
   std::vector<float> expected_values(expected_keys.size(), 0.0f);
   std::vector<float> expected_sum(expected_keys.size(), 0.0f);
-  const std::array<unsigned, 8> positions{0, 1, 3, 7, 255, 511, 1, 0};
+  const std::array<unsigned, 8> positions{
+      0, 1 % capacity, 3 % capacity, 7 % capacity, capacity / 2, capacity - 1, 1 % capacity, 0};
   for (unsigned pass = 0; pass < 2; ++pass) {
     for (unsigned iteration = 0; iteration < positions.size(); ++iteration) {
       unsigned position = positions[iteration];
       std::cout << "write pass=" << pass << " position=" << position << std::endl;
-      std::vector<float> next_key(512), next_value(512);
-      for (unsigned head = 0; head < 2; ++head) {
-        for (unsigned dim = 0; dim < 256; ++dim) {
-          auto index = head * 256 + dim;
+      std::vector<float> next_key(token.elements()), next_value(token.elements());
+      for (unsigned head = 0; head < spec.heads; ++head) {
+        for (unsigned dim = 0; dim < spec.head_dim; ++dim) {
+          auto index = head * spec.head_dim + dim;
           next_key[index] = 0.125f * (1 + pass + iteration) + 0.25f * head;
           next_value[index] = 0.5f + 0.5f * head + 0.0625f * (dim % 4);
-          auto offset = (head * capacity + position) * 256 + dim;
+          auto offset = (head * capacity + position) * spec.head_dim + dim;
           expected_keys[offset] = next_key[index];
           expected_values[offset] = next_value[index];
           expected_sum[offset] = next_key[index] + next_value[index];
@@ -119,7 +134,9 @@ void run(const std::filesystem::path &directory) {
   context.close();
   std::ofstream report(directory / "cache.json");
   report << "{\"status\":\"numerical_pass\",\"writes\":16,"
-            "\"cache_payload_bytes\":1048576,\"write_payload_bytes\":2048,"
+            "\"cache_payload_bytes\":"
+         << spec.token_bytes() * capacity << ",\"write_payload_bytes\":" << spec.token_bytes()
+         << ","
             "\"copy_graph_revalidations\":"
          << revalidations
          << ","
@@ -132,13 +149,24 @@ void run(const std::filesystem::path &directory) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: np101_kv_cache_check OUTPUT_DIRECTORY\n";
+  if (argc != 2 && argc != 5) {
+    std::cerr << "usage: np101_kv_cache_check OUTPUT_DIRECTORY [HEADS HEAD_DIM CAPACITY]\n";
     return 1;
   }
   try {
     std::filesystem::create_directories(argv[1]);
-    run(argv[1]);
+    KvSpec spec{2, 256, 512};
+    if (argc == 5) {
+      auto dimension = [](const char *argument) {
+        auto shape = parse_shape(argument);
+        if (shape.size() != 1) {
+          throw std::invalid_argument("expected one positive dimension");
+        }
+        return shape.front();
+      };
+      spec = {dimension(argv[2]), dimension(argv[3]), dimension(argv[4])};
+    }
+    run(argv[1], spec);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

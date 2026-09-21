@@ -22,7 +22,8 @@ def main():
     parser.add_argument("--trace", type=Path, help="deployment-fp16 layer-0/3 trace")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path, help="override the selected native test executable")
-    parser.add_argument("--first-layer", type=int, choices=(0, 3), default=0)
+    parser.add_argument("--first-layer", type=int, default=0)
+    parser.add_argument("--layers", type=int, nargs="+", help="explicit ordered layer slice")
     parser.add_argument("--steps", type=int, choices=(2, 8, 32, 512), default=32)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--sdk-lib", type=Path, default=Path("/usr/lib/ljmicro"))
@@ -47,7 +48,8 @@ def main():
             args.trace.resolve(),
             output / "fixture",
             args.steps,
-            args.first_layer,
+            args.layers[0] if args.layers else args.first_layer,
+            args.layers,
         )
         if args.prepare_only:
             print(f"Prepared {args.steps} steps: {output / 'fixture'}")
@@ -74,7 +76,7 @@ def main():
                 str(output / "fixture"),
                 str(output / "device"),
                 str(args.steps),
-                str(args.first_layer),
+                str(args.layers[0] if args.layers else args.first_layer),
             ]
             evidence = run_device(
                 binary,

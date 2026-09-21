@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from scripts.check_np101_allocation import allocation_complete
 
-from specferry.export.memory import memory_budget
 from specferry.export.schema import expected_text_tensors, validate_text_entries
 from specferry.export.weights import (
     convert_bytes,
@@ -23,6 +22,7 @@ from specferry.export.weights import (
     write_native_index,
     write_weight_pack,
 )
+from specferry.models.qwen3_5.memory import memory_budget
 
 
 def source_tensor(root, name, values, dtype):
@@ -37,6 +37,7 @@ def source_tensor(root, name, values, dtype):
         "text_name": name,
         "file": filename,
         "dtype": dtype,
+        "target_dtype": "F32" if dtype == "F32" else "F16",
         "shape": list(values.shape),
         "data_offsets": [0, len(raw)],
     }
@@ -95,13 +96,13 @@ class PrecisionTests(unittest.TestCase):
             [0, -0.0, 1.0078125, -3.140625, 2**-14, 2**-24, 0.333984375], dtype=torch.bfloat16
         )
         raw = values.view(torch.uint8).numpy().tobytes()
-        actual, dtype = convert_bytes(raw, "BF16")
+        actual, dtype = convert_bytes(raw, "BF16", "F16")
         self.assertEqual(dtype, "F16")
         self.assertEqual(actual, values.half().view(torch.uint8).numpy().tobytes())
 
     def test_native_fp32_is_bitwise_preserved(self):
         values = np.array([-0.0, 1.0000001192092896, 3.1415927], dtype="<f4")
-        result, dtype = convert_bytes(values.tobytes(), "F32")
+        result, dtype = convert_bytes(values.tobytes(), "F32", "F32")
         self.assertEqual(dtype, "F32")
         self.assertEqual(result, values.tobytes())
 
@@ -109,7 +110,7 @@ class PrecisionTests(unittest.TestCase):
         for value in (float("nan"), float("inf"), -float("inf"), 1e10):
             values = torch.tensor([value], dtype=torch.bfloat16)
             with self.subTest(value=value), self.assertRaises((ValueError, FloatingPointError)):
-                convert_bytes(values.view(torch.uint8).numpy().tobytes(), "BF16")
+                convert_bytes(values.view(torch.uint8).numpy().tobytes(), "BF16", "F16")
 
 
 class WeightPackTests(unittest.TestCase):

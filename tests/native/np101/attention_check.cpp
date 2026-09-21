@@ -1,5 +1,5 @@
 #include "case_file.hpp"
-#include "np101/attention.hpp"
+#include "models/qwen3_5/attention.hpp"
 #include "np101/context.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/weights.hpp"
@@ -20,6 +20,7 @@
 
 namespace {
 using namespace specferry::np101;
+using namespace specferry::models::qwen3_5;
 namespace fs = std::filesystem;
 const std::array<std::string, 7> outputs{"output", "query",  "key",          "value",
                                          "keys",   "values", "probabilities"};
@@ -31,6 +32,7 @@ bool checkpoint(unsigned step, unsigned count) {
 
 struct Progress {
   fs::path directory;
+  KvSpec kv{};
   std::string phase = "validate";
   std::string sequence = "none";
   unsigned completed_steps = 0;
@@ -49,7 +51,9 @@ struct Progress {
          << ",\"copy_graph_revalidations\":" << revalidations
          << ",\"capacity_rejected\":" << (capacity_rejected ? "true" : "false")
          << ",\"invalid_truncate_rejected\":" << (invalid_truncate_rejected ? "true" : "false")
-         << ",\"cache_payload_bytes\":1048576,\"slot_write_payload_bytes\":2048,"
+         << ",\"cache_payload_bytes\":" << kv.heads * kv.head_dim * 4ULL * kv.capacity
+         << ",\"slot_write_payload_bytes\":" << kv.heads * kv.head_dim * 4ULL
+         << ","
             "\"cache_copies\":1,\"per_step_host_kv_transfers\":false,"
             "\"hardware_execution_proven\":false,\"device_residency_verified\":false}\n";
     if (!file) {
@@ -102,7 +106,7 @@ void check_rejections(Attention &model, const std::vector<std::uint8_t> &input,
   } catch (const std::out_of_range &) {
     progress.invalid_truncate_rejected = true;
   }
-  if (length == KvCache::maximum_capacity) {
+  if (length == progress.kv.capacity) {
     try {
       model.step(input);
     } catch (const std::out_of_range &) {
@@ -137,12 +141,14 @@ int main(int argc, char **argv) {
     }
     fs::create_directories(progress.directory);
     progress.enter("validate");
+    const auto config = read_config(fs::path(argv[2]) / "components.txt");
+    progress.kv = config.kv;
     WeightStore weights(argv[1]);
     weights.verify();
     std::vector<std::vector<std::uint8_t>> inputs;
     for (unsigned index = 0; index < count; ++index) {
-      inputs.push_back(
-          specferry::testing::read_bytes(argv[2], "input." + std::to_string(index) + ".bin", 2048));
+      inputs.push_back(specferry::testing::read_bytes(
+          argv[2], "input." + std::to_string(index) + ".bin", config.hidden_spec().bytes()));
     }
     const std::vector<std::vector<std::uint8_t>> short_inputs(
         inputs.begin(), inputs.begin() + std::min<std::size_t>(8, count));
@@ -150,7 +156,7 @@ int main(int argc, char **argv) {
 
     progress.enter("initialize");
     Context context;
-    Attention model(context, weights);
+    Attention model(context, weights, config, 3);
     run_sequence(model, inputs, "zero", false, progress);
     check_rejections(model, inputs.front(), progress);
 
@@ -171,7 +177,7 @@ int main(int argc, char **argv) {
     model.close();
 
     progress.enter("recreate");
-    Attention fresh(context, weights);
+    Attention fresh(context, weights, config, 3);
     run_sequence(fresh, short_inputs, "fresh", false, progress);
     progress.cache_writes += fresh.cache_writes();
     progress.revalidations += fresh.cache_revalidations();

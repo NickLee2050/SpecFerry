@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/config.hpp"
 #include "np101/context.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
@@ -10,7 +11,11 @@
 #include <string>
 #include <vector>
 
-namespace specferry::np101 {
+namespace specferry::models::qwen3_5 {
+using np101::Context;
+using np101::TensorBinding;
+using np101::WeightStore;
+
 struct DecoderMetrics {
   std::size_t steps = 0;
   std::size_t cache_writes = 0;
@@ -26,7 +31,8 @@ struct DecoderMetrics {
 // Context and input owner outlive the layer. Execution is synchronous.
 class DecoderLayer {
 public:
-  DecoderLayer(Context &context, const WeightStore &weights, unsigned layer, TensorBinding input);
+  DecoderLayer(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
+               TensorBinding input);
   ~DecoderLayer();
   DecoderLayer(const DecoderLayer &) = delete;
   DecoderLayer &operator=(const DecoderLayer &) = delete;
@@ -44,12 +50,13 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Supports the first four-layer group, or layer 3 alone for isolated validation.
+// Runs the explicitly selected, ordered Qwen layer slice.
 // Only the group boundary accepts host activations. Mid-step failure invalidates
 // the entire group: individual recurrent layers cannot be rolled back by length.
 class DecoderGroup {
 public:
-  DecoderGroup(Context &context, const WeightStore &weights, unsigned first_layer = 0);
+  DecoderGroup(Context &context, const WeightStore &weights, const Config &config,
+               const std::vector<unsigned> &layers);
   ~DecoderGroup();
   DecoderGroup(const DecoderGroup &) = delete;
   DecoderGroup &operator=(const DecoderGroup &) = delete;
@@ -65,4 +72,4 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-} // namespace specferry::np101
+} // namespace specferry::models::qwen3_5

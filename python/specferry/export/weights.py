@@ -8,14 +8,14 @@ from pathlib import Path
 
 import numpy as np
 
-from specferry.reference.checkpoint import MODEL_ID, REVISION, local_path, sha256
-
-from .schema import expected_text_tensors
+from specferry.data.checkpoint import local_path, sha256
 
 ALIGNMENT = 64
 
 
-def convert_bytes(raw: bytes, source_dtype: str) -> tuple[bytes, str]:
+def convert_bytes(raw: bytes, source_dtype: str, target_dtype: str) -> tuple[bytes, str]:
+    if (source_dtype, target_dtype) not in {("BF16", "F16"), ("F16", "F16"), ("F32", "F32")}:
+        raise ValueError(f"unsupported precision conversion: {source_dtype} -> {target_dtype}")
     if source_dtype == "BF16":
         if len(raw) % 2:
             raise ValueError("unaligned BF16 input")
@@ -23,6 +23,11 @@ def convert_bytes(raw: bytes, source_dtype: str) -> tuple[bytes, str]:
         target = "F16"
         with np.errstate(over="raise", invalid="raise"):
             converted = values.astype("<f2")
+    elif source_dtype == "F16":
+        if len(raw) % 2:
+            raise ValueError("unaligned FP16 input")
+        converted = np.frombuffer(raw, dtype="<f2")
+        target = "F16"
     elif source_dtype == "F32":
         if len(raw) % 4:
             raise ValueError("unaligned FP32 input")
@@ -57,9 +62,9 @@ def write_weight_pack(
     root: Path, entries: list[dict], output: Path, chunk_bytes=8 * 1024 * 1024, head_block_rows=4096
 ) -> list[dict]:
     """Call only after checkpoint inventory validation; this function never loads a model."""
-    if chunk_bytes < 4 or chunk_bytes % 4 or head_block_rows < 1:
+    if not 4 <= chunk_bytes <= 8 * 1024 * 1024 or chunk_bytes % 4 or head_block_rows < 1:
         raise ValueError(
-            "chunk bytes must be a positive multiple of four; block rows must be positive"
+            "chunk bytes must be a multiple of four up to 8 MiB; block rows must be positive"
         )
     records = []
     with (output / "weights.bin").open("xb") as destination:
@@ -70,7 +75,9 @@ def write_weight_pack(
             digest = hashlib.sha256()
             target_dtype = None
             for block in tensor_blocks(root, entry, chunk_bytes):
-                converted, target_dtype = convert_bytes(block, entry["dtype"])
+                converted, target_dtype = convert_bytes(
+                    block, entry["dtype"], entry["target_dtype"]
+                )
                 destination.write(converted)
                 digest.update(converted)
             size = destination.tell() - offset
@@ -109,7 +116,7 @@ def write_weight_pack(
     return records
 
 
-def write_native_index(output: Path, records: list[dict]) -> None:
+def native_index_text(records: list[dict]) -> str:
     lines = ["specferry-np101-weights 1"]
     for record in records:
         shape = ",".join(map(str, record["sdk_shape"]))
@@ -117,7 +124,11 @@ def write_native_index(output: Path, records: list[dict]) -> None:
             f"{record['name']} {record['dtype']} {shape} {record['offset']} "
             f"{record['bytes']} {record['sha256']}"
         )
-    (output / "weights.index").write_text("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
+
+
+def write_native_index(output: Path, records: list[dict]) -> None:
+    (output / "weights.index").write_text(native_index_text(records))
 
 
 def verify_weight_pack(root: Path) -> dict:
@@ -141,7 +152,9 @@ def verify_weight_pack(root: Path) -> dict:
             if (
                 not shape
                 or len(shape) > 8
-                or any(type(dimension) is not int or dimension <= 0 for dimension in shape)
+                or any(
+                    type(dimension) is not int or not 0 < dimension < 2**32 for dimension in shape
+                )
             ):
                 raise ValueError("invalid export tensor shape")
             size = math.prod(tensor["shape"]) * {"F16": 2, "F32": 4}[tensor["dtype"]]
@@ -184,37 +197,16 @@ def verify_weight_pack(root: Path) -> dict:
             end = tensor["offset"] + size
     if end != (root / "weights.bin").stat().st_size:
         raise ValueError("unexpected trailing export data")
-    if manifest["aliases"] != {"lm_head.weight": "model.embed_tokens.weight"}:
-        raise ValueError("embedding/head sharing contract changed")
-    if "model.embed_tokens.weight" not in names:
-        raise ValueError("shared embedding/head target is missing")
-    return {"status": "verified", "tensors": len(names), "bytes": end}
-
-
-def verify_export(root: Path) -> dict:
-    result = verify_weight_pack(root)
-    manifest = json.loads((root / "deployment-manifest.json").read_text())
-    if manifest.get("repo_id") != MODEL_ID or manifest.get("revision") != REVISION:
-        raise ValueError("deployment does not identify the fixed first DLM revision")
-    expected = expected_text_tensors(manifest["text_config"])
-    records = {tensor["name"]: tensor for tensor in manifest["tensors"]}
-    if set(records) != set(expected):
-        raise ValueError("deployment is missing text tensors or contains unexpected tensors")
-    lines = ["specferry-np101-weights 1"]
-    for record in manifest["tensors"]:
-        shape, source_dtype = expected[record["name"]]
-        dtype = "F32" if source_dtype == "F32" else "F16"
-        if (
-            record["shape"] != shape
-            or record["dtype"] != dtype
-            or record["source_dtype"] != source_dtype
-        ):
-            raise ValueError("deployment tensor violates the fixed shape/precision contract")
-        sdk_shape = ",".join(map(str, record["sdk_shape"]))
-        lines.append(
-            f"{record['name']} {record['dtype']} {sdk_shape} {record['offset']} "
-            f"{record['bytes']} {record['sha256']}"
-        )
-    if (root / "weights.index").read_text() != "\n".join(lines) + "\n":
+    if (root / "weights.index").read_text() != native_index_text(manifest["tensors"]):
         raise ValueError("native index disagrees with deployment manifest")
-    return result
+    aliases = manifest.get("aliases", {})
+    if not isinstance(aliases, dict) or any(
+        not isinstance(alias, str)
+        or not alias
+        or alias in names
+        or not isinstance(target, str)
+        or target not in names
+        for alias, target in aliases.items()
+    ):
+        raise ValueError("aliases must name distinct logical tensors and existing physical records")
+    return {"status": "verified", "tensors": len(names), "bytes": end}

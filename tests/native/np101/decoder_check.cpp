@@ -1,6 +1,6 @@
 #include "case_file.hpp"
+#include "models/qwen3_5/decoder.hpp"
 #include "np101/context.hpp"
-#include "np101/decoder.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 
@@ -21,6 +21,7 @@
 
 namespace {
 using namespace specferry::np101;
+using namespace specferry::models::qwen3_5;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
@@ -32,6 +33,9 @@ bool checkpoint(unsigned step, unsigned count) {
 struct Progress {
   fs::path directory;
   unsigned first_layer;
+  Config config{};
+  std::vector<unsigned> selected;
+  unsigned attention_layers = 0;
   std::string phase = "validate";
   std::string sequence = "none";
   unsigned completed_steps = 0;
@@ -67,9 +71,10 @@ struct Progress {
          << ",\"application_readback_bytes\":" << readback_bytes
          << ",\"step_upload_bytes\":" << step_upload_bytes << ",\"step_uploads\":" << step_uploads
          << ",\"step_reads\":" << step_reads
-         << ",\"boundary_upload_bytes\":" << completed_steps * 2048ULL
-         << ",\"attention_control_upload_bytes\":" << completed_steps * 8ULL
-         << ",\"explicit_kv_copy_bytes\":" << cache_writes * 2048ULL
+         << ",\"boundary_upload_bytes\":" << completed_steps * config.hidden * 2ULL
+         << ",\"attention_control_upload_bytes\":" << completed_steps * attention_layers * 8ULL
+         << ",\"explicit_kv_copy_bytes\":"
+         << cache_writes * config.kv.heads * config.kv.head_dim * 4ULL
          << ",\"execution_seconds\":" << execution_seconds
          << ",\"initialization_seconds\":" << initialization_seconds
          << ",\"reset_seconds\":" << reset_seconds << ",\"release_seconds\":" << release_seconds
@@ -79,7 +84,7 @@ struct Progress {
       if (index) {
         file << ',';
       }
-      file << "{\"layer\":" << first_layer + index << ",\"steps\":" << layer.steps
+      file << "{\"layer\":" << selected[index] << ",\"steps\":" << layer.steps
            << ",\"normalization_seconds\":" << layer.normalization_seconds
            << ",\"mixer_seconds\":" << layer.mixer_seconds
            << ",\"feed_forward_seconds\":" << layer.feed_forward_seconds
@@ -123,10 +128,10 @@ double elapsed(Clock::time_point start) {
 }
 
 void capture(DecoderGroup &model, unsigned index, Progress &progress) {
-  for (unsigned layer = progress.first_layer; layer < 4; ++layer) {
+  for (unsigned layer : progress.selected) {
     std::vector<std::string> outputs{"normalized", "mixer", "residual",
                                      "post_norm",  "mlp",   "output"};
-    if (layer == 3) {
+    if (progress.config.mixer(layer) == MixerKind::Attention) {
       outputs.insert(outputs.end(), {"keys", "values"});
     } else {
       outputs.insert(outputs.end(), {"recurrent", "convolution"});
@@ -159,7 +164,9 @@ void run_sequence(DecoderGroup &model, const std::vector<std::vector<std::uint8_
     progress.step_uploads += uploads;
     progress.step_upload_bytes += upload_bytes;
     progress.step_reads += reads;
-    if (uploads != 3 || upload_bytes != 2056 || reads != 0) {
+    if (uploads != 1 + 2 * progress.attention_layers ||
+        upload_bytes != progress.config.hidden_spec().bytes() + 8 * progress.attention_layers ||
+        reads != 0) {
       throw std::runtime_error("decoder step performed unexpected explicit host tensor transfers");
     }
     progress.execution_seconds += elapsed(start);
@@ -184,7 +191,7 @@ void check_rejections(DecoderGroup &model, const std::vector<std::uint8_t> &inpu
   } catch (const std::invalid_argument &) {
     progress.invalid_input_rejected = true;
   }
-  if (length == 512) {
+  if (length == progress.config.kv.capacity) {
     try {
       model.step(input);
     } catch (const std::out_of_range &) {
@@ -241,8 +248,8 @@ int main(int argc, char **argv) {
   try {
     const std::string count_text = argv[4], layer_text = argv[5];
     if (count_text.empty() || count_text.find_first_not_of("0123456789") != std::string::npos ||
-        (layer_text != "0" && layer_text != "3")) {
-      throw std::invalid_argument("steps must be 2-512 and first layer must be 0 or 3");
+        (layer_text.empty() || layer_text.find_first_not_of("0123456789") != std::string::npos)) {
+      throw std::invalid_argument("steps and first layer must be unsigned integers");
     }
     const auto count = std::stoul(count_text);
     if (count < 2 || count > 512) {
@@ -251,18 +258,35 @@ int main(int argc, char **argv) {
     progress.first_layer = std::stoul(layer_text);
     fs::create_directories(progress.directory);
     progress.enter("validate");
+    const auto config = read_config(fs::path(argv[2]) / "components.txt");
+    if (count > config.kv.capacity) {
+      throw std::invalid_argument("steps exceed configured capacity");
+    }
+    progress.config = config;
+    std::ifstream layer_file(fs::path(argv[2]) / "layers.txt");
+    unsigned index;
+    while (layer_file >> index) {
+      progress.selected.push_back(index);
+    }
+    if (!layer_file.eof() || progress.selected.empty() ||
+        progress.selected.front() != progress.first_layer) {
+      throw std::invalid_argument("invalid decoder layer list");
+    }
+    for (auto layer : progress.selected) {
+      progress.attention_layers += config.mixer(layer) == MixerKind::Attention;
+    }
     WeightStore weights(argv[1]);
     weights.verify();
     std::vector<std::vector<std::uint8_t>> inputs;
     for (unsigned index = 0; index < count; ++index) {
-      inputs.push_back(
-          specferry::testing::read_bytes(argv[2], "input." + std::to_string(index) + ".bin", 2048));
+      inputs.push_back(specferry::testing::read_bytes(
+          argv[2], "input." + std::to_string(index) + ".bin", config.hidden_spec().bytes()));
     }
 
     progress.enter("initialize");
     Context context;
     auto start = Clock::now();
-    DecoderGroup model(context, weights, progress.first_layer);
+    DecoderGroup model(context, weights, config, progress.selected);
     progress.initialization_seconds += elapsed(start);
     run_sequence(model, inputs, count, "zero", false, progress);
     check_rejections(model, inputs.front(), progress);
@@ -275,7 +299,7 @@ int main(int argc, char **argv) {
 
     progress.enter("recreate");
     start = Clock::now();
-    DecoderGroup fresh(context, weights, progress.first_layer);
+    DecoderGroup fresh(context, weights, config, progress.selected);
     progress.initialization_seconds += elapsed(start);
     run_sequence(fresh, inputs, std::min<unsigned>(8, count), "fresh", false, progress);
     release(fresh, progress);

@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
+from specferry.models.qwen3_5.operator_cases import catalog
+from specferry.models.qwen3_5.precision import TOLERANCES
 from specferry.validation import capabilities
-from specferry.validation.operator_cases import catalog
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -23,14 +24,14 @@ class AcceptanceTests(unittest.TestCase):
             output.mkdir()
             correct = (root / "fixture/y.expected.1.bin").read_bytes()
             (output / "cycle.0.y.1.bin").write_bytes(correct)
-            results = capabilities.compare_outputs(metadata, root / "fixture", output)
+            results = capabilities.compare_outputs(metadata, root / "fixture", output, TOLERANCES)
             self.assertEqual(set(results), {"cycle.0.y.1", "cycle.1.y.1"})
             self.assertTrue(results["cycle.0.y.1"]["passed"])
             self.assertFalse(results["cycle.1.y.1"]["passed"])
             (output / "cycle.1.y.1.bin").write_bytes(
                 (root / "fixture/y.expected.0.bin").read_bytes()
             )
-            results = capabilities.compare_outputs(metadata, root / "fixture", output)
+            results = capabilities.compare_outputs(metadata, root / "fixture", output, TOLERANCES)
             self.assertFalse(results["cycle.1.y.1"]["passed"])
 
     def test_budget_blocks_device_submission(self):

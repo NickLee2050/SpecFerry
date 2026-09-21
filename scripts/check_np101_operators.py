@@ -9,11 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.export.weights import verify_export
+from specferry.models.qwen3_5.export import verify_export
+from specferry.models.qwen3_5.operator_cases import catalog
+from specferry.models.qwen3_5.reference_cases import reference_catalog
 from specferry.validation.capabilities import check_case
 from specferry.validation.device import device_lock, fingerprint, host_boot_id, write_json
-from specferry.validation.operator_cases import catalog
-from specferry.validation.reference_cases import reference_catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 
