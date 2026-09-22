@@ -32,6 +32,4 @@ void validate_layer_weights(const np101::WeightStore &weights, const Config &con
                             bool include_feed_forward);
 // A small, versioned component fixture written from the validated model config.
 Config read_config(const std::filesystem::path &path);
-const np101::WeightRecord &resolve_weight(const np101::WeightStore &weights,
-                                          const std::string &name);
 } // namespace specferry::models::qwen3_5

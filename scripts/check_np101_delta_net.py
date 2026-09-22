@@ -2,7 +2,6 @@
 """Validate the real layer-0 DeltaNet mixer, sequential state and reset."""
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -10,8 +9,14 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.validation.delta_net import evaluate, prepare
-from specferry.validation.device import device_lock, fingerprint, run_device, write_json
+from specferry.models.qwen3_5.validation_delta_net import evaluate, prepare
+from specferry.validation.device import (
+    device_lock,
+    record_sources,
+    run_device,
+    snapshot_binary,
+    write_json,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,19 +49,8 @@ def main():
             return 0
         with device_lock(ROOT / ".cache/runs"):
             binary = output / "np101_delta_net_check"
-            shutil.copy2(args.binary.resolve(), binary)
-            write_json(
-                output / "sources.json",
-                {
-                    "binary_sha256": fingerprint(binary),
-                    "sources": {
-                        str(path.relative_to(ROOT)): fingerprint(path)
-                        for directory in ("native", "python", "scripts", "tests")
-                        for path in sorted((ROOT / directory).rglob("*"))
-                        if path.is_file() and path.suffix in (".cpp", ".hpp", ".py")
-                    },
-                },
-            )
+            snapshot_binary(args.binary.resolve(), binary)
+            record_sources(ROOT, binary, output / "sources.json")
             print("Running fixed-graph DeltaNet trajectories and reset checks ...", flush=True)
             evidence = run_device(
                 binary,

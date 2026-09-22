@@ -2,7 +2,6 @@
 """Probe DLM operators using isolated, bounded SDK processes."""
 
 import argparse
-import shutil
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,7 +12,13 @@ from specferry.models.qwen3_5.export import verify_export
 from specferry.models.qwen3_5.operator_cases import catalog
 from specferry.models.qwen3_5.reference_cases import reference_catalog
 from specferry.validation.capabilities import check_case
-from specferry.validation.device import device_lock, fingerprint, host_boot_id, write_json
+from specferry.validation.device import (
+    device_lock,
+    fingerprint,
+    host_boot_id,
+    snapshot_binary,
+    write_json,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -90,9 +95,7 @@ def main() -> int:
     # Keep one immutable executable for the suite, even if another terminal rebuilds.
     binary = args.binary.resolve()
     if not args.prepare_only:
-        snapshot = output / "np101_op_check"
-        shutil.copy2(binary, snapshot)
-        binary = snapshot
+        binary = snapshot_binary(binary, output / "np101_op_check")
     results = []
     summary = {
         "status": "running",

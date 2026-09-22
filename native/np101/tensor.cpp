@@ -1,4 +1,3 @@
-#include "dlfcn.h"
 #include "np101/tensor.hpp"
 
 #include <algorithm>
@@ -152,30 +151,4 @@ vsi_nn_tensor_id_t bind_tensor(TensorBinding binding, Graph &receiver, const Ten
   return retain_tensor(binding.owner, binding.id, receiver);
 }
 
-TensorAttachment::TensorAttachment(Graph &owner, vsi_nn_tensor_id_t tensor, Graph &receiver)
-    : receiver_(receiver), id_(VSI_NN_TENSOR_ID_NA) {
-  if (owner.get() == receiver.get() || owner.get()->ctx != receiver.get()->ctx) {
-    throw std::invalid_argument("tensor attachment requires separate graphs in one context");
-  }
-  // Some SDK distributions declare this function but hide it from the dynamic
-  // symbol table. Probe availability without making every tensor user unlinkable.
-  using Attach = vsi_nn_tensor_id_t (*)(vsi_nn_graph_t *, vsi_nn_tensor_id_t, vsi_nn_tensor_t *);
-  auto attach = reinterpret_cast<Attach>(dlsym(RTLD_DEFAULT, "vsi_nn_AttachTensorToGraph"));
-  if (!attach) {
-    throw std::runtime_error("SDK does not export vsi_nn_AttachTensorToGraph");
-  }
-  id_ = attach(receiver.get(), VSI_NN_TENSOR_ID_AUTO, get_tensor(owner, tensor));
-  if (id_ == VSI_NN_TENSOR_ID_NA) {
-    throw std::runtime_error("AttachTensorToGraph failed");
-  }
-}
-
-TensorAttachment::~TensorAttachment() {
-  // AttachTensorToGraph inserts the existing wrapper into the receiver's map
-  // without retaining it. Remove only that map entry: RemoveTensor would free the
-  // owner's wrapper and cause a second release when the owner graph is destroyed.
-  if (receiver_.get()) {
-    vsi_nn_MapRemove(receiver_.get()->tensor_table, id_);
-  }
-}
 } // namespace specferry::np101

@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
-from specferry.reference.checkpoint import inventory, local_path
+from specferry.models.qwen3_5.checkpoint import inventory, local_path
 
 try:
     import torch
 
-    from specferry.reference.trace import compare
+    from specferry.models.qwen3_5.trace import compare
 except ImportError:
     torch = None
 

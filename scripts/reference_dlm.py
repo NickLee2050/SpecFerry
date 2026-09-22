@@ -26,7 +26,7 @@ def main():
         parser.error("threads must be positive; max-new-tokens must be 1..64")
     args.output.mkdir(parents=True, exist_ok=True)
     try:
-        from specferry.reference.runner import run
+        from specferry.models.qwen3_5.runner import run
 
         return run(args.model.resolve(), args.output.resolve(), args.threads, args.max_new_tokens)
     except Exception as error:

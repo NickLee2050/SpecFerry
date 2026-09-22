@@ -187,13 +187,6 @@ TensorSpec DeltaNet::convolution_spec() const {
   return impl_->forward->config.delta.convolution();
 }
 
-TensorSpec DeltaNet::output_spec(const std::string &name) const {
-  if (!impl_) {
-    throw std::logic_error("closed DeltaNet");
-  }
-  return impl_->forward->outputs.at(name).spec;
-}
-
 void DeltaNet::reset(const std::vector<std::uint8_t> &recurrent,
                      const std::vector<std::uint8_t> &convolution) {
   if (!impl_) {

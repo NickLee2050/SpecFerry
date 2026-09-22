@@ -1,8 +1,9 @@
 # Reusable component contracts and regression
 
-The scope is existing checkpoint/reference tools, export/storage, SDK graph helpers,
-state and decoder slices. The downloaded OPT checkpoint is retained; these changes
-do not add its weight-format adapter, decoder, or full-model device generation.
+This record covers the completed separation of checkpoint/reference tools,
+export/storage, SDK graph helpers, state and decoder slices. The subsequent OPT
+adapter and generation work is recorded in [OPT validation](np101-opt.md) and
+[complete-model validation](np101-generation.md).
 
 ## Dependency boundaries
 
@@ -14,10 +15,10 @@ do not add its weight-format adapter, decoder, or full-model device generation.
 | `native/np101/ops/`: graph construction, projection, normalization, Attention core, short convolution, DeltaNet recurrence and SwiGLU | Qwen projection paths, norm conventions, RoPE, gates and residual/layer order |
 | `tensor.*`, `component_spec.*`, `kv_cache.*`: bindings, dimensions and one K/V allocation with slot views | Model dimensions, capacity and selected layer list |
 
-Shared production libraries never import model modules. Existing Python imports
-under `reference/`, `export/schema.py`, `export/verification.py` and the three
-`validation/` mixer/decoder modules are explicit Qwen compatibility facades.
-New callers should import the model module directly when selecting Qwen policy.
+Shared production libraries never import model modules. Scripts and tests import
+Qwen-specific behavior directly from `specferry.models.qwen3_5`; the nine temporary
+compatibility facades have been removed. `reference/tensors.py` remains a shared
+utility. CLI names, checkpoint formats and Qwen regression entry points are retained.
 `Context`, graph ownership, downloads, Conda and the raw SDK fixture protocol retain
 their existing responsibilities. The SDK probes remain independent of production
 arithmetic, and expected decoder values use official Transformers computation.
@@ -51,8 +52,9 @@ Reset/truncate only change the valid prefix. DeltaNet still uses two state banks
 and two execution graphs; deferred weight duplication remains unchanged.
 
 The physical `weights.index` version stays 1. `WeightStore` uses exact physical
-names without a `model.` prefix requirement or implicit aliases. Qwen's adapter
-resolves the old LM-head alias. Generic manifest aliases must point directly to
+names without a `model.` prefix requirement or implicit aliases. Qwen's export
+manifest records the tied LM-head alias; the unused native alias resolver has been
+removed. Generic manifest aliases must point directly to
 physical records; dangling, chained, cyclic and colliding aliases are rejected.
 Conversions are explicit: BF16→F16, F16→F16, or F32→F32. Other conversions fail.
 

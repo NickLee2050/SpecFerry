@@ -11,7 +11,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.models.qwen3_5.precision import TOLERANCES
-from specferry.validation.attention import OUTPUTS, captured_inputs, compare_prefix, evaluate
+from specferry.models.qwen3_5.validation_attention import (
+    OUTPUTS,
+    captured_inputs,
+    compare_prefix,
+    evaluate,
+)
 
 
 class AttentionAcceptanceTests(unittest.TestCase):

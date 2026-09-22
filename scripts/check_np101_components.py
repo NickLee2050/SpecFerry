@@ -2,7 +2,6 @@
 """Validate shared operators with a small synthetic decoder and a second KV layout."""
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -12,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.models.qwen3_5.component_checks import prepare
 from specferry.models.qwen3_5.validation_decoder import evaluate
-from specferry.validation.device import device_lock, run_device, write_json
+from specferry.validation.device import device_lock, run_device, snapshot_binary, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +31,7 @@ def main():
         return 0
     with device_lock(ROOT / ".cache/runs"):
         binary = output / "np101_decoder_check"
-        shutil.copy2(ROOT / "build/tests/np101_decoder_check", binary)
+        snapshot_binary(ROOT / "build/tests/np101_decoder_check", binary)
         evidence = run_device(
             binary,
             [
@@ -52,7 +51,7 @@ def main():
         if result["status"] != "numerical_pass" or evidence["device_recovery_required"]:
             return 1
         cache_binary = output / "np101_kv_cache_check"
-        shutil.copy2(ROOT / "build/tests/np101_kv_cache_check", cache_binary)
+        snapshot_binary(ROOT / "build/tests/np101_kv_cache_check", cache_binary)
         cache = run_device(
             cache_binary,
             [str(output / "kv"), "3", "16", "8"],

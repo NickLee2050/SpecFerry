@@ -13,7 +13,6 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from specferry.export.schema import expected_text_tensors, validate_text_entries
 from specferry.export.weights import (
     convert_bytes,
     verify_weight_pack,
@@ -21,6 +20,7 @@ from specferry.export.weights import (
     write_weight_pack,
 )
 from specferry.models.qwen3_5.memory import memory_budget
+from specferry.models.qwen3_5.schema import expected_text_tensors, validate_text_entries
 
 
 def source_tensor(root, name, values, dtype):

@@ -1,11 +1,10 @@
 """Shared execution and acceptance contracts for allocation-only diagnostics."""
 
 import os
-import shutil
 from argparse import ArgumentParser
 from pathlib import Path
 
-from .device import RECOVERY_ROOT, device_lock, run_device
+from .device import RECOVERY_ROOT, device_lock, run_device, snapshot_binary
 
 MIB = 1024**2
 BLOCK_BYTES = 8 * MIB
@@ -29,8 +28,7 @@ def run_allocation(
     with device_lock(RECOVERY_ROOT):
         if not os.access("/dev/galcore", os.R_OK | os.W_OK):
             raise RuntimeError("/dev/galcore is unavailable or not readable/writable")
-        snapshot = output / binary.name
-        shutil.copy2(binary.resolve(strict=True), snapshot)
+        snapshot = snapshot_binary(binary, output / binary.name)
         # run_device records the snapshot hash and SDK fingerprints in one place.
         return run_device(snapshot, arguments, output, sdk_lib, timeout)
 

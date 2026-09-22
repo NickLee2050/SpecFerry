@@ -43,7 +43,6 @@ public:
 
   TensorSpec recurrent_spec() const;
   TensorSpec convolution_spec() const;
-  TensorSpec output_spec(const std::string &name) const;
 
 private:
   struct Impl;

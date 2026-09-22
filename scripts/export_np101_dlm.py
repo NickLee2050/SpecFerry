@@ -10,9 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.export.weights import write_native_index, write_weight_pack
+from specferry.models.qwen3_5.checkpoint import MODEL_ID, REVISION, inventory, sha256
 from specferry.models.qwen3_5.export import deployment_entries, verify_export
 from specferry.models.qwen3_5.memory import memory_budget
-from specferry.reference.checkpoint import MODEL_ID, REVISION, inventory, sha256
 from specferry.validation.device import write_json
 
 ROOT = Path(__file__).resolve().parents[1]

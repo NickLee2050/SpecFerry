@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.validation.device import device_lock, run_device
+from specferry.validation.device import device_lock, run_device, snapshot_binary
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,8 +31,10 @@ def main() -> int:
     arguments = ["--output", str(output / "conv-relu-pool.json"), "--repeats", str(args.repeats)]
     try:
         with device_lock(ROOT / ".cache/runs"):
+            output.mkdir(parents=True)
+            binary = snapshot_binary(args.binary, output / "np101_conv_relu_pool_test")
             evidence = run_device(
-                args.binary,
+                binary,
                 arguments,
                 output,
                 args.sdk_lib,

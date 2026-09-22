@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.export.verification import compare_checkpoint
+from specferry.models.qwen3_5.verification import compare_checkpoint
 from specferry.validation.device import write_json
 
 ROOT = Path(__file__).resolve().parents[1]

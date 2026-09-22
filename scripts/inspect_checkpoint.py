@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.reference.checkpoint import inventory
+from specferry.models.qwen3_5.checkpoint import inventory
 
 ROOT = Path(__file__).resolve().parents[1]
 

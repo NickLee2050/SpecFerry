@@ -28,6 +28,27 @@ def fingerprint(path: Path) -> str:
     return digest.hexdigest()
 
 
+def snapshot_binary(source: Path, destination: Path) -> Path:
+    """Keep the executable used by this run independent of later rebuilds."""
+    shutil.copy2(source.resolve(strict=True), destination)
+    return destination
+
+
+def record_sources(root: Path, binary: Path, output: Path) -> None:
+    """Record the current source fingerprints beside a run's executable snapshot.
+
+    These hashes describe the working tree, not proof of what was compiled into
+    the binary. The executable's own hash identifies the artifact that ran.
+    """
+    sources = {
+        str(path.relative_to(root)): fingerprint(path)
+        for directory in ("native", "python", "scripts", "tests")
+        for path in sorted((root / directory).rglob("*"))
+        if path.is_file() and path.suffix in (".cpp", ".hpp", ".py")
+    }
+    write_json(output, {"binary_sha256": fingerprint(binary), "sources": sources})
+
+
 def process_group_members(group: int) -> list[dict]:
     members = []
     for path in Path("/proc").iterdir():

@@ -12,6 +12,14 @@ of the original 75 cases; deletion does not turn failures into passes or close
 state acceptance. See the [investigation archive](state-feedback-investigation.md)
 for the source, commands, and evidence needed to reproduce retired cases.
 
+Maintenance update, 2026-09-22: the unavailable cross-graph attachment probe and
+unused `TensorAttachment` wrapper have also been retired. The removed files are
+available at Git commit `8165dd5` (`scripts/check_np101_graph_sharing.py`,
+`tests/native/np101/graph_sharing_check.cpp`, and `native/np101/tensor.*`).
+The historical symbol-unavailable result and `graph-sharing/` evidence below
+remain unchanged. Production retained-tensor sharing is covered by the existing
+DeltaNet, KV, Attention and decoder validation paths.
+
 ## Results
 
 All 71 synthetic cases and four captured-reference projections were executed.

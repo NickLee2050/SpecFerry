@@ -30,7 +30,7 @@ foreach(name ovxlib OpenVX OpenVXU CLC VSC GAL ArchModelSw NNArchPerf)
   find_library(SDK_${name} NAMES ${name} PATHS "${LJMICRO_SDK_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
   target_link_libraries(np101_context PUBLIC "${SDK_${name}}")
 endforeach()
-target_link_libraries(np101_context PUBLIC np101_data Threads::Threads ${CMAKE_DL_LIBS} m)
+target_link_libraries(np101_context PUBLIC np101_data Threads::Threads m)
 target_link_options(np101_context PUBLIC "-Wl,-rpath-link,${LJMICRO_SDK_LIBRARY_DIR}")
 set(CMAKE_BUILD_RPATH "${LJMICRO_SDK_LIBRARY_DIR}")
 

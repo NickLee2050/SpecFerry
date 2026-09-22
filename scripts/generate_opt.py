@@ -3,14 +3,13 @@
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.models.opt.generation import lifecycle, prepare_request
-from specferry.validation.device import device_lock, fingerprint, run_device, write_json
+from specferry.validation.device import device_lock, run_device, snapshot_binary, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,8 +75,7 @@ def main():
             arguments.append(str(metadata["selection"]["seed"]))
         with device_lock(ROOT / ".cache/runs"):
             binary = output / "specferry_opt_generate"
-            shutil.copy2(ROOT / "build/bin/specferry_opt_generate", binary)
-            write_json(output / "binary.json", {"sha256": fingerprint(binary)})
+            snapshot_binary(ROOT / "build/bin/specferry_opt_generate", binary)
             print("Initializing resident OPT-350M and generating ...", flush=True)
             evidence = run_device(
                 binary,

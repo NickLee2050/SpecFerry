@@ -1,444 +1,161 @@
 # Engineering follow-up
 
-Updated: 2026-09-22. Active target: resident text inference of OPT-350M on NP101.
-
-## NP101-MODEL-001: Decouple completed data, reference and NP101 paths
-
-- [x] Audit all completed modules and record which need separation, parameterization
-  or no structural change.
-- [x] Separate reusable checkpoint/reference tools, weight preparation, operators
-  and storage from Qwen contracts and composition. Retain already independent
-  infrastructure and the validated numerical behavior.
-
-The user selected `facebook/opt-350m` on 2026-09-21. The active download changes
-to that checkpoint; existing Qwen3.5 caches, code and evidence remain available
-for regression. The [completed decoupling checklist](docs/model-decoupling-plan.md)
-records the retain/change decision and implementation for all completed modules,
-from environment/download tools through CPU references, SDK checks, weight export,
-mixers and decoder slices. Reusable mechanisms are extracted from existing paths;
-new OPT checkpoint-format support, an OPT decoder and complete device generation
-remain separate follow-up work under the original construction sequence.
-Download and independent CPU FP16 import validation passed:
-388 tensors, 331,196,416 unique parameters, 662,392,832 weight payload bytes;
-three short generations and an eight-token cache comparison passed. Evidence
-and a rerun script are in `.cache/runs/opt-350m-import-20260921/`.
-The refactor is complete. Shared data/NP101 operators now accept explicit contracts;
-Qwen policy, official references and layer composition live in model modules.
-55 Python tests, host CTest/build, original CPU traces/export, alternate component
-sizes, mixers, short slices and four-layer 32/512-step numerical regressions passed.
-See [the acceptance record](tests/np101-components.md#decoupling-acceptance-record).
-The integrated OPT reference/export workflow and NP101 adaptation are tracked
-separately below. Existing hardware evidence gates stay open.
-
-The Qwen weight, layer and allocation figures below describe the retained
-baseline. OPT requires its own export, memory accounting, numerical validation
-and execution/residency evidence. Its smaller weights do not establish that a
-complete graph fits, but the Qwen weight-size blocker does not automatically
-block OPT either. NP101-OBS-001 and the KV-related NP101-STATE-001 checks remain
-applicable. Deferred DeltaNet weight duplication (NP101-MEM-002) is not an OPT
-prerequisite.
-
-## NP101-MODEL-002: Validate the OPT adapter through decoder slices
-
-- [x] Load the locked original FP16 checkpoint into the official CPU implementation;
-  compare prefill, sequential cache and fresh-prefix decoding.
-- [x] Export and independently verify all 388 tensors without precision conversion;
-  preserve the embedding/head alias and record model-specific memory resources.
-- [x] Implement a separate OPT post-norm/ReLU decoder adapter using shared graph
-  construction, biased projection, LayerNorm, Attention and single-buffer KV storage.
-- [x] Prepare independent layer-0, layer-23 and four-layer 512-step CPU trajectories;
-  align the original captured prefix with the full official model.
-- [x] Locate the initialization SIGSEGV in the SDK optimizer and replace the failing
-  biased-FCL path with documented MatMul/Add. Single-layer, last-layer and four-layer
-  32/512-step numerical/lifecycle checks pass without changing the reference or thresholds.
-- [ ] Establish actual execution backend and residency, together with NP101-OBS-001.
-
-On 2026-09-21, the first eight-step layer-0 device attempt exited with SIGSEGV
-while `phase=initialize`, before any completed step or output capture. The process
-group exited; the runner set `.cache/runs/np101-recovery-required.json`.
-On 2026-09-22, constant/mutable allocation and the convolution baseline passed on
-the same boot. GDB located a null dereference in
-`libOpenVX.so:vxoGraphOptimization_getKernelType`, reached from
-`vxoGraphOptimization_ConvertMaxPool2Conv` during verification of the first Q/K/V
-graph. An isolated 8x8 biased FCL reproduced it with valid tensor handles and no
-cache or shared graphs. No `nn_param`/`pool.local` overwrite was found.
-
-The production fix uses FP16 MatMul followed by FP16 bias addition. Weight bytes
-stay unchanged; the extra activation rounding is checked against the unchanged
-official reference. The SDK optimizer failure remains unresolved, but this
-documented path avoids it. The old recovery marker was archived after a corrected
-OPT slice passed calculation, reset, recreation, release and process-exit checks.
-The four-layer capacity suite passed 1,465 checks across 560 total steps and 2,240
-KV appends, with no explicit intermediate readbacks during steps. The retained
-Qwen synthetic decoder/KV regression, 61 host Python tests, CTest and format checks
-also passed. These are numerical/lifecycle results, not exclusive NPU proof.
-See [commands, diagnosis and evidence](tests/np101-opt.md). Full-model integration and generation are now implemented under S9/S10 below;
-final hardware acceptance remains S11. No repeated Qwen capacity
-probe or driver/system changes are part of this adapter task.
-
-## NP101-MODEL-003: Complete OPT input/output and generation (S9/S10)
-
-- [x] S9: Add blocked FP16 token lookup, project-in and learned position offset.
-- [x] S9: Bind the last decoder output to project-out and the complete tied LM head.
-- [x] S9: Share resident embedding/head allocations; perform local/global argmax
-  and candidate gathering in SDK graphs, including exact ties and valid tail rows.
-- [x] S9: Validate original-weight input/output and independent exact selection cases.
-- [x] S10: Integrate 4, 8 and all 24 resident decoder layers with ordinary shared
-  activations and one preallocated K/V pair per layer; no host hidden/cache copies.
-- [x] S10: Implement sequential prefill, greedy decode, BOS/EOS, fixed capacity,
-  zero/maximum new-token limits, reset and explicit consumed-length semantics.
-- [x] S10: Validate every layer against official CPU trajectories, exact reset,
-  final-only/fresh repeats, scalar-only transfers, ordered release and process exit.
-- [x] S10: Generate a 32-token continuation through the complete SDK model and
-  compare all token IDs with the official CPU implementation.
-- [x] Resolve default decoding from the checkpoint generation configuration;
-  retain sampling as an explicit override and reject unsupported policy settings.
-- [ ] S11: Establish per-kernel backend and physical weight/KV residency, account
-  for SDK layouts/workspace, and complete formal whole-model performance acceptance.
-
-Evidence and commands: [complete-model validation](tests/np101-generation.md).
-The 24-layer numerical suite passes 491 checks with unchanged tolerances; all
-24 layers and capacity-512 KV buffers coexist. Known payload is 679.71 MiB before
-SDK overhead. Normal computation uploads 104 control bytes per consumed token
-and reads four bytes per prediction. The France and dinner prompts' 32-token
-continuations both match CPU exactly. Empty input with capacity one consumes BOS,
-returns one matching token and stops for capacity. This does not establish exclusive NPU execution or physical
-board residency; NP101-OBS-001 and the physical-state portion of NP101-STATE-001
-remain open. OPT execution is not blocked by the historical Qwen allocation limit.
-The requested Qwen3.5 real-weight four-layer regression also passed: 737 checks,
-80 total steps across reset/final-only/fresh sequences, unchanged CPU references
-and tolerances, and no explicit host intermediate reads during normal steps.
-
-After S11, continue the original sequence with TLM/protocol integration and later
-speculative-inference experiments. No TLM, network protocol, onboard CPU deployment,
-MLIR or quantization work is included in S9/S10.
-
-## NP101-OP-003: Direct FP16 categorical sampling returns incorrect indices
-
-- [x] Reproduce the documented RANDOM_MULTINOMIAL operator with 8 and 50,272 classes.
-- [x] Validate FP32 logits and exact FP16-to-FP32 promotion; use the promoted path
-  for optional OPT sampling while preserving original FP16 weights and greedy default.
-- [ ] Ask the chip team to confirm or correct direct FP16 sampling before enabling it.
-
-Direct FP16 returned index 8 for every eight-class sample, and index 8216 even
-when only token 50271 had non-negligible probability in the full-vocabulary case.
-SDK calls and teardown succeeded. This is a numerical failure, not a driver hang.
-The validated FP32 path removes the current sampling blocker; it does not establish
-the kernel's exclusive NPU execution. See [reproduction and evidence](tests/np101-sampling.md).
-
-## NP101-MEM-002: Share DeltaNet weights across alternating state graphs
-
-- [ ] Eliminate duplicate weight storage between the A-to-B and B-to-A graphs.
-
-Status: explicitly deferred by the user on 2026-09-21. Record the issue only;
-do not implement graph fusion or change weight ownership in the current task.
-
-Each `StepGraph` currently creates its own constant weight tensors. The first
-four complete layers therefore load 218.68 MiB of weight payload instead of
-158.35 MiB, including 60.33 MiB duplicated by the three DeltaNet mixers.
-The duplication follows from separate allocation, not an inherent requirement
-of using two graphs. Combining graphs alone does not establish weight sharing.
-
-When resumed, validate a supported shared read-only allocation/packing path,
-including both graph directions, numerical agreement, owner/consumer lifetimes,
-reset and release. Measure SDK copies/layouts rather than inferring savings from
-shared wrapper pointers. Evaluate graph consolidation only if necessary for a
-validated storage/execution strategy.
-
-Dependencies: existing two-graph execution and four-layer numerical validation
-provide the baseline. This optimization does not block isolated component work
-or the implemented decoder checks. Before full-model resident integration,
-account for duplication across every DeltaNet layer or remove it through a
-validated path. Resolving this item does not resolve NP101-MEM-001: unique text
-weights alone still exceed the provisional 1 GiB allocation ceiling. Physical
-memory savings and residency require NP101-OBS-001 evidence.
-
-## NP101-MEM-001: Enable full-model resident weight allocation
-
-- [ ] Resolve the effective tensor allocation/upload limit and validate the
-  vendor-supported allocation path.
-
-Status: the supplied 1.0.6 package was rechecked on 2026-09-22. The vendor-command
-reproduction allocated and initialized all 502 Qwen weight/state tensors,
-totaling 1,550,863,040 bytes, but weight readback failed at
-`model.layers.17.mlp.gate_proj.weight` (offset 0, 7,340,032-byte chunk).
-All 320 logical weights uploaded; only 912,175,872 earlier weight bytes were
-verified before the mismatch. The process exited with code 1, without timeout,
-signal or residual children, and the module reference count returned to zero.
-Evidence is under `.cache/runs/allocation-repro_0922_1/`.
-
-Synthetic allocation and initialization also succeeded for 1,152 MiB in both
-constant and mutable mode, but retained-byte readback failed in both. The old
-allocation/upload boundary has been crossed; reliable retained data remains
-unverified at these sizes. The capacity issue remains open. See
-[new-package capacity evidence](tests/np101-capacity.md).
-
-The largest payload fully verified in this recheck was 864 MiB (constant mode).
-This is a tested lower bound, not a measured physical-memory limit. Both the
-1,024 MiB constant run and 1,152 MiB mutable run had an identical failed block:
-block 109, starting at byte 1,274,680 within that block, with 12 FP16 values
-replaced by zeros. Both explicitly released and exited normally. Probing toward
-4 GiB stopped at this data-integrity failure. The separate convolution preflight
-also raised SIGFPE in `NNTransposeCycleCount_V9`; its caller/SDK cause is unresolved.
-All 617 checked installed package files matched the supplied package.
-
-The strengthened version-2 diagnostics now compare equal-byte FP16/FP32 allocations
-in both constant and mutable modes. All four 64 MiB controls pass. All four
-1152 MiB runs reproduce zero data in the same three eight-byte regions of block
-109: twelve FP16 values or six FP32 values. This is not an FP16-only failure.
-The real Qwen run captures the first changed byte at offset 3,400,312 of the same
-layer-17 weight, then verifies all 46,071,808 zero-initialized state bytes and
-explicitly releases. Small weight/state fixtures pass both storage modes.
-All eleven runs exit without signal, timeout or residual process; the final module
-reference count is zero. Evidence is under `.cache/runs/allocation-review-20260922/`.
-The diagnostic implementation passes its build, 73 Python tests, three CTest
-tests and formatting checks. Data integrity above 1 GiB remains unresolved.
-
-### Working constraint and evidence
-
-The previous package used **1 GiB (1,073,741,824 bytes)** as the provisional ceiling
-for the tested constant and mutable allocation/upload paths. It was a planning constraint, not a verified
-description of all board memory or proof of which pool backs the tensors.
-Allow room below it for SDK allocations, alignment, and any duplicated layouts.
-
-- `vsi_nn_AddTensor` with `is_const=TRUE` retained 266 tensors containing
-  1,070,874,144 bytes, then failed while creating a 7,340,032-byte FP16 tensor
-  from `model.layers.20.mlp.down_proj.weight`.
-- The same allocation boundary reproduced after a cold restart. The second
-  run closed the device and exited with code 1 without timeout or residual
-  children; the previous run remained in a driver mutex wait.
-- On 2026-09-17, all weights were created with `is_const=false` and explicitly
-  uploaded. The first 266 chunks uploaded 1,070,874,144 bytes, exactly matching
-  the constant-mode boundary. The next tensor object was created, but uploading
-  its 7,340,032 bytes failed in `vsi_nn_CopyDataToTensor` with status -5
-  (`VX_ERROR_NOT_ALLOCATED`). It was the same layer-20 MLP down-projection weight.
-  Full weight readback and state allocation were not reached. The process exited
-  normally with code 1, without a timeout or residual child. A bounded follow-up
-  passed mutable FP16/FP32 weight readback and state allocation/release.
-  Changing `is_const` alone therefore does not bypass the observed limit; the
-  evidence no longer supports treating it as necessarily exclusive to constants.
-- Live driver parameters report `exclusiveSize=1,073,741,824` and
-  `externalSize=2,008,023,040`. The selected constant-tensor pool is unconfirmed.
-- The exported text weights contain 1,504,791,232 payload bytes. Weights plus
-  planned state/auxiliary buffers have a known lower bound of 1,550,875,816 bytes,
-  before unresolved SDK copies, activations, graph data, and workspace.
-- The user additionally reports that a warm restart could not complete boot,
-  while a cold restart restored the host. That observation has no independently
-  captured boot-failure log here and must not be attributed to the memory limit
-  without further evidence.
-
-Local evidence is retained under
-`.cache/runs/weight-allocation-after-reboot-20260909/`: `recheck-report.md`,
-`comparison.json`, `driver-parameters.json`, `sdk.log`, and `driver.strace`.
-The original run is under `.cache/runs/weight-allocation-first/`.
-The mutable experiment is under `.cache/runs/weight-allocation-mutable-20260917/`;
-see [the allocation comparison](tests/np101-mutable-allocation.md).
-
-### Required follow-up and closure
-
-The immediate 1.0.6 follow-up is to explain/fix the reproducible retained-byte
-corruption and the independent computation SIGFPE. Existing numerical evidence
-from the previous SDK is not automatic acceptance of the new package. Full Qwen
-weight loading and new-package whole-model hardware acceptance remain dependent
-on these checks; host implementation and CPU reference work may continue.
-
-1. Obtain the team's explanation of constant/mutable tensor pool selection and a
-   supported driver configuration, driver build, or alternative allocation API.
-   Record affected versions, limits, ownership, and lifetime requirements.
-2. Review and integrate that solution. Any sudo action or system configuration
-   change still requires explicit authorization for that action.
-3. Revalidate the affected tensor API and a previously supported small operation,
-   including changing inputs, numerical comparison, cleanup, and device execution
-   evidence. Full FP32 feedback capability remains a separate gate.
-4. Re-run `scripts/check_np101_allocation.py` with a new output directory. All
-   320 logical text-weight tensors, including their row blocks, and the planned
-   state tensors must remain allocated together. Confirm shared embedding/head
-   storage, successful release, and no remaining child processes. The number of
-   SDK allocations can exceed 320 because weights are split into row blocks.
-5. Repeat initialization/allocation/release with recorded memory observations;
-   reject a growing allocation footprint, timeout, or failed cleanup. Document
-   what supports device residency rather than counting SDK success alone.
-
-Close this item after the supported resident allocation path passes these checks.
-The full model's actual graph/workspace peak remains a later integration check;
-it is not a prerequisite for closing this item, which would create a dependency
-cycle. A vendor response alone does not close the item.
-
-While waiting, do not repeat the known full-weight capacity probe without a
-changed allocation path or new vendor guidance. Keep the model, precision policy,
-and full-device target fixed. Per-token host weight streaming is outside the
-resident-inference acceptance criteria.
-
-The small constant, mutable, and mixed-weight graphs now pass numerical and
-lifecycle checks with changing inputs/weights. This permits a separate, bounded
-comparison of allocation paths before a full-model retry. It does not demonstrate
-different physical pools, extra capacity, or device residency. See the
-[operator acceptance record](tests/np101-operator-acceptance.md).
-The all-mutable comparison has now been performed once and reproduced the same
-upload boundary. Do not repeat either full-capacity path without another concrete
-change or vendor guidance. Actual DeltaNet/Attention state reuse remains a
-separate unresolved item below.
-
-## NP101-STATE-001: Validate device-resident state reuse
-
-- [ ] Implement and validate state reuse/reset without a per-token host state copy.
-
-Status on 2026-09-17: a C++ layer-0 DeltaNet mixer now implements fixed A-to-B and
-B-to-A graph execution with shared ordinary tensors. Two-step and 32-step
-real-weight tests passed numerical/lifecycle checks, including nonzero initial
-state, reset, recreation and final-only readback. There are no application state
-uploads between steps. Layer-3 Attention now uses one preallocated FP16 K/V cache
-with slot views; its 512-token suite passed 1,042 appends and 207 checks, including
-truncate/overwrite, reset, fresh-instance comparison, final-only readback and
-capacity rejection. KV payload is 1 MiB per layer, with only the new 2 KiB token
-submitted to the slot-copy graph on each step. **SDK-internal transfers and
-physical residency remain unverified. This item stays open.**
-See the [DeltaNet validation record](tests/np101-delta-net.md) for the isolated
-API exception, duplicate graph weights, SDK warnings and acceptance evidence.
-The [Attention validation record](tests/np101-attention.md) documents its view/
-ownership API exception, tested Softmax layout and the small copy graph's
-per-append revalidation overhead. Dynamic KV allocation remains deferred.
-
-Decoder composition now uses fixed shared inputs/outputs across all four complete
-layers, including both DeltaNet graph directions. Initial integration exposed
-FP16 core subnormal loss; the sensitive core dot product now stays FP32 through
-gated RMS reduction. Independent CPU arithmetic and frozen tolerances are unchanged.
-The group validates positions before execution and requires recreation after a
-partial SDK failure. It does not claim recurrent-state rollback through KV truncation.
-See the [decoder validation record](tests/np101-decoder.md) for current trajectories,
-transfer counters, known memory payload and timing observations.
-
-The 22 SDK RNN feedback cases and temporary buffer tests remain retired in the
-[investigation archive](tests/state-feedback-investigation.md). Handle swapping
-has not been restored. Their removal did not resolve this item.
-
-Required implementation and acceptance:
-
-1. Use the chip team's `demo/ref_op_api_guide.md` as the interface baseline for
-   actual DeltaNet/Attention state. If it cannot express the required reuse or
-   incurs a significant predictable performance cost, document that specific
-   limitation before adopting and validating an alternative.
-2. Verify a representative changing-input trajectory for recurrent state,
-   convolution history, and KV storage against independent references. Preserve
-   necessary FP32 state precision, check intermediate results, and ensure KV
-   writes retain untouched rows and reject out-of-capacity positions.
-3. Reset to a defined initial state and compare the subsequent outputs with
-   both the reference and a fresh instance using the same input sequence.
-4. Run continuously with final-only application readback and establish that the
-   SDK does not transfer the state through the host between steps. Matching the
-   final result or having no application copy alone is insufficient. Check normal
-   release/recreation and retain separate hardware/residency evidence.
-
-Implement these checks with the real modules rather than restoring a generic
-matrix of delays, flushes, and SDK feedback variants. Use representative
-configurations for trajectory, reset, and transfer-free execution.
-
-This gates acceptance of device-resident sequential DeltaNet, Attention/KV,
-four-layer decoder groups, and full generation. Isolated operator checks,
-selected-weight projections, MLP, and bounded allocation experiments can continue;
-DeltaNet/Attention implementation can proceed while establishing their state path.
-
-## NP101-OBS-001: Obtain execution and device-memory evidence
-
-- [ ] Correlate graph nodes with actual NP101 execution/completion and observe
-  device allocation/release through a supported profiler or diagnostic API.
-
-The installed target-query headers describe available targets and kernel support,
-not the selected execution backend of every node. Driver IO, successful output,
-`argmax.execute_on_sw=false`, and a swappable tensor flag do not establish full
-hardware execution or residency. All current operator reports retain these gates.
-
-Four representative cases each complete 20 graph lifetimes. File descriptors
-stabilize after initialization and host RSS settles after early growth, but board
-memory counters are unavailable. Do not infer leak-free device allocation or use
-traced diagnostic timings as performance benchmarks.
-
-This blocks hardware acceptance and trustworthy device memory/performance claims
-for all modules; it does not block host implementation or numerical diagnostics.
-
-## Qwen baseline dependencies and work that can continue
-
-Split the existing weight-preparation prerequisite into three independently
-tracked results: verified host export, validated layouts for the tensors used by
-a subgraph, and full-model resident allocation. An isolated subgraph requires
-the first two and its own memory check; it does not require all model weights to
-be resident. The full-model allocation result remains blocked by NP101-MEM-001.
-
-| Work item | Implementation while waiting | Device validation while waiting | Dependencies |
-|---|---|---|---|
-| Operator and state capability checks | Retain operator checks; implement state reuse/reset checks with the actual DeltaNet/Attention modules. | Targeted operator regressions can run after device health checks; state acceptance remains pending. | NP101-STATE-001 for state reuse/reset; NP101-OBS-001 for hardware evidence. |
-| Weight export, integrity, layouts, and memory accounting | Host export and independent byte comparisons already pass; layout and accounting work can continue. | Validate selected weight tensors and their projections. Full-model simultaneous allocation remains blocked. | Selected-operator checks; NP101-MEM-001 for full resident allocation. |
-| DeltaNet subgraph | Layer-0 C++ mixer and fixed state routing implemented. | Numerical trajectories through 32 steps, nonzero state, reset and recreation pass; actual backend, SDK state transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; graph composition must revisit duplicated weights. |
-| Attention subgraph | Layer-3 C++ mixer and single-buffer KV append/reset/truncate implemented. | Real-weight 512-token trajectories, invalid-slot masking, capacity rejection and lifecycle pass; actual backend, SDK transfers and board memory remain unverified. | NP101-STATE-001 and NP101-OBS-001 for resident hardware acceptance; copy-graph revalidation remains a performance concern. |
-| MLP and four-layer decoder group | Complete layers 0-3 and fixed shared activation bindings implemented. | Complete Attention layer and four-layer 2/32/512-step numerical/lifecycle checks pass, including capacity rejection, reset/fresh/final-only equality and explicit-transfer limits. | NP101-STATE-001 and NP101-OBS-001 still gate resident hardware acceptance. |
-| Embedding, LM head, and token selection | Implement lookup, fixed row blocks, valid tail rows, tie handling, and device-wide selection. | Test embedding and the full-vocabulary head in isolation using captured hidden states. Shared-table integration needs a validated storage/view strategy. | Gather, projection, device argmax/selection, supported sharing/layout, and measured memory. |
-| Full 24-layer generation | Interfaces, sequencing, consumed-length semantics, EOS handling, and host-only contract tests can be prepared. | Full prompt/decode execution with all weights/state resident is blocked. | All subgraphs and head validated; NP101-MEM-001 resolved; final workspace allocation verified. |
-| First complete DLM acceptance | Prepare fixed prompts, teacher-forcing cases, result schema, and benchmark collection. | Complete correctness, repeated reset/generation, full-model memory, and latency acceptance are blocked. | Working full 24-layer generation on NP101. |
-| Spark TLM and speculative integration | Independent protocol/TLM preparation is technically possible, but remains deferred under the current single-DLM-first scope. | Real NP101-DLM/TLM integration and optimization measurements are blocked downstream. | Complete DLM acceptance, followed by the planned TLM/protocol stages. |
-
-### Other capability gates remain independent
-
-- Model-sized FP32 matrix operations and the four real-weight projections now
-  pass numerical checks. Resident feedback/reset remains blocked by
-  NP101-STATE-001, and hardware proof by NP101-OBS-001.
-- `vsi_nn_AttachTensorToGraph` is declared but not exported by the current SDK.
-  Retained ordinary tensors passed DeltaNet and Attention numerical sharing
-  checks. New composed graphs still need their own integration and residency
-  checks; resolving NP101-MEM-001 alone does not provide that evidence.
-- Full-vocabulary gather, individual head blocks/tail, and block token selection
-  pass their numerical probes. The complete blocked head is not yet integrated;
-  device execution remains unverified. CPU selection cannot satisfy the complete
-  DLM requirement.
-
-### Weight footprints for isolated tests
-
-These are payload sums from the exported deployment manifest, not measured SDK
-memory footprints. State, activation, layout copies, and workspace are additional.
-
-| Isolated component | Weight payload |
-|---|---:|
-| DeltaNet mixer, layer 0, excluding its MLP | 20.11 MiB |
-| Attention mixer, layer 3, excluding its MLP | 14.00 MiB |
-| One MLP | 21.00 MiB |
-| Complete layers 0-3, including their MLPs and norms | 158.35 MiB |
-| Shared embedding/head table, counted once | 485.00 MiB |
-| All text weights | 1,435.08 MiB |
-
-These sizes support attempting isolated component tests under the provisional
-limit, subject to actual allocation and execution checks. Load only the selected
-component, keep its weights/state resident across tokens, then release it before
-the next test. Do not combine all component fixtures into one resident test graph.
-Head row blocking limits individual operations; it does not reduce total resident
-weight bytes when all blocks remain allocated. Avoid assuming that manifest-level
-weight aliases prove sharing inside the SDK.
-
-## Retained Qwen follow-up order
-
-The immediate task is the refactor of completed implementations in the checklist above.
-After that, resume the original construction sequence; the following record
-describes the retained Qwen scope and its allocation gate, not a new OPT plan.
-
-1. Reuse the validated operator results; check changed operators and selected-weight
-   layouts as needed. Do not restore the retired SDK RNN diagnostic matrix.
-2. Retain the implemented DeltaNet mixer and its numerical state/reset checks;
-   obtain the missing hardware/residency evidence without repeating the retired
-   diagnostic matrix.
-3. Retain the implemented Attention layer and its single-buffer KV/boundary
-   checks. Investigate copy-graph revalidation cost and obtain hardware/residency
-   evidence during later integration; do not add dynamic allocation yet. The complete four-layer untraced
-   observation averaged 447.4 ms per group step, including 2.30 ms of KV graph
-   revalidation. These are host times with an unknown SDK backend; establish
-   execution evidence before drawing device-performance conclusions.
-4. Retain the complete MLP/residual/normalization and four-layer decoder group,
-   with its numerical, state, boundary and explicit-transfer checks. See the
-   [decoder validation record](tests/np101-decoder.md).
-5. Implement and validate standalone embedding, full-vocabulary head, and device
-   token selection; validate their sharing strategy before combining them.
-6. Stop before full resident 24-layer device integration until NP101-MEM-001 is
-   resolved. Interfaces and host-only tests can be prepared without claiming
-   successful device inference.
-
-This is the maximum planned component-level progress allowed by the memory
-constraint alone. Unresolved operator, state, or sharing capabilities can stop
-the sequence earlier. Individual component passes never substitute for complete
-DLM or speculative-inference acceptance.
+Updated: 2026-09-22. Active target: complete resident OPT-350M text inference on NP101.
+Numerical SDK validation and formal hardware acceptance are tracked separately.
+
+## Current work and dependencies
+
+| Work | Current state | Next action / dependency |
+|---|---|---|
+| OPT input/output and generation (S9/S10) | Implemented and numerically validated on the earlier SDK | Retain the regression; revalidate execution after the new-package computation fault is resolved |
+| Complete DLM hardware acceptance (S11) | Open | Resolve the new-package computation fault; establish backend/residency evidence and measure full-model memory and performance |
+| Full Qwen weight loading | Allocation succeeds on package 1.0.6, retained bytes fail validation | NP101-MEM-001; also account for deferred DeltaNet duplication before any full-model integration |
+| Qwen component regression | Existing implementation and evidence retained | Recheck affected components after relevant changes; no new full-Qwen integration in the active OPT scope |
+| TLM/protocol and speculative inference | Deferred | Complete the DLM acceptance stage before joint inference and optimization measurements |
+
+Host implementation, references, export verification and unit tests may continue
+while device issues are unresolved. Earlier numerical passes are not acceptance
+of a changed driver/SDK package. Do not repeat known failing capacity/compute runs
+without a relevant change or a concrete diagnostic hypothesis.
+
+## NP101-MEM-001: Validate retained tensor data above 1 GiB
+
+- [x] Recheck constant and mutable storage using equal-byte FP16/FP32 diagnostics.
+- [x] Capture failed bytes and explicit cleanup results for synthetic and actual weights.
+- [ ] Obtain a vendor-supported correction or explanation of the corruption.
+- [ ] Revalidate retained bytes and normal release before increasing the target size.
+- [ ] Revalidate all Qwen weights and the historical allocation-state fixture together.
+
+Package 1.0.6 accepts all 502 Qwen weight/state tensors (1,550,863,040 bytes),
+but the first readback mismatch is in `model.layers.17.mlp.gate_proj.weight`.
+The strengthened checks locate it at byte 3,400,312 within the first 7 MiB chunk;
+all 46,071,808 zero-initialized state bytes still compare correctly.
+
+All four 64 MiB controls pass. All four 1,152 MiB runs (FP16/FP32 × constant/mutable)
+fail at the same three eight-byte regions of block 109, starting at byte 1,274,680.
+The largest earlier fully verified payload is 864 MiB in constant mode, a tested
+lower bound rather than a physical limit. The old 1 GiB allocation ceiling is
+historical; the current failure is retained-data integrity. Physical pool selection
+and usable capacity near 4 GiB remain unverified.
+
+Evidence and reproduction:
+[capacity diagnostics](tests/np101-capacity.md),
+[old constant/mutable comparison](tests/np101-mutable-allocation.md),
+`.cache/runs/allocation-review-20260922/`.
+
+Closure checks after a relevant vendor change:
+
+1. Record the matching driver/SDK versions, supported allocation path, ownership
+   rules and any pool configuration. System changes require specific authorization.
+2. Start with small FP16/FP32 constant/mutable controls. Increase only after full
+   byte readback, explicit graph/context release and clean process exit.
+3. Repeat the full weight/state fixture with a fresh output directory. Verify every
+   retained weight and state byte, not just allocation/upload status.
+4. Repeat initialization/readback/release with supported memory observations and
+   investigate any growing footprint or failed cleanup.
+
+Close this allocation item after a supported path passes those checks. Full-model
+workspace and exclusive-NPU residency belong to S11 and NP101-OBS-001; they are
+not prerequisites for closing the allocation diagnostic itself. OPT's smaller
+payload needs its own full-graph memory checks and is not automatically blocked
+or validated by the Qwen result. Per-token host weight streaming does not satisfy
+resident-inference acceptance.
+
+## NP101-OP-004: Diagnose the new-package convolution SIGFPE
+
+- [x] Locate the fault in `libNNArchPerf.so:NNTransposeCycleCount_V9` at an integer
+  division instruction and verify the installed files against the supplied package.
+- [ ] Determine the failing operand/configuration with the chip team and correct
+  the caller or SDK path as indicated by evidence.
+- [ ] Revalidate changing-input convolution/ReLU/pooling, cleanup and process exit,
+  then revalidate the affected OPT numerical path on the corrected package.
+
+Caller/SDK root cause remains unresolved; matching package files do not establish
+correct computation. This is separate from the allocation-only readback failure.
+See the [preflight record](tests/np101-capacity.md).
+This item gates new-package computation acceptance, not CPU work or the recorded
+allocation-only controls.
+
+## NP101-OBS-001: Establish execution and device-memory evidence (S11)
+
+- [ ] Obtain a supported trace/profiler that identifies each kernel's execution
+  backend and completion, plus physical allocation/residency observations.
+- [ ] Account for weights, KV, activations, SDK layout copies and workspace with
+  the complete OPT model resident at the tested capacity.
+- [ ] Verify release/recreation against device memory observations.
+- [ ] Measure initialization, prompt processing and decoding after correctness
+  and execution/residency are established; separate diagnostic tracing overhead.
+
+Generic driver IO, SDK success, numeric agreement and `argmax.execute_on_sw=false`
+do not establish exclusive NPU execution. Host RSS/FD stability is not a board
+memory measurement. Existing reports retain this distinction.
+
+Known OPT weight/KV payload at capacity 512 is 712,724,480 bytes (679.71 MiB),
+excluding SDK overhead, activations and workspace. Use the
+[complete-model checks](tests/np101-generation.md) as the numerical baseline.
+This item gates hardware acceptance and device-performance claims for all modules.
+
+## NP101-STATE-001: Establish physical residency of reused state
+
+- [x] Implement numerical state reuse/reset without per-token application state copies.
+- [x] Validate DeltaNet recurrence/convolution state, Attention/KV append, untouched
+  rows, valid-prefix bounds, reset, recreation and final-only readback.
+- [x] Integrate fixed activation sharing into Qwen slices and full OPT generation.
+- [ ] Establish that SDK-internal transfers do not shuttle state through the host
+  during normal steps, using NP101-OBS-001 evidence.
+
+Retain the existing DeltaNet two-bank implementation and single-buffer KV design.
+Do not restore handle swapping or the retired SDK RNN/delay/flush test matrix.
+Dynamic KV allocation remains deferred. KV truncation does not roll back recurrent
+state; recreate a model after a partial SDK failure.
+
+Numerical/lifecycle records: [DeltaNet](tests/np101-delta-net.md),
+[Attention/KV](tests/np101-attention.md), [Qwen decoder](tests/np101-decoder.md),
+[OPT generation](tests/np101-generation.md).
+The [state investigation archive](tests/state-feedback-investigation.md) preserves
+retired experiments. The remaining residency check gates formal device-resident
+sequential inference acceptance, not implementation of already validated state routing.
+
+## NP101-MEM-002: Share DeltaNet weights across alternating graphs
+
+- [ ] Eliminate duplicate weights after the user resumes this deferred optimization.
+
+Explicitly deferred on 2026-09-21. Do not fuse graphs or change weight ownership
+as part of routine cleanup. The first four Qwen layers load 218.68 MiB of weight
+payload versus 158.35 MiB unique weights: 60.33 MiB is duplicated by three DeltaNet
+mixers. Separate allocation causes duplication; graph fusion alone does not prove
+sharing or physical savings.
+
+When resumed, validate shared read-only storage in both graph directions,
+references/ownership, numerical trajectories, reset and release. Measure actual
+SDK copies/layouts. Before future full-Qwen integration, either account for every
+duplicated layer or remove duplication through a validated path. This does not
+block OPT, and its resolution would not fix NP101-MEM-001. Baseline:
+[decoder memory record](tests/np101-decoder.md).
+
+## NP101-OP-003: Correct direct FP16 categorical sampling
+
+- [x] Reproduce incorrect indices with direct FP16 RANDOM_MULTINOMIAL.
+- [x] Validate FP32 logits and exact FP16-to-FP32 promotion for optional OPT sampling.
+- [ ] Obtain a vendor correction and revalidate before enabling direct FP16 sampling.
+
+The validated promoted path remains in use; model weights stay FP16. Default
+text generation follows the checkpoint policy. This vendor issue does not block
+that path, but its execution backend still needs NP101-OBS-001 evidence.
+See [sampling reproduction and results](tests/np101-sampling.md).
+
+## Completed implementation and retained evidence
+
+| Item | Delivered behavior | Record |
+|---|---|---|
+| NP101-MODEL-001 | Model-specific configuration/reference/composition separated from reusable data, operators and storage | [Completed decoupling checklist](docs/model-decoupling-plan.md), [component regression](tests/np101-components.md) |
+| NP101-MODEL-002 | Original FP16 OPT import/export and decoder slices; documented MatMul/Add avoids the biased-FCL optimizer crash | [OPT validation](tests/np101-opt.md) |
+| NP101-MODEL-003 (S9/S10) | Shared embedding/head, all 24 layers, persistent KV, checkpoint-default generation and optional sampling | [Complete-model validation](tests/np101-generation.md) |
+
+Qwen checkpoints, exported weights, references and historical validation artifacts
+remain available as regression baselines. Future Qwen embedding/head or full-model
+integration is separate work, subject to its memory and state gates; it is not the
+next task ahead of active OPT acceptance. The old attachment-symbol probe is
+retired; actual `retain_tensor`/`bind_tensor` sharing remains covered by mixer,
+KV and decoder checks. Its historical result is retained in the
+[operator record](tests/np101-operator-acceptance.md).

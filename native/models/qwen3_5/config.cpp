@@ -82,11 +82,6 @@ Config read_config(const std::filesystem::path &path) {
   return config;
 }
 
-const np101::WeightRecord &resolve_weight(const np101::WeightStore &weights,
-                                          const std::string &name) {
-  return weights.find(name == "lm_head.weight" ? "model.embed_tokens.weight" : name);
-}
-
 void validate_layer_weights(const np101::WeightStore &weights, const Config &config, unsigned layer,
                             bool include_feed_forward) {
   config.validate();

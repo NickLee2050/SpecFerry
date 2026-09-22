@@ -10,7 +10,6 @@
 | `native/np101/data_test.cpp` | Tensor/component contracts, native weight reader, and fixture parser unit tests | No |
 | `native/np101/conv_relu_pool_test.cpp` | FP16 convolution, ReLU, and max-pooling numerical regression | Yes |
 | `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
-| `native/np101/graph_sharing_check.cpp` | Cross-graph tensor attachment and execution | Yes, when the SDK exports the API |
 | `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, weight/state readback and explicit teardown | Yes |
 | `native/np101/capacity_check.cpp` | Equal-byte FP16/FP32 capacity probes in constant/mutable storage | Yes |
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
@@ -28,8 +27,46 @@ ctest --test-dir build --output-on-failure
 ```
 
 CTest registers only host unit tests. Hardware checks are explicit `scripts/check_np101_*.py`
-commands documented in the root README. Each uses a fresh output directory under
+commands documented here and in the linked guides. Each uses a fresh output directory under
 `.cache/runs/`; generated fixtures and logs are not source files.
+
+## Diagnostic commands
+
+After building, use fresh output directories for each device run:
+
+```bash
+python scripts/check_np101_conv_relu_pool.py --output .cache/runs/conv-relu-pool --repeats 10
+python scripts/check_np101_operators.py --list
+python scripts/check_np101_operators.py --output .cache/runs/operators-small --diagnostic
+python scripts/check_np101_attention.py --storage-only \
+  --output .cache/runs/kv-storage --diagnostic
+```
+
+Review the [current package's computation fault](np101-capacity.md) before
+re-running the convolution or other operator paths. A recovery marker blocks
+further device execution until recovery has been confirmed.
+
+The operator runner accepts repeatable `--case NAME`, `--scale model`,
+`--prepare-only`, `--readback final`, `--cycles 20`, `--binary`, `--sdk-lib` and
+`--shader-header`. The default per-case timeout is 300 seconds and the payload
+cap is 768 MiB; SDK overhead is additional. Each case keeps its `graph.txt`,
+inputs, expected bytes, comparison and execution evidence. Final-only comparison
+does not substitute for checking every output in a numerical trajectory.
+
+Device runners share executable snapshots and source fingerprints through
+`python/specferry/validation/device.py`. `sources.json`, where emitted, records
+the current working tree; it does not prove which source revision built a binary.
+Execution evidence retains the actual binary hash and runtime library fingerprints.
+Generation, sampling and allocation do not emit a duplicate `binary.json`.
+Device locking, timeouts, recovery checks and per-run report layouts remain shared.
+
+The unavailable `AttachTensorToGraph` probe and its unused wrapper are retired.
+Their source remains in Git at commit `8165dd5`; the
+[operator record](np101-operator-acceptance.md) preserves results and local evidence.
+Actual cross-graph `retain_tensor`/`bind_tensor` behavior remains covered by
+DeltaNet, KV, Attention and decoder checks.
+
+## Fixture and acceptance contracts
 
 [Capacity probing](np101-capacity.md) records the bounded 1–4 GiB experiment,
 the new-package preflight and the distinction between an allocation rejection

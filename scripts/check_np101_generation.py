@@ -2,7 +2,6 @@
 """Validate OPT input/output or resident decoder prefixes against the official CPU model."""
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -11,7 +10,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.models.opt.validation_generation import evaluate, prepare, prepare_selection
-from specferry.validation.device import device_lock, fingerprint, run_device, write_json
+from specferry.validation.device import (
+    device_lock,
+    record_sources,
+    run_device,
+    snapshot_binary,
+    write_json,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,19 +77,8 @@ def main():
                     str(fixture / "tokens.txt"),
                 ]
             binary = output / source.name
-            shutil.copy2(source, binary)
-            write_json(
-                output / "sources.json",
-                {
-                    "binary_sha256": fingerprint(binary),
-                    "sources": {
-                        str(p.relative_to(ROOT)): fingerprint(p)
-                        for d in ("native", "python", "scripts", "tests")
-                        for p in sorted((ROOT / d).rglob("*"))
-                        if p.is_file() and p.suffix in (".cpp", ".hpp", ".py")
-                    },
-                },
-            )
+            snapshot_binary(source, binary)
+            record_sources(ROOT, binary, output / "sources.json")
             print(
                 f"Running {args.mode}"
                 + (f", {args.layers} resident layers" if args.mode == "teacher" else "")

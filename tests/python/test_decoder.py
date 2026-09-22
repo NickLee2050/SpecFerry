@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.models.qwen3_5.precision import TOLERANCES
-from specferry.validation.decoder import DecoderCache, captured_inputs, evaluate
+from specferry.models.qwen3_5.validation_decoder import DecoderCache, captured_inputs, evaluate
 
 
 class DecoderAcceptanceTests(unittest.TestCase):

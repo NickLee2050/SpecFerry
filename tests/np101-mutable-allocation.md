@@ -58,6 +58,9 @@ clang-format checks also passed.
 
 Local artifacts (ignored by Git):
 
+- `.cache/runs/weight-allocation-first/`: original constant allocation attempt.
+- `.cache/runs/weight-allocation-after-reboot-20260909/`: cold-restart constant
+  recheck, comparison, driver parameters, SDK output and trace.
 - `.cache/runs/weight-allocation-mutable-20260917/`: allocation report, SDK log,
   driver trace, executable snapshot, source snapshot/hashes, and process check.
 - `.cache/runs/weight-allocation-mutable-20260917-environment/`: SDK/driver facts.
