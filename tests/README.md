@@ -3,6 +3,9 @@
 | Directory | Purpose | Device required |
 |---|---|---|
 | `python/` | Download, export integrity/precision, memory budget, and numerical comparison unit tests | No |
+| `native/generation_test.cpp` | BOS/EOS, capacity, generation limits and consumed-token semantics | No |
+| `native/np101/opt_io_check.cpp` | Shared embedding/head blocks, learned positions and greedy selection | Yes |
+| `native/np101/sampling_check.cpp` | Categorical frequencies, seed replay and full-vocabulary bounds | Yes |
 | `native/np101/data_test.cpp` | Tensor/component contracts, native weight reader, and fixture parser unit tests | No |
 | `native/np101/conv_relu_pool_test.cpp` | FP16 convolution, ReLU, and max-pooling numerical regression | Yes |
 | `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
@@ -80,6 +83,16 @@ alias rejection, independent memory resources and invalid component configuratio
 The native data test parses component contracts without linking or opening the SDK.
 
 [OPT validation](np101-opt.md) records the original FP16 checkpoint, CPU baseline,
-byte-preserving export, independent decoder expectations and current device blocker.
+byte-preserving export, independent decoder expectations and the corrected SDK crash.
 `test_opt.py` checks import/precision rejection, chunk identity, trace ordering,
 valid-prefix comparison and lifecycle/mask/repeat failures without a model download.
+
+[Complete OPT generation](np101-generation.md) uses the production
+`build/bin/specferry_opt_generate` executable for teacher-forced 4/8/24-layer
+checks and normal text generation. `test_generation.py` protects token bounds,
+scalar-only transfer accounting, exact resets and honest hardware-evidence gates.
+`autoregressive_generation_contract` is a host CTest and never opens the SDK.
+
+[Sampling validation](np101-sampling.md) covers the documented RANDOM_MULTINOMIAL
+operator and OPT's optional sampling head. `test_sampling.py` rejects out-of-range
+or distribution-ignoring output even when SDK execution reports success.

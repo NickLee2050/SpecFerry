@@ -40,7 +40,8 @@ add_library(qwen_data native/models/qwen3_5/config.cpp)
 target_link_libraries(qwen_data PUBLIC np101_data)
 target_compile_options(qwen_data PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_ops native/np101/ops/graph_builder.cpp native/np101/ops/mixers.cpp)
+add_library(np101_ops native/np101/ops/graph_builder.cpp native/np101/ops/mixers.cpp
+  native/np101/ops/vocabulary.cpp)
 target_link_libraries(np101_ops PUBLIC np101_context)
 target_compile_options(np101_ops PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -64,9 +65,19 @@ add_library(opt_data native/models/opt/config.cpp)
 target_link_libraries(opt_data PUBLIC np101_data)
 target_compile_options(opt_data PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_opt_decoder native/models/opt/decoder.cpp)
-target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data)
+add_library(specferry_generation native/inference/generation.cpp)
+target_compile_features(specferry_generation PUBLIC cxx_std_17)
+target_include_directories(specferry_generation PUBLIC native)
+target_compile_options(specferry_generation PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(np101_opt_decoder native/models/opt/decoder.cpp native/models/opt/model.cpp)
+target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data specferry_generation)
 target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(specferry_opt_generate native/cli/opt_generate.cpp)
+target_link_libraries(specferry_opt_generate PRIVATE np101_opt_decoder)
+target_compile_options(specferry_opt_generate PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(specferry_opt_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 include(CTest)
 if(BUILD_TESTING)

@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <fstream>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 
 namespace specferry::models::opt {
@@ -87,5 +88,62 @@ void validate_weights(const np101::WeightStore &weights, const Config &config,
     require("fc2.weight", {config.intermediate, config.hidden});
     require("fc2.bias", {config.hidden});
   }
+}
+
+void ModelConfig::validate() const {
+  decoder.validate();
+  if (!embedding || !vocabulary || vocabulary > std::numeric_limits<std::int32_t>::max() ||
+      positions < decoder.capacity || position_offset != 2 ||
+      positions > std::numeric_limits<std::int32_t>::max() - position_offset || !block_rows ||
+      block_rows > 4096 || bos >= vocabulary || eos >= vocabulary || pad >= vocabulary ||
+      pad == bos || pad == eos ||
+      std::uint64_t(embedding) * std::max(block_rows, decoder.hidden) * 2 > 8 * 1024 * 1024 ||
+      std::uint64_t(decoder.hidden) * (positions + position_offset) * 2 > 8 * 1024 * 1024) {
+    throw std::invalid_argument("unsupported OPT input/output configuration");
+  }
+}
+
+void ModelConfig::validate_token(std::int32_t token) const {
+  if (token < 0 || unsigned(token) >= vocabulary) {
+    throw std::invalid_argument("token is outside the vocabulary");
+  }
+}
+
+ModelConfig read_model_config(const std::filesystem::path &directory) {
+  auto decoder = read_config(directory / "components.txt");
+  std::ifstream input(directory / "model.txt");
+  std::string line;
+  if (!std::getline(input, line) || line != "specferry-opt-model 1") {
+    throw std::invalid_argument("missing or unsupported OPT model configuration");
+  }
+  ModelConfig result{decoder, 0, 0, 0, 0, 0, 0, 0, 0};
+  if (!(input >> result.embedding >> result.vocabulary >> result.positions >>
+        result.position_offset >> result.block_rows >> result.bos >> result.eos >> result.pad) ||
+      input >> line) {
+    throw std::invalid_argument("invalid OPT model configuration");
+  }
+  result.validate();
+  return result;
+}
+
+void validate_model_weights(const np101::WeightStore &weights, const ModelConfig &config,
+                            unsigned layers) {
+  config.validate();
+  if (!layers || layers > config.decoder.layers) {
+    throw std::invalid_argument("invalid OPT resident layer count");
+  }
+  std::vector<unsigned> selected(layers);
+  std::iota(selected.begin(), selected.end(), 0);
+  validate_weights(weights, config.decoder, selected);
+  auto require = [&](const std::string &name, std::vector<std::uint32_t> shape) {
+    const auto &record = weights.find("decoder." + name + ".weight");
+    if (record.spec.type != np101::DataType::Float16 || record.spec.shape != shape) {
+      throw std::invalid_argument("OPT input/output weight mismatch: " + record.name);
+    }
+  };
+  require("embed_tokens", {config.embedding, config.vocabulary});
+  require("embed_positions", {config.decoder.hidden, config.positions + config.position_offset});
+  require("project_in", {config.embedding, config.decoder.hidden});
+  require("project_out", {config.decoder.hidden, config.embedding});
 }
 } // namespace specferry::models::opt

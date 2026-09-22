@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -218,6 +219,38 @@ Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const Weigh
   auto first_output = matmul(input, first, {block_rows, 1}, false, true);
   auto second_output = matmul(input, second, {rows - block_rows, 1}, false, true);
   return concat(first_output, second_output);
+}
+
+Tensor GraphBuilder::gather(Tensor input, Tensor indices, unsigned axis) {
+  if (axis >= input.spec.shape.size() || indices.spec.type != DataType::Int32 ||
+      indices.spec.shape.size() != 1) {
+    throw std::invalid_argument("gather requires a valid axis and an INT32 index vector");
+  }
+  auto shape = input.spec.shape;
+  shape[axis] = indices.spec.shape[0];
+  auto output = tensor({input.spec.type, shape});
+  node(VSI_NN_OP_GATHER, {input, indices}, output)->nn_param.gather.axis = axis;
+  return output;
+}
+
+Tensor GraphBuilder::argmax(Tensor input, unsigned axis) {
+  auto shape = input.spec.shape;
+  if (axis >= shape.size()) {
+    throw std::invalid_argument("argmax axis exceeds rank");
+  }
+  shape.erase(shape.begin() + axis);
+  if (shape.empty()) {
+    shape.push_back(1);
+  }
+  auto output = tensor({DataType::Int32, shape});
+  node(VSI_NN_OP_ARGMAX, {input}, output)->nn_param.argmax.axis = axis;
+  return output;
+}
+
+Tensor GraphBuilder::integer(std::int32_t value) {
+  std::vector<std::uint8_t> bytes(sizeof(value));
+  std::memcpy(bytes.data(), &value, sizeof(value));
+  return constant({DataType::Int32, {1}}, bytes);
 }
 
 Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned axis) {

@@ -20,6 +20,10 @@ target_link_libraries(np101_decoder_check PRIVATE np101_decoder)
 
 specferry_native_test(np101_opt_decoder_check np101/opt_decoder_check.cpp np101/case_file.cpp)
 target_link_libraries(np101_opt_decoder_check PRIVATE np101_opt_decoder)
+specferry_native_test(np101_opt_io_check np101/opt_io_check.cpp np101/case_file.cpp)
+target_link_libraries(np101_opt_io_check PRIVATE np101_opt_decoder)
+specferry_native_test(np101_sampling_check np101/sampling_check.cpp)
+target_link_libraries(np101_sampling_check PRIVATE np101_ops)
 
 add_executable(np101_data_test np101/data_test.cpp np101/case_file.cpp)
 target_link_libraries(np101_data_test PRIVATE np101_data opt_data qwen_data)
@@ -27,6 +31,13 @@ target_compile_options(np101_data_test PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(np101_data_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 add_test(NAME np101_data_contract COMMAND np101_data_test)
 set_tests_properties(np101_data_contract PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
+
+add_executable(generation_test generation_test.cpp)
+target_link_libraries(generation_test PRIVATE specferry_generation)
+target_compile_options(generation_test PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(generation_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME autoregressive_generation_contract COMMAND generation_test)
+set_tests_properties(autoregressive_generation_contract PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
 
 # Device diagnostics are explicit commands: ordinary CTest must not open NP101
 # or spend minutes waiting for a device graph to complete.

@@ -2,6 +2,7 @@
 
 #include "models/opt/config.hpp"
 #include "np101/context.hpp"
+#include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 
 #include <cstddef>
@@ -18,11 +19,16 @@ class DecoderSlice {
 public:
   DecoderSlice(np101::Context &context, const np101::WeightStore &weights, const Config &config,
                const std::vector<unsigned> &layers);
+  DecoderSlice(np101::Context &context, const np101::WeightStore &weights, const Config &config,
+               const std::vector<unsigned> &layers, np101::TensorBinding input);
   ~DecoderSlice();
   DecoderSlice(const DecoderSlice &) = delete;
   DecoderSlice &operator=(const DecoderSlice &) = delete;
 
   void step(const std::vector<std::uint8_t> &hidden);
+  // Execute from a retained producer tensor, without uploading a hidden vector.
+  void step_bound();
+  np101::TensorBinding output_binding();
   void reset();
   unsigned length() const;
   std::size_t cache_writes() const;

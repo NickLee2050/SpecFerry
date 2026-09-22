@@ -2,8 +2,8 @@
 
 Status on 2026-09-22: **CPU, export, single-layer and four-layer numerical/lifecycle
 checks passed after avoiding an SDK optimizer crash.** This covers the model adapter and existing component/slice scope.
-Full embedding, all-layer execution, LM head and device text generation are not
-implemented by this check.
+This slice check remains focused on components. Embedding, all-layer execution,
+LM head and greedy generation now have a [separate validation path](np101-generation.md).
 
 ## Checkpoint and precision
 

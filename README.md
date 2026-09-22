@@ -11,7 +11,8 @@ and decoder checks remain a regression baseline. Shared NP101 graph construction
 normalization, Attention/DeltaNet arithmetic, SwiGLU, tensor bindings and KV storage
 now take explicit contracts. Model configuration, checkpoint names and decoder
 composition live under `native/models/` and `python/specferry/models/`.
-Full DLM inference on NP101 is not yet implemented.
+The complete OPT embedding-to-token SDK path is implemented, including all 24 layers.
+Numerical validation is separate from the pending exclusive-NPU/residency acceptance.
 See the [completed-module decoupling checklist](docs/model-decoupling-plan.md),
 [component contracts and checks](tests/np101-components.md), and
 [project constraints](AGENTS.md).
@@ -108,8 +109,46 @@ layers at 32 and 512 steps. A SIGSEGV on the
 first FCL attempt set a recovery marker; it was archived after basic health and
 the corrected OPT lifecycle checks passed. Honor any new recovery marker.
 `--diagnostic` permits numerical success without proving exclusive NPU execution
-or physical residency. Full-model embedding, LM head and generation remain later
-integration work. See [OPT validation and the SDK crash diagnosis](tests/np101-opt.md).
+or physical residency. See [OPT slice validation and the SDK crash diagnosis](tests/np101-opt.md), and
+[complete-model validation](tests/np101-generation.md).
+
+## Generate text with OPT-350M
+
+After verifying the OPT export and building the native targets:
+
+```bash
+cmake --build build -j 4
+python scripts/generate_opt.py --prompt 'The capital of France is' \
+  --max-new-tokens 32 --output .cache/runs/opt-generation
+```
+
+The C++ runtime keeps the embedding/head table, all 24 decoder layers and their
+KV buffers alive together. Normal generation uploads scalar controls and reads
+only predicted token IDs. Python tokenizes and displays text; it does not compute
+model layers. Capacity defaults to 512 and batch size is one. The default decoding
+policy comes from the checkpoint's `generation_config.json`, with omitted fields
+resolved by the pinned Transformers version. For the retained OPT-350M checkpoint,
+this resolves to greedy decoding (`do_sample=false`, `num_beams=1`). Generation
+length remains an application setting: `--max-new-tokens` defaults to 32.
+Reports include stop reason, consumed length, transfer counts, initialization and
+wall-clock token timings. The last returned token has not yet been consumed into KV.
+Use a new output directory for each run.
+Add `--compare-cpu` to check generated token IDs with the official CPU model
+after native execution using the checkpoint's default decoding policy; normal
+generation does not load that reference. Reports retain the generation-config
+hash, resolved policy and any explicit sampling override. Unsupported checkpoint
+policies fail before SDK execution rather than being silently replaced.
+
+To explicitly override the model policy with full-vocabulary sampling, add `--sample --seed 42`.
+This uses temperature 1 without top-k/top-p filtering. The SDK samples logits
+promoted exactly from FP16 to FP32; model weights remain FP16. Sampling uploads
+16 seed bytes per prediction and still reads only the resulting token ID.
+`--compare-cpu` is restricted to greedy mode because SDK and CPU random streams
+are not interchangeable. See [sampling validation](tests/np101-sampling.md).
+
+The [complete-model validation guide](tests/np101-generation.md) documents input/output,
+4/8/24-layer checks, exact tie handling, bounds, reset/recreation and the preserved
+hardware evidence gates. SDK execution success is not proof of exclusive NPU execution.
 
 ## Record the host and device environment
 
@@ -318,7 +357,7 @@ results, memory accounting, and the remaining hardware evidence gates.
 These CLI defaults enforce the retained Qwen checkpoint contract. The shared pack
 reader/writer, integrity checks and memory accounting are model independent; the
 Qwen adapter selects names, aliases and target dtypes. OPT uses `scripts/export_opt.py`;
-its full-model device allocation remains pending.
+its complete-model SDK initialization now passes; physical residency remains unproven.
 
 ```bash
 python scripts/export_np101_dlm.py --output .cache/np101/Qwen3.5-0.8B
@@ -441,7 +480,6 @@ ctest --test-dir build --output-on-failure
 
 ## Pending implementation
 
-Full NP101 model inference, onboard CPU deployment, TLM inference, and communication
-between the draft and target models are not yet implemented. Capability diagnostics
-and exported weights are preparation for full deployment; review their unresolved
-hardware and memory acceptance items before proceeding.
+OPT complete-model computation and greedy generation are implemented through the SDK.
+Final NPU execution/residency and performance acceptance remain open. Onboard CPU
+deployment, TLM inference and draft/target communication remain later work.

@@ -129,6 +129,19 @@ void opt_contracts() {
   const auto config = specferry::models::opt::read_config(path);
   require(config.kv_spec().head_dim == 64, "OPT heads must retain their configured width");
   rejects([&] { config.prefix(24); }, "OPT layer outside configured range");
+  write(directory.path / "model.txt", "specferry-opt-model 1\n512 50272 2048 2 4096 2 2 1\n");
+  auto model = specferry::models::opt::read_model_config(directory.path);
+  model.validate_token(0);
+  model.validate_token(50271);
+  rejects([&] { model.validate_token(-1); }, "negative model token");
+  rejects([&] { model.validate_token(50272); }, "out-of-vocabulary model token");
+  for (const auto *record : {"512 50272 2048 0 4096 2 2 1", "512 50272 511 2 4096 2 2 1",
+                             "512 50272 2048 2 0 2 2 1", "512 50272 2048 2 4096 50272 2 1",
+                             "512 50272 2048 2 4096 2 2 2", "512 50272 2048 2 4096 2 2 1 extra"}) {
+    write(directory.path / "model.txt", std::string("specferry-opt-model 1\n") + record + "\n");
+    rejects([&] { specferry::models::opt::read_model_config(directory.path); },
+            "invalid model IO configuration rejected before device initialization");
+  }
   for (const auto *record :
        {"1024 4096 0 24 512 1e-5", "1024 4096 16 24 513 1e-5", "1024 4096 16 24 512 -1",
         "1024 4096 16 24 512 1e-5 extra", "-1 4096 16 24 512 1e-5", "1024 4097 16 24 512 1e-5"}) {

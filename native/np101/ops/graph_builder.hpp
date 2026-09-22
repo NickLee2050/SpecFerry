@@ -45,6 +45,9 @@ public:
   Tensor reduce(Tensor input, bool mean, unsigned axis = 0);
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);
+  Tensor gather(Tensor input, Tensor indices, unsigned axis);
+  Tensor argmax(Tensor input, unsigned axis);
+  Tensor integer(std::int32_t value);
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
   // FP16 MatMul followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,

@@ -72,9 +72,59 @@ The four-layer capacity suite passed 1,465 checks across 560 total steps and 2,2
 KV appends, with no explicit intermediate readbacks during steps. The retained
 Qwen synthetic decoder/KV regression, 61 host Python tests, CTest and format checks
 also passed. These are numerical/lifecycle results, not exclusive NPU proof.
-See [commands, diagnosis and evidence](tests/np101-opt.md). Full-model integration and generation
-remain S9/S10; final hardware acceptance remains S11. No repeated Qwen capacity
+See [commands, diagnosis and evidence](tests/np101-opt.md). Full-model integration and generation are now implemented under S9/S10 below;
+final hardware acceptance remains S11. No repeated Qwen capacity
 probe or driver/system changes are part of this adapter task.
+
+## NP101-MODEL-003: Complete OPT input/output and generation (S9/S10)
+
+- [x] S9: Add blocked FP16 token lookup, project-in and learned position offset.
+- [x] S9: Bind the last decoder output to project-out and the complete tied LM head.
+- [x] S9: Share resident embedding/head allocations; perform local/global argmax
+  and candidate gathering in SDK graphs, including exact ties and valid tail rows.
+- [x] S9: Validate original-weight input/output and independent exact selection cases.
+- [x] S10: Integrate 4, 8 and all 24 resident decoder layers with ordinary shared
+  activations and one preallocated K/V pair per layer; no host hidden/cache copies.
+- [x] S10: Implement sequential prefill, greedy decode, BOS/EOS, fixed capacity,
+  zero/maximum new-token limits, reset and explicit consumed-length semantics.
+- [x] S10: Validate every layer against official CPU trajectories, exact reset,
+  final-only/fresh repeats, scalar-only transfers, ordered release and process exit.
+- [x] S10: Generate a 32-token continuation through the complete SDK model and
+  compare all token IDs with the official CPU implementation.
+- [x] Resolve default decoding from the checkpoint generation configuration;
+  retain sampling as an explicit override and reject unsupported policy settings.
+- [ ] S11: Establish per-kernel backend and physical weight/KV residency, account
+  for SDK layouts/workspace, and complete formal whole-model performance acceptance.
+
+Evidence and commands: [complete-model validation](tests/np101-generation.md).
+The 24-layer numerical suite passes 491 checks with unchanged tolerances; all
+24 layers and capacity-512 KV buffers coexist. Known payload is 679.71 MiB before
+SDK overhead. Normal computation uploads 104 control bytes per consumed token
+and reads four bytes per prediction. The France and dinner prompts' 32-token
+continuations both match CPU exactly. Empty input with capacity one consumes BOS,
+returns one matching token and stops for capacity. This does not establish exclusive NPU execution or physical
+board residency; NP101-OBS-001 and the physical-state portion of NP101-STATE-001
+remain open. OPT execution is not blocked by the historical Qwen allocation limit.
+The requested Qwen3.5 real-weight four-layer regression also passed: 737 checks,
+80 total steps across reset/final-only/fresh sequences, unchanged CPU references
+and tolerances, and no explicit host intermediate reads during normal steps.
+
+After S11, continue the original sequence with TLM/protocol integration and later
+speculative-inference experiments. No TLM, network protocol, onboard CPU deployment,
+MLIR or quantization work is included in S9/S10.
+
+## NP101-OP-003: Direct FP16 categorical sampling returns incorrect indices
+
+- [x] Reproduce the documented RANDOM_MULTINOMIAL operator with 8 and 50,272 classes.
+- [x] Validate FP32 logits and exact FP16-to-FP32 promotion; use the promoted path
+  for optional OPT sampling while preserving original FP16 weights and greedy default.
+- [ ] Ask the chip team to confirm or correct direct FP16 sampling before enabling it.
+
+Direct FP16 returned index 8 for every eight-class sample, and index 8216 even
+when only token 50271 had non-negligible probability in the full-vocabulary case.
+SDK calls and teardown succeeded. This is a numerical failure, not a driver hang.
+The validated FP32 path removes the current sampling blocker; it does not establish
+the kernel's exclusive NPU execution. See [reproduction and evidence](tests/np101-sampling.md).
 
 ## NP101-MEM-002: Share DeltaNet weights across alternating state graphs
 

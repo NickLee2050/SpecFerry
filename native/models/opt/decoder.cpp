@@ -2,7 +2,6 @@
 #include "np101/kv_cache.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
-#include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
 
@@ -151,20 +150,24 @@ struct DecoderSlice::Impl {
   Config config;
   Graph storage;
   vsi_nn_tensor_id_t input;
+  bool bound_input;
   std::vector<unsigned> selected;
   std::vector<std::unique_ptr<Layer>> layers;
   unsigned completed = 0;
   bool failed = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &spec,
-       const std::vector<unsigned> &indices)
-      : config(spec), storage(context, 1, 0),
-        input(add_tensor(storage, config.hidden_spec(), false,
-                         std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
+       const std::vector<unsigned> &indices, const TensorBinding *external = nullptr)
+      : config(spec), storage(context, 1, 0), input(VSI_NN_TENSOR_ID_NA), bound_input(external),
         selected(indices) {
+    if (!external) {
+      input = add_tensor(storage, config.hidden_spec(), false,
+                         std::vector<std::uint8_t>(config.hidden_spec().bytes()));
+    }
     try {
       for (auto layer : selected) {
-        const auto binding = layers.empty() ? TensorBinding{storage, input}
+        const auto first = external ? *external : TensorBinding{storage, input};
+        const auto binding = layers.empty() ? first
                                             : TensorBinding{layers.back()->tail.graph,
                                                             layers.back()->tail.output.id};
         layers.push_back(std::make_unique<Layer>(context, weights, config, layer, binding));
@@ -192,9 +195,18 @@ DecoderSlice::DecoderSlice(Context &context, const WeightStore &weights, const C
 
 DecoderSlice::~DecoderSlice() = default;
 
+DecoderSlice::DecoderSlice(Context &context, const WeightStore &weights, const Config &config,
+                           const std::vector<unsigned> &layers, TensorBinding input) {
+  validate_weights(weights, config, layers);
+  impl_ = std::make_unique<Impl>(context, weights, config, layers, &input);
+}
+
 void DecoderSlice::step(const std::vector<std::uint8_t> &hidden) {
   if (!impl_ || impl_->failed) {
     throw std::logic_error("OPT slice is closed or failed");
+  }
+  if (impl_->bound_input) {
+    throw std::logic_error("use step_bound for an externally bound OPT slice");
   }
   if (hidden.size() != impl_->config.hidden_spec().bytes()) {
     throw std::invalid_argument("OPT input size mismatch");
@@ -209,6 +221,29 @@ void DecoderSlice::step(const std::vector<std::uint8_t> &hidden) {
   }
   ++impl_->completed;
   impl_->failed = false;
+}
+
+void DecoderSlice::step_bound() {
+  if (!impl_ || impl_->failed || !impl_->bound_input) {
+    throw std::logic_error("OPT slice has no valid external input binding");
+  }
+  if (impl_->completed >= impl_->config.capacity) {
+    throw std::out_of_range("OPT KV capacity exhausted");
+  }
+  impl_->failed = true;
+  for (auto &layer : impl_->layers) {
+    layer->step(impl_->completed);
+  }
+  ++impl_->completed;
+  impl_->failed = false;
+}
+
+TensorBinding DecoderSlice::output_binding() {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("OPT slice is closed or failed");
+  }
+  auto &tail = impl_->layers.back()->tail;
+  return {tail.graph, tail.output.id};
 }
 
 void DecoderSlice::reset() {
