@@ -4,8 +4,9 @@ A testbed for speculative decoding across heterogeneous edge devices and a local
 The active deployment target is full text inference of `facebook/opt-350m`
 on NP101 as the draft language model (DLM). OPT now has an official FP16 CPU
 reference, a byte-preserving checkpoint exporter, and a native decoder-slice
-validation path. Its first device run crashed during initialization, so OPT
-device numerical acceptance remains pending. Qwen3.5-0.8B references, mixers
+validation path. Biased projections use documented MatMul/Add after an isolated
+FCL graph reproduced an SDK optimizer crash. OPT single-layer and four-layer
+numerical/lifecycle checks now pass. Qwen3.5-0.8B references, mixers
 and decoder checks remain a regression baseline. Shared NP101 graph construction, projections,
 normalization, Attention/DeltaNet arithmetic, SwiGLU, tensor bindings and KV storage
 now take explicit contracts. Model configuration, checkpoint names and decoder
@@ -101,13 +102,14 @@ every byte independently, and aliases the LM head to the embedding. The default
 deployment directory is `.cache/np101/opt-350m`.
 
 `--prepare-only` creates independent official CPU expectations without accessing the
-board. After device recovery is confirmed, use a new output directory and replace
-`--prepare-only` with `--diagnostic` to execute the slice. Start with `--layers 0
---steps 8 --capacity 8`, then check four layers at 32 and 512 steps. A SIGSEGV on the
-first attempt set the existing recovery marker; do not bypass it to retry.
+board. Use a new output directory and replace `--prepare-only` with `--diagnostic`
+to execute the slice. Start with `--layers 0 --steps 8 --capacity 8`, then check four
+layers at 32 and 512 steps. A SIGSEGV on the
+first FCL attempt set a recovery marker; it was archived after basic health and
+the corrected OPT lifecycle checks passed. Honor any new recovery marker.
 `--diagnostic` permits numerical success without proving exclusive NPU execution
 or physical residency. Full-model embedding, LM head and generation remain later
-integration work. See [OPT validation and current blocker](tests/np101-opt.md).
+integration work. See [OPT validation and the SDK crash diagnosis](tests/np101-opt.md).
 
 ## Record the host and device environment
 

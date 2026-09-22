@@ -1,6 +1,6 @@
 # Engineering follow-up
 
-Updated: 2026-09-21. Active target: resident text inference of OPT-350M on NP101.
+Updated: 2026-09-22. Active target: resident text inference of OPT-350M on NP101.
 
 ## NP101-MODEL-001: Decouple completed data, reference and NP101 paths
 
@@ -48,21 +48,31 @@ prerequisite.
   construction, biased projection, LayerNorm, Attention and single-buffer KV storage.
 - [x] Prepare independent layer-0, layer-23 and four-layer 512-step CPU trajectories;
   align the original captured prefix with the full official model.
-- [ ] Diagnose the initialization SIGSEGV, then pass the device single-layer and
-  four-layer numerical/lifecycle suites after confirmed device recovery.
+- [x] Locate the initialization SIGSEGV in the SDK optimizer and replace the failing
+  biased-FCL path with documented MatMul/Add. Single-layer, last-layer and four-layer
+  32/512-step numerical/lifecycle checks pass without changing the reference or thresholds.
 - [ ] Establish actual execution backend and residency, together with NP101-OBS-001.
 
 On 2026-09-21, the first eight-step layer-0 device attempt exited with SIGSEGV
 while `phase=initialize`, before any completed step or output capture. The process
 group exited; the runner set `.cache/runs/np101-recovery-required.json`.
-This is not evidence of a numerical mismatch, an allocation ceiling, or a proven
-FCL defect. The failing call is not yet known. CPU/export acceptance remains valid;
-OPT device acceptance is **blocked**, not complete.
+On 2026-09-22, constant/mutable allocation and the convolution baseline passed on
+the same boot. GDB located a null dereference in
+`libOpenVX.so:vxoGraphOptimization_getKernelType`, reached from
+`vxoGraphOptimization_ConvertMaxPool2Conv` during verification of the first Q/K/V
+graph. An isolated 8x8 biased FCL reproduced it with valid tensor handles and no
+cache or shared graphs. No `nn_param`/`pool.local` overwrite was found.
 
-Resume with confirmed device recovery, locate the failing call with a debugger,
-fix the demonstrated cause, and run single-layer capacity/reset/recreation checks
-before the four-layer 32/512-step checks. Keep the predeclared numerical thresholds.
-See [commands and evidence](tests/np101-opt.md). Full-model integration and generation
+The production fix uses FP16 MatMul followed by FP16 bias addition. Weight bytes
+stay unchanged; the extra activation rounding is checked against the unchanged
+official reference. The SDK optimizer failure remains unresolved, but this
+documented path avoids it. The old recovery marker was archived after a corrected
+OPT slice passed calculation, reset, recreation, release and process-exit checks.
+The four-layer capacity suite passed 1,465 checks across 560 total steps and 2,240
+KV appends, with no explicit intermediate readbacks during steps. The retained
+Qwen synthetic decoder/KV regression, 61 host Python tests, CTest and format checks
+also passed. These are numerical/lifecycle results, not exclusive NPU proof.
+See [commands, diagnosis and evidence](tests/np101-opt.md). Full-model integration and generation
 remain S9/S10; final hardware acceptance remains S11. No repeated Qwen capacity
 probe or driver/system changes are part of this adapter task.
 

@@ -61,7 +61,8 @@ Tensor GraphBuilder::bind(TensorBinding source, TensorSpec expected) {
 vsi_nn_node_t *GraphBuilder::node(vsi_nn_op_t op, std::initializer_list<Tensor> inputs,
                                   Tensor output) {
   auto *result = vsi_nn_AddNode(graph.get(), op, 0, 0, nullptr);
-  if (!result || result->input.num < inputs.size() || result->output.num < 1) {
+  if (!result || !result->input.tensors || !result->output.tensors ||
+      result->input.num < inputs.size() || result->output.num < 1) {
     throw std::runtime_error("AddNode failed");
   }
   std::fill_n(result->input.tensors, result->input.num, VSI_NN_TENSOR_ID_NA);
@@ -237,13 +238,11 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
       bias.spec.shape != Shape{matrix.spec.shape[1]}) {
     throw std::invalid_argument("linear requires FP16 input [K,1], weight [K,N], bias [N]");
   }
-  auto coefficients = weight(store, matrix, matrix.spec);
-  auto offset = weight(store, bias, bias.spec);
-  auto output = tensor({f16, {matrix.spec.shape[1], 1}});
-  auto *operation = node(VSI_NN_OP_FCL, {input, coefficients, offset}, output);
-  operation->nn_param.fcl.weights = matrix.spec.shape[1];
-  operation->nn_param.fcl.axis = 0;
-  return output;
+  // The installed SDK crashes while verifying even an isolated biased FCL.
+  // Use documented MatMul/Add; FP16 projection rounds before the bias addition.
+  // Keep this boundary visible in the independent model-level comparisons.
+  auto projected = project(input, store, matrix);
+  return binary(VSI_NN_OP_ADD, projected, weight(store, bias, bias.spec));
 }
 
 Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {

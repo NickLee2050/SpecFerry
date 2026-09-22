@@ -46,7 +46,7 @@ public:
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
-  // Fused FP16 fully connected operation, including bias before output rounding.
+  // FP16 MatMul followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
                 const WeightRecord &bias);
   Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);

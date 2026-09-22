@@ -1,7 +1,7 @@
 # OPT checkpoint and decoder validation
 
-Status on 2026-09-21: **CPU and export passed; device validation blocked during
-initialization.** This covers the model adapter and existing component/slice scope.
+Status on 2026-09-22: **CPU, export, single-layer and four-layer numerical/lifecycle
+checks passed after avoiding an SDK optimizer crash.** This covers the model adapter and existing component/slice scope.
 Full embedding, all-layer execution, LM head and device text generation are not
 implemented by this check.
 
@@ -28,10 +28,15 @@ checkpoint precision.
 
 `python/specferry/models/opt/` owns checkpoint contracts, official references,
 export and comparisons. `native/models/opt/` owns layer names, post-norm ordering,
-ReLU selection and configuration. Shared `np101/ops/GraphBuilder` adds biased FCL
-projection and LayerNorm arithmetic; existing Attention and KV code is reused.
-FCL is documented in the chip team's guide; this configuration has **not yet
-passed device validation**. Do not infer SDK support from its presence in the guide.
+ReLU selection and configuration. Shared `np101/ops/GraphBuilder` implements biased
+projection with documented `MATRIXMUL` followed by `ADD`, plus LayerNorm arithmetic;
+existing Attention and KV code is reused. Biased FCL is not used by the production
+adapter because its graph verification crashes in the installed SDK.
+
+MatMul stores an FP16 intermediate before bias addition, adding a rounding boundary
+relative to a fused projection. This is an activation difference, not a checkpoint
+conversion. Official CPU expectations and predeclared thresholds remain unchanged;
+the checks include each projection and the complete downstream decoder trajectory.
 
 The projection graph produces FP16 Q/K/V; Q is scaled before QK to match the
 official OPT operation order. A slot-copy graph appends only the new K/V to one
@@ -67,11 +72,11 @@ python scripts/export_opt.py --verify-only
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --target np101_opt_decoder_check -j 4
 
-# Offline expectations; safe while device recovery is pending.
+# Offline expectations; no device access.
 python scripts/check_np101_opt.py --trace .cache/runs/opt-cpu/trace.npz \
   --layers 0 1 2 3 --steps 512 --prepare-only --output .cache/runs/opt-prepared
 
-# Only after device recovery has been confirmed; use new output directories.
+# Device checks require a healthy device and new output directories.
 python scripts/check_np101_opt.py --trace .cache/runs/opt-cpu/trace.npz \
   --layers 0 --steps 8 --capacity 8 --diagnostic --output .cache/runs/opt-layer
 python scripts/check_np101_opt.py --trace .cache/runs/opt-cpu/trace.npz \
@@ -100,16 +105,73 @@ Paths below are relative to `.cache/`:
 | Layer 0 device attempt | SIGSEGV in initialization; zero completed steps | `runs/opt-layer-device-20260921/device/` |
 | Host regression and code checks | 61 Python tests, CTest, full native build, self-contained headers, Ruff and clang-format passed | Repository host test commands |
 
-The process returned `-11`, fault address `0xb0`, after driver activity was observed.
+The original process returned `-11`, fault address `0xb0`, after driver activity was observed.
 `execution.json` remained at `phase=initialize`, with no captured output.
 All traced processes exited. The runner set `runs/np101-recovery-required.json`;
-its existing recovery guard prevents automatic retries. The available Apport file
+its existing recovery guard prevented automatic retries. The available Apport file
 describes `strace`, not the decoder, so it does not locate the failing SDK call.
 Current-user journal access did not expose kernel logs; no sudo was used.
-The cause is unresolved; do not label this as a memory-capacity or FCL defect.
 
-After confirmed recovery, obtain a debugger backtrace, fix the demonstrated cause,
-then pass the device commands in increasing scope. No device result or exclusive
-NPU execution/residency claim is available yet. The whole-model memory report is
-a lower bound (weights plus KV); SDK layouts, activations and workspace remain
-unknown. Selected-slice success would not establish full-model allocation.
+## Diagnosis and correction on 2026-09-22
+
+The user authorized basic health checks, then OPT diagnosis. On the same boot,
+constant and mutable paths each loaded/read back 25 weights (118,156 bytes), and
+two convolution/ReLU/pooling iterations reproduced the earlier outputs. All
+processes exited normally. Evidence: `runs/device-health-20260922/summary.json`.
+
+GDB located the fault during `vsi_nn_VerifyGraph` of the first Q/K/V projection:
+
+```text
+vxoGraphOptimization_getKernelType
+vxoGraphOptimization_ConvertMaxPool2Conv
+vxoGraphOptimization
+vxoGraph_VerifyGraph
+vxVerifyGraph
+GraphBuilder::compile
+Projection::Projection
+```
+
+The faulting instruction dereferenced `0xb0` from a zero register inside
+`libOpenVX.so.1`. An isolated 8x8 biased FCL, without model weights, cache or
+cross-graph bindings, reproduced the same stack. All four tensor handles were
+non-null and passed `vxGetStatus` before verification; the FCL node handle was
+also non-null. The failing graph contains no POOL node and does not replace
+`nn_param` or `pool.local`, so this is distinct from the demo README's deinitialization
+mistake. The SDK's internal reason for the null reference still needs vendor analysis.
+
+Two alternatives were rejected before adoption: FP16-input/FP32-output MatMul
+returned an explicit unsupported-dtype error, and a 1x1 convolution projection
+hit the same optimizer fault. Ordinary FP16 MatMul plus FP16 Add passed a small
+exact-output probe and the actual OPT regression. No internal SDK pointer or
+undocumented optimizer switch was patched. Required node input/output arrays are
+checked before dereference; SDK-owned parameter state remains intact.
+
+Temporary probes, immutable binaries and GDB logs are under
+`runs/opt-debug-20260922/`. They are diagnostic artifacts, not new permanent test
+entry points. Existing OPT suites provide the regression for production `linear`.
+
+| Corrected check | Result | Evidence under `runs/` |
+|---|---|---|
+| Layer 0, capacity 8 | 322 checks, 32 total steps; capacity rejection, reset/fresh/final-only agreement | `opt-fixed-layer-20260922/opt.json` |
+| Layer 23, second prompt | 322 checks, 32 total steps | `opt-fixed-last-layer-20260922/opt.json` |
+| Four layers, 32-step trajectory | 1,345 checks, 80 total steps, 320 KV appends | `opt-fixed-group-32-20260922/opt.json` |
+| Four layers, 512-step trajectory | 1,465 checks, 560 total steps, 2,240 KV appends; token 513 rejected | `opt-fixed-group-512-20260922/opt.json` |
+| Retained Qwen decoder and alternate KV layout | 353 decoder checks and KV suite passed | `opt-fix-qwen-regression-20260922/` |
+
+All four corrected OPT runs passed the original `atol=0.08, rtol=0.02` budget.
+The largest observed absolute difference in the four-layer capacity run was
+0.0625. Exact reset/fresh/final-only repeats and masked-suffix checks passed. Normal
+steps made zero explicit intermediate reads; the capacity suite uploaded 1,155,840
+bytes across 560 steps (2,048 hidden bytes plus four 4-byte length controls per step).
+The 61 Python tests, native CTest, complete build and both formatting checks passed.
+
+The first corrected layer reused the original frozen fixture under
+`runs/opt-layer-device-20260921/fixture/`. Subsequent runs snapshot their own fixtures,
+binary and source hashes. The prior recovery marker was archived in
+`runs/opt-fixed-layer-20260922/previous-recovery.json` after the corrected layer
+passed reset, recreation, release and normal process exit; no driver change, sudo
+or server restart was used. New abnormal exits must still stop automatic tests.
+
+Exclusive NPU execution and physical residency remain unproven. The whole-model
+memory report is a lower bound (weights plus KV); SDK layouts, activations and
+workspace remain unknown. Slice success does not establish full-model allocation.

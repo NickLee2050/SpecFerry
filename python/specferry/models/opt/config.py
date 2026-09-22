@@ -35,7 +35,7 @@ class Components:
             or self.epsilon <= 0
         ):
             raise ValueError("unsupported OPT component configuration")
-        # The current FCL path reads each matrix in one bounded block.
+        # The current projection path reads each matrix in one bounded block.
         if self.hidden * max(self.hidden, self.intermediate) * 2 > 8 * 1024**2:
             raise ValueError("OPT projection exceeds the validated 8 MiB matrix size")
 
