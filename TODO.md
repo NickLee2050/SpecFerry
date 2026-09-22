@@ -158,14 +158,46 @@ memory savings and residency require NP101-OBS-001 evidence.
 - [ ] Resolve the effective tensor allocation/upload limit and validate the
   vendor-supported allocation path.
 
-Status: waiting for the NP101 development team. The user has sent the findings
-to the team and will provide their driver update or alternative API usage.
-Integration and verification belong to SpecFerry after that response arrives.
+Status: the supplied 1.0.6 package was rechecked on 2026-09-22. The vendor-command
+reproduction allocated and initialized all 502 Qwen weight/state tensors,
+totaling 1,550,863,040 bytes, but weight readback failed at
+`model.layers.17.mlp.gate_proj.weight` (offset 0, 7,340,032-byte chunk).
+All 320 logical weights uploaded; only 912,175,872 earlier weight bytes were
+verified before the mismatch. The process exited with code 1, without timeout,
+signal or residual children, and the module reference count returned to zero.
+Evidence is under `.cache/runs/allocation-repro_0922_1/`.
+
+Synthetic allocation and initialization also succeeded for 1,152 MiB in both
+constant and mutable mode, but retained-byte readback failed in both. The old
+allocation/upload boundary has been crossed; reliable retained data remains
+unverified at these sizes. The capacity issue remains open. See
+[new-package capacity evidence](tests/np101-capacity.md).
+
+The largest payload fully verified in this recheck was 864 MiB (constant mode).
+This is a tested lower bound, not a measured physical-memory limit. Both the
+1,024 MiB constant run and 1,152 MiB mutable run had an identical failed block:
+block 109, starting at byte 1,274,680 within that block, with 12 FP16 values
+replaced by zeros. Both explicitly released and exited normally. Probing toward
+4 GiB stopped at this data-integrity failure. The separate convolution preflight
+also raised SIGFPE in `NNTransposeCycleCount_V9`; its caller/SDK cause is unresolved.
+All 617 checked installed package files matched the supplied package.
+
+The strengthened version-2 diagnostics now compare equal-byte FP16/FP32 allocations
+in both constant and mutable modes. All four 64 MiB controls pass. All four
+1152 MiB runs reproduce zero data in the same three eight-byte regions of block
+109: twelve FP16 values or six FP32 values. This is not an FP16-only failure.
+The real Qwen run captures the first changed byte at offset 3,400,312 of the same
+layer-17 weight, then verifies all 46,071,808 zero-initialized state bytes and
+explicitly releases. Small weight/state fixtures pass both storage modes.
+All eleven runs exit without signal, timeout or residual process; the final module
+reference count is zero. Evidence is under `.cache/runs/allocation-review-20260922/`.
+The diagnostic implementation passes its build, 73 Python tests, three CTest
+tests and formatting checks. Data integrity above 1 GiB remains unresolved.
 
 ### Working constraint and evidence
 
-Use **1 GiB (1,073,741,824 bytes)** as the provisional ceiling for the current
-tested constant and mutable allocation/upload paths. It is a planning constraint, not a verified
+The previous package used **1 GiB (1,073,741,824 bytes)** as the provisional ceiling
+for the tested constant and mutable allocation/upload paths. It was a planning constraint, not a verified
 description of all board memory or proof of which pool backs the tensors.
 Allow room below it for SDK allocations, alignment, and any duplicated layouts.
 
@@ -203,6 +235,12 @@ The mutable experiment is under `.cache/runs/weight-allocation-mutable-20260917/
 see [the allocation comparison](tests/np101-mutable-allocation.md).
 
 ### Required follow-up and closure
+
+The immediate 1.0.6 follow-up is to explain/fix the reproducible retained-byte
+corruption and the independent computation SIGFPE. Existing numerical evidence
+from the previous SDK is not automatic acceptance of the new package. Full Qwen
+weight loading and new-package whole-model hardware acceptance remain dependent
+on these checks; host implementation and CPU reference work may continue.
 
 1. Obtain the team's explanation of constant/mutable tensor pool selection and a
    supported driver configuration, driver build, or alternative allocation API.

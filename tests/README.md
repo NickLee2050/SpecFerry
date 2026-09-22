@@ -4,13 +4,15 @@
 |---|---|---|
 | `python/` | Download, export integrity/precision, memory budget, and numerical comparison unit tests | No |
 | `native/generation_test.cpp` | BOS/EOS, capacity, generation limits and consumed-token semantics | No |
+| `native/allocation_support_test.cpp` | Finite FP16/FP32 patterns, page-alias detection, byte/length mismatch and report escaping | No |
 | `native/np101/opt_io_check.cpp` | Shared embedding/head blocks, learned positions and greedy selection | Yes |
 | `native/np101/sampling_check.cpp` | Categorical frequencies, seed replay and full-vocabulary bounds | Yes |
 | `native/np101/data_test.cpp` | Tensor/component contracts, native weight reader, and fixture parser unit tests | No |
 | `native/np101/conv_relu_pool_test.cpp` | FP16 convolution, ReLU, and max-pooling numerical regression | Yes |
 | `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
 | `native/np101/graph_sharing_check.cpp` | Cross-graph tensor attachment and execution | Yes, when the SDK exports the API |
-| `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, state coexistence, and full weight readback | Yes |
+| `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, weight/state readback and explicit teardown | Yes |
+| `native/np101/capacity_check.cpp` | Equal-byte FP16/FP32 capacity probes in constant/mutable storage | Yes |
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 | `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
 | `native/np101/decoder_check.cpp` | Explicit decoder slices, shared bindings, state/reset, transfer counts and capacity | Yes |
@@ -28,6 +30,10 @@ ctest --test-dir build --output-on-failure
 CTest registers only host unit tests. Hardware checks are explicit `scripts/check_np101_*.py`
 commands documented in the root README. Each uses a fresh output directory under
 `.cache/runs/`; generated fixtures and logs are not source files.
+
+[Capacity probing](np101-capacity.md) records the bounded 1–4 GiB experiment,
+the new-package preflight and the distinction between an allocation rejection
+and an abnormal SDK exit. Its host test never opens the device.
 
 The operator fixture format is a versioned test protocol, not a model compiler.
 NumPy arrays are row-major; graph tensor dimensions list the contiguous axis first.

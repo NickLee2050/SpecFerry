@@ -1,8 +1,8 @@
+#include "allocation_support.hpp"
 #include "np101/context.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
-#include "sys/resource.h"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -11,7 +11,6 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <ios>
 #include <iostream>
 #include <sstream>
@@ -21,12 +20,12 @@
 
 namespace {
 using namespace specferry::np101;
+using namespace specferry::testing;
 
 struct AllocationProgress {
-  std::filesystem::path output;
-  std::string phase = "validate_weights";
+  AllocationOutcome outcome;
+  Storage storage = Storage::Constant;
   std::string current_weight;
-  bool constant_weights = true;
   std::size_t tensors = 0;
   std::size_t payload_bytes = 0;
   std::size_t expected_weights = 0;
@@ -34,35 +33,45 @@ struct AllocationProgress {
   std::size_t expected_weight_bytes = 0;
   std::size_t uploaded_weight_bytes = 0;
   std::size_t verified_weight_bytes = 0;
+  std::size_t expected_state_bytes = 0;
+  std::size_t uploaded_state_bytes = 0;
+  std::size_t verified_state_bytes = 0;
   std::size_t chunk_offset = 0;
   std::size_t chunk_bytes = 0;
   bool states_complete = false;
 
-  void save(const std::string &status) const {
-    struct rusage usage {};
-
-    if (getrusage(RUSAGE_SELF, &usage) != 0) {
-      throw std::runtime_error("getrusage failed");
-    }
-    std::ofstream report(output);
-    report << std::boolalpha << "{\"status\":\"" << status << "\",\"phase\":\"" << phase
-           << "\",\"allocated_tensors\":" << tensors << ",\"payload_bytes\":" << payload_bytes
-           << ",\"weight_storage\":\"" << (constant_weights ? "constant" : "mutable") << '"'
-           << ",\"is_const\":" << constant_weights
-           << ",\"current_weight\":" << std::quoted(current_weight)
-           << ",\"chunk_offset_bytes\":" << chunk_offset << ",\"chunk_bytes\":" << chunk_bytes
+  void save(const std::string &status = "running") const {
+    std::ofstream report(outcome.report);
+    report << std::boolalpha << "{\"status\":";
+    json_string(report, status);
+    report << ",\"allocated_tensors\":" << tensors << ",\"payload_bytes\":" << payload_bytes
+           << ",\"weight_storage\":";
+    json_string(report, storage_name(storage));
+    report << ",\"is_const\":" << (storage == Storage::Constant) << ",\"current_weight\":";
+    json_string(report, current_weight);
+    report << ",\"chunk_offset_bytes\":" << chunk_offset << ",\"chunk_bytes\":" << chunk_bytes
            << ",\"expected_weights\":" << expected_weights
            << ",\"completed_weights\":" << completed_weights
            << ",\"expected_weight_bytes\":" << expected_weight_bytes
            << ",\"uploaded_weight_bytes\":" << uploaded_weight_bytes
            << ",\"verified_weight_bytes\":" << verified_weight_bytes
-           << ",\"state_allocation_complete\":" << states_complete
-           << ",\"host_peak_rss_bytes\":" << usage.ru_maxrss * 1024ULL
-           << ",\"device_residency_verified\":false,\"model_memory_fit_verified\":false,"
-              "\"graph_workspace_included\":false}\n";
+           << ",\"expected_state_bytes\":" << expected_state_bytes
+           << ",\"uploaded_state_bytes\":" << uploaded_state_bytes
+           << ",\"verified_state_bytes\":" << verified_state_bytes
+           << ",\"state_allocation_complete\":" << states_complete << ',';
+    outcome.write_fields(report);
+    report << "}\n";
+    report.close();
     if (!report) {
       throw std::runtime_error("cannot write allocation report");
     }
+  }
+
+  std::string status() const {
+    if (!outcome.error.empty() || !outcome.released || !outcome.release_error.empty()) {
+      return "failed";
+    }
+    return outcome.mismatch ? "readback_mismatch" : "allocation_pass";
   }
 };
 
@@ -79,38 +88,34 @@ std::vector<WeightChunk> allocate_weights(Graph &graph, const WeightStore &weigh
   for (const auto &record : weights.records()) {
     progress.current_weight = record.name;
     auto shape = record.spec.shape;
-    auto total_rows = shape.back();
-    auto bytes_per_row = record.bytes / total_rows;
-    auto rows_per_chunk = std::min<std::uint64_t>(4096, 8 * 1024 * 1024 / bytes_per_row);
+    const auto total_rows = shape.back();
+    const auto bytes_per_row = record.bytes / total_rows;
+    const auto rows_per_chunk =
+        std::min<std::uint64_t>(4096, allocation_block_bytes / bytes_per_row);
     if (rows_per_chunk == 0) {
       throw std::runtime_error("one weight row exceeds the bounded host staging buffer");
     }
     for (std::uint64_t row = 0; row < total_rows; row += rows_per_chunk) {
-      auto count = std::min<std::uint64_t>(rows_per_chunk, total_rows - row);
+      const auto count = std::min<std::uint64_t>(rows_per_chunk, total_rows - row);
       shape.back() = count;
-      auto data = weights.read(record, row * bytes_per_row, count * bytes_per_row);
-      progress.phase = "allocate_weight";
+      const auto data = weights.read(record, row * bytes_per_row, count * bytes_per_row);
+      progress.outcome.phase = "allocate_weight";
       progress.chunk_offset = row * bytes_per_row;
       progress.chunk_bytes = data.size();
-      progress.save("running");
-      vsi_nn_tensor_id_t tensor;
-      if (progress.constant_weights) {
-        tensor = add_tensor(graph, {record.spec.type, shape}, true, data);
-      } else {
-        // Follow the documented mutable-tensor path: create, then explicitly
-        // upload bytes. Creating an empty tensor alone is not a loading test.
-        tensor = add_tensor(graph, {record.spec.type, shape});
-      }
+      progress.save();
+      const auto tensor = progress.storage == Storage::Constant
+                              ? add_tensor(graph, {record.spec.type, shape}, true, data)
+                              : add_tensor(graph, {record.spec.type, shape});
       progress.payload_bytes += data.size();
       ++progress.tensors;
-      if (!progress.constant_weights) {
-        progress.phase = "upload_weight";
-        progress.save("running");
+      if (progress.storage == Storage::Mutable) {
+        progress.outcome.phase = "upload_weight";
+        progress.save();
         upload_tensor(graph, tensor, data);
       }
       progress.uploaded_weight_bytes += data.size();
       chunks.push_back({tensor, &record, progress.chunk_offset, data.size()});
-      progress.save("running");
+      progress.save();
     }
     ++progress.completed_weights;
   }
@@ -119,17 +124,22 @@ std::vector<WeightChunk> allocate_weights(Graph &graph, const WeightStore &weigh
 
 void verify_weights(Graph &graph, const WeightStore &weights,
                     const std::vector<WeightChunk> &chunks, AllocationProgress &progress) {
-  // Read back only after all weights and states coexist, so reusing or
-  // overwriting an earlier allocation cannot silently pass the loading check.
-  for (const auto &chunk : chunks) {
-    progress.phase = "verify_weight";
+  // Read back only after all weights and states coexist.
+  for (unsigned index = 0; index < chunks.size(); ++index) {
+    const auto &chunk = chunks[index];
+    progress.outcome.phase = "verify_weight";
     progress.current_weight = chunk.record->name;
     progress.chunk_offset = chunk.offset;
     progress.chunk_bytes = chunk.bytes;
-    progress.save("running");
-    auto expected = weights.read(*chunk.record, chunk.offset, chunk.bytes);
-    if (read_tensor(graph, chunk.tensor) != expected) {
-      throw std::runtime_error("weight readback differs from the exported bytes");
+    progress.save();
+    const auto expected = weights.read(*chunk.record, chunk.offset, chunk.bytes);
+    const auto actual = read_tensor(graph, chunk.tensor);
+    if (!progress.outcome.verify(
+            {chunk.record->name, chunk.tensor, index, chunk.record->spec.type, chunk.offset},
+            actual, expected)) {
+      std::cout << "weight readback mismatch: " << chunk.record->name
+                << " byte=" << chunk.offset + progress.outcome.mismatch->offset << std::endl;
+      break;
     }
     progress.verified_weight_bytes += chunk.bytes;
   }
@@ -154,9 +164,9 @@ std::vector<StateAllocation> read_states(const std::filesystem::path &path) {
         copies.find_first_not_of("0123456789") != std::string::npos) {
       throw std::invalid_argument("invalid allocation state record");
     }
-    auto count = std::stoul(copies);
+    const auto count = std::stoul(copies);
     TensorSpec spec{parse_dtype(dtype), parse_shape(shape)};
-    if (!count || count > 1024 || spec.bytes() > 8 * 1024 * 1024) {
+    if (!count || count > 1024 || spec.bytes() > allocation_block_bytes) {
       throw std::invalid_argument("state fixture exceeds bounded allocation parameters");
     }
     states.push_back({spec, static_cast<unsigned>(count)});
@@ -167,74 +177,112 @@ std::vector<StateAllocation> read_states(const std::filesystem::path &path) {
   return states;
 }
 
-void allocate_state(Graph &graph, AllocationProgress &progress,
-                    const std::vector<StateAllocation> &states) {
+struct StateTensor {
+  vsi_nn_tensor_id_t tensor;
+  TensorSpec spec;
+};
+
+std::vector<StateTensor> allocate_states(Graph &graph, AllocationProgress &progress,
+                                         const std::vector<StateAllocation> &states) {
+  std::vector<StateTensor> retained;
   for (const auto &state : states) {
-    std::vector<std::uint8_t> zeros(state.spec.bytes());
+    // Preserve the historical reproducer's zero initialization and allocation order.
+    const std::vector<std::uint8_t> zeros(state.spec.bytes());
     for (unsigned copy = 0; copy < state.copies; ++copy) {
-      progress.phase = "allocate_state";
+      progress.outcome.phase = "allocate_state";
       progress.chunk_bytes = zeros.size();
-      progress.save("running");
-      auto id = add_tensor(graph, state.spec);
+      progress.save();
+      const auto tensor = add_tensor(graph, state.spec);
       ++progress.tensors;
       progress.payload_bytes += zeros.size();
-      progress.phase = "upload_state";
-      progress.save("running");
-      upload_tensor(graph, id, zeros);
-      progress.save("running");
+      progress.outcome.phase = "upload_state";
+      progress.save();
+      upload_tensor(graph, tensor, zeros);
+      progress.uploaded_state_bytes += zeros.size();
+      retained.push_back({tensor, state.spec});
+      progress.save();
     }
   }
   progress.states_complete = true;
+  return retained;
+}
+
+void verify_states(Graph &graph, const std::vector<StateTensor> &states,
+                   AllocationProgress &progress) {
+  progress.outcome.phase = "verify_state";
+  progress.current_weight.clear();
+  progress.chunk_offset = 0;
+  for (unsigned index = 0; index < states.size(); ++index) {
+    const auto &state = states[index];
+    progress.chunk_bytes = state.spec.bytes();
+    progress.save();
+    const std::vector<std::uint8_t> expected(state.spec.bytes());
+    const auto actual = read_tensor(graph, state.tensor);
+    if (!progress.outcome.verify(
+            {"state." + std::to_string(index), state.tensor, index, state.spec.type, 0}, actual,
+            expected)) {
+      std::cout << "state readback mismatch: state." << index << std::endl;
+      break;
+    }
+    progress.verified_state_bytes += expected.size();
+  }
+}
+
+void probe(const WeightStore &weights, const std::vector<StateAllocation> &states,
+           AllocationProgress &progress) {
+  progress.outcome.phase = "initialize";
+  progress.save();
+  Context context;
+  Graph graph(context, 1024, 1);
+  try {
+    const auto chunks = allocate_weights(graph, weights, progress);
+    progress.current_weight.clear();
+    progress.chunk_offset = 0;
+    const auto state_tensors = allocate_states(graph, progress, states);
+    verify_weights(graph, weights, chunks, progress);
+    // A byte mismatch is not an SDK exception: still check state storage and
+    // explicitly release. The first mismatch remains the primary evidence.
+    verify_states(graph, state_tensors, progress);
+  } catch (const std::exception &error) {
+    progress.outcome.fail(error.what());
+  }
+  progress.outcome.release(graph, context, [&] { progress.save(); });
+  progress.save(progress.status());
 }
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 5 && argc != 7) {
+  if ((argc != 5 && argc != 7) || std::string(argv[3]) != "--state-spec") {
     std::cerr << "usage: np101_weight_allocation_check DEPLOYMENT_DIRECTORY REPORT_JSON "
                  "--state-spec STATE_FILE [--weight-storage constant|mutable]\n";
     return 2;
   }
   AllocationProgress progress;
-  progress.output = argv[2];
-  if (std::string(argv[3]) != "--state-spec") {
-    std::cerr << "explicit --state-spec is required\n";
-    return 2;
-  }
-  if (argc == 7) {
-    const std::string option = argv[5], storage = argv[6];
-    if (option != "--weight-storage" || (storage != "constant" && storage != "mutable")) {
-      std::cerr << "invalid weight storage option\n";
-      return 2;
-    }
-    progress.constant_weights = storage == "constant";
-  }
+  progress.outcome.report = argv[2];
   try {
-    progress.save("running");
+    if (argc == 7) {
+      if (std::string(argv[5]) != "--weight-storage") {
+        throw std::invalid_argument("expected --weight-storage");
+      }
+      progress.storage = parse_storage(argv[6]);
+    }
+    progress.outcome.phase = "validate_weights";
+    progress.save();
     const WeightStore weights(argv[1]);
     weights.verify();
     progress.expected_weights = weights.records().size();
     for (const auto &record : weights.records()) {
       progress.expected_weight_bytes += record.bytes;
     }
-    progress.phase = "initialize";
-    progress.save("running");
     const auto states = read_states(argv[4]);
-    Context context;
-    Graph graph(context, 1024, 1);
-    const auto chunks = allocate_weights(graph, weights, progress);
-    progress.current_weight.clear();
-    progress.chunk_offset = 0;
-    allocate_state(graph, progress, states);
-    verify_weights(graph, weights, chunks, progress);
-    progress.phase = "release";
-    progress.save("running");
-    graph.close();
-    context.close();
-    progress.phase = "complete";
-    progress.save("allocation_pass");
-    return 0;
+    for (const auto &state : states) {
+      progress.expected_state_bytes += state.spec.bytes() * state.copies;
+    }
+    probe(weights, states, progress);
+    return progress.status() == "allocation_pass" ? 0 : 1;
   } catch (const std::exception &error) {
-    std::cerr << progress.phase << ": " << error.what() << '\n';
+    progress.outcome.fail(error.what());
+    std::cerr << progress.outcome.phase << ": " << error.what() << '\n';
     try {
       progress.save("failed");
     } catch (const std::exception &report_error) {

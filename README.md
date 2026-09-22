@@ -17,9 +17,14 @@ See the [completed-module decoupling checklist](docs/model-decoupling-plan.md),
 [component contracts and checks](tests/np101-components.md), and
 [project constraints](AGENTS.md).
 
-The Qwen full-model allocation experiment encountered an effective limit near
-1 GiB in both tested constant and mutable tensor paths. The NP101 team is
-evaluating the allocation mechanism. OPT's smaller weight payload needs its own
+The previous Qwen allocation experiment encountered an effective limit near
+1 GiB in both constant and mutable tensor paths. The 1.0.6 package now accepts
+all 502 tensors in the Qwen allocation fixture (about 1.444 GiB), but weight
+readback fails. Equal-byte FP16 and FP32 synthetic 1,152 MiB checks both fail
+readback in constant and mutable storage at the same locations;
+usable capacity above 1 GiB and the proposed 4 GiB bound remain unverified. The new
+convolution preflight also encounters an unresolved SIGFPE. See the
+[new-package capacity report](tests/np101-capacity.md). OPT's smaller weight payload needs its own
 full-graph allocation, workspace and residency checks; it is not automatically
 blocked or validated by the Qwen result. [Engineering follow-up](TODO.md) records
 the evidence and remaining acceptance gates.
@@ -390,13 +395,19 @@ and keeps all weight and state tensors alive together. `--weight-storage mutable
 sets every weight to `is_const=false`, creates it with `vsi_nn_AddTensor`, then
 uploads its bytes with `vsi_nn_CopyDataToTensor`. The existing `constant` mode
 remains the default; the flag does not establish which physical pool is used.
-After all allocations, the check reads every weight block back and compares its
-bytes with the export. Both modes retain the same chunk sizes and state buffers.
+After all allocations, the check reads weight blocks back and compares their
+bytes with the export, then checks state bytes against their initial values.
+The first mismatching weight stops further weight reads; state checks and explicit
+teardown still follow. Both modes retain the same chunk sizes and state buffers.
 The Python wrapper writes an explicit versioned `allocation-states.txt`; direct
 native invocation requires `--state-spec FILE`. The historical allocation-only KV
 shape is retained for reproduction and is distinct from the execution layout.
-Reports record completed weights, uploaded/verified bytes, the current chunk,
-allocation failures, and host peak RSS. The executable is snapshotted per run.
+Reports record separate weight/state upload and verification totals, the first
+mismatch's dtype/location/bytes, program errors, and explicit release results.
+Expected/actual failed-block bytes and an executable snapshot are retained per run.
+Both allocation scripts accept custom `--binary` and `--sdk-lib` paths. The
+[synthetic capacity probe](tests/np101-capacity.md) adds `--dtype F16|F32` with equal
+byte budgets for comparing storage paths independently of a model.
 The test does not include full model graphs or their workspace, and an SDK
 allocation alone does not prove physical board residency.
 

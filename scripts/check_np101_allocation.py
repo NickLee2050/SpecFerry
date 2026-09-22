@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Check weight/state tensor allocation without claiming full model memory fit."""
+"""Check retained model weight/state bytes without claiming full model memory fit."""
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -11,60 +10,68 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.models.qwen3_5.export import verify_export
 from specferry.models.qwen3_5.memory import write_allocation_states
-from specferry.validation.device import device_lock, run_device
+from specferry.validation.allocation import (
+    STORAGE_MODES,
+    add_run_arguments,
+    run_allocation,
+    weights_complete,
+)
+from specferry.validation.device import write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_run_arguments(parser, ROOT / "build/tests/np101_weight_allocation_check", 300)
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/Qwen3.5-0.8B")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--binary", type=Path, default=ROOT / "build/tests/np101_weight_allocation_check"
-    )
-    parser.add_argument("--sdk-lib", type=Path, default=Path("/usr/lib/ljmicro"))
-    parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument(
         "--weight-storage",
-        choices=("constant", "mutable"),
+        choices=STORAGE_MODES,
         default="constant",
         help="mutable creates every weight with is_const=false and explicitly uploads its bytes",
     )
     args = parser.parse_args()
     if args.timeout < 1 or args.output.exists():
         parser.error("positive timeout and a new output directory are required")
+    output = args.output.resolve()
     try:
         verify_export(args.model)
-        output = args.output.resolve()
-        with device_lock(ROOT / ".cache/runs"):
-            output.mkdir(parents=True)
-            states = output / "allocation-states.txt"
-            write_allocation_states(states)
-            binary = output / "np101_weight_allocation_check"
-            shutil.copy2(args.binary.resolve(), binary)
-            result = run_device(
-                binary,
-                [
-                    str(args.model.resolve()),
-                    str(output / "allocation.json"),
-                    "--state-spec",
-                    str(states),
-                    "--weight-storage",
-                    args.weight_storage,
-                ],
-                output,
-                args.sdk_lib,
-                args.timeout,
-            )
-        report_path = output / "allocation.json"
-        report = json.loads(report_path.read_text()) if report_path.is_file() else {}
-        complete = allocation_complete(report, args.weight_storage)
+        output.mkdir(parents=True)
+        states = output / "allocation-states.txt"
+        write_allocation_states(states)
+        evidence = run_allocation(
+            args.binary,
+            [
+                str(args.model.resolve()),
+                str(output / "allocation.json"),
+                "--state-spec",
+                str(states),
+                "--weight-storage",
+                args.weight_storage,
+            ],
+            output,
+            args.sdk_lib,
+            args.timeout,
+        )
+        path = output / "allocation.json"
+        report = json.loads(path.read_text()) if path.is_file() else {}
+        complete = weights_complete(report, evidence, args.weight_storage)
+        write_json(
+            output / "summary.json",
+            {
+                "status": "allocation_pass" if complete else "failed",
+                "readback_and_release_passed": complete,
+                "allocation": report,
+                "evidence": evidence,
+                "model_memory_fit_verified": False,
+            },
+        )
         print(
             json.dumps(
                 {
-                    "returncode": result["returncode"],
-                    "device_recovery_required": result["device_recovery_required"],
+                    "returncode": evidence["returncode"],
+                    "device_recovery_required": evidence["device_recovery_required"],
                     "output": str(output),
                     "weight_storage": args.weight_storage,
                     "allocation_and_readback_complete": complete,
@@ -72,28 +79,12 @@ def main() -> int:
                 }
             )
         )
-        return int(result["returncode"] != 0 or result["device_recovery_required"] or not complete)
+        return int(not complete)
     except (OSError, ValueError, KeyError, RuntimeError) as error:
+        if output.is_dir():
+            write_json(output / "failure.json", {"status": "failed", "error": str(error)})
         print(f"allocation check failed: {error}", file=sys.stderr)
         return 1
-
-
-def allocation_complete(report: dict, storage: str) -> bool:
-    """Require complete uploads, retained-byte checks, and normal SDK release."""
-    expected_bytes = report.get("expected_weight_bytes", 0)
-    expected_weights = report.get("expected_weights", 0)
-    return (
-        report.get("status") == "allocation_pass"
-        and report.get("phase") == "complete"
-        and report.get("weight_storage") == storage
-        and report.get("is_const") is (storage == "constant")
-        and expected_weights > 0
-        and report.get("completed_weights") == expected_weights
-        and expected_bytes > 0
-        and report.get("uploaded_weight_bytes") == expected_bytes
-        and report.get("verified_weight_bytes") == expected_bytes
-        and report.get("state_allocation_complete") is True
-    )
 
 
 if __name__ == "__main__":

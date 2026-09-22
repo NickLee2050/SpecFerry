@@ -7,7 +7,15 @@ endfunction()
 
 specferry_native_test(np101_conv_relu_pool_test np101/conv_relu_pool_test.cpp)
 specferry_native_test(np101_op_check np101/op_check.cpp np101/operators.cpp np101/case_file.cpp)
+add_library(np101_allocation_support np101/allocation_support.cpp)
+target_link_libraries(np101_allocation_support PUBLIC np101_context)
+target_include_directories(np101_allocation_support PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(np101_allocation_support PRIVATE -Wall -Wextra -Wpedantic)
+
 specferry_native_test(np101_weight_allocation_check np101/weight_allocation_check.cpp)
+target_link_libraries(np101_weight_allocation_check PRIVATE np101_allocation_support)
+specferry_native_test(np101_capacity_check np101/capacity_check.cpp)
+target_link_libraries(np101_capacity_check PRIVATE np101_allocation_support)
 specferry_native_test(np101_graph_sharing_check np101/graph_sharing_check.cpp)
 specferry_native_test(np101_delta_net_check np101/delta_net_check.cpp)
 target_link_libraries(np101_delta_net_check PRIVATE np101_delta_net)
@@ -38,6 +46,13 @@ target_compile_options(generation_test PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(generation_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 add_test(NAME autoregressive_generation_contract COMMAND generation_test)
 set_tests_properties(autoregressive_generation_contract PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
+
+add_executable(allocation_support_test allocation_support_test.cpp)
+target_link_libraries(allocation_support_test PRIVATE np101_allocation_support)
+target_compile_options(allocation_support_test PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(allocation_support_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME allocation_readback_contract COMMAND allocation_support_test)
+set_tests_properties(allocation_readback_contract PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
 
 # Device diagnostics are explicit commands: ordinary CTest must not open NP101
 # or spend minutes waiting for a device graph to complete.
