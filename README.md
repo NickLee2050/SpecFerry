@@ -2,14 +2,15 @@
 A testbed for speculative decoding across heterogeneous edge devices and a local inference hub.
 
 The active deployment target is full text inference of `facebook/opt-350m`
-on NP101 as the draft language model (DLM). The existing CPU reference, exporter,
-DeltaNet/Attention mixers and four-layer decoder still implement Qwen3.5-0.8B;
-they remain a regression baseline. Shared NP101 graph construction, projections,
+on NP101 as the draft language model (DLM). OPT now has an official FP16 CPU
+reference, a byte-preserving checkpoint exporter, and a native decoder-slice
+validation path. Its first device run crashed during initialization, so OPT
+device numerical acceptance remains pending. Qwen3.5-0.8B references, mixers
+and decoder checks remain a regression baseline. Shared NP101 graph construction, projections,
 normalization, Attention/DeltaNet arithmetic, SwiGLU, tensor bindings and KV storage
 now take explicit contracts. Model configuration, checkpoint names and decoder
-composition live in `native/models/qwen3_5/` and `python/specferry/models/qwen3_5/`.
-OPT download and CPU import validation do not make those inference paths compatible
-with OPT. Full DLM inference on NP101 is not yet implemented.
+composition live under `native/models/` and `python/specferry/models/`.
+Full DLM inference on NP101 is not yet implemented.
 See the [completed-module decoupling checklist](docs/model-decoupling-plan.md),
 [component contracts and checks](tests/np101-components.md), and
 [project constraints](AGENTS.md).
@@ -80,6 +81,34 @@ The download script works on both Windows and Linux. The current full reference
 environment is validated on Linux x86_64; the native NP101 SDK is required to
 build and run the native SDK validation tests.
 
+## Validate the OPT checkpoint and decoder slices
+
+Use the activated `SpecFerry` environment and a new run directory:
+
+```bash
+python scripts/reference_opt.py --output .cache/runs/opt-cpu
+python scripts/export_opt.py
+python scripts/export_opt.py --verify-only
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --target np101_opt_decoder_check -j 4
+python scripts/check_np101_opt.py --trace .cache/runs/opt-cpu/trace.npz \
+  --layers 0 1 2 3 --steps 32 --output .cache/runs/opt-slice --prepare-only
+```
+
+The CPU reference checks prefill against sequential execution and cached decoding
+against fresh prefixes. The exporter preserves all 388 source FP16 tensors, verifies
+every byte independently, and aliases the LM head to the embedding. The default
+deployment directory is `.cache/np101/opt-350m`.
+
+`--prepare-only` creates independent official CPU expectations without accessing the
+board. After device recovery is confirmed, use a new output directory and replace
+`--prepare-only` with `--diagnostic` to execute the slice. Start with `--layers 0
+--steps 8 --capacity 8`, then check four layers at 32 and 512 steps. A SIGSEGV on the
+first attempt set the existing recovery marker; do not bypass it to retry.
+`--diagnostic` permits numerical success without proving exclusive NPU execution
+or physical residency. Full-model embedding, LM head and generation remain later
+integration work. See [OPT validation and current blocker](tests/np101-opt.md).
+
 ## Record the host and device environment
 
 Run from the repository root, in a session that can see `/dev/galcore`:
@@ -97,9 +126,8 @@ No driver or system configuration is changed by these tools.
 ## Run the retained Qwen CPU reference and validation
 
 This reference path still requires the existing Qwen3.5-0.8B checkpoint and its
-verified `download-manifest.json`. It does not yet accept the newly selected
-OPT model. This refactor separates reusable reference utilities from Qwen policy;
-adding an OPT reference workflow remains separate work.
+verified `download-manifest.json`. Use `scripts/reference_opt.py` for OPT;
+the two adapters share reference utilities but retain their own model policies.
 Use the same activated `SpecFerry` Conda environment for the CPU reference.
 CUDA and FLA are not required.
 
@@ -287,8 +315,8 @@ results, memory accounting, and the remaining hardware evidence gates.
 
 These CLI defaults enforce the retained Qwen checkpoint contract. The shared pack
 reader/writer, integrity checks and memory accounting are model independent; the
-Qwen adapter selects names, aliases and target dtypes. OPT checkpoint export and
-full-model allocation remain separate, pending work.
+Qwen adapter selects names, aliases and target dtypes. OPT uses `scripts/export_opt.py`;
+its full-model device allocation remains pending.
 
 ```bash
 python scripts/export_np101_dlm.py --output .cache/np101/Qwen3.5-0.8B

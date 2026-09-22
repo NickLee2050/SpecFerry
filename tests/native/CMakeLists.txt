@@ -18,8 +18,11 @@ target_link_libraries(np101_attention_check PRIVATE np101_attention)
 specferry_native_test(np101_decoder_check np101/decoder_check.cpp np101/case_file.cpp)
 target_link_libraries(np101_decoder_check PRIVATE np101_decoder)
 
+specferry_native_test(np101_opt_decoder_check np101/opt_decoder_check.cpp np101/case_file.cpp)
+target_link_libraries(np101_opt_decoder_check PRIVATE np101_opt_decoder)
+
 add_executable(np101_data_test np101/data_test.cpp np101/case_file.cpp)
-target_link_libraries(np101_data_test PRIVATE np101_data qwen_data)
+target_link_libraries(np101_data_test PRIVATE np101_data opt_data qwen_data)
 target_compile_options(np101_data_test PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(np101_data_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 add_test(NAME np101_data_contract COMMAND np101_data_test)

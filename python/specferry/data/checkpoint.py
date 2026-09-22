@@ -27,7 +27,7 @@ def local_path(root, name):
     return path
 
 
-def inventory(root: Path, *, repo_id: str, revision: str):
+def verify_download(root: Path, *, repo_id: str, revision: str):
     manifest = json.loads((root / "download-manifest.json").read_text())
     if (
         manifest.get("status") != "complete"
@@ -42,6 +42,12 @@ def inventory(root: Path, *, repo_id: str, revision: str):
             raise ValueError(f"missing or wrong-size checkpoint file: {path}")
         if entry.get("sha256") and sha256(path) != entry["sha256"]:
             raise ValueError(f"checkpoint SHA256 mismatch: {path}")
+    return manifest
+
+
+def inventory(root: Path, *, repo_id: str, revision: str):
+    manifest = verify_download(root, repo_id=repo_id, revision=revision)
+    files = manifest["files"]
     index = json.loads((root / "model.safetensors.index.json").read_text())
     selected = {entry["path"] for entry in files}
     if not set(index["weight_map"].values()) <= selected:

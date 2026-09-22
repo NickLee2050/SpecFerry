@@ -59,7 +59,13 @@ def tensor_blocks(root: Path, entry: dict, chunk_bytes: int):
 
 
 def write_weight_pack(
-    root: Path, entries: list[dict], output: Path, chunk_bytes=8 * 1024 * 1024, head_block_rows=4096
+    root: Path,
+    entries: list[dict],
+    output: Path,
+    chunk_bytes=8 * 1024 * 1024,
+    head_block_rows=4096,
+    *,
+    block_reader=tensor_blocks,
 ) -> list[dict]:
     """Call only after checkpoint inventory validation; this function never loads a model."""
     if not 4 <= chunk_bytes <= 8 * 1024 * 1024 or chunk_bytes % 4 or head_block_rows < 1:
@@ -74,7 +80,7 @@ def write_weight_pack(
             offset = destination.tell()
             digest = hashlib.sha256()
             target_dtype = None
-            for block in tensor_blocks(root, entry, chunk_bytes):
+            for block in block_reader(root, entry, chunk_bytes):
                 converted, target_dtype = convert_bytes(
                     block, entry["dtype"], entry["target_dtype"]
                 )
@@ -88,7 +94,7 @@ def write_weight_pack(
                 "source_name": entry["source_name"],
                 "source_file": entry["file"],
                 "source_dtype": entry["dtype"],
-                "source_data_offsets": entry["data_offsets"],
+                "source_data_offsets": entry.get("data_offsets"),
                 "dtype": target_dtype,
                 "shape": entry["shape"],
                 "sdk_shape": list(reversed(entry["shape"])),

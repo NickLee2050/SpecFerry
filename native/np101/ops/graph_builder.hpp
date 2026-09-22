@@ -46,6 +46,10 @@ public:
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
+  // Fused FP16 fully connected operation, including bias before output rounding.
+  Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
+                const WeightRecord &bias);
+  Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);
   // FP32 square/reduce/rsqrt: mean=true is RMS; false is L2 normalization.
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);
   Tensor rms_norm(Tensor input, Tensor scale, float epsilon, float scale_offset,

@@ -1,4 +1,5 @@
 #include "case_file.hpp"
+#include "models/opt/config.hpp"
 #include "models/qwen3_5/config.hpp"
 #include "np101/component_spec.hpp"
 #include "np101/tensor_spec.hpp"
@@ -120,6 +121,31 @@ void component_contracts() {
   rejects([&] { specferry::models::qwen3_5::read_config(path); }, "unknown mixer");
 }
 
+void opt_contracts() {
+  TemporaryDirectory directory;
+  const auto path = directory.path / "components.txt";
+  const std::string header = "specferry-opt-components 1\n";
+  write(path, header + "1024 4096 16 24 512 1e-5\n");
+  const auto config = specferry::models::opt::read_config(path);
+  require(config.kv_spec().head_dim == 64, "OPT heads must retain their configured width");
+  rejects([&] { config.prefix(24); }, "OPT layer outside configured range");
+  for (const auto *record :
+       {"1024 4096 0 24 512 1e-5", "1024 4096 16 24 513 1e-5", "1024 4096 16 24 512 -1",
+        "1024 4096 16 24 512 1e-5 extra", "-1 4096 16 24 512 1e-5", "1024 4097 16 24 512 1e-5"}) {
+    write(path, header + record + "\n");
+    rejects([&] { specferry::models::opt::read_config(path); }, "invalid OPT contract");
+  }
+  // An otherwise well-formed package lacking projection biases cannot build a layer.
+  write(directory.path / "weights.bin", std::string("\1\2\3\4\5\6\7\10", 8));
+  write(directory.path / "weights.index",
+        "specferry-np101-weights 1\ndecoder.layers.0.self_attn.q_proj.weight F16 2,2 0 8 "
+        "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n");
+  WeightStore weights(directory.path);
+  const specferry::models::opt::Config small{2, 4, 1, 1, 2, 1e-5f};
+  rejects([&] { specferry::models::opt::validate_weights(weights, small, {0}); },
+          "incomplete OPT weights rejected before SDK initialization");
+}
+
 void case_validation() {
   TemporaryDirectory directory;
   const auto path = directory.path / "graph.txt";
@@ -179,6 +205,7 @@ int main() {
     tensor_boundaries();
     weight_integrity();
     component_contracts();
+    opt_contracts();
     case_validation();
     std::cout << "Tensor boundaries, weight integrity, and fixture validation passed.\n";
     return 0;

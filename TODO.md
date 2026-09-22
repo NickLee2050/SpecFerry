@@ -27,8 +27,8 @@ Qwen policy, official references and layer composition live in model modules.
 55 Python tests, host CTest/build, original CPU traces/export, alternate component
 sizes, mixers, short slices and four-layer 32/512-step numerical regressions passed.
 See [the acceptance record](tests/np101-components.md#decoupling-acceptance-record).
-The integrated OPT reference/export workflow and NP101 adaptation remain
-unimplemented and outside this checklist. Existing hardware evidence gates stay open.
+The integrated OPT reference/export workflow and NP101 adaptation are tracked
+separately below. Existing hardware evidence gates stay open.
 
 The Qwen weight, layer and allocation figures below describe the retained
 baseline. OPT requires its own export, memory accounting, numerical validation
@@ -37,6 +37,34 @@ complete graph fits, but the Qwen weight-size blocker does not automatically
 block OPT either. NP101-OBS-001 and the KV-related NP101-STATE-001 checks remain
 applicable. Deferred DeltaNet weight duplication (NP101-MEM-002) is not an OPT
 prerequisite.
+
+## NP101-MODEL-002: Validate the OPT adapter through decoder slices
+
+- [x] Load the locked original FP16 checkpoint into the official CPU implementation;
+  compare prefill, sequential cache and fresh-prefix decoding.
+- [x] Export and independently verify all 388 tensors without precision conversion;
+  preserve the embedding/head alias and record model-specific memory resources.
+- [x] Implement a separate OPT post-norm/ReLU decoder adapter using shared graph
+  construction, biased projection, LayerNorm, Attention and single-buffer KV storage.
+- [x] Prepare independent layer-0, layer-23 and four-layer 512-step CPU trajectories;
+  align the original captured prefix with the full official model.
+- [ ] Diagnose the initialization SIGSEGV, then pass the device single-layer and
+  four-layer numerical/lifecycle suites after confirmed device recovery.
+- [ ] Establish actual execution backend and residency, together with NP101-OBS-001.
+
+On 2026-09-21, the first eight-step layer-0 device attempt exited with SIGSEGV
+while `phase=initialize`, before any completed step or output capture. The process
+group exited; the runner set `.cache/runs/np101-recovery-required.json`.
+This is not evidence of a numerical mismatch, an allocation ceiling, or a proven
+FCL defect. The failing call is not yet known. CPU/export acceptance remains valid;
+OPT device acceptance is **blocked**, not complete.
+
+Resume with confirmed device recovery, locate the failing call with a debugger,
+fix the demonstrated cause, and run single-layer capacity/reset/recreation checks
+before the four-layer 32/512-step checks. Keep the predeclared numerical thresholds.
+See [commands and evidence](tests/np101-opt.md). Full-model integration and generation
+remain S9/S10; final hardware acceptance remains S11. No repeated Qwen capacity
+probe or driver/system changes are part of this adapter task.
 
 ## NP101-MEM-002: Share DeltaNet weights across alternating state graphs
 

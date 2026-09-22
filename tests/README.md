@@ -11,6 +11,7 @@
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 | `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
 | `native/np101/decoder_check.cpp` | Explicit decoder slices, shared bindings, state/reset, transfer counts and capacity | Yes |
+| `native/np101/opt_decoder_check.cpp` | OPT post-norm decoder slices, affine projections, LayerNorm and KV/lifecycle checks | Yes |
 | `native/np101/attention_check.cpp` | Real-weight Attention, single-buffer KV, capacity, truncation, reset and final-only readback | Yes |
 
 Run host tests from the repository root with the `SpecFerry` Conda environment:
@@ -77,3 +78,8 @@ versioned component fixtures, small synthetic decoder and alternate KV layout.
 `test_components.py` covers non-Qwen checkpoint names, explicit FP16 preservation,
 alias rejection, independent memory resources and invalid component configuration.
 The native data test parses component contracts without linking or opening the SDK.
+
+[OPT validation](np101-opt.md) records the original FP16 checkpoint, CPU baseline,
+byte-preserving export, independent decoder expectations and current device blocker.
+`test_opt.py` checks import/precision rejection, chunk identity, trace ordering,
+valid-prefix comparison and lifecycle/mask/repeat failures without a model download.

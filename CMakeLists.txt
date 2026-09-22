@@ -60,6 +60,14 @@ add_library(np101_decoder native/models/qwen3_5/decoder.cpp)
 target_link_libraries(np101_decoder PUBLIC np101_delta_net np101_attention)
 target_compile_options(np101_decoder PRIVATE -Wall -Wextra -Wpedantic)
 
+add_library(opt_data native/models/opt/config.cpp)
+target_link_libraries(opt_data PUBLIC np101_data)
+target_compile_options(opt_data PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(np101_opt_decoder native/models/opt/decoder.cpp)
+target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data)
+target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(tests/native)

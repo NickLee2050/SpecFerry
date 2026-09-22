@@ -229,6 +229,38 @@ Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned 
   return binary(VSI_NN_OP_MULTIPLY, input, inverse);
 }
 
+Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
+                            const WeightRecord &bias) {
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || input.spec.shape[1] != 1 ||
+      matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
+      matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
+      bias.spec.shape != Shape{matrix.spec.shape[1]}) {
+    throw std::invalid_argument("linear requires FP16 input [K,1], weight [K,N], bias [N]");
+  }
+  auto coefficients = weight(store, matrix, matrix.spec);
+  auto offset = weight(store, bias, bias.spec);
+  auto output = tensor({f16, {matrix.spec.shape[1], 1}});
+  auto *operation = node(VSI_NN_OP_FCL, {input, coefficients, offset}, output);
+  operation->nn_param.fcl.weights = matrix.spec.shape[1];
+  operation->nn_param.fcl.axis = 0;
+  return output;
+}
+
+Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || input.spec.shape[1] != 1 ||
+      scale.spec.type != f16 || bias.spec.type != f16 ||
+      scale.spec.shape != Shape{input.spec.shape[0]} || bias.spec.shape != scale.spec.shape) {
+    throw std::invalid_argument("layer norm requires FP16 [width,1] and affine vectors");
+  }
+  auto values = convert(input, f32);
+  auto centered = binary(VSI_NN_OP_SUBTRACT, values, reduce(values, true));
+  auto normalized = normalize(centered, true, epsilon);
+  auto multiplier = reshape(convert(scale, f32), input.spec.shape);
+  auto offset = reshape(convert(bias, f32), input.spec.shape);
+  return convert(binary(VSI_NN_OP_ADD, binary(VSI_NN_OP_MULTIPLY, normalized, multiplier), offset),
+                 f16);
+}
+
 Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float scale_offset,
                               DataType output_type) {
   auto normalized = normalize(convert(input, f32), true, epsilon);
