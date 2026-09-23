@@ -252,19 +252,29 @@ void probe(const WeightStore &weights, const std::vector<StateAllocation> &state
 } // namespace
 
 int main(int argc, char **argv) {
-  if ((argc != 5 && argc != 7) || std::string(argv[3]) != "--state-spec") {
+  if (argc < 3 || argc > 7 || argc % 2 == 0) {
     std::cerr << "usage: np101_weight_allocation_check DEPLOYMENT_DIRECTORY REPORT_JSON "
-                 "--state-spec STATE_FILE [--weight-storage constant|mutable]\n";
+                 "[--state-spec STATE_FILE] [--weight-storage constant|mutable]\n";
     return 2;
   }
   AllocationProgress progress;
   progress.outcome.report = argv[2];
   try {
-    if (argc == 7) {
-      if (std::string(argv[5]) != "--weight-storage") {
-        throw std::invalid_argument("expected --weight-storage");
+    std::filesystem::path state_path;
+    bool storage_specified = false;
+    for (int index = 3; index < argc; index += 2) {
+      const std::string option(argv[index]);
+      if (option == "--state-spec" && state_path.empty()) {
+        state_path = argv[index + 1];
+        if (state_path.empty()) {
+          throw std::invalid_argument("state file path is empty");
+        }
+      } else if (option == "--weight-storage" && !storage_specified) {
+        progress.storage = parse_storage(argv[index + 1]);
+        storage_specified = true;
+      } else {
+        throw std::invalid_argument("unknown or repeated allocation option: " + option);
       }
-      progress.storage = parse_storage(argv[6]);
     }
     progress.outcome.phase = "validate_weights";
     progress.save();
@@ -274,7 +284,8 @@ int main(int argc, char **argv) {
     for (const auto &record : weights.records()) {
       progress.expected_weight_bytes += record.bytes;
     }
-    const auto states = read_states(argv[4]);
+    const auto states =
+        state_path.empty() ? std::vector<StateAllocation>{} : read_states(state_path);
     for (const auto &state : states) {
       progress.expected_state_bytes += state.spec.bytes() * state.copies;
     }

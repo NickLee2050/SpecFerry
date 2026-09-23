@@ -4,7 +4,6 @@ from functools import partial
 
 import numpy as np
 
-from specferry.validation.extended_cases import block_selection, weight_storage
 from specferry.validation.fixtures import Fixture, array
 
 
@@ -150,8 +149,6 @@ def extend_catalog(cases, case_type):
     def add(name, family, scale, function, *args):
         cases[name] = case_type(name, family, scale, partial(function, name, *args))
 
-    for storage in ("constant", "mutable", "mixed"):
-        add(f"weights_{storage}_fp16", "weight_storage", "small", weight_storage, storage)
     add("delta_update_fp32", "state_matrix", "model", delta_update)
     add("attention_qk_fp32", "attention_matrix", "model", attention_product, False)
     add("attention_pv_fp32", "attention_matrix", "model", attention_product, True)
@@ -159,4 +156,3 @@ def extend_catalog(cases, case_type):
     add("attention_gqa_layout", "attention_layout", "small", gqa_layout)
     add("partial_rope_fp32", "position_encoding", "model", partial_rope)
     add("weighted_rms_fp32", "normalization", "model", weighted_norm)
-    add("block_token_selection", "token_selection", "small", block_selection)

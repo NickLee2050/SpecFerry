@@ -23,8 +23,7 @@ from specferry.export.weights import (
     write_weight_pack,
 )
 from specferry.models.qwen3_5.components import BASELINE, Components
-from specferry.models.qwen3_5.memory import write_allocation_states
-from tests.python.test_export import complete_manifest, source_tensor
+from tests.python.weight_fixtures import complete_manifest, source_tensor
 
 
 class GenericCheckpointTests(unittest.TestCase):
@@ -145,8 +144,6 @@ class ComponentConfigurationTests(unittest.TestCase):
             self.assertEqual(
                 (root / "components.txt").read_text().splitlines()[-1], "delta attention"
             )
-            write_allocation_states(root / "allocation.txt")
-            self.assertIn("F16 256,2,512 12", (root / "allocation.txt").read_text())
 
     def test_invalid_components_rejected_without_sdk(self):
         for change in (

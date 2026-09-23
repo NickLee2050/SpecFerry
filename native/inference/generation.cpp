@@ -34,6 +34,8 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
     executor.consume(token);
     ++result.consumed;
   }
+  result.prefill_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   auto previous = start;
   for (unsigned index = 0; index < maximum_new_tokens; ++index) {
     const auto token = executor.predict();
@@ -66,6 +68,8 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
     executor.consume(token);
     ++result.consumed;
   }
+  result.total_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   return result;
 }
 } // namespace specferry::inference

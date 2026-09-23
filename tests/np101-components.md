@@ -63,9 +63,10 @@ binaries require newly prepared component fixtures; rerun the existing CLI with
 `--prepare-only` rather than applying defaults to an archived fixture. Historical
 binaries/reports remain available for exact reproduction.
 
-Allocation diagnostics also require a versioned `--state-spec FILE` listing
-`DTYPE SDK_SHAPE COPIES`. `check_np101_allocation.py` writes the historical Qwen
-profile with its original order and allocation-only KV shape `[256,2,512]`.
+Allocation diagnostics accept an optional versioned `--state-spec FILE` listing
+`DTYPE SDK_SHAPE COPIES`; omitting it checks weights only. The historical Qwen
+fixture is stored explicitly in `tests/fixtures/qwen3_5_allocation_states.txt`,
+with its original order and allocation-only KV shape `[256,2,512]`.
 This is not the runtime KV layout. Small component checks use actual state shapes.
 
 ## Commands

@@ -48,7 +48,12 @@ further device execution until recovery has been confirmed.
 
 The operator runner accepts repeatable `--case NAME`, `--scale model`,
 `--prepare-only`, `--readback final`, `--cycles 20`, `--binary`, `--sdk-lib` and
-`--shader-header`. The default per-case timeout is 300 seconds and the payload
+`--shader-header`. Its default `--profile generic` contains 24 independent small
+SDK cases and imports no model adapter. Use `--profile qwen3.5` for the retained
+49-case catalog, including model-sized and architecture-specific compositions.
+`--scale model` requires that explicit profile. Real projection fixtures also
+require `--reference-trace` and an explicit `--model` deployment directory.
+The default per-case timeout is 300 seconds and the payload
 cap is 768 MiB; SDK overhead is additional. Each case keeps its `graph.txt`,
 inputs, expected bytes, comparison and execution evidence. Final-only comparison
 does not substitute for checking every output in a numerical trajectory.
@@ -70,7 +75,9 @@ DeltaNet, KV, Attention and decoder checks.
 
 [Capacity probing](np101-capacity.md) records the bounded 1–4 GiB experiment,
 the new-package preflight and the distinction between an allocation rejection
-and an abnormal SDK exit. Its host test never opens the device.
+and an abnormal SDK exit. Explicit `--readback none` separates accepted allocation
+from integrity; `--readback all` maps corrupt regions across every retained block.
+Its host test never opens the device.
 
 The operator fixture format is a versioned test protocol, not a model compiler.
 NumPy arrays are row-major; graph tensor dimensions list the contiguous axis first.
@@ -80,8 +87,9 @@ stateless subset of versions 1 and 2. Retired `feedback`, `reset_after`, and
 `handle` storage fixtures are rejected before device initialization; use the
 archived source/binaries to reproduce historical feedback experiments.
 Node inputs must come from initialized tensors, graph inputs, or earlier nodes.
-The Qwen catalog supplies fixed-input tolerances from `python/specferry/models/qwen3_5/tolerances.json`.
-The generic comparator requires an explicit policy; it does not select model budgets.
+Generic cases supply fixed-input tolerances from `validation/operator_cases.py`;
+their numerical thresholds are unchanged. Qwen-specific cases retain the model
+adapter's tolerance policy. The comparator always requires an explicit policy.
 Both nonfinite values and wrong output sizes fail validation.
 
 Use `build/tests/np101_op_check --validate-only PATH/graph.txt` to validate native
@@ -90,8 +98,8 @@ fixture parsing and input sizes without creating a device context.
 `test_operator_acceptance.py` protects final-only readback, independent graph
 lifetimes, payload rejection before device access, failed release despite correct
 outputs, and the distinction between numerical agreement, hardware proof, and
-device residency. The current catalog contains 49 synthetic operator cases plus
-four optional captured-reference projections, with no cross-execution feedback.
+device residency. The optional Qwen profile contains 49 synthetic operator cases
+plus four optional captured-reference projections, with no cross-execution feedback.
 The [operator acceptance record](np101-operator-acceptance.md) preserves historical
 results, and the [state investigation record](state-feedback-investigation.md)
 documents the retired experiments. The [DeltaNet module check](np101-delta-net.md)
@@ -123,6 +131,9 @@ state must not be indiscriminately converted to virtual tensors.
 versioned component fixtures, small synthetic decoder and alternate KV layout.
 `test_components.py` covers non-Qwen checkpoint names, explicit FP16 preservation,
 alias rejection, independent memory resources and invalid component configuration.
+The synthetic decoder in `check_np101_components.py` intentionally remains a
+Qwen architecture regression; using synthetic weights does not make its layer
+composition model-independent.
 The native data test parses component contracts without linking or opening the SDK.
 
 [OPT validation](np101-opt.md) records the original FP16 checkpoint, CPU baseline,
@@ -139,3 +150,25 @@ scalar-only transfer accounting, exact resets and honest hardware-evidence gates
 [Sampling validation](np101-sampling.md) covers the documented RANDOM_MULTINOMIAL
 operator and OPT's optional sampling head. `test_sampling.py` rejects out-of-range
 or distribution-ignoring output even when SDK execution reports success.
+
+[Complete-model acceptance](np101-acceptance.md) combines exact selection,
+teacher-forced model checks, repeated resident requests and fresh process lifetimes.
+The native generator's benchmark mode records prefill, first-token and decode
+times with no application trace or streaming callback during measurement.
+`test_acceptance.py` covers failed preflight short-circuiting, warmup exclusion,
+CPU token equality, timing/transfer contracts and hardware-pending status.
+
+## Generic weight loading
+
+`check_np101_allocation.py --deployment DIRECTORY` validates a common weight pack,
+then loads and reads back its physical weight records. It has no implicit model
+or state profile. Add `--state-spec FILE` for an explicit state fixture, or
+`--prepare-only` to validate files without device IO. `--model` remains an alias
+for `--deployment`; a directory must be supplied. See the
+[capacity guide](np101-capacity.md#generic-weight-pack-readback) for commands.
+
+`test_weight_loading.py` covers arbitrary model identities, no-state loads,
+explicit state snapshots, preflight rejection and requested-payload matching.
+Reusable pack fixtures live in `tests/python/weight_fixtures.py`, independently
+of model-specific test modules. This checks data integrity, not architecture
+compatibility or full-model residency.

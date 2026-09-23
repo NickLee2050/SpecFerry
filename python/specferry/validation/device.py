@@ -49,6 +49,16 @@ def record_sources(root: Path, binary: Path, output: Path) -> None:
     write_json(output, {"binary_sha256": fingerprint(binary), "sources": sources})
 
 
+def clean_execution(evidence: dict, expected_returncode: int = 0) -> bool:
+    return (
+        evidence.get("returncode") == expected_returncode
+        and evidence.get("timeout") is False
+        and evidence.get("process_group_exited") is True
+        and evidence.get("remaining_processes") == []
+        and evidence.get("device_recovery_required") is False
+    )
+
+
 def process_group_members(group: int) -> list[dict]:
     members = []
     for path in Path("/proc").iterdir():
@@ -127,6 +137,7 @@ def run_device(
     artifact_prefix: str | None = None,
     shader_header: Path | None = None,
     trace_driver: bool = True,
+    print_targets: bool = True,
 ) -> dict:
     require_recovered_device(RECOVERY_ROOT)
     binary = binary.resolve(strict=True)
@@ -143,7 +154,7 @@ def run_device(
         shader_headers.append({"source": str(header), "sha256": fingerprint(destination)})
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(sdk_lib.resolve(strict=True))
-    env["VIV_VX_ENABLE_PRINT_TARGET"] = "1"
+    env["VIV_VX_ENABLE_PRINT_TARGET"] = "1" if print_targets else "0"
     log_name = f"{artifact_prefix}.log" if artifact_prefix else "sdk.log"
     trace_name = f"{artifact_prefix}.strace" if artifact_prefix else "driver.strace"
     evidence_name = (
@@ -171,6 +182,15 @@ def run_device(
         "started_at": datetime.now(timezone.utc).isoformat(),
         "command": command,
         "driver_traced": tracer is not None,
+        "runtime_options": {
+            name: env.get(name)
+            for name in (
+                "VIV_VX_ENABLE_PRINT_TARGET",
+                "VIV_VX_PROFILE",
+                "VIV_MEMORY_PROFILE",
+                "VIV_VX_ENABLE_SHADER",
+            )
+        },
         "binary_sha256": fingerprint(binary),
         "linked_libraries": libraries,
         "sdk_library_dir": str(sdk_lib.resolve()),
@@ -179,7 +199,16 @@ def run_device(
         "boot_id": host_boot_id(),
         "sdk_sha256": {
             path.name: fingerprint(path)
-            for path in (sdk_lib / "libovxlib.so", sdk_lib / "libOpenVX.so", sdk_lib / "libGAL.so")
+            for path in (
+                sdk_lib / name
+                for name in (
+                    "libovxlib.so",
+                    "libOpenVX.so",
+                    "libGAL.so",
+                    "libArchModelSw.so",
+                    "libNNArchPerf.so",
+                )
+            )
         },
     }
     with (output / log_name).open("w") as log:

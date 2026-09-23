@@ -187,8 +187,8 @@ def read_tokens(path):
 
 
 @torch.inference_mode()
-def compare_generation(checkpoint, request, generation, maximum_new_tokens):
-    """Optional validation after native execution; never part of device decoding."""
+def reference_generation(checkpoint, request, maximum_new_tokens):
+    """Independent checkpoint-policy oracle; never part of device decoding."""
     maximum = min(maximum_new_tokens, request["capacity"] - len(request["tokens"]) + 1)
     expected = []
     if maximum:
@@ -208,6 +208,13 @@ def compare_generation(checkpoint, request, generation, maximum_new_tokens):
             max_new_tokens=maximum,
         )
         expected = output[0, ids.shape[1] :].tolist()
+    return {"tokens": expected, "reference": source_record()}
+
+
+def compare_generation(checkpoint, request, generation, maximum_new_tokens):
+    """Optional validation after native execution; never part of device decoding."""
+    reference = reference_generation(checkpoint, request, maximum_new_tokens)
+    expected = reference["tokens"]
     actual = generation["tokens"]
     mismatch = next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
     if mismatch is None and len(actual) != len(expected):
@@ -216,7 +223,7 @@ def compare_generation(checkpoint, request, generation, maximum_new_tokens):
         "passed": actual == expected,
         "expected_tokens": expected,
         "first_mismatch": mismatch,
-        "reference": source_record(),
+        "reference": reference["reference"],
     }
 
 

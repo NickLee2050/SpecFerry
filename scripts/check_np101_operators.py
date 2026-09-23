@@ -8,9 +8,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.models.qwen3_5.export import verify_export
-from specferry.models.qwen3_5.operator_cases import catalog
-from specferry.models.qwen3_5.reference_cases import reference_catalog
 from specferry.validation.capabilities import check_case
 from specferry.validation.device import (
     device_lock,
@@ -19,6 +16,7 @@ from specferry.validation.device import (
     snapshot_binary,
     write_json,
 )
+from specferry.validation.operator_cases import catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,6 +33,12 @@ def main() -> int:
         help="unmodified SDK header needed by the runtime shader compiler",
     )
     parser.add_argument("--scale", choices=("small", "model", "all"), default="small")
+    parser.add_argument(
+        "--profile",
+        choices=("generic", "qwen3.5"),
+        default="generic",
+        help="generic SDK contracts or the retained Qwen architecture cases",
+    )
     parser.add_argument("--case", action="append", default=[], help="select a case; repeatable")
     parser.add_argument("--list", action="store_true", help="list available cases without running")
     parser.add_argument(
@@ -42,7 +46,7 @@ def main() -> int:
         type=Path,
         help="deployment-fp16 layer-0-3-sequential.npz; enables real projection cases",
     )
-    parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/Qwen3.5-0.8B")
+    parser.add_argument("--model", type=Path, help="explicit deployment for --reference-trace")
     parser.add_argument(
         "--prepare-only", action="store_true", help="write fixtures without device IO"
     )
@@ -64,7 +68,21 @@ def main() -> int:
     )
     args = parser.parse_args()
     cases = catalog()
+    if args.profile == "qwen3.5":
+        from specferry.models.qwen3_5.operator_cases import catalog as model_catalog
+
+        cases = model_catalog()
+    elif args.scale == "model":
+        parser.error("model-scale cases require an explicit --profile")
+    if args.model is not None and args.reference_trace is None:
+        parser.error("--model is only used with --reference-trace")
     if args.reference_trace:
+        if args.profile != "qwen3.5" or args.model is None:
+            parser.error("--reference-trace requires --profile qwen3.5 and --model")
+        from specferry.models.qwen3_5.export import verify_export
+        from specferry.models.qwen3_5.reference_cases import reference_catalog
+
+        verify_export(args.model)
         cases.update(reference_catalog(args.model.resolve(), args.reference_trace.resolve()))
     if args.list:
         for case in cases.values():
@@ -81,8 +99,6 @@ def main() -> int:
         parser.error(f"unknown cases: {sorted(unknown)}")
     if len(args.case) != len(set(args.case)):
         parser.error("case names must not be repeated")
-    if args.reference_trace:
-        verify_export(args.model)
     selected = (
         [cases[name] for name in args.case]
         if args.case
@@ -99,6 +115,7 @@ def main() -> int:
     results = []
     summary = {
         "status": "running",
+        "profile": args.profile,
         "cases": results,
         "hardware_acceptance": "unverified",
         "state_reuse_acceptance": "not_evaluated_by_operator_suite",

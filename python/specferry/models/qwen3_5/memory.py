@@ -50,25 +50,3 @@ def memory_budget(
         sdk_overhead_bytes=sdk_overhead_bytes,
         workspace_bytes=workspace_bytes,
     )
-
-
-def write_allocation_states(path):
-    """Preserve the exact shape/order of the historical allocation-only reproducer.
-
-    Its KV tensor is a byte-allocation fixture, not the current compute layout.
-    """
-    config = BASELINE
-    delta_copies = 2 * config.layer_types.count("delta")
-    kv_copies = 2 * config.layer_types.count("attention")
-    records = [
-        ("F32", (config.value_dim, config.key_dim, config.delta_heads), delta_copies),
-        ("F16", (config.convolution_width, config.channels), delta_copies),
-        ("F16", (config.head_dim, config.kv_heads, config.capacity), kv_copies),
-        ("F32", (config.rotary_dim, config.capacity), 2),
-    ]
-    path.write_text(
-        "specferry-allocation-states 1\n"
-        + "".join(
-            f"{dtype} {','.join(map(str, shape))} {copies}\n" for dtype, shape, copies in records
-        )
-    )

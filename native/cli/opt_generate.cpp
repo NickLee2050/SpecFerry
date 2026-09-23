@@ -7,13 +7,16 @@
 #include "sys/resource.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,6 +33,28 @@ struct Report {
   std::size_t uploads = 0, upload_bytes = 0, reads = 0, read_bytes = 0, cache_writes = 0;
   bool released = false, bounds_rejected = false, reset_rejected_stale = false;
   double initialize_seconds = 0, execute_seconds = 0;
+
+  void sample_host(const std::string &stage) const {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    std::size_t rss_kib = 0;
+    bool found = false;
+    while (std::getline(status, line)) {
+      if (line.rfind("VmRSS:", 0) == 0) {
+        std::istringstream value(line.substr(6));
+        found = bool(value >> rss_kib);
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("cannot query current host RSS");
+    }
+    std::ofstream out(directory / "host-resources.jsonl", std::ios::app);
+    out << "{\"phase\":\"" << stage << "\",\"rss_bytes\":" << rss_kib * 1024 << "}\n";
+    if (!out) {
+      throw std::runtime_error("cannot write host resource observation");
+    }
+  }
 
   void save(const std::string &status = "running") const {
     rusage usage{};
@@ -154,29 +179,51 @@ void reset(Model &model, Report &report) {
   report.reset_rejected_stale = true;
 }
 
-void save_generation(const specferry::models::opt::Generation &result, const fs::path &directory) {
-  std::ofstream out(directory / "generation.json");
+void save_generation(const specferry::models::opt::Generation &result, const fs::path &directory,
+                     const std::string &filename = "generation.json") {
+  std::ofstream out(directory / filename);
+  out << std::setprecision(17);
   out << "{\"tokens\":[";
   for (unsigned index = 0; index < result.tokens.size(); ++index) {
     out << (index ? "," : "") << result.tokens[index];
   }
   out << "],\"consumed\":" << result.consumed << ",\"stop_reason\":\"" << result.stop_reason
-      << "\",\"first_token_seconds\":" << result.first_token_seconds << ",\"token_seconds\":[";
+      << "\",\"prefill_seconds\":" << result.prefill_seconds
+      << ",\"first_token_seconds\":" << result.first_token_seconds << ",\"token_seconds\":[";
   for (unsigned index = 0; index < result.token_seconds.size(); ++index) {
     out << (index ? "," : "") << result.token_seconds[index];
   }
-  out << "]}\n";
+  out << "],\"total_seconds\":" << result.total_seconds << "}\n";
   if (!out) {
     throw std::runtime_error("cannot save generation result");
+  }
+}
+
+void benchmark(Model &model, const std::vector<std::int32_t> &tokens, unsigned maximum,
+               unsigned warmups, unsigned repeats, Report &report) {
+  for (unsigned index = 0; index < warmups + repeats; ++index) {
+    const bool warmup = index < warmups;
+    const auto name = std::string(warmup ? "warmup." : "measured.") +
+                      std::to_string(warmup ? index : index - warmups);
+    report.phase = name;
+    report.save();
+    specferry::models::opt::Generation result;
+    // Each request resets the valid KV prefix while retaining the same model.
+    // No streaming callback, diagnostics or file IO runs inside the timed call.
+    report.observe([&] { result = model.generate(tokens, maximum); });
+    report.steps += result.consumed;
+    save_generation(result, report.directory, name + ".json");
+    report.sample_host(name);
   }
 }
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 8 && argc != 9) {
+  if (argc != 8 && argc != 9 && argc != 10) {
     std::cerr << "usage: specferry_opt_generate DEPLOYMENT REQUEST OUTPUT MODE LAYERS MAX_NEW "
                  "TOKENS [SAMPLE_SEED]\n"
-              << "MODE is load, teacher, or generate; TOKENS is a whitespace-separated ID file.\n";
+              << "MODE is load, teacher, generate, or benchmark; TOKENS is an ID file.\n"
+              << "For benchmark, replace [SAMPLE_SEED] with WARMUPS REPEATS.\n";
     return 2;
   }
   Report report{argv[3]};
@@ -184,8 +231,16 @@ int main(int argc, char **argv) {
     fs::create_directories(report.directory);
     report.save();
     const std::string mode(argv[4]);
-    if (mode != "load" && mode != "teacher" && mode != "generate") {
+    if (mode != "load" && mode != "teacher" && mode != "generate" && mode != "benchmark") {
       throw std::invalid_argument("unknown execution mode");
+    }
+    if ((mode == "benchmark") != (argc == 10)) {
+      throw std::invalid_argument("benchmark requires WARMUPS REPEATS instead of SAMPLE_SEED");
+    }
+    const auto warmups = mode == "benchmark" ? number(argv[8]) : 0;
+    const auto repeats = mode == "benchmark" ? number(argv[9]) : 0;
+    if (mode == "benchmark" && (warmups > 5 || repeats < 2 || repeats > 20)) {
+      throw std::invalid_argument("benchmark requires 0..5 warmups and 2..20 measured requests");
     }
     const auto config = specferry::models::opt::read_model_config(argv[2]);
     report.layers = number(argv[5]);
@@ -197,7 +252,8 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("sampling is only supported in generation mode");
     }
     if (tokens.size() > config.decoder.capacity || (mode == "teacher" && tokens.empty()) ||
-        (mode == "generate" && report.layers != config.decoder.layers)) {
+        ((mode == "generate" || mode == "benchmark") && report.layers != config.decoder.layers) ||
+        (mode == "benchmark" && !maximum)) {
       throw std::invalid_argument("request exceeds capacity or generation omits layers");
     }
     for (auto token : tokens) {
@@ -208,13 +264,17 @@ int main(int argc, char **argv) {
     specferry::models::opt::validate_model_weights(weights, config, report.layers);
     report.phase = "initialize";
     report.save();
+    report.sample_host("before_initialize");
     const auto start = Clock::now();
     specferry::np101::Context context;
     auto model = std::make_unique<Model>(context, weights, config, report.layers, sampling);
     report.initialize_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    report.sample_host("after_initialize");
     report.phase = mode;
     report.save();
-    if (mode == "generate") {
+    if (mode == "benchmark") {
+      benchmark(*model, tokens, maximum, warmups, repeats, report);
+    } else if (mode == "generate") {
       specferry::models::opt::Generation result;
       report.observe([&] {
         result = model->generate(tokens, maximum, [](std::int32_t token) {
@@ -262,6 +322,7 @@ int main(int argc, char **argv) {
     model->close();
     model.reset();
     context.close();
+    report.sample_host("after_release");
     report.released = true;
     report.phase = "complete";
     report.save("executed");

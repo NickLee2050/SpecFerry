@@ -1,11 +1,20 @@
 """Parameterized operator fixtures with independent fixed-input expectations."""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import numpy as np
 
+from .extended_cases import block_selection, weight_storage
 from .fixtures import Fixture, array
+
+# Fixed-input budgets are independent of any checkpoint's end-to-end calibration.
+# Preserve the previously validated operator thresholds when moving this catalog.
+FIXED_INPUT_TOLERANCES = {
+    "fixed_input_fp16_output": {"atol": 0.01, "rtol": 0.02},
+    "fixed_input_fp32_state": {"atol": 0.0001, "rtol": 0.001},
+}
 
 
 @dataclass(frozen=True)
@@ -15,6 +24,60 @@ class Case:
     scale: str
     build: Callable[[], Fixture]
     tolerances: dict | None = None
+
+
+def catalog() -> dict[str, Case]:
+    """Small SDK contracts with explicit shapes and no model adapter dependency."""
+    cases = {}
+
+    def add(name, family, function, *args, **kwargs):
+        cases[name] = Case(
+            name, family, "small", partial(function, name, *args, **kwargs), FIXED_INPUT_TOLERANCES
+        )
+
+    add("matmul_fp16_small", "linear", matrix, 8, 5)
+    add("fcl_fp16_small", "linear", matrix, 8, 5, fcl=True)
+    add("matmul_dynamic_fp32", "state_matrix", matrix, 8, 5, dtype="F32", dynamic=True)
+    add(
+        "matmul_batched_fp32",
+        "state_matrix",
+        matrix,
+        8,
+        5,
+        dtype="F32",
+        dynamic=True,
+        batch=2,
+        transpose=False,
+    )
+    for mean, kind in ((True, "rms"), (False, "l2")):
+        add(f"{kind}_fp32_small", "normalization", normalization, 8, mean=mean)
+    add("short_conv_small", "short_convolution", short_convolution, 8)
+    add("mask_softmax_small", "attention_mask", masked_softmax, 8)
+    add("scatter_small", "cache_update", scatter, 8, 4)
+    add("argmax_small", "token_selection", argmax, 8)
+    for operation, dtype in (
+        ("SWISH", "F16"),
+        ("SIGMOID", "F16"),
+        ("SIGMOID", "F32"),
+        ("SWISH", "F32"),
+        ("EXP", "F32"),
+        ("SOFTRELU", "F32"),
+    ):
+        add(f"{operation.lower()}_{dtype.lower()}", "activation", activation, operation, 16, dtype)
+    add("gather_small", "lookup", gather, 17, 8)
+    add("layout", "layout", layout)
+    for source, target in (("F16", "F32"), ("F32", "F16")):
+        add(
+            f"convert_{source.lower()}_{target.lower()}",
+            "dtype_conversion",
+            conversion,
+            source,
+            target,
+        )
+    for storage in ("constant", "mutable", "mixed"):
+        add(f"weights_{storage}_fp16", "weight_storage", weight_storage, storage)
+    add("block_token_selection", "token_selection", block_selection)
+    return cases
 
 
 def matrix(name, k, n, *, dtype="F16", dynamic=False, batch=1, transpose=True, fcl=False):

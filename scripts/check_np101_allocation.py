@@ -8,11 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from specferry.models.qwen3_5.export import verify_export
-from specferry.models.qwen3_5.memory import write_allocation_states
 from specferry.validation.allocation import (
     STORAGE_MODES,
     add_run_arguments,
+    prepare_weight_check,
     run_allocation,
     weights_complete,
 )
@@ -24,7 +23,20 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_run_arguments(parser, ROOT / "build/tests/np101_weight_allocation_check", 300)
-    parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/Qwen3.5-0.8B")
+    parser.add_argument(
+        "--deployment",
+        "--model",
+        dest="deployment",
+        type=Path,
+        required=True,
+        help="verified common weight-pack directory; --model is an alias",
+    )
+    parser.add_argument(
+        "--state-spec", type=Path, help="optional explicit state allocation fixture"
+    )
+    parser.add_argument(
+        "--prepare-only", action="store_true", help="verify inputs without device IO"
+    )
     parser.add_argument(
         "--weight-storage",
         choices=STORAGE_MODES,
@@ -36,27 +48,30 @@ def main() -> int:
         parser.error("positive timeout and a new output directory are required")
     output = args.output.resolve()
     try:
-        verify_export(args.model)
         output.mkdir(parents=True)
-        states = output / "allocation-states.txt"
-        write_allocation_states(states)
+        inputs = prepare_weight_check(args.deployment, args.state_spec, output)
+        write_json(output / "inputs.json", inputs)
+        if args.prepare_only:
+            print(f"Verified weight-check inputs: {output / 'inputs.json'}")
+            return 0
+        arguments = [
+            str(args.deployment.resolve()),
+            str(output / "allocation.json"),
+            "--weight-storage",
+            args.weight_storage,
+        ]
+        if args.state_spec is not None:
+            arguments.extend(["--state-spec", str(output / "allocation-states.txt")])
         evidence = run_allocation(
             args.binary,
-            [
-                str(args.model.resolve()),
-                str(output / "allocation.json"),
-                "--state-spec",
-                str(states),
-                "--weight-storage",
-                args.weight_storage,
-            ],
+            arguments,
             output,
             args.sdk_lib,
             args.timeout,
         )
         path = output / "allocation.json"
         report = json.loads(path.read_text()) if path.is_file() else {}
-        complete = weights_complete(report, evidence, args.weight_storage)
+        complete = weights_complete(report, evidence, args.weight_storage, inputs["expected"])
         write_json(
             output / "summary.json",
             {
@@ -65,20 +80,11 @@ def main() -> int:
                 "allocation": report,
                 "evidence": evidence,
                 "model_memory_fit_verified": False,
+                "inputs": inputs,
             },
         )
-        print(
-            json.dumps(
-                {
-                    "returncode": evidence["returncode"],
-                    "device_recovery_required": evidence["device_recovery_required"],
-                    "output": str(output),
-                    "weight_storage": args.weight_storage,
-                    "allocation_and_readback_complete": complete,
-                    "model_memory_fit_verified": False,
-                }
-            )
-        )
+        print(f"Weight/state readback and release: {'passed' if complete else 'failed'}")
+        print(f"Evidence: {output / 'summary.json'}")
         return int(not complete)
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         if output.is_dir():

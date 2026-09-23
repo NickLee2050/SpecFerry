@@ -1,8 +1,6 @@
 """Export integrity, precision, tensor contracts, and memory accounting regressions."""
 
-import hashlib
 import json
-import struct
 import sys
 import tempfile
 import unittest
@@ -21,42 +19,7 @@ from specferry.export.weights import (
 )
 from specferry.models.qwen3_5.memory import memory_budget
 from specferry.models.qwen3_5.schema import expected_text_tensors, validate_text_entries
-
-
-def source_tensor(root, name, values, dtype):
-    raw = values.view(torch.uint8).numpy().tobytes()
-    header = json.dumps(
-        {name: {"dtype": dtype, "shape": list(values.shape), "data_offsets": [0, len(raw)]}}
-    ).encode()
-    filename = name.replace(".", "_") + ".safetensors"
-    (root / filename).write_bytes(struct.pack("<Q", len(header)) + header + raw)
-    return {
-        "source_name": name,
-        "text_name": name,
-        "file": filename,
-        "dtype": dtype,
-        "target_dtype": "F32" if dtype == "F32" else "F16",
-        "shape": list(values.shape),
-        "data_offsets": [0, len(raw)],
-    }
-
-
-def complete_manifest(root, records):
-    manifest = {
-        "format": "specferry-np101-weights-v1",
-        "status": "complete",
-        "tensors": records,
-        "aliases": {"lm_head.weight": "model.embed_tokens.weight"},
-        "files": {
-            name: {
-                "bytes": (root / name).stat().st_size,
-                "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest(),
-            }
-            for name in ("weights.bin", "weights.index")
-        },
-    }
-    (root / "deployment-manifest.json").write_text(json.dumps(manifest))
-    return manifest
+from tests.python.weight_fixtures import complete_manifest, source_tensor
 
 
 class PrecisionTests(unittest.TestCase):
@@ -109,7 +72,9 @@ class WeightPackTests(unittest.TestCase):
             ]
             records = write_weight_pack(root, entries, root, chunk_bytes=8, head_block_rows=2)
             write_native_index(root, records)
-            complete_manifest(root, records)
+            complete_manifest(
+                root, records, aliases={"lm_head.weight": "model.embed_tokens.weight"}
+            )
             self.assertEqual(verify_weight_pack(root)["tensors"], 2)
             packed = (root / "weights.bin").read_bytes()
             self.assertEqual(records[1]["offset"] % 64, 0)

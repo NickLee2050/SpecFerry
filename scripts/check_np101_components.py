@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate shared operators with a small synthetic decoder and a second KV layout."""
+"""Regress shared operators through a synthetic Qwen decoder and a second KV layout."""
 
 import argparse
 import sys

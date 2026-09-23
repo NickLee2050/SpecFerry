@@ -75,6 +75,114 @@ def weights_report(storage="constant"):
 
 
 class AllocationReportTests(unittest.TestCase):
+    def test_skipped_readback_proves_only_allocation_and_release(self):
+        report = capacity_report() | {
+            "readback_mode": "none",
+            "rejection_phase": "",
+            "verified_bytes": 0,
+            "scanned_bytes": 0,
+            "scanned_blocks": 0,
+            "mismatched_bytes": 0,
+            "mismatched_blocks": 0,
+        }
+        self.assertTrue(
+            allocation.capacity_allocation_complete(
+                report, clean_evidence(), "constant", "F16", 64, "none"
+            )
+        )
+        self.assertFalse(capacity_complete(report, clean_evidence(), "constant", "F16", 64))
+        for change in (
+            {"released": False},
+            {"error": "read failure"},
+            {"verified_bytes": 1},
+            {"readback_mode": "all"},
+        ):
+            self.assertFalse(
+                allocation.capacity_allocation_complete(
+                    report | change, clean_evidence(), "constant", "F16", 64, "none"
+                )
+            )
+        for change in ({"returncode": -8}, {"returncode": 1}, {"timeout": True}):
+            self.assertFalse(
+                allocation.capacity_allocation_complete(
+                    report, clean_evidence() | change, "constant", "F16", 64, "none"
+                )
+            )
+
+    def test_full_scan_covers_blocks_after_the_first_corruption(self):
+        report = capacity_report(target_mib=16) | {
+            "readback_mode": "all",
+            "rejection_phase": "",
+            "status": "readback_mismatch",
+            "first_mismatch": {"block_index": 0, "byte_offset": 3},
+            "failure_phase": "readback",
+            "readback_error": "byte_mismatch",
+            "verified_bytes": BLOCK_BYTES,
+            "scanned_bytes": 2 * BLOCK_BYTES,
+            "scanned_blocks": 2,
+            "mismatched_bytes": 2,
+            "mismatched_blocks": 1,
+        }
+        rows = [
+            {
+                "block_index": index,
+                "payload_offset_bytes": index * BLOCK_BYTES,
+                "expected_bytes": BLOCK_BYTES,
+                "actual_bytes": BLOCK_BYTES,
+                "mismatched_bytes": 2 if index == 0 else 0,
+                "byte_range_count": 1 if index == 0 else 0,
+                "byte_ranges": [[3, 5]] if index == 0 else [],
+                "byte_ranges_truncated": False,
+                "bad_page_ranges": [[0, 1]] if index == 0 else [],
+                "logical_page_size": 4096,
+            }
+            for index in range(2)
+        ]
+        evidence = clean_evidence() | {"returncode": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            path = output / "readback-blocks.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            self.assertTrue(
+                allocation.capacity_scan_complete(report, evidence, "constant", "F16", 16, output)
+            )
+            self.assertFalse(capacity_complete(report, evidence, "constant", "F16", 16))
+            rejected = report | {
+                "target_bytes": 24 * MIB,
+                "rejected_block_bytes": BLOCK_BYTES,
+                "rejection_phase": "allocate",
+                "allocation_error": "AddTensor failed",
+            }
+            self.assertTrue(
+                allocation.capacity_scan_complete(rejected, evidence, "constant", "F16", 24, output)
+            )
+            mutable_rejection = rejected | {
+                "storage": "mutable",
+                "rejection_phase": "upload",
+                "allocation_error": "CopyDataToTensor failed: SDK status=-5",
+            }
+            self.assertTrue(
+                allocation.capacity_scan_complete(
+                    mutable_rejection, evidence, "mutable", "F16", 24, output
+                )
+            )
+            for change in (
+                {"scanned_blocks": 1},
+                {"mismatched_bytes": 1},
+                {"status": "target_reached"},
+                {"error": "read failed"},
+            ):
+                self.assertFalse(
+                    allocation.capacity_scan_complete(
+                        report | change, evidence, "constant", "F16", 16, output
+                    )
+                )
+            rows[1]["block_index"] = 0
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            self.assertFalse(
+                allocation.capacity_scan_complete(report, evidence, "constant", "F16", 16, output)
+            )
+
     def test_complete_reports_require_the_requested_dtype_storage_and_size(self):
         for storage in allocation.STORAGE_MODES:
             self.assertTrue(weights_complete(weights_report(storage), clean_evidence(), storage))

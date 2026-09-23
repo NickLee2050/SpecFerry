@@ -137,13 +137,41 @@ execution evidence visible. It does not turn numerical failures into passes.
 Without this flag, these validation runners return 2 when hardware acceptance
 is still pending. Read the generated report as well as the exit status.
 
+List the model-independent operator checks and verify an exported weight pack
+without opening the board:
+
+```bash
+python scripts/check_np101_operators.py --list
+python scripts/check_np101_allocation.py --deployment .cache/np101/opt-350m \
+  --prepare-only --output .cache/runs/opt-weights-prepared
+```
+
+To load and read back those weights on the board, omit `--prepare-only` and use a
+fresh output directory. State allocation is optional and requires `--state-spec FILE`.
+Inspect `inputs.json` and `summary.json`; this check verifies weight bytes and
+release, without running the model's computation graph. For the retained Qwen
+operator catalog, add `--profile qwen3.5` to the operator command.
+
 Additional run instructions:
 
 - [Test index and shared operator checks](tests/README.md)
 - [OPT decoder slices](tests/np101-opt.md)
 - [Complete-model input/output and generation](tests/np101-generation.md)
+- [Repeated generation, timing and hardware acceptance](tests/np101-acceptance.md)
 - [Sampling](tests/np101-sampling.md)
 - [Weight and FP16/FP32 capacity diagnostics](tests/np101-capacity.md)
+
+To run the full-model correctness gates followed by warmups and repeated generation:
+
+```bash
+python scripts/check_np101_acceptance.py --output .cache/runs/opt-acceptance
+```
+
+Inspect `acceptance.json`. Exit code 2 with `hardware_pending` means numerical
+checks passed but execution/residency evidence remains open. Use `--prepare-only`
+to prepare CPU fixtures without opening the board. Timing runs disable strace and
+token printing; their reported latency is host wall time. See the linked guide
+for prompt, repeat, capacity and SDK-path options.
 
 ## Run the retained Qwen regression
 
@@ -176,6 +204,21 @@ python scripts/collect_environment.py --output .cache/runs/environment
 Inspect each run's report, SDK log and execution evidence; `strace` output is
 included when available. Current driver-specific reproduction details are in the
 [capacity diagnostic guide](tests/np101-capacity.md).
+
+To measure retained allocation separately from data integrity, use fresh directories:
+
+```bash
+python scripts/check_np101_capacity.py --target-mib 4096 --readback none \
+  --output .cache/runs/allocation-bound
+python scripts/check_np101_capacity.py --target-mib 2840 --readback all \
+  --output .cache/runs/readback-map
+```
+
+Choose the scan target from the allocation result. `none` skips readback; `all`
+records every corrupt block in `readback-blocks.jsonl` and returns 1 for mismatches.
+Inspect `allocation_and_release_passed`, `full_scan_completed` and
+`readback_and_release_passed` separately in `summary.json`. Set `--dtype F32`
+or `--storage mutable` to compare precision and storage modes.
 
 If a run times out, exits on a signal or leaves a child process, further device
 runs are blocked by `.cache/runs/np101-recovery-required.json`. Have the device

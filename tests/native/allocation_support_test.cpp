@@ -71,6 +71,31 @@ void check_report_escaping() {
   require(outcome.failure_phase == "upload" && !outcome.released,
           "program failure lost its phase or claimed cleanup");
 }
+
+void check_scan() {
+  std::vector<std::uint8_t> expected(3 * 4096, 1);
+  auto actual = expected;
+  actual[0] = 0;
+  actual[4095] = 0;
+  actual[4096] = 0;
+  actual.back() = 0;
+  const auto scan = scan_readback(actual, expected);
+  require(scan.mismatched_bytes == 4 && scan.range_count == 3 && scan.ranges.size() == 3,
+          "scan lost separated mismatches or a page-crossing interval");
+  require(scan.ranges[1].begin == 4095 && scan.ranges[1].end == 4097 &&
+              scan.page_ranges.size() == 1 && scan.page_ranges[0].begin == 0 &&
+              scan.page_ranges[0].end == 3,
+          "scan page coverage is incomplete");
+  const auto bounded = scan_readback(actual, expected, 1);
+  require(bounded.ranges.size() == 1 && bounded.range_count == 3 && bounded.mismatched_bytes == 4 &&
+              bounded.page_ranges[0].end == 3,
+          "bounded detail truncated total counts or page coverage");
+  const auto short_read = scan_readback({1, 2}, {1, 2, 3, 4});
+  require(short_read.mismatched_bytes == 2 && short_read.ranges[0].begin == 2 &&
+              short_read.ranges[0].end == 4,
+          "short readback lost the missing tail");
+  require(scan_readback(expected, expected).page_ranges.empty(), "intact data produced bad pages");
+}
 } // namespace
 
 int main() {
@@ -79,6 +104,7 @@ int main() {
     check_pattern(DataType::Float32);
     check_comparison();
     check_report_escaping();
+    check_scan();
     std::cout << "Allocation pattern and readback contracts passed without opening the device.\n";
     return 0;
   } catch (const std::exception &error) {

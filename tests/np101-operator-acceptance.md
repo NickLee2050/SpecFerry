@@ -6,7 +6,7 @@ capabilities and their test infrastructure; complete DLM deployment is not accep
 
 Maintenance update, 2026-09-16: the 22 SDK RNN feedback cases (11 handle and
 11 ordinary) and the temporary buffer diagnostic were removed from the active
-suite. The current catalog has 49 synthetic operator cases and four optional
+suite. The retained Qwen catalog has 49 synthetic operator cases and four optional
 captured-reference projections. The results below remain the historical record
 of the original 75 cases; deletion does not turn failures into passes or close
 state acceptance. See the [investigation archive](state-feedback-investigation.md)
@@ -19,6 +19,12 @@ available at Git commit `8165dd5` (`scripts/check_np101_graph_sharing.py`,
 The historical symbol-unavailable result and `graph-sharing/` evidence below
 remain unchanged. Production retained-tensor sharing is covered by the existing
 DeltaNet, KV, Attention and decoder validation paths.
+
+Maintenance update, 2026-09-23: the default `--profile generic` now selects 24
+independent SDK cases. The explicit `--profile qwen3.5` preserves all 49 retained
+cases, with unchanged shapes, builders and numerical budgets. Real projections
+require that profile plus explicit `--model` and `--reference-trace` paths.
+This separates fixture ownership; it does not revalidate historical hardware results.
 
 ## Results
 

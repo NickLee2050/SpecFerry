@@ -41,6 +41,24 @@ struct ByteMismatch {
 
 std::optional<ByteMismatch> compare_bytes(const std::vector<std::uint8_t> &actual,
                                           const std::vector<std::uint8_t> &expected);
+
+struct ByteRange {
+  std::size_t begin;
+  std::size_t end;
+};
+
+struct ReadbackScan {
+  std::size_t mismatched_bytes = 0;
+  std::size_t range_count = 0;
+  // Bound detailed output even if every other byte is corrupt. Page intervals
+  // still cover every affected logical 4 KiB page; they are not physical pages.
+  std::vector<ByteRange> ranges;
+  std::vector<ByteRange> page_ranges;
+};
+
+ReadbackScan scan_readback(const std::vector<std::uint8_t> &actual,
+                           const std::vector<std::uint8_t> &expected,
+                           std::size_t maximum_ranges = 256);
 void json_string(std::ostream &output, const std::string &value);
 
 struct ReadbackLocation {

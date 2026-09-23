@@ -1,5 +1,11 @@
 {
   "python.defaultInterpreterPath": "${env:HOME}/miniconda3/envs/SpecFerry/bin/python",
+  "python.languageServer": "Pylance",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/python"
+  ],
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.indexing": true,
   "python.terminal.activateEnvironment": true,
   "python-envs.defaultEnvManager": "ms-python.python:conda",
   "python-envs.defaultPackageManager": "ms-python.python:conda"

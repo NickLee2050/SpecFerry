@@ -1,0 +1,5 @@
+specferry-allocation-states 1
+F32 128,128,16 36
+F16 4,6144 36
+F16 256,2,512 12
+F32 64,512 2

@@ -14,8 +14,10 @@ struct Generation {
   std::vector<std::int32_t> tokens;
   unsigned consumed = 0;
   std::string stop_reason;
+  double prefill_seconds = 0;
   double first_token_seconds = 0;
   std::vector<double> token_seconds;
+  double total_seconds = 0;
 };
 
 struct GenerationExecutor {

@@ -5,6 +5,66 @@ existing device lock, timeout, process checks and recovery marker. This diagnost
 does not build or execute an operator graph. It measures simultaneously retained,
 initialized SDK tensor payload, not model workspace or proven physical residency.
 
+## Allocation bound and complete corruption map, 2026-09-23
+
+The requested capacity experiment ignores content mismatches when determining
+the accepted allocation budget. All four dtype/storage combinations retain **355
+initialized 8 MiB blocks: 2,840 MiB = 2,977,955,840 bytes = 2.7734375 GiB**.
+The next 8 MiB block is rejected. This is the observed boundary at 8 MiB
+granularity for this allocation pattern; smaller final allocations, other block
+sizes, mixed-pool layouts and physical exhaustion are not established.
+
+| Dtype | Storage | Accepted initialized payload | Rejection on next block | Full scan |
+|---|---|---:|---|---|
+| F16 | constant | 2,840 MiB | `AddTensor`: create-tensor-from-data failure | Block 109, 24 mismatched bytes |
+| F16 | mutable | 2,840 MiB | `CopyDataToTensor`: status -5 | Block 109, 24 mismatched bytes |
+| F32 | constant | 2,840 MiB | `AddTensor`: create-tensor-from-data failure | Block 109, 24 mismatched bytes |
+| F32 | mutable | 2,840 MiB | `CopyDataToTensor`: status -5 | Block 109, 24 mismatched bytes |
+
+The installed `/usr/inc/VX/vx_types.h` defines -5 as `VX_ERROR_NOT_ALLOCATED`.
+Mutable handle creation succeeds for the next block but initialization does not;
+that uninitialized handle is excluded from the accepted payload and released
+with the graph. The result does not prove a hardware fault or identify a pool's
+physical capacity. It also does not demonstrate usable payload near 4 GiB.
+
+The F16 constant experiment first skips readback while seeking the bound, then
+uses a fresh process to scan all 2,840 MiB. The other three combinations seek the
+same bound and then scan every retained block, even after finding a mismatch.
+All **355 blocks** are examined in each large scan. Only block 109 (zero-based;
+the 110th block) differs. Its other bytes and all 354 remaining blocks match.
+All four modes return zeros in the same three intervals:
+
+| Offset within block 109, bytes `[begin,end)` | Cumulative payload offset, bytes `[begin,end)` | Size |
+|---|---|---:|
+| `[1,274,680, 1,274,688)` | `[915,632,952, 915,632,960)` | 8 bytes |
+| `[1,274,744, 1,274,752)` | `[915,633,016, 915,633,024)` | 8 bytes |
+| `[1,274,808, 1,274,816)` | `[915,633,080, 915,633,088)` | 8 bytes |
+
+These intervals lie in logical page 311 within that block. They correspond to
+12 FP16 values or six FP32 values. The findings reproduce the earlier corruption
+locations, but now establish that the remainder of the successfully retained
+2,840 MiB also compares correctly in these runs. They **do not** identify a
+physical bad page or justify skipping that logical page in the allocator.
+
+All four initial 64 MiB controls pass. No run times out, exits on a signal or leaves
+a device process; graph/context release completes, including after a rejected
+allocation. The final 64 MiB control also passes after the matrix. The driver
+reference count is zero and no recovery marker is present after all ten runs.
+No computation graph, driver change or sudo command is involved.
+
+Local evidence: `.cache/runs/capacity-map-20260923/` contains `control-*`,
+`limit-f16-constant`, `scan-*`, `post-control-f16-constant`, host environment,
+source/binary hashes and `results.json`. Per-block JSONL and first-mismatch binary
+dumps are retained for each scan. The first F16 mutable wrapper conservatively
+rejected an upload-stage bound; `summary-review.json` records its later offline
+evaluation using the explicit initialized-payload contract. Its original native
+report, execution evidence and initial summary remain unchanged.
+
+The follow-up closure work is in the
+[remaining acceptance checklist](../docs/remaining-acceptance-plan.md).
+Corrupt bytes still fail deployment integrity; the allocation-only success does
+not close `NP101-MEM-001`.
+
 ## Method
 
 - Allocate nonvirtual FP16 or FP32 tensors in blocks of at most 8 MiB, retaining
@@ -15,9 +75,11 @@ initialized SDK tensor payload, not model workspace or proven physical residency
   as zero-filled or overwritten data. Memory readback does not validate FP32 ops.
 - Constant mode supplies bytes to `vsi_nn_AddTensor`. Mutable mode creates the
   tensor and explicitly uploads with `vsi_nn_CopyDataToTensor`.
-- Stop at the requested target or the first SDK rejection. Read every successful
-  block back while all blocks coexist, compare every byte, then release the graph
-  and context. Host staging remains bounded to one block and its readback.
+- Stop at the requested target or the first SDK rejection. The readback mode
+  controls whether to stop at the first mismatch (`first`, default), scan all
+  successful blocks (`all`), or skip readback (`none`). Every block coexists until
+  readback is finished; then release the graph and context. Host staging remains
+  bounded to one block and its readback.
 - `target_reached` establishes a tested payload lower bound. `allocation_limit`
   records a rejected next block and requires full retained-byte verification and
   clean release. It is a bound for this allocation pattern, not proof of physical
@@ -56,12 +118,47 @@ The executable stops at the first rejected block and caps all requests at
 claim that the requested target was reached. Inspect `summary.json` and retain
 `capacity.json`, SDK output, driver trace and executable snapshot.
 
-A near-4-GiB run (`--target-mib 4096`) remains deferred on the current package
-because the 1152 MiB checks fail. Consider it only after a corrected path passes
-the smaller targets with complete readback and release.
+The default integrity acceptance still requires matching retained bytes before
+increasing a deployment budget. On 2026-09-23 the user separately requested an
+allocation-bound experiment that ignores content errors, followed by a complete
+corruption map. That diagnostic exception uses the explicit modes below; it does
+not authorize treating corrupt memory as usable model storage.
+
+```bash
+python scripts/check_np101_capacity.py --dtype F16 --storage constant \
+  --target-mib 4096 --readback none --output .cache/runs/capacity-allocation-bound
+python scripts/check_np101_capacity.py --dtype F16 --storage constant \
+  --target-mib 2840 --readback all --output .cache/runs/capacity-corruption-map
+```
+
+`none` still initializes every tensor, avoiding a measurement of unmaterialized
+handles alone. `allocation_and_release_passed` records accepted payload and clean
+teardown independently from `readback_and_release_passed`; skipped readback never
+passes the latter. A rejected next block is recorded with its SDK error and
+`rejection_phase`. No graph compilation/workspace is included.
+For mutable tensors, creation of a handle may succeed before initialization
+fails. The accepted payload counts only completely initialized blocks; an
+`upload` rejection is reported separately from rejection in `AddTensor`. It is
+not silently converted to a successful bare-handle allocation.
+
+`all` writes one `readback-blocks.jsonl` row per retained block, including intact
+blocks. It reports exact mismatched-byte counts, contiguous half-open byte ranges,
+and all affected logical 4 KiB page intervals. Detailed byte ranges are capped at
+256 per block with an explicit truncation flag; total counts and page coverage
+are never truncated. Block indices and offsets start at zero. The cumulative
+`payload_offset_bytes` is the sum of preceding payloads, **not a physical address**.
+First-mismatch binary dumps remain available. The scanner does not rewrite tensors.
+
+`full_scan_completed` requires complete coverage, consistent per-block totals and
+normal release/exit. It may be true when integrity fails: a complete scan with
+content errors still returns exit code 1 and `readback_mismatch`. Such a normal
+diagnostic result permits the next explicitly requested comparison; SDK read errors,
+signals, timeouts, recovery markers or failed release do not. `verified_bytes`
+counts only wholly intact blocks, while `scanned_bytes` includes corrupt blocks.
 
 Both allocation scripts accept `--binary`, `--sdk-lib`, `--output` and `--timeout`.
-The capacity binary requires `REPORT_JSON constant|mutable F16|F32 TARGET_MIB`.
+The capacity binary requires `REPORT_JSON constant|mutable F16|F32 TARGET_MIB`
+and accepts an optional final `first|all|none` argument.
 Rebuild it with the matching wrapper; old reports remain historical evidence and
 cannot satisfy the new version-2 acceptance contract. Binary hashes live in
 `execution-evidence.json`; a duplicate `binary.json` is no longer generated.
@@ -86,6 +183,52 @@ Host checks: `python -m unittest tests.python.test_capacity` and
 These cover dtype/storage and byte-count contracts, incomplete/contradictory
 reports, release/process failure, short/long readback, page aliases, deterministic
 finite patterns and CLI overrides without opening the device.
+
+## Generic weight-pack readback
+
+The weight checker consumes the common `deployment-manifest.json`, `weights.index`
+and `weights.bin` format. Supply a directory explicitly; `--model` is retained as
+an alias for `--deployment`. Generic verification checks file/tensor integrity,
+shapes, offsets and aliases; it does not assert a model-specific architecture or
+replace the stricter OPT/Qwen export validation.
+
+```bash
+# Host-only verification of an existing pack; no state buffers are implicit.
+python scripts/check_np101_allocation.py --deployment .cache/np101/opt-350m \
+  --prepare-only --output .cache/runs/opt-weight-check-prepared
+
+# Explicitly reproduce the historical Qwen weight/state allocation after a relevant fix.
+python scripts/check_np101_allocation.py --deployment .cache/np101/Qwen3.5-0.8B \
+  --state-spec tests/fixtures/qwen3_5_allocation_states.txt \
+  --output .cache/runs/qwen-weight-state-recheck
+```
+
+Without `--prepare-only`, the first command performs weight-only device readback.
+Optional state files begin with `specferry-allocation-states 1`, followed by
+`DTYPE SDK_SHAPE COPIES` rows. The historical fixture is now an explicit data file,
+replacing automatic Qwen-specific generation; its shape/order and 46,071,808-byte
+payload are preserved. No-state checks require all state counters to be zero.
+
+`inputs.json` retains model identity/revision when supplied by the manifest,
+manifest/pack hashes, a snapshot/hash of the optional state specification, and
+expected physical weight count and payload totals. Acceptance compares the native
+report with those requested totals, in addition to integrity and lifecycle checks.
+It never counts a tied-weight alias as another physical tensor. A prepared or
+successful readback result does not claim complete-model fit or hardware execution.
+
+Capacity acceptance now shares explicit payload/boundary checks between its
+allocation and integrity predicates; it never rewrites reported verification
+counts or process exit codes to manufacture an intermediate passing report.
+
+Refactor validation on 2026-09-23 is retained under
+`.cache/runs/test-cleanup-20260923/`. Host preflight passed for the cached OPT pack
+without states and the cached Qwen pack with the historical state fixture.
+Two tiny device controls passed readback and release: 32 bytes of constant
+FP16/FP32 weights without states, and the same mutable weights plus 272 bytes of
+explicit state. The driver reference count returned to zero and no recovery
+marker was created. These controls do not revalidate full-model loading or resolve
+the large-allocation corruption below. Offline review of all ten existing
+capacity-map records preserved their allocation/scan verdicts.
 
 ## New package preflight, 2026-09-22
 
@@ -176,6 +319,10 @@ the installed SDK and run without changes to its test logic:
 python scripts/check_np101_allocation.py \
   --output .cache/runs/allocation-repro_0922_1 --timeout 600
 ```
+
+This is the historical invocation. With the current generic runner, explicitly
+supply `--deployment .cache/np101/Qwen3.5-0.8B` and
+`--state-spec tests/fixtures/qwen3_5_allocation_states.txt` to select the same fixture.
 
 All 320 logical Qwen text weights uploaded successfully (1,504,791,232 bytes).
 With the state buffers, all 502 SDK tensors were allocated and initialized,

@@ -71,7 +71,9 @@ For an authorized recheck after a relevant change, use a fresh output directory:
 ```bash
 conda activate SpecFerry
 cmake --build build --target np101_weight_allocation_check -j 4
-python scripts/check_np101_allocation.py --weight-storage mutable --timeout 300 \
+python scripts/check_np101_allocation.py --deployment .cache/np101/Qwen3.5-0.8B \
+  --state-spec tests/fixtures/qwen3_5_allocation_states.txt \
+  --weight-storage mutable --timeout 300 \
   --output .cache/runs/weight-allocation-mutable-recheck
 ```
 

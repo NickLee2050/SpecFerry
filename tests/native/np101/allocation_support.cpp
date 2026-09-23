@@ -96,6 +96,39 @@ std::optional<ByteMismatch> compare_bytes(const std::vector<std::uint8_t> &actua
   return mismatch;
 }
 
+ReadbackScan scan_readback(const std::vector<std::uint8_t> &actual,
+                           const std::vector<std::uint8_t> &expected, std::size_t maximum_ranges) {
+  ReadbackScan result;
+  const auto size = std::max(actual.size(), expected.size());
+  const auto differs = [&](std::size_t offset) {
+    return offset >= actual.size() || offset >= expected.size() ||
+           actual[offset] != expected[offset];
+  };
+  std::size_t offset = 0;
+  while (offset < size) {
+    if (!differs(offset)) {
+      ++offset;
+      continue;
+    }
+    const auto begin = offset;
+    while (offset < size && differs(offset)) {
+      ++offset;
+    }
+    result.mismatched_bytes += offset - begin;
+    ++result.range_count;
+    if (result.ranges.size() < maximum_ranges) {
+      result.ranges.push_back({begin, offset});
+    }
+    const ByteRange pages{begin / 4096, (offset - 1) / 4096 + 1};
+    if (!result.page_ranges.empty() && pages.begin <= result.page_ranges.back().end) {
+      result.page_ranges.back().end = pages.end;
+    } else {
+      result.page_ranges.push_back(pages);
+    }
+  }
+  return result;
+}
+
 void json_string(std::ostream &output, const std::string &value) {
   constexpr char hex[] = "0123456789abcdef";
   output << '"';

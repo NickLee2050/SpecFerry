@@ -1,14 +1,17 @@
 # Engineering follow-up
 
-Updated: 2026-09-22. Active target: complete resident OPT-350M text inference on NP101.
+Updated: 2026-09-23. Active target: complete resident OPT-350M text inference on NP101.
 Numerical SDK validation and formal hardware acceptance are tracked separately.
+
+Next implementation steps and closure criteria:
+[remaining S11 acceptance checklist](docs/remaining-acceptance-plan.md).
 
 ## Current work and dependencies
 
 | Work | Current state | Next action / dependency |
 |---|---|---|
-| OPT input/output and generation (S9/S10) | Implemented and numerically validated on the earlier SDK | Retain the regression; revalidate execution after the new-package computation fault is resolved |
-| Complete DLM hardware acceptance (S11) | Open | Resolve the new-package computation fault; establish backend/residency evidence and measure full-model memory and performance |
+| OPT input/output and generation (S9/S10) | Implemented; full 24-layer numerical/lifecycle regression also passes on package 1.0.6 | Retain the regression; the independent convolution fault remains open |
+| Complete DLM hardware acceptance (S11) | Acceptance/measurement runner implemented; formal hardware gates open | Establish per-kernel backend/residency evidence and device memory accounting; complete long-context/performance acceptance |
 | Full Qwen weight loading | Allocation succeeds on package 1.0.6, retained bytes fail validation | NP101-MEM-001; also account for deferred DeltaNet duplication before any full-model integration |
 | Qwen component regression | Existing implementation and evidence retained | Recheck affected components after relevant changes; no new full-Qwen integration in the active OPT scope |
 | TLM/protocol and speculative inference | Deferred | Complete the DLM acceptance stage before joint inference and optimization measurements |
@@ -22,8 +25,10 @@ without a relevant change or a concrete diagnostic hypothesis.
 
 - [x] Recheck constant and mutable storage using equal-byte FP16/FP32 diagnostics.
 - [x] Capture failed bytes and explicit cleanup results for synthetic and actual weights.
+- [x] Separately measure the accepted allocation bound and scan all retained blocks,
+  continuing past byte mismatches as explicitly requested on 2026-09-23.
 - [ ] Obtain a vendor-supported correction or explanation of the corruption.
-- [ ] Revalidate retained bytes and normal release before increasing the target size.
+- [ ] Revalidate retained bytes and normal release before increasing the deployment budget.
 - [ ] Revalidate all Qwen weights and the historical allocation-state fixture together.
 
 Package 1.0.6 accepts all 502 Qwen weight/state tensors (1,550,863,040 bytes),
@@ -33,6 +38,12 @@ all 46,071,808 zero-initialized state bytes still compare correctly.
 
 All four 64 MiB controls pass. All four 1,152 MiB runs (FP16/FP32 × constant/mutable)
 fail at the same three eight-byte regions of block 109, starting at byte 1,274,680.
+The 2026-09-23 extension retains 2,840 MiB in all four combinations, then rejects
+the next 8 MiB block (constant: AddTensor; mutable: upload status -5,
+`VX_ERROR_NOT_ALLOCATED`). Complete scans of all 355 retained blocks find only
+the same 24 differing bytes, all read back as zero. All remaining bytes compare
+correctly and cleanup completes. This is an initialized-payload boundary at
+8 MiB granularity, not proof of physical exhaustion or usable model capacity.
 The largest earlier fully verified payload is 864 MiB in constant mode, a tested
 lower bound rather than a physical limit. The old 1 GiB allocation ceiling is
 historical; the current failure is retained-data integrity. Physical pool selection
@@ -42,6 +53,8 @@ Evidence and reproduction:
 [capacity diagnostics](tests/np101-capacity.md),
 [old constant/mutable comparison](tests/np101-mutable-allocation.md),
 `.cache/runs/allocation-review-20260922/`.
+The extended allocation and corruption-map evidence is in
+`.cache/runs/capacity-map-20260923/`.
 
 Closure checks after a relevant vendor change:
 
@@ -68,16 +81,25 @@ resident-inference acceptance.
 - [ ] Determine the failing operand/configuration with the chip team and correct
   the caller or SDK path as indicated by evidence.
 - [ ] Revalidate changing-input convolution/ReLU/pooling, cleanup and process exit,
-  then revalidate the affected OPT numerical path on the corrected package.
+  on a corrected path.
+- [x] Independently recheck exact OPT selection and the complete 24-layer numerical
+  path on package 1.0.6; both passed on 2026-09-22 without changing the convolution test.
 
 Caller/SDK root cause remains unresolved; matching package files do not establish
 correct computation. This is separate from the allocation-only readback failure.
 See the [preflight record](tests/np101-capacity.md).
-This item gates new-package computation acceptance, not CPU work or the recorded
-allocation-only controls.
+This item gates convolution acceptance. The passing OPT regression shows that it
+does not currently block the tested OPT graph path; neither result resolves the
+independent allocation corruption.
 
 ## NP101-OBS-001: Establish execution and device-memory evidence (S11)
 
+- [x] Implement staged correctness gates, checkpoint-default CPU token comparisons,
+  same-instance warmups/repeats and fresh-process model lifetimes.
+- [x] Separate initialization, prefill, first-token and decode wall times; retain
+  counts, distributions, explicit transfers and host RSS outside timed requests.
+- [x] Keep failed/incomplete runs out of timing summaries and retain missing
+  hardware evidence as an explicit blocking result.
 - [ ] Obtain a supported trace/profiler that identifies each kernel's execution
   backend and completion, plus physical allocation/residency observations.
 - [ ] Account for weights, KV, activations, SDK layout copies and workspace with
@@ -85,6 +107,13 @@ allocation-only controls.
 - [ ] Verify release/recreation against device memory observations.
 - [ ] Measure initialization, prompt processing and decoding after correctness
   and execution/residency are established; separate diagnostic tracing overhead.
+- [ ] Complete representative long-context checks before formal model acceptance.
+
+Implementation, run commands and current observations:
+[complete-model acceptance](tests/np101-acceptance.md). The runner can collect
+untraced host observations now; they are not formal NPU performance measurements.
+The initial suite passes all numerical gates, warmups, repeated requests and four
+fresh model lifetimes. Host memory growth is tracked separately as NP101-MEM-003.
 
 Generic driver IO, SDK success, numeric agreement and `argmax.execute_on_sw=false`
 do not establish exclusive NPU execution. Host RSS/FD stability is not a board
@@ -115,6 +144,35 @@ Numerical/lifecycle records: [DeltaNet](tests/np101-delta-net.md),
 The [state investigation archive](tests/state-feedback-investigation.md) preserves
 retired experiments. The remaining residency check gates formal device-resident
 sequential inference acceptance, not implementation of already validated state routing.
+
+## NP101-MEM-003: Explain per-token host allocation growth
+
+- [x] Observe repeatable RSS growth during full OPT generation with persistent models.
+- [x] Independently validate the exported HAL memory-profile counter with an 8 MiB
+  allocation/readback control, then sample a separate full-model run.
+- [ ] Locate the allocation source and determine whether it is retained workspace,
+  missing release or another SDK/application ownership issue.
+- [ ] Verify bounded steady-state host allocation and release after the correction.
+
+The unprofiled suite grows approximately 3 MiB of host RSS per consumed token.
+With `VIV_MEMORY_PROFILE=1`, three nine-token requests increase SDK
+`system_memory.currentSize` by 28,313,280 bytes per repeated request. The SDK's
+exit dump still reports 84,939,840 bytes and 1,296 allocations not freed after
+27 consumed tokens: 3,145,920 bytes and 48 allocations per token. This is stronger
+evidence than RSS alone, but does not yet identify the allocating call or root cause.
+Application transfer counts and tokens remain correct. Ask the chip team to
+interpret these counters and investigate allocation stacks/lifetimes, including
+the per-slot KV graph verification path; that path is a hypothesis, not a diagnosis.
+
+SDK `gpu_memory` accounting stays constant during the three requests and returns
+to zero in the exit dump. Its roughly 1.36 GiB peak is not accepted as physical
+NP101 memory: an 8 MiB control produces roughly 16 MiB of counted allocations.
+These counters remain diagnostic only, outside the default inference/benchmark path.
+The source, binary and logs are retained under
+`.cache/runs/acceptance-20260922-memory-profile/`.
+This issue gates long-running resource stability and final S11 acceptance;
+long-context/stress acceptance is deferred until the growth is explained or
+corrected. It does not invalidate the completed short numerical comparisons.
 
 ## NP101-MEM-002: Share DeltaNet weights across alternating graphs
 

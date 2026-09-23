@@ -39,6 +39,8 @@ void contracts() {
   require(result.tokens == predictions && result.stop_reason == "eos");
   require(consumed == std::vector<std::int32_t>({2, 7, 3, 4}));
   require(result.consumed == 4 && streamed == predictions && result.token_seconds.size() == 2);
+  require(result.prefill_seconds >= 0 && result.first_token_seconds >= result.prefill_seconds &&
+          result.total_seconds >= result.first_token_seconds);
 
   result = generate_tokens({10, 8, 2, 2}, executor, {}, 1, notify);
   require(consumed == std::vector<std::int32_t>({2}) &&
@@ -51,6 +53,8 @@ void contracts() {
   require(result.stop_reason == "max_new_tokens" && result.consumed == 2);
   result = generate_tokens({10, 8, 2, 2}, executor, {}, 0);
   require(consumed.empty() && !selected && result.tokens.empty() && !result.consumed);
+  require(result.prefill_seconds == 0 && result.first_token_seconds == 0 &&
+          result.total_seconds == 0 && result.token_seconds.empty());
 
   const auto before = resets;
   rejects([&] { generate_tokens({10, 2, 2, 2}, executor, {2, 3, 4}, 1); });

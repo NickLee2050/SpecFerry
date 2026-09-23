@@ -1,6 +1,7 @@
 """Probe comparisons must reject stale, nonfinite, truncated, and wrong-index outputs."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,13 +15,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from scripts import check_np101_operators
 
-from specferry.models.qwen3_5.operator_cases import catalog
-from specferry.models.qwen3_5.precision import TOLERANCES
 from specferry.validation import capabilities
 from specferry.validation.capabilities import compare_arrays, compare_outputs
+from specferry.validation.operator_cases import FIXED_INPUT_TOLERANCES, catalog
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_generic_cli_never_imports_model_adapters(self):
+        root = Path(__file__).resolve().parents[2]
+        program = (
+            "import runpy, sys; "
+            "sys.argv=['check_np101_operators', '--list']; "
+            "module=runpy.run_path('scripts/check_np101_operators.py'); "
+            "assert module['main']() == 0; "
+            "assert not any(name.startswith('specferry.models.') for name in sys.modules)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertIn("matmul_fp16_small", result.stdout)
+        self.assertNotIn("projection_qkv", result.stdout)
+
     def test_interrupted_run_stops_suite_even_with_matching_outputs_and_zero_exit(self):
         def interrupted_run(binary, arguments, output, sdk_lib, timeout, **options):
             fixture = Path(arguments[0]).parent
@@ -115,12 +135,12 @@ class ComparisonTests(unittest.TestCase):
             metadata = fixture.write(root / "fixture")
             execution = root / "execution"
             execution.mkdir()
-            result = compare_outputs(metadata, root / "fixture", execution, TOLERANCES)
+            result = compare_outputs(metadata, root / "fixture", execution, FIXED_INPUT_TOLERANCES)
             self.assertTrue(all(not item["passed"] for item in result.values()))
             first = (root / "fixture/y.expected.0.bin").read_bytes()
             (execution / "y.0.bin").write_bytes(first[:-1])
             (execution / "y.1.bin").write_bytes(first)
-            result = compare_outputs(metadata, root / "fixture", execution, TOLERANCES)
+            result = compare_outputs(metadata, root / "fixture", execution, FIXED_INPUT_TOLERANCES)
             self.assertFalse(result["y.0"]["passed"])
             self.assertFalse(result["y.1"]["passed"])
 
