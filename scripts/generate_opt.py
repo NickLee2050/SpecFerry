@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--capacity", type=int, default=512)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--sdk-timing", choices=("off", "summary"), default="off")
     parser.add_argument(
         "--sample",
         action="store_true",
@@ -84,6 +85,8 @@ def main():
                 Path("/usr/lib/ljmicro"),
                 args.timeout,
                 shader_header=Path("/usr/inc/CL/cl_viv_vx_ext.h"),
+                sdk_timing=args.sdk_timing,
+                progress_interval=10,
             )
         path = output / "device/execution.json"
         execution = json.loads(path.read_text()) if path.is_file() else {}

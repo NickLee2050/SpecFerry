@@ -1,4 +1,5 @@
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -11,14 +12,15 @@ void check(vsi_status status, const char *operation) {
   }
 }
 
-Context::Context() : handle_(vsi_nn_CreateContext()) {
+Context::Context()
+    : handle_(sdk_call("vsi_nn_CreateContext", [] { return vsi_nn_CreateContext(); })) {
   if (!handle_) {
     throw std::runtime_error("vsi_nn_CreateContext returned null");
   }
   try {
     check(vxGetStatus(reinterpret_cast<vx_reference>(handle_->c)), "vxGetStatus(context)");
   } catch (...) {
-    vsi_nn_ReleaseContext(&handle_);
+    sdk_call("vsi_nn_ReleaseContext", [&] { vsi_nn_ReleaseContext(&handle_); });
     throw;
   }
 }
@@ -31,7 +33,7 @@ Context::~Context() {
 
 void Context::close() {
   if (handle_) {
-    vsi_nn_ReleaseContext(&handle_);
+    sdk_call("vsi_nn_ReleaseContext", [&] { vsi_nn_ReleaseContext(&handle_); });
   }
   if (handle_) {
     throw std::runtime_error("vsi_nn_ReleaseContext did not clear handle");
@@ -39,7 +41,8 @@ void Context::close() {
 }
 
 Graph::Graph(Context &context, unsigned tensors, unsigned nodes)
-    : handle_(vsi_nn_CreateGraph(context.get(), tensors, nodes)) {
+    : handle_(sdk_call("vsi_nn_CreateGraph",
+                       [&] { return vsi_nn_CreateGraph(context.get(), tensors, nodes); })) {
   if (!handle_) {
     throw std::runtime_error("vsi_nn_CreateGraph returned null");
   }
@@ -53,7 +56,7 @@ Graph::~Graph() {
 
 void Graph::close() {
   if (handle_) {
-    vsi_nn_ReleaseGraph(&handle_);
+    sdk_call("vsi_nn_ReleaseGraph", [&] { vsi_nn_ReleaseGraph(&handle_); });
   }
   if (handle_) {
     throw std::runtime_error("vsi_nn_ReleaseGraph did not clear handle");

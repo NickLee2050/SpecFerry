@@ -4,6 +4,7 @@
 |---|---|---|
 | `python/` | Download, export integrity/precision, memory budget, and numerical comparison unit tests | No |
 | `native/generation_test.cpp` | BOS/EOS, capacity, generation limits and consumed-token semantics | No |
+| `native/diagnostics_test.cpp` | SDK timing transparency, result/exception propagation and scope restoration | No |
 | `native/allocation_support_test.cpp` | Finite FP16/FP32 patterns, page-alias detection, byte/length mismatch and report escaping | No |
 | `native/np101/opt_io_check.cpp` | Shared embedding/head blocks, learned positions and greedy selection | Yes |
 | `native/np101/sampling_check.cpp` | Categorical frequencies, seed replay and full-vocabulary bounds | Yes |
@@ -11,6 +12,8 @@
 | `native/np101/conv_relu_pool_test.cpp` | FP16 convolution, ReLU, and max-pooling numerical regression | Yes |
 | `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
 | `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, weight/state readback and explicit teardown | Yes |
+| `native/np101/memory_growth_check.cpp` | Single-copy graph rebinding and phase RSS | Yes |
+| `native/np101/memory_accounting_check.cpp` | One-tensor SDK accounting versus payload | Yes |
 | `native/np101/capacity_check.cpp` | Equal-byte FP16/FP32 capacity probes in constant/mutable storage | Yes |
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 | `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
@@ -29,6 +32,12 @@ ctest --test-dir build --output-on-failure
 CTest registers only host unit tests. Hardware checks are explicit `scripts/check_np101_*.py`
 commands documented here and in the linked guides. Each uses a fresh output directory under
 `.cache/runs/`; generated fixtures and logs are not source files.
+
+[Memory diagnostics](np101-memory.md) document three model-independent reproduction
+commands: host growth, SDK accounting, and large-allocation byte corruption.
+The [SDK timing guide](np101-sdk-timing.md) adds a checkpoint-free selection command,
+startup-wait evidence and optional per-component inference timing. Its host-only
+contracts live in `native/diagnostics_test.cpp` and the existing Python runner tests.
 
 ## Diagnostic commands
 

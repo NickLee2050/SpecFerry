@@ -1,4 +1,5 @@
 #include "models/opt/decoder.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
@@ -102,21 +103,35 @@ struct Layer {
   Projection producer;
   KvCache cache;
   DecoderTail tail;
+  const std::string qkv_label, cache_label, tail_label;
 
   Layer(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
         TensorBinding input)
       : producer(context, weights, config, layer, input),
         cache(context, producer.graph, producer.key.id, producer.value.id, config.kv_spec()),
-        tail(context, weights, config, layer, producer, cache) {}
+        tail(context, weights, config, layer, producer, cache),
+        qkv_label(config.prefix(layer) + "qkv"), cache_label(config.prefix(layer) + "kv"),
+        tail_label(config.prefix(layer) + "attention_ffn") {}
 
   void step(unsigned position) {
-    check(vsi_nn_RunGraph(producer.graph.get()), "OPT Q/K/V projections");
-    cache.write(position);
-    const auto length = static_cast<std::int32_t>(position + 1);
-    std::vector<std::uint8_t> bytes(sizeof(length));
-    std::memcpy(bytes.data(), &length, sizeof(length));
-    upload_tensor(tail.graph, tail.valid_length.id, bytes);
-    check(vsi_nn_RunGraph(tail.graph.get()), "OPT attention and feed-forward");
+    {
+      TimingLabel component(TimingField::Component, qkv_label);
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(producer.graph.get()); }),
+            "OPT Q/K/V projections");
+    }
+    {
+      TimingLabel component(TimingField::Component, cache_label);
+      cache.write(position);
+    }
+    {
+      TimingLabel component(TimingField::Component, tail_label);
+      const auto length = static_cast<std::int32_t>(position + 1);
+      std::vector<std::uint8_t> bytes(sizeof(length));
+      std::memcpy(bytes.data(), &length, sizeof(length));
+      upload_tensor(tail.graph, tail.valid_length.id, bytes);
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(tail.graph.get()); }),
+            "OPT attention and feed-forward");
+    }
   }
 
   std::vector<std::uint8_t> read(const std::string &name) {
@@ -166,6 +181,7 @@ struct DecoderSlice::Impl {
     }
     try {
       for (auto layer : selected) {
+        TimingLabel component(TimingField::Component, config.prefix(layer) + "initialize");
         const auto first = external ? *external : TensorBinding{storage, input};
         const auto binding = layers.empty() ? first
                                             : TensorBinding{layers.back()->tail.graph,
@@ -273,6 +289,26 @@ std::size_t DecoderSlice::cache_revalidations() const {
     }
   }
   return count;
+}
+
+double DecoderSlice::cache_write_seconds() const {
+  double seconds = 0;
+  if (impl_) {
+    for (const auto &layer : impl_->layers) {
+      seconds += layer->cache.write_seconds();
+    }
+  }
+  return seconds;
+}
+
+double DecoderSlice::cache_revalidation_seconds() const {
+  double seconds = 0;
+  if (impl_) {
+    for (const auto &layer : impl_->layers) {
+      seconds += layer->cache.revalidation_seconds();
+    }
+  }
+  return seconds;
 }
 
 std::vector<std::uint8_t> DecoderSlice::read(unsigned layer, const std::string &name) {

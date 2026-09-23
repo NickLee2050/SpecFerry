@@ -55,6 +55,8 @@ public:
   void reset();
   unsigned length() const;
   std::size_t cache_writes() const;
+  double cache_write_seconds() const;
+  double cache_revalidation_seconds() const;
   std::vector<std::uint8_t> read(const std::string &name, unsigned layer = 0);
   Generation generate(const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
                       const std::function<void(std::int32_t)> &on_token = {});

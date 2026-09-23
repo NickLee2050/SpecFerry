@@ -1,6 +1,7 @@
 #include "models/opt/config.hpp"
 #include "models/opt/model.hpp"
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/ops/vocabulary.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
@@ -24,6 +25,9 @@
 namespace {
 namespace fs = std::filesystem;
 using specferry::models::opt::Model;
+using specferry::np101::SdkTimings;
+using specferry::np101::TimingField;
+using specferry::np101::TimingLabel;
 using Clock = std::chrono::steady_clock;
 
 struct Report {
@@ -33,6 +37,8 @@ struct Report {
   std::size_t uploads = 0, upload_bytes = 0, reads = 0, read_bytes = 0, cache_writes = 0;
   bool released = false, bounds_rejected = false, reset_rejected_stale = false;
   double initialize_seconds = 0, execute_seconds = 0;
+  mutable std::string saved_phase{};
+  mutable double phase_started_at = 0;
 
   void sample_host(const std::string &stage) const {
     std::ifstream status("/proc/self/status");
@@ -57,13 +63,21 @@ struct Report {
   }
 
   void save(const std::string &status = "running") const {
+    if (saved_phase != phase) {
+      saved_phase = phase;
+      phase_started_at =
+          std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+              .count();
+    }
     rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) != 0) {
       throw std::runtime_error("cannot query host process memory");
     }
-    std::ofstream out(directory / "execution.json");
-    out << std::boolalpha << "{\"status\":\"" << status << "\",\"phase\":\"" << phase
-        << "\",\"layers\":" << layers << ",\"steps\":" << steps << ",\"uploads\":" << uploads
+    const auto temporary = directory / "execution.json.tmp";
+    std::ofstream out(temporary);
+    out << std::setprecision(17) << std::boolalpha << "{\"status\":\"" << status
+        << "\",\"phase\":\"" << phase << "\",\"phase_started_at\":" << phase_started_at
+        << ",\"layers\":" << layers << ",\"steps\":" << steps << ",\"uploads\":" << uploads
         << ",\"upload_bytes\":" << upload_bytes << ",\"reads\":" << reads
         << ",\"read_bytes\":" << read_bytes << ",\"cache_writes\":" << cache_writes
         << ",\"released\":" << released << ",\"bounds_rejected\":" << bounds_rejected
@@ -71,9 +85,11 @@ struct Report {
         << ",\"initialize_seconds\":" << initialize_seconds
         << ",\"execute_seconds\":" << execute_seconds
         << ",\"host_peak_rss_kib\":" << usage.ru_maxrss << "}\n";
+    out.close();
     if (!out) {
       throw std::runtime_error("cannot write execution report");
     }
+    fs::rename(temporary, directory / "execution.json");
   }
 
   template <class Action> void observe(Action action) {
@@ -132,6 +148,9 @@ void capture(Model &model, const std::string &prefix, unsigned layers, const fs:
   }
   for (unsigned layer = 0; layer < layers; ++layer) {
     save("layer." + std::to_string(layer), model.read("output", layer));
+    for (const auto *name : {"keys", "values"}) {
+      save("layer." + std::to_string(layer) + "." + name, model.read(name, layer));
+    }
   }
 }
 
@@ -180,7 +199,7 @@ void reset(Model &model, Report &report) {
 }
 
 void save_generation(const specferry::models::opt::Generation &result, const fs::path &directory,
-                     const std::string &filename = "generation.json") {
+                     const std::string &filename, double cache_seconds, double verify_seconds) {
   std::ofstream out(directory / filename);
   out << std::setprecision(17);
   out << "{\"tokens\":[";
@@ -193,27 +212,37 @@ void save_generation(const specferry::models::opt::Generation &result, const fs:
   for (unsigned index = 0; index < result.token_seconds.size(); ++index) {
     out << (index ? "," : "") << result.token_seconds[index];
   }
-  out << "],\"total_seconds\":" << result.total_seconds << "}\n";
+  out << "],\"total_seconds\":" << result.total_seconds
+      << ",\"cache_write_seconds\":" << cache_seconds
+      << ",\"cache_revalidation_seconds\":" << verify_seconds << "}\n";
   if (!out) {
     throw std::runtime_error("cannot save generation result");
   }
 }
 
 void benchmark(Model &model, const std::vector<std::int32_t> &tokens, unsigned maximum,
-               unsigned warmups, unsigned repeats, Report &report) {
+               unsigned warmups, unsigned repeats, Report &report, SdkTimings &timings,
+               const std::vector<std::vector<std::int32_t>> &requests = {}) {
   for (unsigned index = 0; index < warmups + repeats; ++index) {
     const bool warmup = index < warmups;
     const auto name = std::string(warmup ? "warmup." : "measured.") +
                       std::to_string(warmup ? index : index - warmups);
     report.phase = name;
     report.save();
+    TimingLabel request(TimingField::Request, name);
     specferry::models::opt::Generation result;
+    const auto cache_before = model.cache_write_seconds();
+    const auto verify_before = model.cache_revalidation_seconds();
     // Each request resets the valid KV prefix while retaining the same model.
     // No streaming callback, diagnostics or file IO runs inside the timed call.
-    report.observe([&] { result = model.generate(tokens, maximum); });
+    const auto &prompt = requests.empty() ? tokens : requests.at(index);
+    report.observe([&] { result = model.generate(prompt, maximum); });
     report.steps += result.consumed;
-    save_generation(result, report.directory, name + ".json");
+    save_generation(result, report.directory, name + ".json",
+                    model.cache_write_seconds() - cache_before,
+                    model.cache_revalidation_seconds() - verify_before);
     report.sample_host(name);
+    timings.save();
   }
 }
 } // namespace
@@ -222,16 +251,20 @@ int main(int argc, char **argv) {
   if (argc != 8 && argc != 9 && argc != 10) {
     std::cerr << "usage: specferry_opt_generate DEPLOYMENT REQUEST OUTPUT MODE LAYERS MAX_NEW "
                  "TOKENS [SAMPLE_SEED]\n"
-              << "MODE is load, teacher, generate, or benchmark; TOKENS is an ID file.\n"
+              << "MODE is load, teacher, generate, benchmark, or requests; TOKENS is an ID file.\n"
+              << "For requests, TOKENS lists absolute ID-file paths, one per request.\n"
               << "For benchmark, replace [SAMPLE_SEED] with WARMUPS REPEATS.\n";
     return 2;
   }
   Report report{argv[3]};
+  std::unique_ptr<SdkTimings> timings;
   try {
     fs::create_directories(report.directory);
+    timings = std::make_unique<SdkTimings>(report.directory);
     report.save();
     const std::string mode(argv[4]);
-    if (mode != "load" && mode != "teacher" && mode != "generate" && mode != "benchmark") {
+    if (mode != "load" && mode != "teacher" && mode != "generate" && mode != "benchmark" &&
+        mode != "requests") {
       throw std::invalid_argument("unknown execution mode");
     }
     if ((mode == "benchmark") != (argc == 10)) {
@@ -239,25 +272,48 @@ int main(int argc, char **argv) {
     }
     const auto warmups = mode == "benchmark" ? number(argv[8]) : 0;
     const auto repeats = mode == "benchmark" ? number(argv[9]) : 0;
-    if (mode == "benchmark" && (warmups > 5 || repeats < 2 || repeats > 20)) {
-      throw std::invalid_argument("benchmark requires 0..5 warmups and 2..20 measured requests");
+    if (mode == "benchmark" && (warmups > 5 || repeats < 1 || repeats > 20)) {
+      throw std::invalid_argument("benchmark requires 0..5 warmups and 1..20 measured requests");
     }
     const auto config = specferry::models::opt::read_model_config(argv[2]);
     report.layers = number(argv[5]);
     const auto maximum = number(argv[6]);
-    const auto tokens = read_tokens(argv[7]);
+    std::vector<std::vector<std::int32_t>> requests;
+    if (mode == "requests") {
+      std::ifstream playlist(argv[7]);
+      std::string path;
+      while (std::getline(playlist, path)) {
+        if (path.empty() || !fs::path(path).is_absolute()) {
+          throw std::invalid_argument("request paths must be absolute and nonempty");
+        }
+        requests.push_back(read_tokens(path));
+      }
+      if (!playlist.eof() || requests.empty() || requests.size() > 20) {
+        throw std::invalid_argument("expected 1..20 request paths");
+      }
+    }
+    const auto tokens = requests.empty() ? read_tokens(argv[7]) : requests.front();
     const specferry::np101::ops::SamplingOptions sampling{argc == 9,
                                                           argc == 9 ? number(argv[8]) : 0};
     if (sampling.enabled && mode != "generate") {
       throw std::invalid_argument("sampling is only supported in generation mode");
     }
     if (tokens.size() > config.decoder.capacity || (mode == "teacher" && tokens.empty()) ||
-        ((mode == "generate" || mode == "benchmark") && report.layers != config.decoder.layers) ||
-        (mode == "benchmark" && !maximum)) {
+        ((mode == "generate" || mode == "benchmark" || mode == "requests") &&
+         report.layers != config.decoder.layers) ||
+        ((mode == "benchmark" || mode == "requests") && !maximum)) {
       throw std::invalid_argument("request exceeds capacity or generation omits layers");
     }
     for (auto token : tokens) {
       config.validate_token(token);
+    }
+    for (const auto &request : requests) {
+      if (request.empty() || request.size() > config.decoder.capacity) {
+        throw std::invalid_argument("request length exceeds capacity or is empty");
+      }
+      for (auto token : request) {
+        config.validate_token(token);
+      }
     }
     specferry::np101::WeightStore weights(argv[1]);
     weights.verify();
@@ -272,8 +328,10 @@ int main(int argc, char **argv) {
     report.sample_host("after_initialize");
     report.phase = mode;
     report.save();
-    if (mode == "benchmark") {
-      benchmark(*model, tokens, maximum, warmups, repeats, report);
+    if (mode == "requests") {
+      benchmark(*model, tokens, maximum, 0, requests.size(), report, *timings, requests);
+    } else if (mode == "benchmark") {
+      benchmark(*model, tokens, maximum, warmups, repeats, report, *timings);
     } else if (mode == "generate") {
       specferry::models::opt::Generation result;
       report.observe([&] {
@@ -282,8 +340,10 @@ int main(int argc, char **argv) {
         });
       });
       report.steps = result.consumed;
-      save_generation(result, report.directory);
+      save_generation(result, report.directory, "generation.json", model->cache_write_seconds(),
+                      model->cache_revalidation_seconds());
     } else if (mode == "teacher") {
+      TimingLabel phase(TimingField::Phase, "teacher");
       teacher(*model, tokens, "teacher", false, report);
       const auto length = model->length();
       const auto writes = model->cache_writes();
@@ -312,13 +372,20 @@ int main(int argc, char **argv) {
       reset(*model, report);
       teacher(*model, tokens, "final", true, report);
       report.cache_writes += model->cache_writes();
-      model->close();
-      model = std::make_unique<Model>(context, weights, config, report.layers);
+      {
+        TimingLabel lifecycle_phase(TimingField::Phase, "release");
+        model->close();
+      }
+      {
+        TimingLabel lifecycle_phase(TimingField::Phase, "initialize");
+        model = std::make_unique<Model>(context, weights, config, report.layers);
+      }
       teacher(*model, tokens, "fresh", true, report);
     }
     report.cache_writes += model->cache_writes();
     report.phase = "release";
     report.save();
+    TimingLabel phase(TimingField::Phase, "release");
     model->close();
     model.reset();
     context.close();
@@ -326,11 +393,15 @@ int main(int argc, char **argv) {
     report.released = true;
     report.phase = "complete";
     report.save("executed");
+    timings->save();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     try {
       report.save("failed");
+      if (timings) {
+        timings->save();
+      }
     } catch (...) {
       // Preserve the original SDK/IO exception in stderr if the report cannot be written.
     }

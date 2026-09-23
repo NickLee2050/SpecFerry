@@ -10,9 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.models.opt.acceptance import evaluate_benchmark, summarize, valid_generation
+from specferry.models.opt.validation_generation import compare_cache_prefixes
+from specferry.validation.timing import summarize_sdk_timing
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,6 +58,59 @@ def evidence():
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_sdk_timing_excludes_warmup_and_requires_actual_call_counts(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            self.fixture(directory)
+            header = (
+                "request\tphase\tcomponent\tapi\tcalls\ttotal_seconds\tmax_seconds\texceptions\n"
+            )
+            data = "warmup.0\tprefill\tmodel\tvsi_nn_RunGraph\t206\t100\t1\t0\n"
+            counts = {
+                "vsi_nn_RunGraph": 412,
+                "vxProcessGraph": 192,
+                "vsi_nn_CopyDataToTensor": 208,
+                "vsi_nn_ConvertTensorToData": 6,
+            }
+            for api, count in counts.items():
+                data += f"measured.0\tdecode\tmodel\t{api}\t{count}\t1\t0.1\t0\n"
+            path = directory / "sdk-timing.tsv"
+            path.write_text(header + data)
+            observations = summarize_sdk_timing(path)
+            self.assertEqual(observations["measured_sdk_seconds"], 4)
+            self.assertEqual(observations["measured_api_calls"], counts)
+            self.assertEqual(observations["measured_api_seconds"]["vsi_nn_RunGraph"], 1)
+            self.assertEqual(observations["measured_api_max_seconds"]["vsi_nn_RunGraph"], 0.1)
+            ev = evidence()
+            ev["runtime_options"]["SPECFERRY_SDK_TIMING"] = "summary"
+            report = evaluate_benchmark(directory, request(), {"tokens": [3, 4, 5]}, ev, 1, 2, 3)
+            self.assertEqual(report["status"], "numerical_pass")
+            path.write_text((header + data).replace("\t412\t", "\t411\t"))
+            report = evaluate_benchmark(directory, request(), {"tokens": [3, 4, 5]}, ev, 1, 2, 3)
+            self.assertEqual(report["status"], "failed")
+            self.assertIsNone(report["metrics"])
+            path.write_text((header + data).replace("\t100\t", "\tnan\t"))
+            with self.assertRaises(ValueError):
+                summarize_sdk_timing(path)
+
+    def test_selection_preparation_needs_no_model_or_device_and_flags_slow_success(self):
+        spec = importlib.util.spec_from_file_location(
+            "acceptance_cli", ROOT / "scripts/check_np101_acceptance.py"
+        )
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(cli, "device_lock") as lock:
+                report = cli.selection_only(SimpleNamespace(prepare_only=True), Path(root))
+            lock.assert_not_called()
+            self.assertEqual(report["status"], "prepared")
+            self.assertTrue((Path(root) / "selection-fixture/deployment/weights.bin").is_file())
+        self.assertFalse(cli.preflight_anomaly({"wall_seconds": 1}, 30))
+        self.assertTrue(cli.preflight_anomaly({"wall_seconds": 31, "returncode": 0}, 30))
+        self.assertTrue(
+            cli.preflight_anomaly({"driver_waits": {"calls_at_least_one_second": 1}}, 30)
+        )
+
     def fixture(self, directory):
         for name in ("warmup.0", "measured.0", "measured.1"):
             result = generation()
@@ -139,6 +196,8 @@ class AcceptanceTests(unittest.TestCase):
                 {"token_seconds": [0.5]},
                 {"consumed": 5},
                 {"stop_reason": "capacity"},
+                {"cache_write_seconds": -1},
+                {"cache_write_seconds": 0.2, "cache_revalidation_seconds": 0.3},
             ):
                 with self.subTest(change=change):
                     self.assertFalse(
@@ -178,6 +237,102 @@ class AcceptanceTests(unittest.TestCase):
         capacity = request() | {"capacity": 2}
         result.update(tokens=[3], stop_reason="capacity")
         self.assertTrue(valid_generation(result, capacity, [3], 3))
+
+    def test_mixed_requests_use_their_own_prompt_lengths_and_cpu_tokens(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            execution = self.fixture(directory)
+            other = request() | {"tokens": [2]}
+            sequence = [
+                (request(), {"tokens": [3, 4, 5]}),
+                (other, {"tokens": [6, 7, 8]}),
+                (request(), {"tokens": [3, 4, 5]}),
+            ]
+            for index, (prompt, reference) in enumerate(sequence):
+                result = generation() | {
+                    "tokens": reference["tokens"],
+                    "consumed": len(prompt["tokens"]) + 2,
+                }
+                (directory / f"measured.{index}.json").write_text(json.dumps(result))
+            execution.update(steps=11, cache_writes=264, uploads=286, upload_bytes=1144)
+            (directory / "execution.json").write_text(json.dumps(execution))
+            phases = [
+                "before_initialize",
+                "after_initialize",
+                "measured.0",
+                "measured.1",
+                "measured.2",
+                "after_release",
+            ]
+            (directory / "host-resources.jsonl").write_text(
+                "".join(json.dumps({"phase": name, "rss_bytes": 1024}) + "\n" for name in phases)
+            )
+
+            def evaluate():
+                return evaluate_benchmark(
+                    directory,
+                    request(),
+                    {"tokens": [3, 4, 5]},
+                    evidence(),
+                    0,
+                    3,
+                    3,
+                    sequence=sequence,
+                )
+
+            self.assertEqual(evaluate()["status"], "numerical_pass")
+            # An old A prediction in B is rejected even though both A runs agree.
+            (directory / "measured.1.json").write_text(json.dumps(generation() | {"consumed": 3}))
+            self.assertEqual(evaluate()["status"], "failed")
+
+    def test_cache_prefix_ignores_unused_suffix_but_rejects_changed_history(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            fixture, actual = root / "expected", root / "actual"
+            fixture.mkdir()
+            actual.mkdir()
+            metadata = {
+                "count": 2,
+                "capacity": 4,
+                "observations": {},
+                "tolerances": {"atol": 0.08, "rtol": 0.02},
+            }
+            for index in range(2):
+                name = f"teacher.{index}.layer.0.keys"
+                prefix = np.array([[[1.0], [2.0]]], dtype="<f2")[:, : index + 1]
+                prefix.tofile(fixture / f"{name}.bin")
+                metadata["observations"][name] = {"shape": list(prefix.shape)}
+                storage = np.full((1, 4, 1), 9, dtype="<f2")
+                storage[:, : index + 1] = prefix
+                for repeat in ("teacher", "reset", "final", "fresh"):
+                    storage.tofile(actual / f"{name.replace('teacher', repeat)}.bin")
+            self.assertTrue(
+                all(c["passed"] for c in compare_cache_prefixes(fixture, actual, metadata).values())
+            )
+            path = actual / "teacher.1.layer.0.keys.bin"
+            changed = np.fromfile(path, dtype="<f2")
+            changed[0] += 0.01  # Within CPU tolerance, but history must remain byte-exact.
+            changed.tofile(path)
+            checks = compare_cache_prefixes(fixture, actual, metadata)
+            self.assertTrue(checks["teacher.1.layer.0.keys"]["passed"])
+            self.assertFalse(checks["teacher.1.layer.0.keys.history"]["passed"])
+            path.write_bytes(b"short")
+            self.assertFalse(
+                compare_cache_prefixes(fixture, actual, metadata)["teacher.1.layer.0.keys"][
+                    "passed"
+                ]
+            )
+            path.write_bytes(changed.tobytes() + b"\0")
+            self.assertFalse(
+                compare_cache_prefixes(fixture, actual, metadata)["teacher.1.layer.0.keys"][
+                    "passed"
+                ]
+            )
+            changed[0] = np.nan
+            changed.tofile(path)
+            checks = compare_cache_prefixes(fixture, actual, metadata)
+            self.assertFalse(checks["teacher.1.layer.0.keys"]["passed"])
+            json.dumps(checks, allow_nan=False)  # Numerical failures must remain reportable.
 
     def test_all_numerical_passes_still_leave_hardware_acceptance_open(self):
         stages = [{"name": "selection", "passed": True}, {"name": "teacher", "passed": True}]

@@ -8,6 +8,7 @@ import torch
 from transformers import GenerationConfig
 
 from specferry.validation.arrays import compare_file, save_tensor
+from specferry.validation.capabilities import compare_arrays
 from specferry.validation.device import fingerprint, write_json
 
 from .config import TOLERANCES
@@ -74,7 +75,9 @@ def prepare_selection(directory):
 
 
 @torch.inference_mode()
-def prepare(deployment, checkpoint, directory, mode, layers=24, capacity=512, steps=8):
+def prepare(
+    deployment, checkpoint, directory, mode, layers=24, capacity=512, steps=8, input_ids=None
+):
     verify_export(deployment)
     manifest = json.loads((deployment / "deployment-manifest.json").read_text())
     model, source = load_model(checkpoint)
@@ -124,7 +127,8 @@ def prepare(deployment, checkpoint, directory, mode, layers=24, capacity=512, st
     elif mode == "teacher":
         # Fixed BOS + prompt prefix. Long trajectories deliberately repeat token IDs.
         seed = [2, 2061, 32, 52, 259, 13, 1768, 116]
-        input_ids = [seed[index % len(seed)] for index in range(steps)]
+        input_ids = input_ids or [seed[index % len(seed)] for index in range(steps)]
+        steps = len(input_ids)
         validate_tokens(input_ids, manifest["config"]["vocab_size"], capacity)
         (directory / "tokens.txt").write_text(" ".join(map(str, input_ids)) + "\n")
         decoder.layers = decoder.layers[:layers]
@@ -145,6 +149,9 @@ def prepare(deployment, checkpoint, directory, mode, layers=24, capacity=512, st
                     captured[f"layer.{layer}.output"],
                     observations,
                 )
+                for name in ("keys", "values"):
+                    prefix = getattr(cache.layers[layer], name)[0]
+                    record(directory, f"teacher.{index}.layer.{layer}.{name}", prefix, observations)
             record(
                 directory,
                 f"teacher.{index}.projected",
@@ -230,6 +237,8 @@ def compare_generation(checkpoint, request, generation, maximum_new_tokens):
 def evaluate(fixture, actual, metadata, evidence):
     checks = {}
     for name, spec in metadata["observations"].items():
+        if name.endswith((".keys", ".values")):
+            continue
         checks[name] = compare_file(
             actual / (name + ".bin"), fixture / (name + ".bin"), spec, metadata["tolerances"]
         )
@@ -244,6 +253,8 @@ def evaluate(fixture, actual, metadata, evidence):
                     spec,
                     {"atol": 0, "rtol": 0},
                 )
+    if metadata["mode"] == "teacher":
+        checks.update(compare_cache_prefixes(fixture, actual, metadata))
     execution_path = actual / "execution.json"
     execution = json.loads(execution_path.read_text()) if execution_path.is_file() else {}
     if metadata["mode"] == "io":
@@ -291,3 +302,46 @@ def evaluate(fixture, actual, metadata, evidence):
         "hardware_execution_proven": False,
         "device_residency_proven": False,
     }
+
+
+def compare_cache_prefixes(fixture, actual, metadata):
+    """Check independent CPU prefixes, exact append preservation, and reset/fresh reuse."""
+    checks = {}
+    for name, spec in metadata["observations"].items():
+        if not name.endswith((".keys", ".values")):
+            continue
+        index = int(name.split(".")[1])
+        heads, length, width = spec["shape"]
+        expected = np.fromfile(fixture / f"{name}.bin", dtype="<f2").reshape(heads, length, width)
+        for repeat in ("teacher", "reset", "final", "fresh"):
+            if repeat in ("final", "fresh") and index != metadata["count"] - 1:
+                continue
+            label = name.replace("teacher.", repeat + ".", 1)
+            path = actual / f"{label}.bin"
+            elements = heads * metadata["capacity"] * width
+            if not path.is_file() or path.stat().st_size != elements * 2:
+                checks[label] = {"passed": False, "reason": "missing or invalid cache size"}
+                continue
+            data = np.fromfile(path, dtype="<f2")
+            prefix = data.reshape(heads, metadata["capacity"], width)[:, :length]
+            checks[label] = compare_arrays(prefix, expected, **metadata["tolerances"])
+            checks[label]["valid_length"] = length
+            if repeat in ("teacher", "reset") and index:
+                previous = actual / f"{label.replace(f'.{index}.', f'.{index - 1}.', 1)}.bin"
+                old = (
+                    np.fromfile(previous, dtype="<f2")
+                    if previous.is_file() and previous.stat().st_size == data.nbytes
+                    else np.array([])
+                )
+                checks[label + ".history"] = {
+                    "passed": bool(
+                        old.size == data.size
+                        and np.array_equal(
+                            prefix[:, :-1].view(np.uint16),
+                            old.reshape(heads, metadata["capacity"], width)[:, :index].view(
+                                np.uint16
+                            ),
+                        )
+                    )
+                }
+    return checks

@@ -160,6 +160,19 @@ Additional run instructions:
 - [Repeated generation, timing and hardware acceptance](tests/np101-acceptance.md)
 - [Sampling](tests/np101-sampling.md)
 - [Weight and FP16/FP32 capacity diagnostics](tests/np101-capacity.md)
+- [Model-independent memory growth, accounting and integrity](tests/np101-memory.md)
+- [SDK call timing, progress and startup latency](tests/np101-sdk-timing.md)
+
+Check startup latency without downloading a model:
+
+```bash
+python scripts/check_np101_acceptance.py --selection-only \
+  --output .cache/runs/selection-startup
+```
+
+For per-layer SDK call timing, add `--sdk-timing summary` to the full-model command
+below. Progress is displayed every ten seconds. Use `--progress-interval 0` to
+disable progress messages; timing is disabled by default.
 
 To run the full-model correctness gates followed by warmups and repeated generation:
 
@@ -167,7 +180,22 @@ To run the full-model correctness gates followed by warmups and repeated generat
 python scripts/check_np101_acceptance.py --output .cache/runs/opt-acceptance
 ```
 
-Inspect `acceptance.json`. Exit code 2 with `hardware_pending` means numerical
+For exact natural-text prefixes and readable timing/continuation reports:
+
+```bash
+python scripts/check_np101_acceptance.py --lengths 32 \
+  --output .cache/runs/opt-throughput-short --diagnostic
+python scripts/check_np101_acceptance.py --lengths 128 512 2048 \
+  --warmups 0 --repeats 1 --cycles 1 --timeout 7200 \
+  --output .cache/runs/opt-context-lengths --diagnostic
+```
+
+Read `results.md` for decode tokens/s, prefill tokens/s, TTFT and output text;
+`acceptance.json` retains the raw checks. OPT's 2048-position limit leaves only one
+prediction after a 2048-token prompt, so that case has no decode throughput sample.
+Use `--lengths 2033` with 16 new tokens to leave room for a continuation near the limit.
+
+Exit code 2 with `hardware_pending` means numerical
 checks passed but execution/residency evidence remains open. Use `--prepare-only`
 to prepare CPU fixtures without opening the board. Timing runs disable strace and
 token printing; their reported latency is host wall time. See the linked guide

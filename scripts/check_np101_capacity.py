@@ -81,6 +81,22 @@ def main() -> int:
             f"{summary['status']}: {uploaded / MIB:g} MiB {args.dtype} {args.storage}; "
             f"full readback/release={complete}"
         )
+        if scanned:
+            print(
+                f"Scanned {report['scanned_blocks']} blocks; "
+                f"{report['mismatched_blocks']} damaged blocks, "
+                f"{report['mismatched_bytes']} mismatched bytes."
+            )
+            scan_path = output / "readback-blocks.jsonl"
+            if scan_path.is_file():
+                for line in scan_path.read_text().splitlines():
+                    block = json.loads(line)
+                    if block["mismatched_bytes"]:
+                        print(
+                            f"  Block {block['block_index']}: "
+                            f"{block['mismatched_bytes']} bytes differ; "
+                            f"first ranges {block['byte_ranges'][:16]} (zero-based, end-exclusive)"
+                        )
         print(f"Evidence: {output / 'summary.json'}")
         # A clean SDK rejection is an observed bound, not physical exhaustion.
         # A completed scan with corrupt bytes remains a nonzero integrity result.

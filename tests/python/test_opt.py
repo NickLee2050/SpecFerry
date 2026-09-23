@@ -25,7 +25,7 @@ class OptContractTests(unittest.TestCase):
         for changes in (
             {"hidden": 63},
             {"heads": 0},
-            {"capacity": 513},
+            {"capacity": 2049},
             {"hidden": True},
             {"intermediate": 1000000},
             {"epsilon": float("nan")},

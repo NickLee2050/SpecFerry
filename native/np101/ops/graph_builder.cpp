@@ -1,3 +1,4 @@
+#include "np101/diagnostics.hpp"
 #include "np101/ops/graph_builder.hpp"
 
 #include <algorithm>
@@ -61,7 +62,8 @@ Tensor GraphBuilder::bind(TensorBinding source, TensorSpec expected) {
 
 vsi_nn_node_t *GraphBuilder::node(vsi_nn_op_t op, std::initializer_list<Tensor> inputs,
                                   Tensor output) {
-  auto *result = vsi_nn_AddNode(graph.get(), op, 0, 0, nullptr);
+  auto *result =
+      sdk_call("vsi_nn_AddNode", [&] { return vsi_nn_AddNode(graph.get(), op, 0, 0, nullptr); });
   if (!result || !result->input.tensors || !result->output.tensors ||
       result->input.num < inputs.size() || result->output.num < 1) {
     throw std::runtime_error("AddNode failed");
@@ -315,7 +317,9 @@ void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<
       !vsi_nn_SetGraphOutputs(graph.get(), output_ids.data(), output_ids.size())) {
     throw std::runtime_error("graph IO declaration failed");
   }
-  check(vsi_nn_SetupGraph(graph.get(), FALSE), "SetupGraph");
-  check(vsi_nn_VerifyGraph(graph.get()), "VerifyGraph");
+  check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
+        "SetupGraph");
+  check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(graph.get()); }),
+        "VerifyGraph");
 }
 } // namespace specferry::np101::ops

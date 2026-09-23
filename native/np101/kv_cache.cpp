@@ -1,3 +1,4 @@
+#include "np101/diagnostics.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
@@ -94,7 +95,8 @@ struct KvCache::Impl {
     }
     vxReleaseNode(&value_copy);
     vxReleaseNode(&key_copy);
-    check(vxVerifyGraph(copy.get()->g), "verify KV slot-copy graph");
+    check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(copy.get()->g); }),
+          "verify KV slot-copy graph");
   }
 
   std::unique_ptr<TensorView> view(vsi_nn_tensor_id_t parent, unsigned position) {
@@ -120,20 +122,29 @@ void KvCache::write(unsigned position) {
   }
   auto graph = impl_->copy.get()->g;
   const auto start = std::chrono::steady_clock::now();
-  check(vxSetGraphParameterByIndex(
-            graph, 0, reinterpret_cast<vx_reference>(impl_->key_views[position]->tensor)),
+  check(sdk_call("vxSetGraphParameterByIndex.key",
+                 [&] {
+                   return vxSetGraphParameterByIndex(
+                       graph, 0,
+                       reinterpret_cast<vx_reference>(impl_->key_views[position]->tensor));
+                 }),
         "select key slot");
-  check(vxSetGraphParameterByIndex(
-            graph, 1, reinterpret_cast<vx_reference>(impl_->value_views[position]->tensor)),
+  check(sdk_call("vxSetGraphParameterByIndex.value",
+                 [&] {
+                   return vxSetGraphParameterByIndex(
+                       graph, 1,
+                       reinterpret_cast<vx_reference>(impl_->value_views[position]->tensor));
+                 }),
         "select value slot");
   if (!vxIsGraphVerified(graph)) {
     const auto verify_start = std::chrono::steady_clock::now();
     ++impl_->revalidations;
-    check(vxVerifyGraph(graph), "reverify KV slot-copy graph");
+    check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(graph); }),
+          "reverify KV slot-copy graph");
     impl_->revalidation_seconds +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - verify_start).count();
   }
-  check(vxProcessGraph(graph), "write KV slot");
+  check(sdk_call("vxProcessGraph", [&] { return vxProcessGraph(graph); }), "write KV slot");
   ++impl_->completed_writes;
   impl_->write_seconds +=
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

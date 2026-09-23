@@ -17,6 +17,40 @@ from specferry.validation import device
 
 
 class ExecutionArtifactTests(unittest.TestCase):
+    def test_driver_waits_are_reported_without_treating_success_as_latency_health(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "driver.strace"
+            path.write_text(
+                "1 ioctl(3</dev/galcore>, command, data) = 0 <30.700000>\n"
+                "1 ioctl(3</dev/galcore>, command, data) = 0 <0.001000>\n"
+                "1 ioctl(4</dev/other>, command, data) = 0 <99.000000>\n"
+                "1 ioctl(3</dev/galcore>, command, data <unfinished ...>\n"
+                "1 <... ioctl resumed>) = 0 <30.000000>\n"
+                "2 ioctl(3</dev/galcore>, command, data <unfinished ...>\n"
+                "2 <... ioctl resumed>) = 0 <1000.000000>\n"
+            )
+            report = device.driver_wait_summary(path)
+            self.assertEqual(report["completed_calls"], 3)
+            self.assertEqual(report["calls_at_least_one_second"], 2)
+            self.assertAlmostEqual(report["total_seconds"], 60.701)
+            self.assertEqual(report["unfinished_calls"], 0)
+            self.assertEqual(report["other_threads"]["2"]["maximum_seconds"], 1000)
+            self.assertEqual(report["submission_thread"], "1")
+
+    def test_heartbeat_handles_incomplete_progress_and_preserves_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "execution.json").write_text('{"phase":')
+            process = Mock()
+            process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 10), 0]
+            with (
+                patch.object(device.time, "monotonic", side_effect=[0, 0, 10, 10]),
+                patch("builtins.print") as display,
+            ):
+                self.assertEqual(device.wait_with_progress(process, output, 15, 10, "gate"), 0)
+            self.assertEqual([c.kwargs["timeout"] for c in process.wait.call_args_list], [10, 5])
+            self.assertIn("process 10s", display.call_args.args[0])
+
     def test_snapshot_preserves_executable_bytes_and_mode_across_rebuilds(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -180,6 +214,15 @@ class DeviceRecoveryTests(unittest.TestCase):
         self.assertTrue(result["device_recovery_required"])
         terminate.assert_called_once_with(123456, signal.SIGTERM)
         self.assertEqual(marker["members"], [])
+
+    def test_keyboard_interrupt_stops_child_and_preserves_recovery_evidence(self):
+        result, _, terminate, marker = self.run_fixture([KeyboardInterrupt(), 0], [])
+        self.assertFalse(result["timeout"])
+        self.assertTrue(result["interrupted_by_user"])
+        self.assertTrue(result["device_recovery_required"])
+        self.assertFalse(device.clean_execution(result))
+        terminate.assert_called_once_with(123456, signal.SIGTERM)
+        self.assertIsNotNone(marker)
 
     def test_signal_exit_requires_recovery_but_normal_api_error_does_not(self):
         for code, recovery in ((-signal.SIGSEGV, True), (3, False), (0, False)):

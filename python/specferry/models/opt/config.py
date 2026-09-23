@@ -30,7 +30,7 @@ class Components:
             raise ValueError("OPT dimensions must be positive uint32 values")
         if (
             self.hidden % self.heads
-            or self.capacity > 512
+            or self.capacity > 2048
             or not math.isfinite(self.epsilon)
             or self.epsilon <= 0
         ):

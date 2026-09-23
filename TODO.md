@@ -5,13 +5,46 @@ Numerical SDK validation and formal hardware acceptance are tracked separately.
 
 Next implementation steps and closure criteria:
 [remaining S11 acceptance checklist](docs/remaining-acceptance-plan.md).
+SDK observation and optimization work is tracked as
+[O0–O6](docs/optimization-plan.md); the current authorized implementation is O0–O2.
+
+## NP101-OP-005: Repeated long SDK waits after startup
+
+- [x] Preserve the startup selection with 36 galcore ioctl calls lasting at least
+  one second (many approximately 30.7 seconds); completed numerical checks still pass.
+- [x] Add a checkpoint-free selection entry, progress heartbeat, separate short-gate
+  timeout/latency warning, and optional SDK begin/end records.
+- [x] Provide SDK summary timing by request, phase, component and public API without
+  introducing tensor readbacks or interpreting SDK-internal behavior.
+- [ ] Determine the cause with the chip team if cold-start checks reproduce it.
+
+The historical run `.cache/runs/opt-32-20260923-145020/` has about 1,097 seconds of
+completed galcore ioctl time in selection. Teacher also has five calls above one
+second; its later boundary and generation stages recover. This is separate from
+the normal low token throughput and the three memory observations. The cold-start
+comparison under `.cache/runs/o0-cold-32-20260923/` passes all correctness gates and
+two complete 32-token model lifetimes. The traced submitting thread no longer has
+calls over one second; SDK worker waits are reported separately. Decode remains
+slow (0.3695/0.3728 tokens/s; TTFT medians 82.350/82.135 seconds), despite identical
+native binaries and SDK hashes to the earlier baseline. Commands and stopping rules are in
+[SDK latency diagnostics](tests/np101-sdk-timing.md). Do not claim root-cause repair
+from a successful cold-start run. O2's further reduction is conditional on recurrence.
+
+O1's same-binary off/summary comparison passes token, transfer, API-count and
+lifecycle checks (0.3789/0.3812 tokens/s; TTFT 81.003/80.349 seconds). Of measured
+request time, `RunGraph` accounts for 70.91%, KV `VerifyGraph` for 13.56%, scalar
+uploads for 9.38%, and KV `ProcessGraph` for 5.99%. This locates the time at public
+API boundaries, without identifying SDK-internal launch/compute costs. O3/O4 remain
+the next implementation work; host growth and physical residency remain open.
 
 ## Current work and dependencies
 
 | Work | Current state | Next action / dependency |
 |---|---|---|
 | OPT input/output and generation (S9/S10) | Implemented; full 24-layer numerical/lifecycle regression also passes on package 1.0.6 | Retain the regression; the independent convolution fault remains open |
-| Complete DLM hardware acceptance (S11) | Acceptance/measurement runner implemented; formal hardware gates open | Establish per-kernel backend/residency evidence and device memory accounting; complete long-context/performance acceptance |
+| Short-context DLM acceptance (S11.4/S11.5) | KV/reset/boundary checks pass; 32/128/512/2033-token observations complete | Cold-start 32-token repeat complete; 2048-token case remains cancelled; memory/hardware-proof issues remain separate |
+| Execution/residency evidence (S11.3) | Deferred at the user's request; hardware proof remains open | Resume profiler and physical-memory accounting later; not a prerequisite for bounded functional checks or host-wall timings |
+| Long context and compression | Deferred to a later joint work item | Design separately; not part of the current short-context acceptance |
 | Full Qwen weight loading | Allocation succeeds on package 1.0.6, retained bytes fail validation | NP101-MEM-001; also account for deferred DeltaNet duplication before any full-model integration |
 | Qwen component regression | Existing implementation and evidence retained | Recheck affected components after relevant changes; no new full-Qwen integration in the active OPT scope |
 | TLM/protocol and speculative inference | Deferred | Complete the DLM acceptance stage before joint inference and optimization measurements |
@@ -94,6 +127,14 @@ independent allocation corruption.
 
 ## NP101-OBS-001: Establish execution and device-memory evidence (S11)
 
+Priority update, 2026-09-23: focus now on short-context KV correctness, complete
+responses and host-wall performance. Do not enable a profiler during inference measurements. The isolated one-tensor
+accounting diagnostic explicitly enables SDK memory counters.
+Per-kernel backend, physical residency and device accounting remain deferred proof
+obligations; they do not block those functional checks or preliminary measurements.
+Explore natural-text prefixes of 32, 128, 512 and 2048 tokens now; full long-context
+quality, sustained resource stability and context compression remain separate work.
+
 - [x] Implement staged correctness gates, checkpoint-default CPU token comparisons,
   same-instance warmups/repeats and fresh-process model lifetimes.
 - [x] Separate initialization, prefill, first-token and decode wall times; retain
@@ -105,15 +146,34 @@ independent allocation corruption.
 - [ ] Account for weights, KV, activations, SDK layout copies and workspace with
   the complete OPT model resident at the tested capacity.
 - [ ] Verify release/recreation against device memory observations.
-- [ ] Measure initialization, prompt processing and decoding after correctness
-  and execution/residency are established; separate diagnostic tracing overhead.
-- [ ] Complete representative long-context checks before formal model acceptance.
+- [x] Complete S11.4 short-context KV/prefix checks and same-instance A/B/A reset
+  validation against independent CPU results, preserving complete-model execution.
+- [x] Measure short-context initialization, prefill, model-ready TTFT and decode
+  after functional correctness passes; report RSS growth and exclude tracing overhead.
+- [x] Separate functional/timing results from deferred hardware proof and long-context
+  work in the runner's reports; preserve strict hardware-pending status and flags.
+- [x] Complete natural-text 128/512/2033-token input observations and near-limit
+  continuation, recording actual output length, TTFT, throughput and readable text.
+- [x] Repeat the 32-token timing without overlapping CPU reference preparation,
+  after device recovery is confirmed; retain the separate cold-start O0 baseline.
+
+The user cancelled the separate 2048-token input during prefill on 2026-09-23;
+it has no completed timing or prediction and is not automatically scheduled again.
+Its process group exited; the signal-triggered recovery marker remained until the
+user's subsequent cold start. O0 then passed under a new boot ID. The cancelled
+2048-token case still has no completed result and will not be restarted automatically.
 
 Implementation, run commands and current observations:
 [complete-model acceptance](tests/np101-acceptance.md). The runner can collect
 untraced host observations now; they are not formal NPU performance measurements.
-The initial suite passes all numerical gates, warmups, repeated requests and four
-fresh model lifetimes. Host memory growth is tracked separately as NP101-MEM-003.
+The expanded short suite passes 2,027 checks each for the natural teacher and
+capacity-eight boundary, A/B/A reset/reuse, and two fresh 32-token model lifetimes
+with one warmup plus three measured requests. Decode is 0.6633–0.6648 tokens/s;
+TTFT medians are 45.12–45.16 seconds. KV writing is about 2.4% of request time.
+This does not explain the remaining slow model execution. Host memory growth is tracked separately as NP101-MEM-003.
+The independently prepared 128/512/2033-token cases each return 16 CPU-identical
+tokens; decode rates are 0.6520/0.5974/0.5003 tokens/s. See the acceptance record
+for TTFT, output text, sample counts and the cancelled case's evidence.
 
 Generic driver IO, SDK success, numeric agreement and `argmax.execute_on_sw=false`
 do not establish exclusive NPU execution. Host RSS/FD stability is not a board
@@ -122,7 +182,8 @@ memory measurement. Existing reports retain this distinction.
 Known OPT weight/KV payload at capacity 512 is 712,724,480 bytes (679.71 MiB),
 excluding SDK overhead, activations and workspace. Use the
 [complete-model checks](tests/np101-generation.md) as the numerical baseline.
-This item gates hardware acceptance and device-performance claims for all modules.
+This item gates claims of proven execution backends, physical residency and NPU-only
+performance. It does not gate reporting measured application/SDK wall times.
 
 ## NP101-STATE-001: Establish physical residency of reused state
 
@@ -150,6 +211,10 @@ sequential inference acceptance, not implementation of already validated state r
 - [x] Observe repeatable RSS growth during full OPT generation with persistent models.
 - [x] Independently validate the exported HAL memory-profile counter with an 8 MiB
   allocation/readback control, then sample a separate full-model run.
+- [x] Reproduce growth without a model: one copy node, preallocated views; fixed,
+  same-destination and advancing-destination controls. RSS increases across reverify.
+- [x] Provide integrated readable commands for host growth, one-tensor GPU accounting
+  and existing large-allocation integrity: [memory diagnostics](tests/np101-memory.md).
 - [ ] Locate the allocation source and determine whether it is retained workspace,
   missing release or another SDK/application ownership issue.
 - [ ] Verify bounded steady-state host allocation and release after the correction.
@@ -162,7 +227,9 @@ exit dump still reports 84,939,840 bytes and 1,296 allocations not freed after
 evidence than RSS alone, but does not yet identify the allocating call or root cause.
 Application transfer counts and tokens remain correct. Ask the chip team to
 interpret these counters and investigate allocation stacks/lifetimes, including
-the per-slot KV graph verification path; that path is a hypothesis, not a diagnosis.
+the per-slot KV graph verification path. The new single-node controls reproduce
+growth across re-verification, but the responsible allocation and release contract
+still need explanation; temporal localization alone is not a root-cause diagnosis.
 
 SDK `gpu_memory` accounting stays constant during the three requests and returns
 to zero in the exit dump. Its roughly 1.36 GiB peak is not accepted as physical
@@ -170,9 +237,29 @@ NP101 memory: an 8 MiB control produces roughly 16 MiB of counted allocations.
 These counters remain diagnostic only, outside the default inference/benchmark path.
 The source, binary and logs are retained under
 `.cache/runs/acceptance-20260922-memory-profile/`.
-This issue gates long-running resource stability and final S11 acceptance;
-long-context/stress acceptance is deferred until the growth is explained or
-corrected. It does not invalidate the completed short numerical comparisons.
+This issue gates long-running resource stability. The revised S11 plan permits
+bounded short-context KV/generation checks and preliminary timing while recording
+the growth. Short repeated runs remain bounded; the requested longer exploratory
+prefixes use one request per fresh process and check available host headroom using
+4 MiB per consumed token plus a 4 GiB reserve. This estimate is not a proven bound. Limited localization
+uses existing HAL evidence and non-profiled RSS/call observations first. Unknown
+ownership remains open if vendor allocation details are needed. A normal process
+exit is not a fix. See the linked plan for closure and stopping criteria.
+
+## NP101-MEM-004: Explain SDK device-memory accounting overhead
+
+- [x] Measure one 1/8/32 MiB FP16 tensor in both constant and mutable storage, with
+  complete readback and release, independently of any model or compute graph.
+- [x] Provide `check_np101_memory.py accounting` and its native test in the existing
+  test tree; sentinel-check whether the SDK actually populates its output.
+- [ ] Obtain the meaning of `gpu_memory` counters and explain the observed
+  `2 * payload + 4,672` byte delta; distinguish physical allocation, layouts and accounting.
+
+This is separate from host allocation growth (MEM-003) and corrupt data (MEM-001).
+No common root cause has been established. It gates interpreting counters as
+physical board occupancy, not bounded functional or host-wall performance checks.
+See [commands and observations](tests/np101-memory.md). The isolated diagnostic
+uses memory profiling; inference measurements do not.
 
 ## NP101-MEM-002: Share DeltaNet weights across alternating graphs
 

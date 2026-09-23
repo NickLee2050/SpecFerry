@@ -16,8 +16,8 @@ unsigned product(unsigned left, unsigned right) {
 
 void KvSpec::validate() const {
   product(heads, head_dim);
-  if (!capacity || capacity > 512) {
-    throw std::invalid_argument("KV capacity exceeds validated range [1,512]");
+  if (!capacity || capacity > 2048) {
+    throw std::invalid_argument("KV capacity exceeds experimental limit [1,2048]");
   }
   tensor().bytes();
 }

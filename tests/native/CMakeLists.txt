@@ -16,6 +16,9 @@ specferry_native_test(np101_weight_allocation_check np101/weight_allocation_chec
 target_link_libraries(np101_weight_allocation_check PRIVATE np101_allocation_support)
 specferry_native_test(np101_capacity_check np101/capacity_check.cpp)
 target_link_libraries(np101_capacity_check PRIVATE np101_allocation_support)
+specferry_native_test(np101_memory_growth_check np101/memory_growth_check.cpp)
+specferry_native_test(np101_memory_accounting_check np101/memory_accounting_check.cpp)
+target_link_libraries(np101_memory_accounting_check PRIVATE np101_allocation_support)
 specferry_native_test(np101_delta_net_check np101/delta_net_check.cpp)
 target_link_libraries(np101_delta_net_check PRIVATE np101_delta_net)
 specferry_native_test(np101_kv_cache_check np101/kv_cache_check.cpp)
@@ -55,3 +58,10 @@ set_tests_properties(allocation_readback_contract PROPERTIES LABELS "unit;cpu" T
 
 # Device diagnostics are explicit commands: ordinary CTest must not open NP101
 # or spend minutes waiting for a device graph to complete.
+
+add_executable(diagnostics_test diagnostics_test.cpp)
+target_link_libraries(diagnostics_test PRIVATE specferry_diagnostics)
+target_compile_options(diagnostics_test PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(diagnostics_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME sdk_timing_contract COMMAND diagnostics_test)
+set_tests_properties(sdk_timing_contract PROPERTIES LABELS "unit;cpu" TIMEOUT 30)

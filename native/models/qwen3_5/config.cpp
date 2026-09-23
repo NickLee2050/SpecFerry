@@ -11,7 +11,8 @@ namespace specferry::models::qwen3_5 {
 void Config::validate() const {
   kv.validate();
   delta.validate();
-  if (!hidden || !intermediate || !query_heads || query_heads % kv.heads ||
+  // Longer-cache experiments currently belong to OPT; retain this adapter's limit.
+  if (kv.capacity > 512 || !hidden || !intermediate || !query_heads || query_heads % kv.heads ||
       query_heads > std::numeric_limits<unsigned>::max() / kv.head_dim / 2 || !rotary_dim ||
       rotary_dim % 2 || rotary_dim > kv.head_dim || !std::isfinite(rope_theta) || rope_theta <= 0 ||
       !std::isfinite(epsilon) || epsilon <= 0 || hidden != delta.hidden || layer_types.empty()) {

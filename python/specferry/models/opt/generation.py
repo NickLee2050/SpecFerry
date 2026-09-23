@@ -74,6 +74,8 @@ def resolve_selection(checkpoint, *, sample=False, seed=0):
 
 
 def write_config(directory, config, capacity=512, block_rows=4096):
+    if capacity > config["max_position_embeddings"]:
+        raise ValueError("capacity exceeds the checkpoint's learned position table")
     components = replace(validate_config(config), capacity=capacity)
     components.write(directory / "components.txt")
     directory.joinpath("model.txt").write_text(
@@ -94,7 +96,15 @@ def validate_tokens(tokens, vocabulary, capacity):
 
 
 def prepare_request(
-    deployment, checkpoint, directory, prompt, capacity=512, *, sample=False, seed=0
+    deployment,
+    checkpoint,
+    directory,
+    prompt,
+    capacity=512,
+    *,
+    sample=False,
+    seed=0,
+    prompt_tokens=None,
 ):
     verify_export(deployment)
     manifest = json.loads((deployment / "deployment-manifest.json").read_text())
@@ -108,6 +118,11 @@ def prepare_request(
         checkpoint, local_files_only=True, trust_remote_code=False
     )
     tokens = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+    if prompt_tokens is not None:
+        if not 1 <= prompt_tokens <= len(tokens):
+            raise ValueError("source text is shorter than the requested token prefix")
+        tokens = tokens[:prompt_tokens]
+        prompt = tokenizer.decode(tokens, skip_special_tokens=True)
     if not tokens:
         tokens = [manifest["config"]["bos_token_id"]]
     validate_tokens(tokens, manifest["config"]["vocab_size"], capacity)

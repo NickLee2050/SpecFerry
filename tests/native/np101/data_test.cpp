@@ -98,7 +98,8 @@ void component_contracts() {
   cache.validate();
   require(cache.tensor().bytes() == 768 && cache.token_bytes() == 192,
           "alternate KV dimensions and slot accounting");
-  rejects([] { KvSpec{2, 16, 513}.validate(); }, "unsupported KV capacity");
+  KvSpec{16, 64, 2048}.validate();
+  rejects([] { KvSpec{2, 16, 2049}.validate(); }, "unsupported KV capacity");
   rejects([] { DeltaSpec{64, UINT32_MAX, 8, 8, 3, 1e-6f}.validate(); },
           "overflowing DeltaNet dimensions");
 
@@ -112,6 +113,9 @@ void component_contracts() {
   require(config.mixer(1) == specferry::models::qwen3_5::MixerKind::Attention,
           "explicit layer order");
   rejects([&] { config.mixer(2); }, "unconfigured layer");
+  auto extended = config;
+  extended.kv.capacity = 513;
+  rejects([&] { extended.validate(); }, "Qwen adapter retains its existing cache limit");
   for (const auto &record : {"-1" + parameters.substr(2), parameters + " extra",
                              std::string("64 96 3 2 16 8 8 10000 1e-6 2 8 8 3")}) {
     write(path, "specferry-qwen-components 1\n" + record + "\ndelta attention\n");
@@ -143,7 +147,7 @@ void opt_contracts() {
             "invalid model IO configuration rejected before device initialization");
   }
   for (const auto *record :
-       {"1024 4096 0 24 512 1e-5", "1024 4096 16 24 513 1e-5", "1024 4096 16 24 512 -1",
+       {"1024 4096 0 24 512 1e-5", "1024 4096 16 24 2049 1e-5", "1024 4096 16 24 512 -1",
         "1024 4096 16 24 512 1e-5 extra", "-1 4096 16 24 512 1e-5", "1024 4097 16 24 512 1e-5"}) {
     write(path, header + record + "\n");
     rejects([&] { specferry::models::opt::read_config(path); }, "invalid OPT contract");

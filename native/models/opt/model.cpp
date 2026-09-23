@@ -1,8 +1,10 @@
 #include "models/opt/decoder.hpp"
 #include "models/opt/model.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
 #include "vsi_nn_pub.h"
 
+#include <algorithm>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -28,6 +30,7 @@ InputEmbedding::InputEmbedding(Context &context, const WeightStore &weights,
 }
 
 void InputEmbedding::run(std::int32_t token, unsigned position) {
+  TimingLabel component(TimingField::Component, "embedding.projection");
   config_.validate_token(token);
   if (position >= config_.decoder.capacity) {
     throw std::out_of_range("OPT position exceeds cache capacity");
@@ -37,7 +40,8 @@ void InputEmbedding::run(std::int32_t token, unsigned position) {
   std::vector<std::uint8_t> bytes(sizeof(index));
   std::memcpy(bytes.data(), &index, sizeof(index));
   upload_tensor(graph, position_.id, bytes);
-  check(vsi_nn_RunGraph(graph.get()), "OPT embedding projection and learned position");
+  check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
+        "OPT embedding projection and learned position");
 }
 
 TensorBinding InputEmbedding::binding() { return {graph, output_.id}; }
@@ -53,7 +57,11 @@ OutputProjection::OutputProjection(Context &context, const WeightStore &weights,
   compile({input}, {output_});
 }
 
-void OutputProjection::run() { check(vsi_nn_RunGraph(graph.get()), "OPT output projection"); }
+void OutputProjection::run() {
+  TimingLabel component(TimingField::Component, "output_projection");
+  check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
+        "OPT output projection");
+}
 
 TensorBinding OutputProjection::binding() { return {graph, output_.id}; }
 
@@ -135,6 +143,14 @@ unsigned Model::length() const { return impl_ ? impl_->decoder.length() : 0; }
 
 std::size_t Model::cache_writes() const { return impl_ ? impl_->decoder.cache_writes() : 0; }
 
+double Model::cache_write_seconds() const {
+  return impl_ ? impl_->decoder.cache_write_seconds() : 0;
+}
+
+double Model::cache_revalidation_seconds() const {
+  return impl_ ? impl_->decoder.cache_revalidation_seconds() : 0;
+}
+
 std::vector<std::uint8_t> Model::read(const std::string &name, unsigned layer) {
   require_live();
   if (!length() || ((name == "logits" || name == "projected") && !impl_->prediction_valid)) {
@@ -160,10 +176,19 @@ Generation Model::generate(const std::vector<std::int32_t> &prompt, unsigned max
     throw std::logic_error("text generation requires every decoder layer");
   }
   const auto &config = impl_->config;
+  const auto prompt_length = std::max<std::size_t>(1, prompt.size());
   return inference::generate_tokens(
       {config.vocabulary, config.decoder.capacity, config.bos, config.eos},
-      {[this] { reset(); }, [this](std::int32_t token) { consume(token); },
-       [this] { return predict(); }},
+      {[this] { reset(); },
+       [this, prompt_length](std::int32_t token) {
+         TimingLabel phase(TimingField::Phase, length() < prompt_length ? "prefill" : "decode");
+         consume(token);
+       },
+       [this, prompt_length] {
+         TimingLabel phase(TimingField::Phase,
+                           length() == prompt_length ? "first_prediction" : "decode");
+         return predict();
+       }},
       prompt, maximum_new_tokens, on_token);
 }
 

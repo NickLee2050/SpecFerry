@@ -1,3 +1,4 @@
+#include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
 
 #include <algorithm>
@@ -72,9 +73,10 @@ vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constan
   }
 
   // AddTensor copies initialization bytes; the graph owns the resulting tensor.
-  auto id =
-      vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr,
-                       initial.empty() ? nullptr : const_cast<std::uint8_t *>(initial.data()));
+  auto id = sdk_call("vsi_nn_AddTensor", [&] {
+    return vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr,
+                            initial.empty() ? nullptr : const_cast<std::uint8_t *>(initial.data()));
+  });
   if (id == VSI_NN_TENSOR_ID_NA || !vsi_nn_GetTensor(graph.get(), id)) {
     throw std::runtime_error("AddTensor failed: dtype=" + dtype_name(spec.type) +
                              " bytes=" + std::to_string(bytes));
@@ -87,7 +89,11 @@ void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::u
   if (data.size() != tensor_bytes(tensor)) {
     throw std::invalid_argument("upload byte count does not match tensor");
   }
-  check(vsi_nn_CopyDataToTensor(graph.get(), tensor, const_cast<std::uint8_t *>(data.data())),
+  check(sdk_call("vsi_nn_CopyDataToTensor",
+                 [&] {
+                   return vsi_nn_CopyDataToTensor(graph.get(), tensor,
+                                                  const_cast<std::uint8_t *>(data.data()));
+                 }),
         "CopyDataToTensor");
   ++transfers.uploads;
   transfers.upload_bytes += data.size();
@@ -97,7 +103,9 @@ std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
   auto *tensor = get_tensor(graph, id);
   auto bytes = tensor_bytes(tensor);
   std::unique_ptr<std::uint8_t, decltype(&std::free)> data(
-      vsi_nn_ConvertTensorToData(graph.get(), tensor), std::free);
+      sdk_call("vsi_nn_ConvertTensorToData",
+               [&] { return vsi_nn_ConvertTensorToData(graph.get(), tensor); }),
+      std::free);
   if (!data) {
     throw std::runtime_error("ConvertTensorToData returned null");
   }
@@ -117,7 +125,9 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
   // The SDK's AttachTensorToGraph symbol is unavailable. As in DeltaNet, use
   // public tensor wrappers and explicit OpenVX reference ownership instead.
   auto attr = source->attr;
-  auto shared = vsi_nn_AddTensor(receiver.get(), VSI_NN_TENSOR_ID_AUTO, &attr, nullptr);
+  auto shared = sdk_call("vsi_nn_AddTensor", [&] {
+    return vsi_nn_AddTensor(receiver.get(), VSI_NN_TENSOR_ID_AUTO, &attr, nullptr);
+  });
   if (shared == VSI_NN_TENSOR_ID_NA) {
     throw std::runtime_error("AddTensor failed for retained tensor");
   }

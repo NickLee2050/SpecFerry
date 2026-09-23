@@ -2,6 +2,7 @@
 #include "models/opt/config.hpp"
 #include "models/opt/model.hpp"
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/ops/vocabulary.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,8 +36,10 @@ int main(int argc, char **argv) {
   using namespace specferry::np101::ops;
   using namespace specferry::models::opt;
   const fs::path fixture(argv[2]), output(argv[3]);
+  std::unique_ptr<SdkTimings> timings;
   try {
     fs::create_directories(output);
+    timings = std::make_unique<SdkTimings>(output);
     auto config = read_model_config(fixture);
     WeightStore weights(argv[1]);
     weights.verify();
@@ -53,6 +57,8 @@ int main(int argc, char **argv) {
     std::int32_t token;
     unsigned position, index = 0;
     while (cases >> token >> position) {
+      TimingLabel request(TimingField::Request, "case." + std::to_string(index));
+      TimingLabel phase(TimingField::Phase, "selection");
       input.run(token, position);
       save(output / ("embedding." + std::to_string(index) + ".bin"), input.read());
       upload_tensor(hidden, hidden_id,
@@ -86,6 +92,7 @@ int main(int argc, char **argv) {
     if (rejected != 3) {
       throw std::runtime_error("IO accepted an invalid token/position");
     }
+    TimingLabel phase(TimingField::Phase, "release");
     head.graph.close();
     projection.graph.close();
     hidden.close();
@@ -95,9 +102,17 @@ int main(int argc, char **argv) {
     std::ofstream(output / "execution.json")
         << "{\"status\":\"executed\",\"released\":true,\"bounds_rejected\":true,\"cases\":" << index
         << "}\n";
+    timings->save();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
+    if (timings) {
+      try {
+        timings->save();
+      } catch (const std::exception &logging_error) {
+        std::cerr << "Cannot save SDK timings: " << logging_error.what() << '\n';
+      }
+    }
     return 1;
   }
 }

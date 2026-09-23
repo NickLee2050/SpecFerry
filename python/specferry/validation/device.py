@@ -128,6 +128,81 @@ def device_lock(root: Path):
         yield
 
 
+def wait_with_progress(process, output: Path, timeout: float, interval: float, label: str):
+    """Poll an existing child; observations run outside its measured C++ calls."""
+    if interval <= 0:
+        return process.wait(timeout=timeout)
+    started = time.monotonic()
+    while True:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(label, timeout)
+        try:
+            return process.wait(timeout=min(interval, remaining))
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            phase, phase_seconds = "SDK call or initialization", None
+            try:
+                state = json.loads((output / "execution.json").read_text())
+                phase = state.get("phase", phase)
+                if state.get("phase_started_at"):
+                    phase_seconds = max(0, time.time() - state["phase_started_at"])
+            except (OSError, ValueError, TypeError):
+                pass  # Startup and older native programs may have no progress file.
+            detail = f"; phase {phase_seconds:.0f}s" if phase_seconds is not None else ""
+            print(f"  {label}: {phase}; process {elapsed:.0f}s{detail}", flush=True)
+
+
+def driver_wait_summary(path: Path) -> dict:
+    """Separate submitting-thread latency from overlapping worker-thread waits."""
+
+    def empty():
+        return {
+            "completed_calls": 0,
+            "total_seconds": 0.0,
+            "maximum_seconds": 0.0,
+            "calls_at_least_one_second": 0,
+            "unfinished_calls": 0,
+        }
+
+    threads = {}
+    submission_thread = None
+    pending = set()
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            fields = line.split()
+            if not fields:
+                continue
+            thread = fields[0]
+            # strace -f starts with the launched native process's loader calls.
+            # Later SDK/shader workers must not redefine the submitting thread.
+            if submission_thread is None and thread.isdecimal():
+                submission_thread = thread
+            resumed = "<... ioctl resumed>" in line and thread in pending
+            if not resumed and ("/dev/galcore" not in line or "ioctl(" not in line):
+                continue
+            if "<unfinished ...>" in line:
+                pending.add(thread)
+                continue
+            pending.discard(thread)
+            match = re.search(r"<([0-9.]+)>$", line.rstrip())
+            if not match:
+                continue
+            seconds = float(match[1])
+            stats = threads.setdefault(thread, empty())
+            stats["completed_calls"] += 1
+            stats["calls_at_least_one_second"] += seconds >= 1
+            stats["total_seconds"] += seconds
+            stats["maximum_seconds"] = max(stats["maximum_seconds"], seconds)
+    for thread in pending:
+        threads.setdefault(thread, empty())["unfinished_calls"] += 1
+    return threads.pop(submission_thread, empty()) | {
+        "submission_thread": submission_thread,
+        "other_threads": threads,
+        "scope": "completed galcore ioctls on the native entry thread; other threads are separate and may overlap",
+    }
+
+
 def run_device(
     binary: Path,
     arguments: list[str],
@@ -138,7 +213,11 @@ def run_device(
     shader_header: Path | None = None,
     trace_driver: bool = True,
     print_targets: bool = True,
+    sdk_timing: str = "off",
+    progress_interval: float = 0,
 ) -> dict:
+    if sdk_timing not in ("off", "summary", "calls") or progress_interval < 0:
+        raise ValueError("invalid SDK timing mode or progress interval")
     require_recovered_device(RECOVERY_ROOT)
     binary = binary.resolve(strict=True)
     output.mkdir(parents=True, exist_ok=True)
@@ -155,6 +234,7 @@ def run_device(
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(sdk_lib.resolve(strict=True))
     env["VIV_VX_ENABLE_PRINT_TARGET"] = "1" if print_targets else "0"
+    env["SPECFERRY_SDK_TIMING"] = sdk_timing
     log_name = f"{artifact_prefix}.log" if artifact_prefix else "sdk.log"
     trace_name = f"{artifact_prefix}.strace" if artifact_prefix else "driver.strace"
     evidence_name = (
@@ -189,6 +269,7 @@ def run_device(
                 "VIV_VX_PROFILE",
                 "VIV_MEMORY_PROFILE",
                 "VIV_VX_ENABLE_SHADER",
+                "SPECFERRY_SDK_TIMING",
             )
         },
         "binary_sha256": fingerprint(binary),
@@ -211,6 +292,7 @@ def run_device(
             )
         },
     }
+    started = time.monotonic()
     with (output / log_name).open("w") as log:
         process = subprocess.Popen(
             command,
@@ -220,10 +302,12 @@ def run_device(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        write_json(output / evidence_name, evidence | {"status": "running", "pid": process.pid})
         try:
-            code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            evidence["timeout"] = True
+            code = wait_with_progress(process, output, timeout, progress_interval, output.name)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            evidence["timeout"] = isinstance(error, subprocess.TimeoutExpired)
+            evidence["interrupted_by_user"] = isinstance(error, KeyboardInterrupt)
             terminate_group(process.pid, signal.SIGTERM)
             try:
                 code = process.wait(timeout=5)
@@ -241,7 +325,12 @@ def run_device(
         members = process_group_members(process.pid)
     evidence["process_group_exited"] = not members
     evidence["remaining_processes"] = members
-    interrupted = evidence["timeout"] or code is None or code < 0
+    interrupted = (
+        evidence["timeout"]
+        or evidence.get("interrupted_by_user", False)
+        or code is None
+        or code < 0
+    )
     evidence["device_recovery_required"] = interrupted or bool(members)
     if evidence["device_recovery_required"]:
         marker = RECOVERY_ROOT / "np101-recovery-required.json"
@@ -250,7 +339,7 @@ def run_device(
             marker,
             {
                 "reason": (
-                    "SDK run timed out or was terminated by a signal"
+                    "SDK run timed out, was interrupted, or was terminated by a signal"
                     if interrupted
                     else "SDK process group did not exit after the bounded run"
                 ),
@@ -262,10 +351,19 @@ def run_device(
             },
         )
     evidence["returncode"] = code
+    evidence["status"] = "finished"
+    evidence["wall_seconds"] = time.monotonic() - started
+    if progress_interval:
+        print(
+            f"  {output.name}: exited {code}; process {evidence['wall_seconds']:.2f}s; "
+            f"log: {output / log_name}",
+            flush=True,
+        )
     successes = 0
     if tracer:
         with (output / trace_name).open(errors="replace") as trace:
             successes = sum(bool(re.search(r"ioctl\(.*</dev/galcore.*= 0", line)) for line in trace)
+        evidence["driver_waits"] = driver_wait_summary(output / trace_name)
     evidence.update(
         {
             "successful_galcore_ioctls": successes,
