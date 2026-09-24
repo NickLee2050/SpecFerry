@@ -1,12 +1,91 @@
 # Engineering follow-up
 
-Updated: 2026-09-23. Active target: complete resident OPT-350M text inference on NP101.
+Updated: 2026-09-24. Active target: complete resident OPT-350M text inference on NP101.
 Numerical SDK validation and formal hardware acceptance are tracked separately.
 
 Next implementation steps and closure criteria:
 [remaining S11 acceptance checklist](docs/remaining-acceptance-plan.md).
 SDK observation and optimization work is tracked as
-[O0–O6](docs/optimization-plan.md); the current authorized implementation is O0–O2.
+[O0–O6](docs/optimization-plan.md). Cold-start tests on 2026-09-24 passed the two cache gates and
+existing short regressions; the complete graph failed numerically and timed out
+during teardown. A subsequently authorized small recovery probe and three pipeline
+checks passed. After a further cold boot, the segmented-memory synthetic lookup
+triggered kernel hang/recovery reports during verification and after process exit.
+Its new recovery marker blocks device work. Whole-graph acceptance remains open.
+
+2026-09-24 follow-up: const and non-const application tensor payloads are now
+limited separately to 1 GiB, including shared-reference/temporary-backing accounting.
+Capacity requests above 1024 MiB and oversized weight/state fixtures are rejected
+before device submission. Pipeline checks audit all shared weights across setup,
+verification and execution. This is an application policy, not a driver rollback
+or bad-address exclusion; hidden SDK memory remains unknown.
+
+- [x] Implement segment budgets and complete shared-weight readback diagnostics.
+- [x] Confirm the subsequent cold boot and attempt the first segmented lookup.
+  Weight readback passed in three phases; VerifyGraph returned after 22.372 s,
+  but the first RunGraph was interrupted by the 30 s total deadline.
+- [x] Read one explicitly authorized kernel-log window: NP101 hang/automatic
+  recovery at 11:00:51 and again at 11:01:21, after test exit. Record the new guard.
+- [ ] After recovery, compare the previous passing tiny path and added full-weight
+  readback schedule, then resume [pipeline diagnostics](tests/np101-graph-pipeline.md).
+  The lookup deadline is now 120 s, but no longer-budget retry was attempted after
+  the hang evidence. All subsequent device gates remain unrun in this boot.
+
+## NP101-OP-006: Validate graph-integrated cache append
+
+- [x] Record scatter control success, alias rejection and the rank-three
+  TENSORSTACKCONCAT setup crash with executable/SDK/source fingerprints.
+- [x] Reject the known crashing geometry before SDK calls; implement an experimental
+  per-head 2-D column writer and shared storage reshapes for block/decode graphs.
+- [x] Complete offline fixed-graph OPT construction, block prefill, CPU references,
+  host tests and bounded staged runners. Keep the existing generator as default.
+- [x] Confirm cold start on 2026-09-24 and the working device permission service.
+- [x] Run the user-authorized minimal health probe after the teardown timeout; archive
+  the old marker only after numerical, normal-release and latency checks pass.
+- [x] Validate 2-D append/attention, history, causal masks, resets and release in the small fixture.
+- [x] Validate block/decode cache sharing in the small fixture without per-step revalidation.
+- [ ] Fix complete-graph all-zero token/KV results before full prefill/capacity tests.
+- [ ] Revalidate teardown with the revised budget and stop-on-token-mismatch runner.
+- [x] Recheck existing OPT (249 checks), Qwen (353 checks) and alternate KV layout on 2026-09-24.
+- [x] Check packed inputs, shared weights and blocked lookup (38 synthetic / 13 real checks)
+  and one real joint decoder layer (30 checks, nonzero KV and normal release).
+- [ ] Check device readiness after the new combined-prefix VerifyGraph timeout;
+  preserve its separate incident and recovery marker.
+
+The separate-output scatter control passed in 1.69 s. Both full-view and identical
+retained-reference scatter aliases returned `VX_ERROR_INVALID_GRAPH` (-18) at
+VerifyGraph and released normally. The rank-three TENSORSTACKCONCAT case logged
+`Cannot calculate the reshape tensor 16 to 32`, then SIGSEGV during SetupGraph;
+no RunGraph occurred. Its process group exited, which does not prove device health
+or a kernel hang. Evidence is under `.cache/runs/o3-cache-*-20260923/`.
+
+Both current 2-D small gates passed on 2026-09-24 (0.82/0.87 seconds). The full
+decode graph completed three requests but returned zero token IDs and zero KV in
+all 24 layers. It reached teardown around second 144; the 180-second timeout sent
+SIGTERM during release. All processes exited, but normal SDK teardown was not
+confirmed. O4 correctness/teardown, O5 full-model prefill and O6 performance remain
+blocked; successful small graphs do not establish full-model support.
+
+The runner now stops after the first token mismatch, retains its KV evidence and
+releases normally; ceilings are 360 seconds for decode and 600 for two-graph cases.
+These fixes need device validation. Authorized journal reads found 13,053 PAT
+mapping-attribute notices for the failing PID, with the same message class in
+passing tests, and a device-file release entry after termination. No corresponding
+NP101 kernel crash/OOM/timeout was found; no root cause is established.
+The subsequent same-boot selection probe passed 23 checks in 0.77 seconds, including
+normal graph/context release, with no one-second driver waits. The old marker and
+probe evidence are in `.cache/runs/recovery-probe-20260924/`. This permits further
+small diagnostics at that point; it did not validate complete-graph teardown or repair its zero outputs.
+Three subsequent diagnostics passed, but the one-layer production graph prefix
+(embedding/head included, capacity 64) spent over 110 seconds in VerifyGraph and
+was terminated at the 120-second process deadline. It never reached RunGraph and
+its process group exited. The new marker is retained; do not infer that the prior
+health probe covers this later event. The capacity differs from the original
+failing complete graph (16), so this is not an isolated layer-count comparison.
+Next isolate tiny lookup/head multiple consumers and compare at the same capacity.
+See [pipeline diagnostics](tests/np101-graph-pipeline.md) for evidence and header options.
+Detailed staged commands and acceptance criteria:
+[fixed-graph experiments](tests/np101-graph-optimization.md).
 
 ## NP101-OP-005: Repeated long SDK waits after startup
 
@@ -34,8 +113,9 @@ O1's same-binary off/summary comparison passes token, transfer, API-count and
 lifecycle checks (0.3789/0.3812 tokens/s; TTFT 81.003/80.349 seconds). Of measured
 request time, `RunGraph` accounts for 70.91%, KV `VerifyGraph` for 13.56%, scalar
 uploads for 9.38%, and KV `ProcessGraph` for 5.99%. This locates the time at public
-API boundaries, without identifying SDK-internal launch/compute costs. O3/O4 remain
-the next implementation work; host growth and physical residency remain open.
+API boundaries, without identifying SDK-internal launch/compute costs. O3–O6 now
+have offline implementations; NP101-OP-006 blocks device acceptance. Host growth
+and physical residency remain open.
 
 ## Current work and dependencies
 

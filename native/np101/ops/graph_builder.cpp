@@ -1,5 +1,6 @@
 #include "np101/diagnostics.hpp"
 #include "np101/ops/graph_builder.hpp"
+#include "np101/weight_bank.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -14,8 +15,8 @@ constexpr auto f16 = DataType::Float16;
 constexpr auto f32 = DataType::Float32;
 } // namespace
 
-GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes)
-    : graph(context, tensors, nodes) {}
+GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights)
+    : weights_(weights), graph(context, tensors, nodes) {}
 
 Tensor GraphBuilder::tensor(TensorSpec spec) { return {add_tensor(graph, spec), std::move(spec)}; }
 
@@ -49,7 +50,20 @@ Tensor GraphBuilder::weight(const WeightStore &store, const WeightRecord &record
   if (record.spec.type != expected.type || record.spec.shape != expected.shape) {
     throw std::invalid_argument("unexpected weight contract: " + record.name);
   }
-  return constant(expected, store.read(record, 0, record.bytes));
+  return weight_chunk(store, record, expected, 0);
+}
+
+Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &record,
+                                  TensorSpec spec, std::size_t offset) {
+  if (spec.type != record.spec.type) {
+    throw std::invalid_argument("weight chunk changes dtype");
+  }
+  if (weights_) {
+    const auto id = weights_->bind(graph, store, record, spec, offset);
+    shared_weight_inputs_.push_back(id);
+    return {id, spec};
+  }
+  return constant(spec, store.read(record, offset, spec.bytes()));
 }
 
 Tensor GraphBuilder::share(GraphBuilder &owner, Tensor source) {
@@ -200,10 +214,10 @@ Tensor GraphBuilder::matmul(Tensor left, Tensor right, Shape shape, bool transpo
 }
 
 Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const WeightRecord &record) {
-  if (input.spec.shape.size() != 2 || input.spec.shape[1] != 1 || record.spec.shape.size() != 2 ||
+  if (input.spec.shape.size() != 2 || !input.spec.shape[1] || record.spec.shape.size() != 2 ||
       record.spec.shape[0] != input.spec.shape[0] || input.spec.type != f16 ||
       record.spec.type != f16) {
-    throw std::invalid_argument("projection requires FP16 [K,1] and [K,N]");
+    throw std::invalid_argument("projection requires FP16 [K,tokens] and [K,N]");
   }
   const auto columns = input.spec.shape[0], rows = record.spec.shape[1];
   // Preserve the validated at-most-two-block projection strategy and bounded IO.
@@ -212,14 +226,14 @@ Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const Weigh
     throw std::invalid_argument("projection exceeds validated two-block width");
   }
   if (rows <= block_rows) {
-    return matmul(input, weight(store, record, record.spec), {rows, 1}, false, true);
+    return matmul(input, weight(store, record, record.spec), {rows, input.spec.shape[1]}, false,
+                  true);
   }
   const auto first_bytes = std::size_t(block_rows) * columns * dtype_bytes(f16);
-  auto first = constant({f16, {columns, block_rows}}, store.read(record, 0, first_bytes));
-  auto second = constant({f16, {columns, rows - block_rows}},
-                         store.read(record, first_bytes, record.bytes - first_bytes));
-  auto first_output = matmul(input, first, {block_rows, 1}, false, true);
-  auto second_output = matmul(input, second, {rows - block_rows, 1}, false, true);
+  auto first = weight_chunk(store, record, {f16, {columns, block_rows}}, 0);
+  auto second = weight_chunk(store, record, {f16, {columns, rows - block_rows}}, first_bytes);
+  auto first_output = matmul(input, first, {block_rows, input.spec.shape[1]}, false, true);
+  auto second_output = matmul(input, second, {rows - block_rows, input.spec.shape[1]}, false, true);
   return concat(first_output, second_output);
 }
 
@@ -267,11 +281,11 @@ Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned 
 
 Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
                             const WeightRecord &bias) {
-  if (input.spec.type != f16 || input.spec.shape.size() != 2 || input.spec.shape[1] != 1 ||
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
       matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
       matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
       bias.spec.shape != Shape{matrix.spec.shape[1]}) {
-    throw std::invalid_argument("linear requires FP16 input [K,1], weight [K,N], bias [N]");
+    throw std::invalid_argument("linear requires FP16 [K,tokens], weight [K,N], bias [N]");
   }
   // The installed SDK crashes while verifying even an isolated biased FCL.
   // Use documented MatMul/Add; FP16 projection rounds before the bias addition.
@@ -281,16 +295,17 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
 }
 
 Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {
-  if (input.spec.type != f16 || input.spec.shape.size() != 2 || input.spec.shape[1] != 1 ||
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
       scale.spec.type != f16 || bias.spec.type != f16 ||
       scale.spec.shape != Shape{input.spec.shape[0]} || bias.spec.shape != scale.spec.shape) {
-    throw std::invalid_argument("layer norm requires FP16 [width,1] and affine vectors");
+    throw std::invalid_argument("layer norm requires FP16 [width,tokens] and affine vectors");
   }
   auto values = convert(input, f32);
   auto centered = binary(VSI_NN_OP_SUBTRACT, values, reduce(values, true));
   auto normalized = normalize(centered, true, epsilon);
-  auto multiplier = reshape(convert(scale, f32), input.spec.shape);
-  auto offset = reshape(convert(bias, f32), input.spec.shape);
+  const Shape affine_shape{input.spec.shape[0], 1};
+  auto multiplier = reshape(convert(scale, f32), affine_shape);
+  auto offset = reshape(convert(bias, f32), affine_shape);
   return convert(binary(VSI_NN_OP_ADD, binary(VSI_NN_OP_MULTIPLY, normalized, multiplier), offset),
                  f16);
 }
@@ -306,10 +321,15 @@ Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float s
 }
 
 void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
+  graph.save_memory_report();
+  if (weights_) {
+    weights_->verify_if_requested("before_setup");
+  }
   std::vector<vsi_nn_tensor_id_t> input_ids, output_ids;
   for (const auto &input : inputs) {
     input_ids.push_back(input.id);
   }
+  input_ids.insert(input_ids.end(), shared_weight_inputs_.begin(), shared_weight_inputs_.end());
   for (const auto &output : outputs) {
     output_ids.push_back(output.id);
   }
@@ -319,7 +339,13 @@ void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<
   }
   check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
         "SetupGraph");
+  if (weights_) {
+    weights_->verify_if_requested("after_setup");
+  }
   check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(graph.get()); }),
         "VerifyGraph");
+  if (weights_) {
+    weights_->verify_if_requested("after_verify");
+  }
 }
 } // namespace specferry::np101::ops

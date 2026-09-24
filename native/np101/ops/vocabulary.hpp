@@ -10,6 +10,11 @@ struct SamplingOptions {
   std::uint32_t seed = 0;
 };
 
+// Construction helpers for a caller-owned graph. Blocks are ordered vocabulary
+// row ranges; lookup accepts multiple token columns, selection accepts one.
+Tensor lookup_blocks(GraphBuilder &graph, const std::vector<Tensor> &blocks, Tensor tokens);
+Tensor greedy_token(GraphBuilder &graph, const std::vector<Tensor> &logits, unsigned block_rows);
+
 // One resident table, split into bounded row blocks. Lookup and head graphs retain
 // the same ordinary tensors; they never reload weights during token execution.
 class Vocabulary {

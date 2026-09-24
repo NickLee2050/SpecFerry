@@ -24,7 +24,16 @@ struct GenerationExecutor {
   std::function<void()> reset;
   std::function<void(std::int32_t)> consume;
   std::function<std::int32_t()> predict;
+  // Optional block prefill; it must consume exactly the supplied IDs, without padding.
+  std::function<void(const std::vector<std::int32_t> &)> prefill = {};
 };
+
+struct PrefillChunk {
+  unsigned begin, count;
+};
+
+// At most two fixed graph shapes: complete blocks and single-token tail steps.
+std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block);
 
 // Batch one, no padding. All supplied prompt IDs participate in attention.
 // The last prediction is returned without consuming it into the model state.

@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace specferry::np101 {
 namespace {
@@ -73,6 +74,7 @@ vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constan
   }
 
   // AddTensor copies initialization bytes; the graph owns the resulting tensor.
+  auto allocation = graph.reserve(constant, bytes);
   auto id = sdk_call("vsi_nn_AddTensor", [&] {
     return vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &attr,
                             initial.empty() ? nullptr : const_cast<std::uint8_t *>(initial.data()));
@@ -81,6 +83,7 @@ vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constan
     throw std::runtime_error("AddTensor failed: dtype=" + dtype_name(spec.type) +
                              " bytes=" + std::to_string(bytes));
   }
+  graph.record_storage(id, std::move(allocation));
   return id;
 }
 
@@ -125,6 +128,8 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
   // The SDK's AttachTensorToGraph symbol is unavailable. As in DeltaNet, use
   // public tensor wrappers and explicit OpenVX reference ownership instead.
   auto attr = source->attr;
+  // Count the wrapper's temporary backing until it is replaced by the alias.
+  auto temporary = receiver.reserve(false, tensor_bytes(source));
   auto shared = sdk_call("vsi_nn_AddTensor", [&] {
     return vsi_nn_AddTensor(receiver.get(), VSI_NN_TENSOR_ID_AUTO, &attr, nullptr);
   });
@@ -132,6 +137,7 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
     throw std::runtime_error("AddTensor failed for retained tensor");
   }
   auto *destination = get_tensor(receiver, shared);
+  receiver.record_storage(shared, std::move(temporary));
   check(vxRetainReference(reinterpret_cast<vx_reference>(source->t)), "retain tensor");
   if (destination->t) {
     auto status = vxReleaseTensor(&destination->t);
@@ -142,6 +148,7 @@ vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &rec
     }
   }
   destination->t = source->t;
+  receiver.alias_storage(shared, owner, id);
   return shared;
 }
 

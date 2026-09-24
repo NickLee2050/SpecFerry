@@ -1,5 +1,6 @@
 #include "allocation_support.hpp"
 #include "np101/context.hpp"
+#include "np101/memory_budget.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
@@ -242,8 +243,8 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("expected F16/F32 and an integer target");
     }
     const auto size = std::stoul(target);
-    if (size == 0 || size > maximum_capacity_mib) {
-      throw std::invalid_argument("target must be between 1 and 4096 MiB");
+    if (size == 0 || size > segment_payload_limit / mib) {
+      throw std::invalid_argument("target must be between 1 and 1024 MiB (application policy)");
     }
     progress.target = size * mib;
     probe(progress);

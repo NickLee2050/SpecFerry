@@ -6,6 +6,28 @@
 #include <stdexcept>
 
 namespace specferry::np101 {
+void sample_host_memory(const std::filesystem::path &directory, const std::string &phase) {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  std::size_t rss_kib = 0;
+  bool found = false;
+  while (std::getline(status, line)) {
+    if (line.rfind("VmRSS:", 0) == 0) {
+      std::istringstream value(line.substr(6));
+      found = bool(value >> rss_kib);
+      break;
+    }
+  }
+  if (!found) {
+    throw std::runtime_error("cannot query current host RSS");
+  }
+  std::ofstream out(directory / "host-resources.jsonl", std::ios::app);
+  out << "{\"phase\":\"" << phase << "\",\"rss_bytes\":" << rss_kib * 1024 << "}\n";
+  if (!out) {
+    throw std::runtime_error("cannot write host resource observation");
+  }
+}
+
 thread_local SdkTimings *SdkTimings::active_ = nullptr;
 
 SdkTimings::SdkTimings(const std::filesystem::path &directory)

@@ -308,6 +308,29 @@ class AllocationRunnerTests(unittest.TestCase):
             run.assert_called_once_with(output / binary.name, ["arg"], output, sdk, 42)
             self.assertFalse((output / "binary.json").exists())
 
+    def test_current_capacity_ceiling_rejects_old_large_targets_before_device_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for target in (1025, 1152, 2840, 4096):
+                with (
+                    self.subTest(target=target),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "check_np101_capacity",
+                            "--target-mib",
+                            str(target),
+                            "--output",
+                            str(Path(directory) / "run"),
+                        ],
+                    ),
+                    patch.object(check_np101_capacity, "run_allocation") as run,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    check_np101_capacity.main()
+                run.assert_not_called()
+
     def test_capacity_cli_passes_dtype_and_paths_without_opening_the_device(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

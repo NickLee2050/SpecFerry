@@ -5,6 +5,7 @@
 | `python/` | Download, export integrity/precision, memory budget, and numerical comparison unit tests | No |
 | `native/generation_test.cpp` | BOS/EOS, capacity, generation limits and consumed-token semantics | No |
 | `native/diagnostics_test.cpp` | SDK timing transparency, result/exception propagation and scope restoration | No |
+| `native/memory_budget_test.cpp` | Separate 1 GiB segment limits, boundary rejection and retained/temporary storage lifetime | No |
 | `native/allocation_support_test.cpp` | Finite FP16/FP32 patterns, page-alias detection, byte/length mismatch and report escaping | No |
 | `native/np101/opt_io_check.cpp` | Shared embedding/head blocks, learned positions and greedy selection | Yes |
 | `native/np101/sampling_check.cpp` | Categorical frequencies, seed replay and full-vocabulary bounds | Yes |
@@ -17,6 +18,7 @@
 | `native/np101/capacity_check.cpp` | Equal-byte FP16/FP32 capacity probes in constant/mutable storage | Yes |
 | `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
 | `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
+| `native/np101/graph_cache_check.cpp` | Experimental graph-integrated append, causal attention and shared block/decode cache | Yes |
 | `native/np101/decoder_check.cpp` | Explicit decoder slices, shared bindings, state/reset, transfer counts and capacity | Yes |
 | `native/np101/opt_decoder_check.cpp` | OPT post-norm decoder slices, affine projections, LayerNorm and KV/lifecycle checks | Yes |
 | `native/np101/attention_check.cpp` | Real-weight Attention, single-buffer KV, capacity, truncation, reset and final-only readback | Yes |
@@ -38,6 +40,23 @@ commands: host growth, SDK accounting, and large-allocation byte corruption.
 The [SDK timing guide](np101-sdk-timing.md) adds a checkpoint-free selection command,
 startup-wait evidence and optional per-component inference timing. Its host-only
 contracts live in `native/diagnostics_test.cpp` and the existing Python runner tests.
+
+[Fixed-graph experiments](np101-graph-optimization.md) provide reusable offline
+CPU references and individually gated decode/prefill/capacity checks. The new
+device path remains unvalidated. `python/test_optimization.py` checks stale gates,
+prefix/reset corruption, scalar transfers and withholding failed timing results.
+The generation/data CTests also cover block-tail scheduling and rejection of
+unsupported cache-writer shapes without SDK execution.
+
+[Fixed-graph pipeline diagnostics](np101-graph-pipeline.md) isolate packed inputs,
+shared weights, blocked embedding and a joint OPT layer with indexed KV append.
+They retain per-stage comparisons and document the separate prefix verification
+timeout and installed memory-interface constraints.
+All common allocations currently enforce const/non-const 1 GiB payload caps;
+pipeline checks additionally audit every shared-weight byte at setup/verify/run
+boundaries. The first cold-boot lookup triggered kernel hang reports; remaining
+hardware revalidation is blocked pending recovery. See the
+[current memory policy](np101-memory.md#current-segmented-payload-policy-2026-09-24).
 
 ## Diagnostic commands
 

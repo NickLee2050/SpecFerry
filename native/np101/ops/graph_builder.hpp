@@ -11,6 +11,10 @@
 #include <initializer_list>
 #include <vector>
 
+namespace specferry::np101 {
+class WeightBank;
+}
+
 namespace specferry::np101::ops {
 using Shape = std::vector<std::uint32_t>;
 
@@ -23,16 +27,20 @@ struct Tensor {
 // This is a construction helper, not an execution engine or model registry.
 class GraphBuilder {
   std::deque<Shape> parameters_;
+  WeightBank *weights_;
+  std::vector<vsi_nn_tensor_id_t> shared_weight_inputs_;
 
 public:
   Graph graph;
 
-  GraphBuilder(Context &context, unsigned tensors, unsigned nodes);
+  GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights = nullptr);
   Tensor tensor(TensorSpec spec);
   Tensor constant(TensorSpec spec, const std::vector<std::uint8_t> &bytes);
   Tensor floats(const std::vector<float> &values, Shape shape, DataType type);
   Tensor scalar(float value, DataType type = DataType::Float32);
   Tensor weight(const WeightStore &store, const WeightRecord &record, TensorSpec expected);
+  Tensor weight_chunk(const WeightStore &store, const WeightRecord &record, TensorSpec spec,
+                      std::size_t offset);
   Tensor share(GraphBuilder &owner, Tensor source);
   Tensor bind(TensorBinding source, TensorSpec expected);
   vsi_nn_node_t *node(vsi_nn_op_t op, std::initializer_list<Tensor> inputs, Tensor output);

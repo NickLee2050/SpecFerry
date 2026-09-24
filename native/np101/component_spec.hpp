@@ -5,6 +5,10 @@
 #include <cstddef>
 
 namespace specferry::np101 {
+// Reject unsupported indexed-writer geometry before any SDK node is created.
+void validate_cache_append(const TensorSpec &column, const TensorSpec &index,
+                           const TensorSpec &storage);
+
 struct KvSpec {
   unsigned heads;
   unsigned head_dim;

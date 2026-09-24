@@ -5,6 +5,12 @@ existing device lock, timeout, process checks and recovery marker. This diagnost
 does not build or execute an operator graph. It measures simultaneously retained,
 initialized SDK tensor payload, not model workspace or proven physical residency.
 
+**Current submission policy, 2026-09-24:** const and non-const application payloads
+are limited separately to 1024 MiB. The Python and native capacity entry points
+reject larger targets before SDK access; the default target is 64 MiB. This does
+not downgrade the installed driver or restore its former physical layout. The
+larger results below are historical evidence, not enabled current test targets.
+
 ## Allocation bound and complete corruption map, 2026-09-23
 
 The requested capacity experiment ignores content mismatches when determining
@@ -106,29 +112,29 @@ cmake -S . -B build
 cmake --build build --target np101_capacity_check -j 4
 python scripts/check_np101_capacity.py --dtype F16 --storage constant --target-mib 64 \
   --output .cache/runs/capacity-control
-python scripts/check_np101_capacity.py --dtype F16 --storage constant --target-mib 1152 \
-  --output .cache/runs/capacity-above-1gib
+python scripts/check_np101_capacity.py --dtype F16 --storage constant --target-mib 1024 --readback all \
+  --output .cache/runs/capacity-within-1gib
 ```
 
 Repeat with `--dtype F32` and `--storage mutable` to compare dtype and
 initialization paths, starting each configuration with a small control. Do not
 launch a larger target after an earlier rejection in the same configuration.
 The executable stops at the first rejected block and caps all requests at
-4096 MiB. A normal exit with `allocation_limit` is an observed rejection, not a
+1024 MiB. A normal exit with `allocation_limit` is an observed SDK rejection, not a
 claim that the requested target was reached. Inspect `summary.json` and retain
 `capacity.json`, SDK output, driver trace and executable snapshot.
 
 The default integrity acceptance still requires matching retained bytes before
 increasing a deployment budget. On 2026-09-23 the user separately requested an
 allocation-bound experiment that ignores content errors, followed by a complete
-corruption map. That diagnostic exception uses the explicit modes below; it does
+corruption map. The same modes remain available within the current ceiling; this does
 not authorize treating corrupt memory as usable model storage.
 
 ```bash
 python scripts/check_np101_capacity.py --dtype F16 --storage constant \
-  --target-mib 4096 --readback none --output .cache/runs/capacity-allocation-bound
+  --target-mib 1024 --readback none --output .cache/runs/capacity-allocation-bound
 python scripts/check_np101_capacity.py --dtype F16 --storage constant \
-  --target-mib 2840 --readback all --output .cache/runs/capacity-corruption-map
+  --target-mib 1024 --readback all --output .cache/runs/capacity-corruption-map
 ```
 
 `none` still initializes every tensor, avoiding a measurement of unmaterialized

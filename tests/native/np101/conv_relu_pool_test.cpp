@@ -1,5 +1,7 @@
 #include "gc_hal.h"
 #include "np101/context.hpp"
+#include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -99,19 +101,20 @@ static std::vector<uint8_t> f16(const std::vector<float> &data) {
   return result;
 }
 
-static vsi_nn_tensor_id_t tensor(vsi_nn_graph_t *g, std::initializer_list<size_t> shape,
-                                 bool constant = false, uint8_t *data = nullptr) {
+static vsi_nn_tensor_id_t tensor(specferry::np101::Graph &graph,
+                                 std::initializer_list<std::uint32_t> shape, bool constant = false,
+                                 const std::vector<uint8_t> &data = {}) {
+  if (shape.size()) {
+    return specferry::np101::add_tensor(graph, {specferry::np101::DataType::Float16, shape},
+                                        constant, data);
+  }
+  // The demo's virtual intermediate storage is chosen internally by the SDK.
   vsi_nn_tensor_attr_t a{};
   a.dtype = dtype();
-  a.is_const = constant;
-  a.vtl = shape.size() == 0;
-  a.dim_num = a.vtl ? VSI_NN_DIM_AUTO : shape.size();
-  size_t i = 0;
-  for (auto dim : shape) {
-    a.size[i++] = dim;
-  }
-  auto id = vsi_nn_AddTensor(g, VSI_NN_TENSOR_ID_AUTO, &a, data);
-  if (id == VSI_NN_TENSOR_ID_NA || !vsi_nn_GetTensor(g, id)) {
+  a.vtl = true;
+  a.dim_num = VSI_NN_DIM_AUTO;
+  auto id = vsi_nn_AddTensor(graph.get(), VSI_NN_TENSOR_ID_AUTO, &a, nullptr);
+  if (id == VSI_NN_TENSOR_ID_NA || !vsi_nn_GetTensor(graph.get(), id)) {
     throw std::runtime_error("vsi_nn_AddTensor failed (FP16)");
   }
   return id;
@@ -223,14 +226,15 @@ static ConvolutionData make_test_data() {
   return data;
 }
 
-static GraphIO build_convolution_graph(vsi_nn_graph_t *graph, ConvolutionData &data) {
+static GraphIO build_convolution_graph(specferry::np101::Graph &owner, ConvolutionData &data) {
   // Allocate input, constant weights, intermediate tensors, and output.
-  auto input = tensor(graph, {8, 8, 3, 1});
-  auto weight = tensor(graph, {3, 3, 3, 4}, true, data.weights_fp16.data());
-  auto bias = tensor(graph, {4}, true, data.bias_fp16.data());
-  auto conv_output = tensor(graph, {});
-  auto relu_output = tensor(graph, {});
-  auto output = tensor(graph, {4, 4, 4, 1});
+  auto input = tensor(owner, {8, 8, 3, 1});
+  auto weight = tensor(owner, {3, 3, 3, 4}, true, data.weights_fp16);
+  auto bias = tensor(owner, {4}, true, data.bias_fp16);
+  auto conv_output = tensor(owner, {});
+  auto relu_output = tensor(owner, {});
+  auto output = tensor(owner, {4, 4, 4, 1});
+  auto *graph = owner.get();
 
   // Configure the demo's CONV2D -> RELU -> POOL operators.
   auto *conv = vsi_nn_AddNode(graph, VSI_NN_OP_CONV2D, 3, 1, nullptr);
@@ -378,7 +382,7 @@ int main(int argc, char **argv) {
     auto device = query_device_info(context);
     auto data = make_test_data();
     specferry::np101::Graph graph(context, 6, 3);
-    auto io = build_convolution_graph(graph.get(), data);
+    auto io = build_convolution_graph(graph, data);
     timings.initialize_ms = elapsed(start);
 
     // Prepare and verify once; every iteration reuses this graph.

@@ -162,6 +162,19 @@ Additional run instructions:
 - [Weight and FP16/FP32 capacity diagnostics](tests/np101-capacity.md)
 - [Model-independent memory growth, accounting and integrity](tests/np101-memory.md)
 - [SDK call timing, progress and startup latency](tests/np101-sdk-timing.md)
+- [Experimental fixed-graph decode, block prefill and capacity comparison](tests/np101-graph-optimization.md)
+
+Prepare reusable CPU token/KV expectations for the experimental graph path:
+
+```bash
+python scripts/check_np101_optimization.py --prepare-only \
+  --output .cache/runs/graph-prepared
+```
+
+This command opens no device. Follow the linked experimental guide for the
+separate cache, decode, prefill and capacity gates after device recovery. The
+experimental path requires those gates before use; the normal generation command
+above continues to use the component-graph implementation.
 
 Check startup latency without downloading a model:
 
@@ -233,16 +246,23 @@ Inspect each run's report, SDK log and execution evidence; `strace` output is
 included when available. Current driver-specific reproduction details are in the
 [capacity diagnostic guide](tests/np101-capacity.md).
 
+Tests and generators currently enforce separate **1 GiB (1024 MiB) application
+tensor-payload budgets** for `is_const=true` and `is_const=false`. Shared weights
+use the latter pool alongside KV and ordinary intermediates. `memory-budget.json`
+records the peaks; hidden SDK workspace/copies and physical addresses are not
+controlled by this policy. Readback remains necessary even below the ceiling.
+
 To measure retained allocation separately from data integrity, use fresh directories:
 
 ```bash
-python scripts/check_np101_capacity.py --target-mib 4096 --readback none \
+python scripts/check_np101_capacity.py --target-mib 64 --readback none \
   --output .cache/runs/allocation-bound
-python scripts/check_np101_capacity.py --target-mib 2840 --readback all \
+python scripts/check_np101_capacity.py --target-mib 64 --readback all \
   --output .cache/runs/readback-map
 ```
 
-Choose the scan target from the allocation result. `none` skips readback; `all`
+Start at 64 MiB; after successful readback/release, a separate run may use up to
+`--target-mib 1024`. Larger requests are rejected before device access. `none` skips readback; `all`
 records every corrupt block in `readback-blocks.jsonl` and returns 1 for mismatches.
 Inspect `allocation_and_release_passed`, `full_scan_completed` and
 `readback_and_release_passed` separately in `summary.json`. Set `--dtype F32`

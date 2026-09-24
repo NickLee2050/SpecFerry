@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from specferry.validation.allocation import (
     STORAGE_MODES,
     add_run_arguments,
+    check_segment_budget,
     prepare_weight_check,
     run_allocation,
     weights_complete,
@@ -50,6 +51,11 @@ def main() -> int:
     try:
         output.mkdir(parents=True)
         inputs = prepare_weight_check(args.deployment, args.state_spec, output)
+        inputs["memory_budget"] = check_segment_budget(
+            inputs["expected"]["expected_weight_bytes"],
+            inputs["expected"]["expected_state_bytes"],
+            args.weight_storage,
+        )
         write_json(output / "inputs.json", inputs)
         if args.prepare_only:
             print(f"Verified weight-check inputs: {output / 'inputs.json'}")

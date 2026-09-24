@@ -68,6 +68,40 @@ void contracts() {
   rejects([&] { generate_tokens({10, 8, 2, 2}, executor, {2}, 1); });
   predictions.clear();
   rejects([&] { generate_tokens({10, 8, 2, 2}, executor, {2}, 1); });
+
+  // Block prefill must preserve BOS, EOS and consumed-token semantics, including
+  // a final predicted token that has not yet entered the cache.
+  auto blocked = executor;
+  unsigned prefill_calls = 0;
+  blocked.prefill = [&](const std::vector<std::int32_t> &tokens) {
+    ++prefill_calls;
+    consumed.insert(consumed.end(), tokens.begin(), tokens.end());
+  };
+  predictions = {3, 4, 2};
+  result = generate_tokens({10, 8, 2, 2}, blocked, {2, 7, 8, 9, 1}, 3);
+  require(prefill_calls == 1 && result.consumed == 7 && result.tokens == predictions);
+  require(consumed == std::vector<std::int32_t>({2, 7, 8, 9, 1, 3, 4}));
+  result = generate_tokens({10, 8, 2, 2}, blocked, {}, 1);
+  require(consumed == std::vector<std::int32_t>({2}) && prefill_calls == 2);
+  result = generate_tokens({10, 8, 2, 2}, blocked, {2}, 0);
+  require(prefill_calls == 2 && consumed.empty());
+
+  for (unsigned length = 0; length <= 128; ++length) {
+    for (unsigned block : {1, 4, 8}) {
+      unsigned end = 0;
+      for (auto chunk : plan_prefill(length, block)) {
+        require(chunk.begin == end && (chunk.count == block || chunk.count == 1));
+        require(chunk.count == 1 || chunk.begin % block == 0);
+        require(chunk.begin + chunk.count <= length);
+        end += chunk.count;
+      }
+      require(end == length);
+    }
+  }
+  const auto tail = plan_prefill(7, 4);
+  require(tail.size() == 4 && tail[0].count == 4 && tail.back().begin == 6);
+  rejects([&] { plan_prefill(8, 0); });
+  rejects([&] { plan_prefill(8, 9); });
 }
 } // namespace
 

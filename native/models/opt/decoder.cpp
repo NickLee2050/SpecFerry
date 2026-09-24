@@ -1,4 +1,5 @@
 #include "models/opt/decoder.hpp"
+#include "models/opt/layer.hpp"
 #include "np101/diagnostics.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/ops/graph_builder.hpp"
@@ -7,7 +8,6 @@
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -17,80 +17,41 @@ using namespace np101;
 using namespace np101::ops;
 
 namespace {
-constexpr auto f16 = DataType::Float16;
-
-class OptGraph : public GraphBuilder {
-public:
-  const Config config;
-  const std::string prefix;
-
-  OptGraph(Context &context, const Config &spec, unsigned layer)
-      : GraphBuilder(context, 128, 96), config(spec), prefix(spec.prefix(layer)) {}
-
-  Tensor linear(const WeightStore &weights, Tensor input, const std::string &name) {
-    return GraphBuilder::linear(input, weights, weights.find(prefix + name + ".weight"),
-                                weights.find(prefix + name + ".bias"));
-  }
-
-  Tensor norm(const WeightStore &weights, Tensor input, const std::string &name) {
-    auto scale = weight(weights, weights.find(prefix + name + ".weight"), {f16, {config.hidden}});
-    auto bias = weight(weights, weights.find(prefix + name + ".bias"), {f16, {config.hidden}});
-    return layer_norm(input, scale, bias, config.epsilon);
-  }
-};
-
-class Projection : public OptGraph {
+class Projection : public GraphBuilder {
 public:
   Tensor hidden, query, key, value;
 
   Projection(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
              TensorBinding input)
-      : OptGraph(context, config, layer) {
+      : GraphBuilder(context, 128, 96) {
     hidden = bind(input, config.hidden_spec());
     const auto slot = config.kv_spec().slot().shape;
-    query = linear(weights, hidden, "self_attn.q_proj");
-    // Match the official OPT order: scale Q in FP16 before Q @ K.T.
-    query = reshape(binary(VSI_NN_OP_MULTIPLY, query,
-                           scalar(1.0f / std::sqrt(float(config.kv_spec().head_dim)), f16)),
-                    slot);
-    key = reshape(linear(weights, hidden, "self_attn.k_proj"), slot);
-    value = reshape(linear(weights, hidden, "self_attn.v_proj"), slot);
+    const auto projected = build_projections(*this, weights, config, layer, hidden);
+    query = reshape(projected.query, slot);
+    key = reshape(projected.key, slot);
+    value = reshape(projected.value, slot);
     compile({hidden}, {query, key, value});
   }
 };
 
-class DecoderTail : public OptGraph {
+class DecoderTail : public GraphBuilder {
 public:
   Tensor valid_length, output;
   std::map<std::string, Tensor> outputs;
 
   DecoderTail(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
               Projection &producer, KvCache &cache)
-      : OptGraph(context, config, layer) {
+      : GraphBuilder(context, 128, 96) {
     auto hidden = share(producer, producer.hidden);
     auto query = share(producer, producer.query);
     Tensor keys{cache.retain_keys(graph), config.kv_spec().tensor()};
     Tensor values{cache.retain_values(graph), keys.spec};
     valid_length = tensor({DataType::Int32, {1}});
     auto attention = attention_core(*this, query, keys, values, valid_length, 1.0f);
-    auto mixer = linear(weights, reshape(attention.attended, config.hidden_spec().shape),
-                        "self_attn.out_proj");
-    auto residual = binary(VSI_NN_OP_ADD, hidden, mixer);
-    auto normalized = norm(weights, residual, "self_attn_layer_norm");
-    auto fc1 = linear(weights, normalized, "fc1");
-    auto activation = unary(VSI_NN_OP_RELU, fc1, f16);
-    auto mlp = linear(weights, activation, "fc2");
-    auto final_residual = binary(VSI_NN_OP_ADD, normalized, mlp);
-    output = norm(weights, final_residual, "final_layer_norm");
-    outputs = {{"probabilities", attention.probabilities},
-               {"mixer", mixer},
-               {"attention_residual", residual},
-               {"attention_norm", normalized},
-               {"fc1", fc1},
-               {"activation", activation},
-               {"mlp", mlp},
-               {"ffn_residual", final_residual},
-               {"output", output}};
+    outputs = build_decoder_tail(*this, weights, config, layer, hidden,
+                                 reshape(attention.attended, config.hidden_spec().shape));
+    outputs.emplace("probabilities", attention.probabilities);
+    output = outputs.at("output");
     std::vector<Tensor> snapshots;
     for (const auto &entry : outputs) {
       snapshots.push_back(entry.second);

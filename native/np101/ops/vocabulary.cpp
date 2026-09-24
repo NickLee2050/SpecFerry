@@ -26,6 +26,54 @@ public:
 };
 } // namespace
 
+Tensor lookup_blocks(GraphBuilder &g, const std::vector<Tensor> &blocks, Tensor tokens) {
+  if (blocks.empty() || tokens.spec.type != DataType::Int32 || tokens.spec.shape.size() != 1) {
+    throw std::invalid_argument("blocked lookup requires FP16 blocks and an INT32 token vector");
+  }
+  const auto width = blocks.front().spec.shape.at(0), count = tokens.spec.shape[0];
+  Tensor result{};
+  unsigned offset = 0;
+  for (const auto &block : blocks) {
+    if (block.spec.type != f16 || block.spec.shape.size() != 2 || block.spec.shape[0] != width) {
+      throw std::invalid_argument("vocabulary block widths/dtypes differ");
+    }
+    auto local = g.binary(VSI_NN_OP_SUBTRACT, tokens, g.integer(offset));
+    auto bounded = g.binary(VSI_NN_OP_MINIMUM, g.binary(VSI_NN_OP_MAXIMUM, local, g.integer(0)),
+                            g.integer(block.spec.shape[1] - 1));
+    auto embedding = g.gather(block, bounded, 1);
+    auto lower = g.tensor({DataType::Bool8, {count}});
+    auto upper = g.tensor(lower.spec);
+    g.node(VSI_NN_OP_RELATIONAL_OPS, {local, g.integer(0)}, lower)->nn_param.relational_ops.op =
+        VSI_NN_RELATIONAL_OPS_GREAT_EQUAL;
+    g.node(VSI_NN_OP_RELATIONAL_OPS, {local, g.integer(block.spec.shape[1])}, upper)
+        ->nn_param.relational_ops.op = VSI_NN_RELATIONAL_OPS_LESS;
+    auto selected = g.tensor(embedding.spec), masked = g.tensor(embedding.spec);
+    g.node(VSI_NN_OP_SELECT, {g.reshape(lower, {1, count}), embedding, g.scalar(0, f16)}, selected);
+    g.node(VSI_NN_OP_SELECT, {g.reshape(upper, {1, count}), selected, g.scalar(0, f16)}, masked);
+    result = offset ? g.binary(VSI_NN_OP_ADD, result, masked) : masked;
+    offset += block.spec.shape[1];
+  }
+  return result;
+}
+
+Tensor greedy_token(GraphBuilder &g, const std::vector<Tensor> &logits, unsigned block_rows) {
+  if (logits.empty() || !block_rows) {
+    throw std::invalid_argument("greedy selection requires nonempty ordered logit blocks");
+  }
+  std::vector<Tensor> scores, tokens;
+  for (unsigned index = 0; index < logits.size(); ++index) {
+    auto local = g.argmax(logits[index], 0);
+    scores.push_back(g.reshape(g.gather(logits[index], local, 0), {1}));
+    tokens.push_back(g.binary(VSI_NN_OP_ADD, local, g.integer(index * block_rows)));
+  }
+  auto best_scores = scores.front(), best_tokens = tokens.front();
+  for (unsigned index = 1; index < scores.size(); ++index) {
+    best_scores = g.concat(best_scores, scores[index]);
+    best_tokens = g.concat(best_tokens, tokens[index]);
+  }
+  return g.gather(best_tokens, g.argmax(best_scores, 0), 0);
+}
+
 struct Vocabulary::Impl {
   unsigned rows, width, block_rows;
   Graph storage;
@@ -127,18 +175,11 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
   }
   auto input = bind(source, {f16, {table.width(), 1}});
   std::vector<Tensor> inputs{input};
-  std::vector<Tensor> scores, tokens;
   for (unsigned index = 0; index < table.blocks(); ++index) {
     auto weights = bind(table.block(index), table.block_spec(index));
     inputs.push_back(weights);
     auto logits = matmul(input, weights, {weights.spec.shape[1], 1}, false, true);
     logits_.push_back(logits);
-    if (sampling_.enabled) {
-      continue;
-    }
-    auto local = argmax(logits, 0);
-    scores.push_back(reshape(gather(logits, local, 0), {1}));
-    tokens.push_back(binary(VSI_NN_OP_ADD, local, integer(index * table.block_rows())));
   }
   if (sampling_.enabled) {
     auto combined = logits_.front();
@@ -154,12 +195,7 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
     node(VSI_NN_OP_RANDOM_MULTINOMIAL, {logits, seed_}, token_)
         ->nn_param.random_multinomial.sample_num = 1;
   } else {
-    auto best_scores = scores.front(), best_tokens = tokens.front();
-    for (unsigned index = 1; index < scores.size(); ++index) {
-      best_scores = concat(best_scores, scores[index]);
-      best_tokens = concat(best_tokens, tokens[index]);
-    }
-    token_ = gather(best_tokens, argmax(best_scores, 0), 0);
+    token_ = greedy_token(*this, logits_, table.block_rows());
   }
   auto outputs = logits_;
   outputs.push_back(token_);

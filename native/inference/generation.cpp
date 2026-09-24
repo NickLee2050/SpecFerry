@@ -5,6 +5,20 @@
 #include <stdexcept>
 
 namespace specferry::inference {
+std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block) {
+  if (!block || block > 8) {
+    throw std::invalid_argument("prefill block must be in [1,8]");
+  }
+  std::vector<PrefillChunk> result;
+  unsigned position = 0;
+  while (position < tokens) {
+    const auto count = tokens - position >= block ? block : 1;
+    result.push_back({position, count});
+    position += count;
+  }
+  return result;
+}
+
 Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecutor &executor,
                            const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
                            const std::function<void(std::int32_t)> &on_token) {
@@ -30,9 +44,14 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
     return result;
   }
   const auto start = std::chrono::steady_clock::now();
-  for (auto token : ids) {
-    executor.consume(token);
-    ++result.consumed;
+  if (executor.prefill) {
+    executor.prefill(ids);
+    result.consumed = ids.size();
+  } else {
+    for (auto token : ids) {
+      executor.consume(token);
+      ++result.consumed;
+    }
   }
   result.prefill_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

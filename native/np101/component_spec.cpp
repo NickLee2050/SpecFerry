@@ -14,6 +14,17 @@ unsigned product(unsigned left, unsigned right) {
 }
 } // namespace
 
+void validate_cache_append(const TensorSpec &column, const TensorSpec &index,
+                           const TensorSpec &storage) {
+  if (column.type != DataType::Float16 || storage.type != column.type || column.shape.size() != 2 ||
+      column.shape[1] != 1 || storage.shape.size() != 2 || storage.shape[0] != column.shape[0] ||
+      index.type != DataType::Int32 || index.shape.size() != 1 || index.shape[0] != 1) {
+    throw std::invalid_argument("indexed append requires FP16 [width,1] -> [width,slots], I32[1]");
+  }
+  column.bytes();
+  storage.bytes();
+}
+
 void KvSpec::validate() const {
   product(heads, head_dim);
   if (!capacity || capacity > 2048) {

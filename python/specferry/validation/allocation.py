@@ -20,10 +20,32 @@ from .device import (
 MIB = 1024**2
 BLOCK_BYTES = 8 * MIB
 MAXIMUM_CAPACITY_MIB = 4096
+# Keep historical report validation separate from the current submission ceiling.
+SEGMENT_LIMIT_MIB = 1024
+SEGMENT_LIMIT_BYTES = SEGMENT_LIMIT_MIB * MIB
 REPORT_VERSION = 2
 PATTERN = "splitmix64-finite-v1"
 STORAGE_MODES = ("constant", "mutable")
 FLOAT_DTYPES = ("F16", "F32")
+
+
+def check_segment_budget(weight_bytes: int, state_bytes: int, storage: str) -> dict:
+    """Preflight known payloads; SDK workspace and hidden copies remain unknown."""
+    if storage not in STORAGE_MODES or min(weight_bytes, state_bytes) < 0:
+        raise ValueError("invalid storage mode or payload size")
+    constant = weight_bytes if storage == "constant" else 0
+    mutable = state_bytes + (weight_bytes if storage == "mutable" else 0)
+    if max(constant, mutable) > SEGMENT_LIMIT_BYTES:
+        raise ValueError(
+            f"application segment budget exceeded: const={constant}, nonconst={mutable}, "
+            f"limit={SEGMENT_LIMIT_BYTES} bytes each; device submission blocked"
+        )
+    return {
+        "segment_limit_bytes": SEGMENT_LIMIT_BYTES,
+        "const_bytes": constant,
+        "nonconst_bytes": mutable,
+        "sdk_internal_allocations_included": False,
+    }
 
 
 def add_run_arguments(parser: ArgumentParser, binary: Path, timeout: int) -> None:

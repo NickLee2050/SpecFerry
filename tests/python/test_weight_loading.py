@@ -17,6 +17,8 @@ from scripts import check_np101_allocation
 
 from specferry.export.weights import write_native_index, write_weight_pack
 from specferry.validation.allocation import (
+    SEGMENT_LIMIT_BYTES,
+    check_segment_budget,
     prepare_weight_check,
     state_payload_bytes,
     weights_complete,
@@ -39,6 +41,48 @@ def tiny_pack(root):
 
 
 class WeightLoadingTests(unittest.TestCase):
+    def test_const_and_nonconst_budgets_are_separate_but_mutable_weights_share_state_pool(self):
+        limit = SEGMENT_LIMIT_BYTES
+        self.assertEqual(check_segment_budget(limit, limit, "constant")["const_bytes"], limit)
+        self.assertEqual(check_segment_budget(limit - 1, 1, "mutable")["nonconst_bytes"], limit)
+        for weights, states, storage in (
+            (limit + 1, 0, "constant"),
+            (1, limit + 1, "constant"),
+            (limit, 1, "mutable"),
+        ):
+            with self.subTest(storage=storage), self.assertRaises(ValueError):
+                check_segment_budget(weights, states, storage)
+
+    def test_oversized_weight_pack_is_rejected_before_device_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "check_np101_allocation",
+                        "--deployment",
+                        "unused",
+                        "--output",
+                        str(Path(directory) / "run"),
+                    ],
+                ),
+                patch.object(
+                    check_np101_allocation,
+                    "prepare_weight_check",
+                    return_value={
+                        "expected": {
+                            "expected_weight_bytes": SEGMENT_LIMIT_BYTES + 1,
+                            "expected_state_bytes": 0,
+                        },
+                    },
+                ),
+                patch.object(check_np101_allocation, "run_allocation") as run,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(check_np101_allocation.main(), 1)
+                run.assert_not_called()
+
     def test_historical_model_state_fixture_preserves_its_payload(self):
         path = Path(__file__).resolve().parents[1] / "fixtures/qwen3_5_allocation_states.txt"
         self.assertEqual(state_payload_bytes(path), 46_071_808)

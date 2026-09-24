@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.validation.allocation import (
     FLOAT_DTYPES,
-    MAXIMUM_CAPACITY_MIB,
     MIB,
+    SEGMENT_LIMIT_MIB,
     STORAGE_MODES,
     add_run_arguments,
     capacity_allocation_complete,
@@ -29,7 +29,7 @@ def main() -> int:
     add_run_arguments(parser, ROOT / "build/tests/np101_capacity_check", 600)
     parser.add_argument("--storage", choices=STORAGE_MODES, default="constant")
     parser.add_argument("--dtype", choices=FLOAT_DTYPES, default="F16")
-    parser.add_argument("--target-mib", type=int, default=1152)
+    parser.add_argument("--target-mib", type=int, default=64)
     parser.add_argument(
         "--readback",
         choices=("first", "all", "none"),
@@ -37,8 +37,8 @@ def main() -> int:
         help="stop at first mismatch (default), scan all blocks, or skip readback",
     )
     args = parser.parse_args()
-    if args.output.exists() or not 1 <= args.target_mib <= MAXIMUM_CAPACITY_MIB or args.timeout < 1:
-        parser.error("use a fresh output directory, 1..4096 MiB and a positive timeout")
+    if args.output.exists() or not 1 <= args.target_mib <= SEGMENT_LIMIT_MIB or args.timeout < 1:
+        parser.error("use a fresh output directory, 1..1024 MiB and a positive timeout")
     output = args.output.resolve()
     output.mkdir(parents=True)
     try:

@@ -94,6 +94,18 @@ void weight_integrity() {
 }
 
 void component_contracts() {
+  const TensorSpec index{DataType::Int32, {1}}, storage{DataType::Float16, {8, 16}};
+  validate_cache_append({DataType::Float16, {8, 1}}, index, storage);
+  validate_cache_append({DataType::Float16, {32, 1}}, index, {DataType::Float16, {32, 4}});
+  rejects([&] { validate_cache_append({DataType::Float16, {8, 1, 2}}, index, storage); },
+          "rank-three cache writer rejected before the SDK reshape crash");
+  rejects([&] { validate_cache_append({DataType::Float16, {8, 4}}, index, storage); },
+          "block data must be flattened to one packed column");
+  rejects([&] { validate_cache_append({DataType::Float32, {8, 1}}, index, storage); },
+          "unvalidated cache dtype");
+  rejects(
+      [&] { validate_cache_append({DataType::Float16, {8, 1}}, {DataType::Int32, {2}}, storage); },
+      "cache writer index is scalar");
   KvSpec cache{3, 16, 8};
   cache.validate();
   require(cache.tensor().bytes() == 768 && cache.token_bytes() == 192,

@@ -1,8 +1,12 @@
 #include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
 
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace specferry::np101 {
 void check(vsi_status status, const char *operation) {
@@ -29,6 +33,11 @@ Context::~Context() {
   if (handle_) {
     vsi_nn_ReleaseContext(&handle_);
   }
+  try {
+    save_memory_report();
+  } catch (const std::exception &error) {
+    std::cerr << error.what() << '\n';
+  }
 }
 
 void Context::close() {
@@ -38,11 +47,25 @@ void Context::close() {
   if (handle_) {
     throw std::runtime_error("vsi_nn_ReleaseContext did not clear handle");
   }
+  save_memory_report();
+}
+
+void Context::save_memory_report() const {
+  const auto *path = std::getenv("SPECFERRY_MEMORY_REPORT");
+  if (!path || !*path) {
+    return;
+  }
+  std::ofstream output(path);
+  memory_.write(output);
+  if (!output) {
+    throw std::runtime_error("cannot save tensor memory budget");
+  }
 }
 
 Graph::Graph(Context &context, unsigned tensors, unsigned nodes)
-    : handle_(sdk_call("vsi_nn_CreateGraph",
-                       [&] { return vsi_nn_CreateGraph(context.get(), tensors, nodes); })) {
+    : context_(context), handle_(sdk_call("vsi_nn_CreateGraph", [&] {
+        return vsi_nn_CreateGraph(context.get(), tensors, nodes);
+      })) {
   if (!handle_) {
     throw std::runtime_error("vsi_nn_CreateGraph returned null");
   }
@@ -61,5 +84,20 @@ void Graph::close() {
   if (handle_) {
     throw std::runtime_error("vsi_nn_ReleaseGraph did not clear handle");
   }
+  allocations_.clear();
 }
+
+MemoryBudget::Lease Graph::reserve(bool constant, std::size_t bytes) {
+  return context_.memory().reserve(constant, bytes);
+}
+
+void Graph::record_storage(vsi_nn_tensor_id_t id, MemoryBudget::Lease lease) {
+  allocations_.emplace(id, std::move(lease));
+}
+
+void Graph::alias_storage(vsi_nn_tensor_id_t id, const Graph &owner, vsi_nn_tensor_id_t source) {
+  allocations_.at(id) = owner.allocations_.at(source);
+}
+
+void Graph::save_memory_report() const { context_.save_memory_report(); }
 } // namespace specferry::np101

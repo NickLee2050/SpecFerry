@@ -1,5 +1,6 @@
 #include "allocation_support.hpp"
 #include "np101/context.hpp"
+#include "np101/memory_budget.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
@@ -289,6 +290,11 @@ int main(int argc, char **argv) {
     for (const auto &state : states) {
       progress.expected_state_bytes += state.spec.bytes() * state.copies;
     }
+    // Direct native invocations must reject oversized fixtures before SDK access.
+    MemoryBudget budget;
+    const auto weight_budget =
+        budget.reserve(progress.storage == Storage::Constant, progress.expected_weight_bytes);
+    const auto state_budget = budget.reserve(false, progress.expected_state_bytes);
     probe(weights, states, progress);
     return progress.status() == "allocation_pass" ? 0 : 1;
   } catch (const std::exception &error) {

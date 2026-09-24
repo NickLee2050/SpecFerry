@@ -19,7 +19,6 @@ class Graph;
 namespace specferry::testing {
 constexpr std::size_t mib = 1024 * 1024;
 constexpr std::size_t allocation_block_bytes = 8 * mib;
-constexpr unsigned maximum_capacity_mib = 4096;
 constexpr unsigned allocation_report_version = 2;
 constexpr const char *allocation_pattern = "splitmix64-finite-v1";
 

@@ -60,6 +60,33 @@ rejects SDK success without populated output. This is an **SDK counter observati
 not physical board occupancy or proof of a duplicated tensor. Counter semantics
 still require explanation. Inference performance measurements keep profiling off.
 
+## Current segmented payload policy (2026-09-24)
+
+The common native allocation helpers enforce **1 GiB per `is_const` category**
+across all graphs in a context. Retained references and storage reshapes share one
+budget reservation; their temporary SDK wrapper backing is charged until replaced.
+The charge is returned after the last participating graph releases it. Capacity
+and full-weight checks also reject oversized requests before opening the device.
+An application-budget rejection is not reported as an SDK capacity measurement.
+
+`memory-budget.json` records live/peak application payload per category. These are
+conservative explicit-allocation counts, not physical memory measurements: SDK
+internal tensors, virtual intermediates, workspace, padding and hidden copies are
+unknown. No driver, allocation address or SDK `is_const` flag is changed. Shared
+WeightBank weights remain non-const, so they share that limit with KV and ordinary
+intermediates. OPT-350M's weight pack is 631.707 MiB; graph overhead still matters.
+
+The former corruption offset is **below** 1 GiB of logical payload. This policy
+cannot blacklist it or establish data integrity. Pipeline diagnostics now read
+every shared-weight byte before SetupGraph, after SetupGraph, after VerifyGraph,
+and after execution. See [pipeline checks](np101-graph-pipeline.md).
+
+After the user-confirmed cold boot, the first synthetic lookup reached three exact
+weight-readback phases with const/non-const peaks of 76/1020 bytes, then failed to
+complete. Kernel logs report two NP101 hangs, including one after process exit.
+The segmented policy therefore has no complete hardware acceptance yet. A new
+recovery marker blocks further tests; see the [cold-boot record](np101-graph-pipeline.md).
+
 ## Large retained allocation integrity
 
 Reuse `tests/native/np101/capacity_check.cpp`; do not introduce a second scanner:
@@ -67,7 +94,7 @@ Reuse `tests/native/np101/capacity_check.cpp`; do not introduce a second scanner
 ```bash
 python scripts/check_np101_capacity.py --target-mib 64 --readback all \
   --output .cache/runs/integrity-small
-python scripts/check_np101_capacity.py --target-mib 2840 --readback all --timeout 1200 \
+python scripts/check_np101_capacity.py --target-mib 1024 --readback all --timeout 600 \
   --output .cache/runs/integrity-large
 # Optional independent configurations: --storage mutable and/or --dtype F32.
 ```
@@ -81,8 +108,9 @@ The console summarizes damaged blocks and their ranges. Offsets are zero-based,
 end-exclusive **payload offsets, not physical addresses**.
 
 To measure allocation capacity without integrity, use the same tool with
-`--target-mib 4096 --readback none`. This separate mode cannot establish correct data
-storage. See [the capacity record](np101-capacity.md) for the existing boundary.
+`--target-mib 1024 --readback none`. This separate mode cannot establish correct data
+storage. Larger targets are currently disabled; see [the capacity record](np101-capacity.md)
+for the historical 2840 MiB observation and its matching corruption map.
 
 ## Direct native invocation
 
@@ -94,7 +122,7 @@ VIV_MEMORY_PROFILE=0 build/tests/np101_memory_growth_check advance 128
 VIV_MEMORY_PROFILE=1 build/tests/np101_memory_accounting_check 8 constant
 mkdir -p .cache/runs/integrity-native
 VIV_MEMORY_PROFILE=0 build/tests/np101_capacity_check \
-  .cache/runs/integrity-native/capacity.json constant F16 2840 all
+  .cache/runs/integrity-native/capacity.json constant F16 1024 all
 ```
 
 Direct invocation bypasses the Python device lock and timeout/recovery guard: keep

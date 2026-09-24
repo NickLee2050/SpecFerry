@@ -23,6 +23,10 @@ specferry_native_test(np101_delta_net_check np101/delta_net_check.cpp)
 target_link_libraries(np101_delta_net_check PRIVATE np101_delta_net)
 specferry_native_test(np101_kv_cache_check np101/kv_cache_check.cpp)
 target_link_libraries(np101_kv_cache_check PRIVATE np101_kv_cache)
+specferry_native_test(np101_graph_cache_check np101/graph_cache_check.cpp)
+target_link_libraries(np101_graph_cache_check PRIVATE np101_ops specferry_generation)
+specferry_native_test(np101_graph_pipeline_check np101/graph_pipeline_check.cpp np101/case_file.cpp)
+target_link_libraries(np101_graph_pipeline_check PRIVATE np101_opt_decoder)
 specferry_native_test(np101_attention_check np101/attention_check.cpp np101/case_file.cpp)
 target_link_libraries(np101_attention_check PRIVATE np101_attention)
 specferry_native_test(np101_decoder_check np101/decoder_check.cpp np101/case_file.cpp)
@@ -58,6 +62,13 @@ set_tests_properties(allocation_readback_contract PROPERTIES LABELS "unit;cpu" T
 
 # Device diagnostics are explicit commands: ordinary CTest must not open NP101
 # or spend minutes waiting for a device graph to complete.
+
+add_executable(memory_budget_test memory_budget_test.cpp)
+target_link_libraries(memory_budget_test PRIVATE np101_data)
+target_compile_options(memory_budget_test PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(memory_budget_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME segmented_memory_budget COMMAND memory_budget_test)
+set_tests_properties(segmented_memory_budget PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
 
 add_executable(diagnostics_test diagnostics_test.cpp)
 target_link_libraries(diagnostics_test PRIVATE specferry_diagnostics)

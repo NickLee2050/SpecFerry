@@ -11,6 +11,9 @@
 #include <type_traits>
 
 namespace specferry::np101 {
+// Linux process RSS; call outside measured request intervals. No device IO.
+void sample_host_memory(const std::filesystem::path &directory, const std::string &phase);
+
 enum class TimingField { Request, Phase, Component };
 
 // One optional observer on the submitting thread. It measures public API wall

@@ -19,7 +19,9 @@ AttentionResult attention_core(GraphBuilder &g, Tensor query, Tensor keys, Tenso
       keys.spec.shape != values.spec.shape || query.spec.shape[0] != keys.spec.shape[0] ||
       query.spec.shape[2] != keys.spec.shape[2] || !std::isfinite(scale) || scale <= 0 ||
       query.spec.type != f16 || keys.spec.type != f16 || values.spec.type != f16 ||
-      valid_length.spec.type != DataType::Int32 || valid_length.spec.elements() != 1) {
+      valid_length.spec.type != DataType::Int32 ||
+      (valid_length.spec.elements() != 1 &&
+       (keys.spec.shape[2] != 1 || valid_length.spec.elements() != query.spec.shape[1]))) {
     throw std::invalid_argument("attention Q/K/V contract mismatch");
   }
   const auto dimension = keys.spec.shape[0], capacity = keys.spec.shape[1];
@@ -34,8 +36,10 @@ AttentionResult attention_core(GraphBuilder &g, Tensor query, Tensor keys, Tenso
     std::memcpy(bytes.data() + position * sizeof(value), &value, sizeof(value));
   }
   auto positions = g.constant({DataType::Int32, {capacity, 1}}, bytes);
-  auto valid = g.tensor({DataType::Bool8, positions.spec.shape});
-  g.node(VSI_NN_OP_RELATIONAL_OPS, {positions, valid_length}, valid)->nn_param.relational_ops.op =
+  const bool per_query = valid_length.spec.elements() != 1;
+  auto limits = per_query ? g.reshape(valid_length, {1, groups}) : valid_length;
+  auto valid = g.tensor({DataType::Bool8, {capacity, per_query ? groups : 1}});
+  g.node(VSI_NN_OP_RELATIONAL_OPS, {positions, limits}, valid)->nn_param.relational_ops.op =
       VSI_NN_RELATIONAL_OPS_LESS;
   auto masked = g.tensor(scores.spec);
   g.node(VSI_NN_OP_SELECT, {valid, scores, g.scalar(-1e9f)}, masked);

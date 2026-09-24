@@ -215,6 +215,7 @@ def run_device(
     print_targets: bool = True,
     sdk_timing: str = "off",
     progress_interval: float = 0,
+    weight_readback: bool = False,
 ) -> dict:
     if sdk_timing not in ("off", "summary", "calls") or progress_interval < 0:
         raise ValueError("invalid SDK timing mode or progress interval")
@@ -235,6 +236,18 @@ def run_device(
     env["LD_LIBRARY_PATH"] = str(sdk_lib.resolve(strict=True))
     env["VIV_VX_ENABLE_PRINT_TARGET"] = "1" if print_targets else "0"
     env["SPECFERRY_SDK_TIMING"] = sdk_timing
+    memory_name = (
+        f"{artifact_prefix}-memory-budget.json" if artifact_prefix else "memory-budget.json"
+    )
+    env["SPECFERRY_MEMORY_REPORT"] = str((output / memory_name).resolve())
+    # Do not inherit diagnostic readback into timed inference from the shell.
+    env.pop("SPECFERRY_WEIGHT_READBACK_REPORT", None)
+    if weight_readback:
+        readback = output / "weight-readback.tsv"
+        readback.write_text(
+            "phase\tweight\tchunk_offset_bytes\tbytes\tmismatched_bytes\tfirst_weight_byte\n"
+        )
+        env["SPECFERRY_WEIGHT_READBACK_REPORT"] = str(readback.resolve())
     log_name = f"{artifact_prefix}.log" if artifact_prefix else "sdk.log"
     trace_name = f"{artifact_prefix}.strace" if artifact_prefix else "driver.strace"
     evidence_name = (
@@ -270,6 +283,8 @@ def run_device(
                 "VIV_MEMORY_PROFILE",
                 "VIV_VX_ENABLE_SHADER",
                 "SPECFERRY_SDK_TIMING",
+                "SPECFERRY_MEMORY_REPORT",
+                "SPECFERRY_WEIGHT_READBACK_REPORT",
             )
         },
         "binary_sha256": fingerprint(binary),
