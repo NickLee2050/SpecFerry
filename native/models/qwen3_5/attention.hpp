@@ -35,10 +35,6 @@ public:
   void truncate(unsigned length);
   unsigned length() const;
   std::vector<std::uint8_t> read(const std::string &name);
-  std::size_t cache_writes() const;
-  std::size_t cache_revalidations() const;
-  double cache_write_seconds() const;
-  double cache_revalidation_seconds() const;
   void close();
 
 private:

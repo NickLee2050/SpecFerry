@@ -21,7 +21,7 @@ public:
                           const TensorSpec &spec, std::size_t offset = 0);
   std::size_t payload_bytes() const;
   // Opt-in diagnostics only: all retained bytes, never a sampled readback.
-  void verify_if_requested(const char *phase);
+  void verify();
   void close();
 
 private:

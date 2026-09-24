@@ -113,7 +113,6 @@ Vocabulary::Vocabulary(Context &context, const WeightStore &store, const WeightR
 Vocabulary::~Vocabulary() = default;
 
 void Vocabulary::lookup(std::int32_t token) {
-  TimingLabel component(TimingField::Component, "embedding.lookup");
   if (!impl_ || token < 0 || unsigned(token) >= impl_->rows) {
     throw std::out_of_range("token exceeds vocabulary or table is closed");
   }
@@ -203,7 +202,6 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
 }
 
 std::int32_t VocabularyHead::select() {
-  TimingLabel component(TimingField::Component, "lm_head");
   if (sampling_.enabled) {
     if (draws_ == std::numeric_limits<std::uint32_t>::max()) {
       throw std::out_of_range("sampling draw counter exhausted");

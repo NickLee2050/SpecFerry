@@ -1,125 +1,113 @@
 #!/usr/bin/env python3
-"""Run model-independent host-growth or SDK memory-accounting diagnostics."""
+"""Run one memory experiment. Allocation success and byte integrity are separate."""
 
 import argparse
-import os
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-
-from specferry.validation.device import (
-    clean_execution,
-    device_lock,
-    record_sources,
-    run_device,
-    snapshot_binary,
-    write_json,
+from specferry.validation.allocation import (
+    MIB,
+    capacity_result,
+    check_segment_budget,
+    prepare_weight_check,
+    weights_complete,
 )
+from specferry.validation.device import clean_execution, device_lock, run_device, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("case", choices=("capacity", "weights", "growth", "accounting"))
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--sdk-lib", type=Path, default=Path("/usr/lib/ljmicro"))
     parser.add_argument("--timeout", type=int, default=120)
-    subparsers = parser.add_subparsers(dest="case", required=True)
-    growth = subparsers.add_parser("growth", help="one fixed copy graph, no model weights")
-    growth.add_argument("--mode", choices=("fixed", "same", "advance"), default="advance")
-    growth.add_argument("--iterations", type=int, default=128)
-    accounting = subparsers.add_parser("accounting", help="SDK counter delta for one tensor")
-    accounting.add_argument("--mib", type=int, default=8)
-    accounting.add_argument("--storage", choices=("constant", "mutable"), default="constant")
-    accounting.add_argument("--dtype", choices=("F16", "F32"), default="F16")
+    parser.add_argument("--storage", choices=("constant", "mutable"), default="constant")
+    parser.add_argument("--dtype", choices=("F16", "F32"), default="F16")
+    parser.add_argument("--mib", type=int, default=64)
+    parser.add_argument("--readback", choices=("first", "all", "none"), default="all")
+    parser.add_argument("--mode", choices=("fixed", "same", "advance"), default="advance")
+    parser.add_argument("--iterations", type=int, default=128)
+    parser.add_argument("--deployment", type=Path)
+    parser.add_argument("--state-spec", type=Path)
+    parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
-    if args.output.exists() or args.timeout < 1:
-        parser.error("use a fresh output directory and a positive timeout")
-    if args.case == "growth":
-        if not 1 <= args.iterations <= 4096:
-            parser.error("iterations must be in [1,4096]")
-        name, arguments = "np101_memory_growth_check", [args.mode, str(args.iterations)]
-    else:
-        if not 1 <= args.mib <= 64:
-            parser.error("tensor size must be in [1,64] MiB")
-        name, arguments = "np101_memory_accounting_check", [str(args.mib), args.storage, args.dtype]
+    if not 1 <= args.mib <= (64 if args.case == "accounting" else 1024) or args.timeout < 1:
+        parser.error("payload must fit the segment limit; timeout must be positive")
     output = args.output.resolve()
-    output.mkdir(parents=True)
-    try:
-        with device_lock(ROOT / ".cache/runs"):
-            binary = snapshot_binary(ROOT / "build/tests" / name, output / name)
-            record_sources(ROOT, binary, output / "sources.json")
-            # Process-local settings; the calling shell and inference defaults are unchanged.
-            os.environ["VIV_MEMORY_PROFILE"] = "1" if args.case == "accounting" else "0"
-            os.environ["VIV_VX_PROFILE"] = "0"
-            evidence = run_device(
-                binary,
-                arguments,
-                output,
-                args.sdk_lib,
-                args.timeout,
-                trace_driver=False,
-                print_targets=False,
+    output.mkdir(parents=True, exist_ok=False)
+    inputs = None
+    if args.case == "weights":
+        if args.deployment is None:
+            parser.error("weights requires --deployment")
+        inputs = prepare_weight_check(args.deployment, args.state_spec, output)
+        expected = inputs["expected"]
+        check_segment_budget(
+            expected["expected_weight_bytes"], expected["expected_state_bytes"], args.storage
+        )
+        write_json(output / "inputs.json", inputs)
+        target = "weight_allocation_check"
+        arguments = [
+            args.deployment.resolve(),
+            output / "allocation.json",
+            "--weight-storage",
+            args.storage,
+        ]
+        if args.state_spec:
+            arguments += ["--state-spec", output / "allocation-states.txt"]
+    elif args.case == "capacity":
+        target = "capacity_check"
+        arguments = [output / "capacity.json", args.storage, args.dtype, args.mib, args.readback]
+    elif args.case == "growth":
+        target = "memory_growth_check"
+        arguments = [args.mode, args.iterations]
+    else:
+        target = "memory_accounting_check"
+        arguments = [args.mib, args.storage, args.dtype]
+    if args.prepare_only:
+        print(f"Prepared {args.case}: {arguments}")
+        return 0
+    with device_lock(ROOT / ".cache/runs"):
+        evidence = run_device(
+            ROOT / "build/tests" / ("np101_" + target),
+            arguments,
+            output,
+            Path("/usr/lib/ljmicro"),
+            args.timeout,
+        )
+    passed = clean_execution(evidence)
+    result = {"experiment_completed": passed, "evidence": evidence}
+    if args.case in ("capacity", "weights"):
+        path = output / ("capacity.json" if args.case == "capacity" else "allocation.json")
+        report = json.loads(path.read_text()) if path.is_file() else {}
+        if args.case == "capacity":
+            result.update(
+                capacity_result(
+                    report, evidence, args.mib * MIB, args.storage, args.dtype, args.readback
+                )
             )
-            passed = clean_execution(evidence)
-            report = {
-                "experiment_completed": passed,
-                "case": args.case,
-                "arguments": arguments,
-                "physical_memory_measured": False,
-                "evidence": evidence,
-            }
-            lines = (output / "sdk.log").read_text().splitlines()
-            if args.case == "growth" and passed:
-                rows = [
-                    parts
-                    for line in lines
-                    if len(parts := line.split()) == 4
-                    and parts[0].isdigit()
-                    and parts[1] in ("bind", "verify", "process")
-                ]
-                if len(rows) != args.iterations * 3:
-                    raise RuntimeError("native phase observations are incomplete")
-                baseline, final = int(rows[2][2]), int(rows[-1][2])
-                observations = {
-                    "iterations": args.iterations,
-                    "first_copy_rss_bytes": baseline,
-                    "last_copy_rss_bytes": final,
-                    "subsequent_growth_bytes": final - baseline,
-                    "phases": {},
-                }
-                report["observations"] = observations
-                print(f"Mode: {args.mode}; completed iterations: {args.iterations}")
-                print(f"Host RSS after first / last copy: {baseline:,} / {final:,} bytes")
-                print(
-                    f"Growth over {args.iterations - 1} subsequent copies: {final - baseline:,} bytes"
-                )
-                for phase in ("bind", "verify", "process"):
-                    delta = sum(
-                        int(rows[i][2]) - int(rows[i - 1][2])
-                        for i in range(3, len(rows))
-                        if rows[i][1] == phase
-                    )
-                    seconds = sum(float(row[3]) for row in rows if row[1] == phase)
-                    observations["phases"][phase] = {
-                        "rss_delta_bytes_after_first_copy": delta,
-                        "total_seconds": seconds,
-                    }
-                    print(f"  {phase:7}: RSS delta {delta:>12,} bytes; total {seconds:.6f} s")
-                print(
-                    "Readback and release: PASS. RSS does not establish a leak or physical occupancy."
-                )
-            else:
-                print("\n".join(lines))
-            # A clean native exit is insufficient if its observations are incomplete.
-            write_json(output / "summary.json", report)
-            print(f"Evidence: {output / 'summary.json'}")
-            return 0 if passed else 1
-    except (OSError, ValueError, RuntimeError) as error:
-        write_json(output / "failure.json", {"error": str(error)})
-        print(error, file=sys.stderr)
-        return 1
+            passed = result[
+                "allocation_and_release_passed"
+                if args.readback == "none"
+                else "readback_and_release_passed"
+            ]
+        else:
+            passed = weights_complete(report, evidence, args.storage, inputs["expected"])
+            result["weight_readback_and_release_passed"] = passed
+        result["observations"] = report
+    else:
+        print((output / "sdk.log").read_text())
+    result["passed"] = passed
+    write_json(output / "result.json", result)
+    print(
+        json.dumps(
+            {k: v for k, v in result.items() if k not in ("evidence", "observations")}, indent=2
+        )
+    )
+    print(f"Details: {output}")
+    return int(not passed)
 
 
 if __name__ == "__main__":

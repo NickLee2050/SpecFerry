@@ -36,13 +36,6 @@ def export(args) -> dict:
             args.sdk_overhead_bytes,
             args.workspace_bytes,
         )
-        capability = None
-        if args.capabilities:
-            capability = {
-                "path": str(args.capabilities.resolve()),
-                "sha256": sha256(args.capabilities),
-                "status": json.loads(args.capabilities.read_text()).get("status"),
-            }
         manifest = {
             "format": "specferry-np101-weights-v1",
             "status": "complete",
@@ -59,13 +52,7 @@ def export(args) -> dict:
             "precision_policy": "BF16 weights -> FP16; native FP32 retained; no norm folding",
             "source_groups": metadata["groups"],
             "memory_budget": budget,
-            "capability_report": capability,
             "deployment_ready": False,
-            "deployment_blockers": [
-                "operator_hardware_acceptance",
-                "measured_memory_fit",
-                "device_weight_layout_validation",
-            ],
         }
         write_json(staging / "deployment-manifest.json", manifest)
         write_json(staging / "memory-budget.json", budget)
@@ -80,7 +67,6 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/models/Qwen/Qwen3.5-0.8B")
     parser.add_argument("--output", type=Path, default=ROOT / ".cache/np101/Qwen3.5-0.8B")
     parser.add_argument("--verify-only", action="store_true")
-    parser.add_argument("--capabilities", type=Path)
     parser.add_argument("--context-capacity", type=int, default=512)
     parser.add_argument("--chunk-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument(

@@ -187,9 +187,6 @@ class OptAcceptanceTests(unittest.TestCase):
             self.assertFalse(result["hardware_execution_proven"])
             for change in (
                 {"released": False},
-                {"reads": 1},
-                {"cache_writes": 7},
-                {"upload_bytes": 100},
                 {"phase": "initialize"},
             ):
                 (actual / "execution.json").write_text(json.dumps(execution | change))

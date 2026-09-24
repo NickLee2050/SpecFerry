@@ -1,56 +1,26 @@
 #include "np101/diagnostics.hpp"
 
-#include <algorithm>
 #include <cstdlib>
-#include <iomanip>
 #include <stdexcept>
+#include <string>
 
 namespace specferry::np101 {
-void sample_host_memory(const std::filesystem::path &directory, const std::string &phase) {
-  std::ifstream status("/proc/self/status");
-  std::string line;
-  std::size_t rss_kib = 0;
-  bool found = false;
-  while (std::getline(status, line)) {
-    if (line.rfind("VmRSS:", 0) == 0) {
-      std::istringstream value(line.substr(6));
-      found = bool(value >> rss_kib);
-      break;
-    }
-  }
-  if (!found) {
-    throw std::runtime_error("cannot query current host RSS");
-  }
-  std::ofstream out(directory / "host-resources.jsonl", std::ios::app);
-  out << "{\"phase\":\"" << phase << "\",\"rss_bytes\":" << rss_kib * 1024 << "}\n";
-  if (!out) {
-    throw std::runtime_error("cannot write host resource observation");
-  }
-}
-
 thread_local SdkTimings *SdkTimings::active_ = nullptr;
 
-SdkTimings::SdkTimings(const std::filesystem::path &directory)
-    : directory_(directory), origin_(std::chrono::steady_clock::now()) {
-  const auto *setting = std::getenv("SPECFERRY_SDK_TIMING");
-  const std::string mode = setting ? setting : "off";
-  if (mode != "off" && mode != "summary" && mode != "calls") {
-    throw std::invalid_argument("SPECFERRY_SDK_TIMING must be off, summary or calls");
+SdkTimings::SdkTimings(const std::filesystem::path &directory) {
+  const auto *value = std::getenv("SPECFERRY_SDK_TIMING");
+  if (!value || std::string(value) == "off") {
+    return;
   }
-  if (active_) {
-    throw std::logic_error("SDK timing sessions cannot overlap on one thread");
+  if (std::string(value) != "calls" || active_) {
+    throw std::invalid_argument("SDK timing requires one calls session per thread");
   }
-  enabled_ = mode != "off";
-  if (mode == "calls") {
-    trace_.open(directory / "sdk-calls.tsv");
-    trace_ << "event\tid\telapsed_seconds\trequest\tphase\tcomponent\tapi_or_result\n";
-    if (!trace_) {
-      throw std::runtime_error("cannot open SDK call trace");
-    }
+  output_.open(directory / "sdk-calls.tsv");
+  if (!output_) {
+    throw std::runtime_error("cannot open SDK timing output");
   }
-  if (enabled_) {
-    active_ = this;
-  }
+  output_ << "event\tapi\tseconds\n";
+  active_ = this;
 }
 
 SdkTimings::~SdkTimings() {
@@ -61,71 +31,15 @@ SdkTimings::~SdkTimings() {
 
 bool SdkTimings::enabled() { return active_ != nullptr; }
 
-void SdkTimings::save() const {
-  if (!enabled_) {
-    return;
-  }
-  if (trace_.is_open() && !trace_) {
-    throw std::runtime_error("SDK call trace could not be written completely");
-  }
-  // Cumulative snapshots are written only outside timed requests.
-  const auto temporary = directory_ / "sdk-timing.tsv.tmp";
-  std::ofstream out(temporary);
-  out << std::setprecision(17)
-      << "request\tphase\tcomponent\tapi\tcalls\ttotal_seconds\tmax_seconds\texceptions\n";
-  for (const auto &[key, value] : measurements_) {
-    for (const auto &label : key) {
-      out << label << '\t';
-    }
-    out << value.calls << '\t' << value.seconds << '\t' << value.maximum << '\t' << value.exceptions
-        << '\n';
-  }
-  out.close();
-  if (!out) {
-    throw std::runtime_error("cannot save SDK timing summary");
-  }
-  std::filesystem::rename(temporary, directory_ / "sdk-timing.tsv");
-}
-
-TimingLabel::TimingLabel(TimingField field, const std::string &value)
-    : owner_(SdkTimings::active_), field_(static_cast<std::size_t>(field)) {
-  if (owner_) {
-    previous_ = owner_->labels_[field_];
-    owner_->labels_[field_] = value;
-  }
-}
-
-TimingLabel::~TimingLabel() {
-  if (owner_) {
-    owner_->labels_[field_].swap(previous_);
-  }
-}
-
-SdkTimer::SdkTimer(const char *api) : owner_(SdkTimings::active_) {
-  auto &labels = owner_->labels_;
-  measurement_ = &owner_->measurements_[{labels[0], labels[1], labels[2], api}];
-  id_ = ++owner_->next_id_;
-  if (owner_->trace_.is_open()) {
-    const auto elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - owner_->origin_).count();
-    owner_->trace_ << std::setprecision(17) << "begin\t" << id_ << '\t' << elapsed << '\t'
-                   << labels[0] << '\t' << labels[1] << '\t' << labels[2] << '\t' << api
-                   << std::endl;
-  }
+SdkTimer::SdkTimer(const char *api) : owner_(SdkTimings::active_), api_(api) {
+  owner_->output_ << "begin\t" << api_ << "\t\n" << std::flush;
   start_ = std::chrono::steady_clock::now();
 }
 
-bool SdkTimer::trace_results() const { return owner_->trace_.is_open(); }
-
-void SdkTimer::finish(const std::string &result, bool exception) {
+SdkTimer::~SdkTimer() {
+  // End records mean the call returned or unwound; errors remain in stderr.
   const auto seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
-  ++measurement_->calls;
-  measurement_->seconds += seconds;
-  measurement_->maximum = std::max(measurement_->maximum, seconds);
-  measurement_->exceptions += exception;
-  if (owner_->trace_.is_open()) {
-    owner_->trace_ << "end\t" << id_ << '\t' << seconds << "\t\t\t\t" << result << std::endl;
-  }
+  owner_->output_ << "end\t" << api_ << '\t' << seconds << '\n' << std::flush;
 }
 } // namespace specferry::np101

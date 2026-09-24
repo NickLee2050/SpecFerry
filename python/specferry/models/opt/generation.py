@@ -6,7 +6,8 @@ from dataclasses import replace
 import transformers
 from transformers import AutoTokenizer, GenerationConfig
 
-from specferry.validation.device import fingerprint, write_json
+from specferry.data.checkpoint import sha256 as fingerprint
+from specferry.validation.device import write_json
 
 from .config import validate_config
 from .export import verify_export

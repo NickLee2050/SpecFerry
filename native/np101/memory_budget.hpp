@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <memory>
-#include <ostream>
 
 namespace specferry::np101 {
 // Diagnostic compatibility policy, not a measurement of the current driver.
@@ -31,7 +30,6 @@ public:
   Lease reserve(bool constant, std::size_t bytes);
   std::size_t live(bool constant) const;
   std::size_t peak(bool constant) const;
-  void write(std::ostream &output) const;
 
 private:
   std::shared_ptr<State> state_;

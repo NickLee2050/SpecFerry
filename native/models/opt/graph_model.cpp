@@ -177,9 +177,6 @@ struct GraphModel::Impl {
           "execute complete OPT graph");
     position += tokens.size();
     ++completed_launches;
-    if (completed_launches == 1) {
-      weights.verify_if_requested("after_first_run");
-    }
     latest = &execution;
     failed = false;
   }
@@ -219,24 +216,14 @@ inference::Generation GraphModel::generate(const std::vector<std::int32_t> &prom
     throw std::logic_error("closed or failed graph model");
   }
   const auto &config = impl_->config;
-  const auto prompt_length = prompt.empty() ? 1 : prompt.size();
   return inference::generate_tokens(
       {config.vocabulary, config.decoder.capacity, config.bos, config.eos},
       {[&] {
          impl_->position = 0;
          impl_->latest = nullptr;
        },
-       [&](std::int32_t token) {
-         TimingLabel phase(TimingField::Phase, "decode");
-         impl_->consume({token});
-       },
-       [&] {
-         TimingLabel phase(TimingField::Phase,
-                           impl_->position == prompt_length ? "first_prediction" : "decode");
-         return impl_->predict();
-       },
+       [&](std::int32_t token) { impl_->consume({token}); }, [&] { return impl_->predict(); },
        [&](const std::vector<std::int32_t> &tokens) {
-         TimingLabel phase(TimingField::Phase, "prefill");
          for (const auto chunk : inference::plan_prefill(tokens.size(), impl_->block)) {
            impl_->consume(
                {tokens.begin() + chunk.begin, tokens.begin() + chunk.begin + chunk.count});

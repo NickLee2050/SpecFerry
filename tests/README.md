@@ -1,202 +1,105 @@
-# Validation layout
+# Validation commands
 
-| Directory | Purpose | Device required |
-|---|---|---|
-| `python/` | Download, export integrity/precision, memory budget, and numerical comparison unit tests | No |
-| `native/generation_test.cpp` | BOS/EOS, capacity, generation limits and consumed-token semantics | No |
-| `native/diagnostics_test.cpp` | SDK timing transparency, result/exception propagation and scope restoration | No |
-| `native/memory_budget_test.cpp` | Separate 1 GiB segment limits, boundary rejection and retained/temporary storage lifetime | No |
-| `native/allocation_support_test.cpp` | Finite FP16/FP32 patterns, page-alias detection, byte/length mismatch and report escaping | No |
-| `native/np101/opt_io_check.cpp` | Shared embedding/head blocks, learned positions and greedy selection | Yes |
-| `native/np101/sampling_check.cpp` | Categorical frequencies, seed replay and full-vocabulary bounds | Yes |
-| `native/np101/data_test.cpp` | Tensor/component contracts, native weight reader, and fixture parser unit tests | No |
-| `native/np101/conv_relu_pool_test.cpp` | FP16 convolution, ReLU, and max-pooling numerical regression | Yes |
-| `native/np101/op_check.cpp` | File-driven operator checks with changing inputs | Yes |
-| `native/np101/weight_allocation_check.cpp` | Constant/mutable weight allocation, weight/state readback and explicit teardown | Yes |
-| `native/np101/memory_growth_check.cpp` | Single-copy graph rebinding and phase RSS | Yes |
-| `native/np101/memory_accounting_check.cpp` | One-tensor SDK accounting versus payload | Yes |
-| `native/np101/capacity_check.cpp` | Equal-byte FP16/FP32 capacity probes in constant/mutable storage | Yes |
-| `native/np101/delta_net_check.cpp` | Real-weight DeltaNet trajectories, nonzero state, reset, recreation and final-only readback | Yes |
-| `native/np101/kv_cache_check.cpp` | Exact slot writes, untouched cache rows, fixed-reader visibility and bounds | Yes |
-| `native/np101/graph_cache_check.cpp` | Experimental graph-integrated append, causal attention and shared block/decode cache | Yes |
-| `native/np101/decoder_check.cpp` | Explicit decoder slices, shared bindings, state/reset, transfer counts and capacity | Yes |
-| `native/np101/opt_decoder_check.cpp` | OPT post-norm decoder slices, affine projections, LayerNorm and KV/lifecycle checks | Yes |
-| `native/np101/attention_check.cpp` | Real-weight Attention, single-buffer KV, capacity, truncation, reset and final-only readback | Yes |
+Run from the repository root with `conda activate SpecFerry`. Use a new output
+folder each time. Host unit tests and all `--prepare-only` commands do not open NP101.
+Board commands serialize through one lock; timeout, signal or lingering children
+leave a recovery marker. Do not delete that marker to force a retry.
 
-Run host tests from the repository root with the `SpecFerry` Conda environment:
+## Small board checks
 
 ```bash
-python -m unittest discover -s tests -t . -v
-cmake --build build -j 4
-ctest --test-dir build --output-on-failure
+python scripts/check_np101.py selection --output .cache/runs/selection
+python scripts/check_np101.py conv --output .cache/runs/conv
+python scripts/check_np101.py kv --output .cache/runs/kv
+python scripts/check_np101.py cache --output .cache/runs/cache
+python scripts/check_np101.py cache-block --output .cache/runs/cache-block
+python scripts/check_np101.py sampling --output .cache/runs/sampling
 ```
 
-CTest registers only host unit tests. Hardware checks are explicit `scripts/check_np101_*.py`
-commands documented here and in the linked guides. Each uses a fresh output directory under
-`.cache/runs/`; generated fixtures and logs are not source files.
+`selection` covers embedding/head boundary indices and ties using synthetic weights.
+`kv` checks the component path's cache; `cache` and `cache-block` check the experimental
+2D indexed append, attention, masking and reset. Sampling checks the promoted FP32
+path, not the known-bad direct FP16 operator. Native executables remain in `build/tests`.
+A numerical pass does not prove exclusive NPU execution or physical device residency.
 
-[Memory diagnostics](np101-memory.md) document three model-independent reproduction
-commands: host growth, SDK accounting, and large-allocation byte corruption.
-The [SDK timing guide](np101-sdk-timing.md) adds a checkpoint-free selection command,
-startup-wait evidence and optional per-component inference timing. Its host-only
-contracts live in `native/diagnostics_test.cpp` and the existing Python runner tests.
-
-[Fixed-graph experiments](np101-graph-optimization.md) provide reusable offline
-CPU references and individually gated decode/prefill/capacity checks. The new
-device path remains unvalidated. `python/test_optimization.py` checks stale gates,
-prefix/reset corruption, scalar transfers and withholding failed timing results.
-The generation/data CTests also cover block-tail scheduling and rejection of
-unsupported cache-writer shapes without SDK execution.
-
-[Fixed-graph pipeline diagnostics](np101-graph-pipeline.md) isolate packed inputs,
-shared weights, blocked embedding and a joint OPT layer with indexed KV append.
-They retain per-stage comparisons and document the separate prefix verification
-timeout and installed memory-interface constraints.
-All common allocations currently enforce const/non-const 1 GiB payload caps;
-pipeline checks additionally audit every shared-weight byte at setup/verify/run
-boundaries. The first cold-boot lookup triggered kernel hang reports; remaining
-hardware revalidation is blocked pending recovery. See the
-[current memory policy](np101-memory.md#current-segmented-payload-policy-2026-09-24).
-
-## Diagnostic commands
-
-After building, use fresh output directories for each device run:
+## OPT and Qwen references
 
 ```bash
-python scripts/check_np101_conv_relu_pool.py --output .cache/runs/conv-relu-pool --repeats 10
-python scripts/check_np101_operators.py --list
-python scripts/check_np101_operators.py --output .cache/runs/operators-small --diagnostic
-python scripts/check_np101_attention.py --storage-only \
-  --output .cache/runs/kv-storage --diagnostic
+python scripts/check_np101.py opt --trace .cache/runs/opt-cpu/trace.npz \
+  --layers 0 --steps 2 --capacity 16 --prepare-only --output .cache/runs/opt-prepared
+python scripts/check_np101.py opt --fixture .cache/runs/opt-prepared/fixture \
+  --output .cache/runs/opt-slice
+python scripts/check_np101.py teacher --layer-count 24 --steps 2 --capacity 16 \
+  --prepare-only --output .cache/runs/teacher-prepared
+python scripts/check_np101.py teacher --fixture .cache/runs/teacher-prepared/fixture \
+  --timeout 600 --output .cache/runs/teacher
+
+python scripts/export_np101_dlm.py --verify-only
+python scripts/reference_dlm.py --output .cache/runs/qwen-cpu
+python scripts/check_np101.py qwen --trace .cache/runs/qwen-cpu/layer-0-3-sequential.npz \
+  --layers 0 1 2 3 --steps 2 --prepare-only --output .cache/runs/qwen-prepared
+python scripts/check_np101.py qwen --fixture .cache/runs/qwen-prepared/fixture \
+  --output .cache/runs/qwen-slice
 ```
 
-Review the [current package's computation fault](np101-capacity.md) before
-re-running the convolution or other operator paths. A recovery marker blocks
-further device execution until recovery has been confirmed.
+OPT `teacher` compares embedding, decoder outputs, logits and every valid KV prefix;
+repeated reset/fresh trajectories must match exactly. Qwen retains FP16 projection
+and FP32 recurrent-state reference policies. No Qwen full-model deployment is claimed.
 
-The operator runner accepts repeatable `--case NAME`, `--scale model`,
-`--prepare-only`, `--readback final`, `--cycles 20`, `--binary`, `--sdk-lib` and
-`--shader-header`. Its default `--profile generic` contains 24 independent small
-SDK cases and imports no model adapter. Use `--profile qwen3.5` for the retained
-49-case catalog, including model-sized and architecture-specific compositions.
-`--scale model` requires that explicit profile. Real projection fixtures also
-require `--reference-trace` and an explicit `--model` deployment directory.
-The default per-case timeout is 300 seconds and the payload
-cap is 768 MiB; SDK overhead is additional. Each case keeps its `graph.txt`,
-inputs, expected bytes, comparison and execution evidence. Final-only comparison
-does not substitute for checking every output in a numerical trajectory.
+## Experimental graph diagnosis
 
-Device runners share executable snapshots and source fingerprints through
-`python/specferry/validation/device.py`. `sources.json`, where emitted, records
-the current working tree; it does not prove which source revision built a binary.
-Execution evidence retains the actual binary hash and runtime library fingerprints.
-Generation, sampling and allocation do not emit a duplicate `binary.json`.
-Device locking, timeouts, recovery checks and per-run report layouts remain shared.
+```bash
+python scripts/check_np101.py lookup --output .cache/runs/lookup
+python scripts/check_np101.py layer --fixture .cache/runs/opt-prepared/fixture \
+  --output .cache/runs/layer
+python scripts/check_np101.py prefix --fixture .cache/runs/teacher-prepared/fixture \
+  --layer-count 1 --timeout 360 --output .cache/runs/prefix
+python scripts/generate_opt.py --backend graph --block 1 --capacity 16 \
+  --max-new-tokens 4 --output .cache/runs/graph-decode
+```
 
-The unavailable `AttachTensorToGraph` probe and its unused wrapper are retired.
-Their source remains in Git at commit `8165dd5`; the
-[operator record](np101-operator-acceptance.md) preserves results and local evidence.
-Actual cross-graph `retain_tensor`/`bind_tensor` behavior remains covered by
-DeltaNet, KV, Attention and decoder checks.
+Run one case at a time after device recovery. `layer` requires layer 0 with at least
+two reference steps. For real-weight lookup, prepare `io --prepare-only`, then pass
+its fixture to `lookup --fixture`. Partial-prefix predictions are diagnostic, not meaningful text.
+The production path no longer performs automatic weight readback while compiling;
+lookup/layer tests explicitly verify their shared weight banks after execution.
 
-## Fixture and acceptance contracts
+Add `--sdk-timing` to a compute command for public API begin/end records in
+`sdk-calls.tsv`. Add `--trace-driver` to `check_np101.py` for raw `driver.strace`
+(`strace` must be installed). These are diagnostics, not throughput measurements.
+Failure details and native progress go to `device/sdk.log`.
 
-[Capacity probing](np101-capacity.md) records the bounded 1–4 GiB experiment,
-the new-package preflight and the distinction between an allocation rejection
-and an abnormal SDK exit. Explicit `--readback none` separates accepted allocation
-from integrity; `--readback all` maps corrupt regions across every retained block.
-Its host test never opens the device.
+## Memory diagnostics
 
-The operator fixture format is a versioned test protocol, not a model compiler.
-NumPy arrays are row-major; graph tensor dimensions list the contiguous axis first.
-Files contain exact little-endian FP16, FP32, INT32, or byte-bool values.
-Version 2 adds inclusive INT32 input bounds; the native reader accepts the
-stateless subset of versions 1 and 2. Retired `feedback`, `reset_after`, and
-`handle` storage fixtures are rejected before device initialization; use the
-archived source/binaries to reproduce historical feedback experiments.
-Node inputs must come from initialized tensors, graph inputs, or earlier nodes.
-Generic cases supply fixed-input tolerances from `validation/operator_cases.py`;
-their numerical thresholds are unchanged. Qwen-specific cases retain the model
-adapter's tolerance policy. The comparator always requires an explicit policy.
-Both nonfinite values and wrong output sizes fail validation.
+```bash
+python scripts/check_np101_memory.py capacity --mib 64 --storage constant --dtype F16 \
+  --readback none --output .cache/runs/capacity
+python scripts/check_np101_memory.py capacity --mib 1024 --storage mutable --dtype F32 \
+  --readback all --output .cache/runs/integrity
+python scripts/check_np101_memory.py weights --deployment .cache/np101/opt-350m \
+  --storage constant --output .cache/runs/weights
+python scripts/check_np101_memory.py growth --mode advance --iterations 128 \
+  --output .cache/runs/host-growth
+python scripts/check_np101_memory.py accounting --mib 8 --storage mutable \
+  --output .cache/runs/accounting
+```
 
-Use `build/tests/np101_op_check --validate-only PATH/graph.txt` to validate native
-fixture parsing and input sizes without creating a device context.
+Application const/nonconst tensor payloads are independently capped at 1 GiB.
+`--readback none` measures allocation/release only; `all` scans every retained block,
+including those after corruption. `readback-blocks.jsonl` records logical byte/page
+ranges, not physical addresses. Corruption is a nonzero integrity result even when
+allocation succeeds. `--storage` and `--dtype` are explicit, never fallback policies.
 
-`test_operator_acceptance.py` protects final-only readback, independent graph
-lifetimes, payload rejection before device access, failed release despite correct
-outputs, and the distinction between numerical agreement, hardware proof, and
-device residency. The optional Qwen profile contains 49 synthetic operator cases
-plus four optional captured-reference projections, with no cross-execution feedback.
-The [operator acceptance record](np101-operator-acceptance.md) preserves historical
-results, and the [state investigation record](state-feedback-investigation.md)
-documents the retired experiments. The [DeltaNet module check](np101-delta-net.md)
-now covers recurrent numerical state reuse/reset; the [Attention module check](np101-attention.md)
-covers single-buffer KV. Device-residency evidence remains pending (`NP101-STATE-001`). `test_delta_net.py`
-protects reference-input contracts and rejects incorrect or incomplete trajectory,
-reset, final-only and lifecycle results without opening the device.
-`test_attention.py` additionally protects cache-prefix comparison and exact
-masked-suffix rejection. `test_decoder.py` checks pre-normalization fixture inputs,
-independent per-layer reference state, exact repeat checks and lifecycle rejection.
-The [decoder group check](np101-decoder.md) validates complete layers using the same
-serialized device runner; it remains separate from the small mixer regressions.
+Compare `growth --mode fixed`, `same`, and `advance` to isolate revalidation growth.
+`accounting` reports SDK counters, not proven physical allocation. Both print their
+native tables. For model-independent state allocation alongside weights, add
+`--state-spec tests/fixtures/qwen3_5_allocation_states.txt`; it describes shapes only.
 
-Keep host unit tests small and independent of downloaded weights. Hardware failures,
-timeouts, unsupported APIs, and missing execution evidence must remain visible;
-never convert them into successful deployment acceptance.
+## Entry-point consolidation
 
-SDK node parameters contain private state allocated by `vsi_nn_AddNode`. Change
-individual public fields only; never clear the whole parameter structure or
-overwrite `pool.local`. The convolution regression uses inferred virtual tensors
-between operators, constant FP16 weight/bias bytes, and a 0.1 absolute tolerance,
-matching the vendor's convolution demo. That demo tolerance does not replace the
-separate DLM operator tolerances. Explicit diagnostic tensors and persistent
-state must not be indiscriminately converted to virtual tensors.
-
-## Reusable component regression
-
-[Component contracts and checks](np101-components.md) document the shared/model boundary,
-versioned component fixtures, small synthetic decoder and alternate KV layout.
-`test_components.py` covers non-Qwen checkpoint names, explicit FP16 preservation,
-alias rejection, independent memory resources and invalid component configuration.
-The synthetic decoder in `check_np101_components.py` intentionally remains a
-Qwen architecture regression; using synthetic weights does not make its layer
-composition model-independent.
-The native data test parses component contracts without linking or opening the SDK.
-
-[OPT validation](np101-opt.md) records the original FP16 checkpoint, CPU baseline,
-byte-preserving export, independent decoder expectations and the corrected SDK crash.
-`test_opt.py` checks import/precision rejection, chunk identity, trace ordering,
-valid-prefix comparison and lifecycle/mask/repeat failures without a model download.
-
-[Complete OPT generation](np101-generation.md) uses the production
-`build/bin/specferry_opt_generate` executable for teacher-forced 4/8/24-layer
-checks and normal text generation. `test_generation.py` protects token bounds,
-scalar-only transfer accounting, exact resets and honest hardware-evidence gates.
-`autoregressive_generation_contract` is a host CTest and never opens the SDK.
-
-[Sampling validation](np101-sampling.md) covers the documented RANDOM_MULTINOMIAL
-operator and OPT's optional sampling head. `test_sampling.py` rejects out-of-range
-or distribution-ignoring output even when SDK execution reports success.
-
-[Complete-model acceptance](np101-acceptance.md) combines exact selection,
-teacher-forced model checks, repeated resident requests and fresh process lifetimes.
-The native generator's benchmark mode records prefill, first-token and decode
-times with no application trace or streaming callback during measurement.
-`test_acceptance.py` covers failed preflight short-circuiting, warmup exclusion,
-CPU token equality, timing/transfer contracts and hardware-pending status.
-
-## Generic weight loading
-
-`check_np101_allocation.py --deployment DIRECTORY` validates a common weight pack,
-then loads and reads back its physical weight records. It has no implicit model
-or state profile. Add `--state-spec FILE` for an explicit state fixture, or
-`--prepare-only` to validate files without device IO. `--model` remains an alias
-for `--deployment`; a directory must be supplied. See the
-[capacity guide](np101-capacity.md#generic-weight-pack-readback) for commands.
-
-`test_weight_loading.py` covers arbitrary model identities, no-state loads,
-explicit state snapshots, preflight rejection and requested-payload matching.
-Reusable pack fixtures live in `tests/python/weight_fixtures.py`, independently
-of model-specific test modules. This checks data integrity, not architecture
-compatibility or full-model residency.
+Former `check_np101_{opt,decoder,generation,graph_pipeline,graph_cache,sampling}.py`
+commands are now explicit cases of `check_np101.py`. Former allocation/capacity
+commands are `check_np101_memory.py weights/capacity`. Acceptance timing is
+`generate_opt.py --warmups ... --repeats ... --compare-cpu`; the experimental graph
+uses `--backend graph`. Historical reports retain their original schemas and commands
+in Git/history; they are not inputs to the new runner.

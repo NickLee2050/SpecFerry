@@ -1,3 +1,4 @@
+#include "inference/generation_io.hpp"
 #include "models/opt/config.hpp"
 #include "models/opt/graph_model.hpp"
 #include "np101/context.hpp"
@@ -74,25 +75,12 @@ void progress(const fs::path &directory, const std::string &phase, const char *s
   fs::rename(temporary, directory / "execution.json");
 }
 
-template <class T> void array(std::ostream &out, const std::vector<T> &values) {
-  out << '[';
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    out << (index ? "," : "") << values[index];
-  }
-  out << ']';
-}
-
 void save_generation(const fs::path &path, const inference::Generation &result,
                      std::size_t launches, np101::TensorTransfers before,
                      np101::TensorTransfers after) {
   std::ofstream out(path);
-  out << std::setprecision(17) << "{\"tokens\":";
-  array(out, result.tokens);
-  out << ",\"consumed\":" << result.consumed << ",\"stop_reason\":\"" << result.stop_reason
-      << "\",\"prefill_seconds\":" << result.prefill_seconds
-      << ",\"first_token_seconds\":" << result.first_token_seconds
-      << ",\"total_seconds\":" << result.total_seconds << ",\"token_seconds\":";
-  array(out, result.token_seconds);
+  out << '{';
+  inference::write_generation(out, result);
   out << ",\"launches\":" << launches << ",\"uploads\":" << after.uploads - before.uploads
       << ",\"upload_bytes\":" << after.upload_bytes - before.upload_bytes
       << ",\"reads\":" << after.reads - before.reads
@@ -133,7 +121,6 @@ int main(int argc, char **argv) {
     fs::create_directories(directory);
     progress(directory, "initialize");
     np101::SdkTimings timings(directory);
-    np101::sample_host_memory(directory, "before_initialize");
     const auto start = Clock::now();
     np101::Context context;
     models::opt::GraphModel model(context, weights, config, block);
@@ -147,23 +134,20 @@ int main(int argc, char **argv) {
         throw std::runtime_error("cannot save initialization observation");
       }
     }
-    np101::sample_host_memory(directory, "after_initialize");
     bool tokens_match = true;
 
     for (unsigned index = 0; index < requests.size(); ++index) {
       const auto name = "measured." + std::to_string(index);
       progress(directory, name);
-      np101::TimingLabel request(np101::TimingField::Request, name);
+
       const auto before = np101::tensor_transfers();
       const auto launches = model.launches();
       const auto result = model.generate(requests[index], maximum);
       save_generation(directory / (name + ".json"), result, model.launches() - launches, before,
                       np101::tensor_transfers());
-      np101::sample_host_memory(directory, name);
       // Diagnostics run after generation, outside its transfer/time contract.
       if (readback == "prefix") {
-        np101::TimingLabel diagnostic_request(np101::TimingField::Request,
-                                              "diagnostic." + std::to_string(index));
+
         for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
           for (bool values : {false, true}) {
             auto bytes = model.read_cache(layer, values);
@@ -177,15 +161,14 @@ int main(int argc, char **argv) {
           }
         }
       }
-      timings.save();
       // Keep the first failing request's KV, then release normally. Further
       // requests cannot pass the gate once the independent token oracle fails.
       if (result.tokens != expected[index]) {
         tokens_match = false;
         std::cerr << "Request " << index << " token mismatch; expected ";
-        array(std::cerr, expected[index]);
+        inference::write_array(std::cerr, expected[index]);
         std::cerr << ", got ";
-        array(std::cerr, result.tokens);
+        inference::write_array(std::cerr, result.tokens);
         std::cerr << ". Skipping remaining requests and releasing the model.\n";
         break;
       }
@@ -193,12 +176,10 @@ int main(int argc, char **argv) {
     const auto launches = model.launches();
     progress(directory, "release");
     {
-      np101::TimingLabel phase(np101::TimingField::Phase, "release");
+
       model.close();
       context.close();
     }
-    timings.save();
-    np101::sample_host_memory(directory, "after_release");
     rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage)) {
       throw std::runtime_error("cannot read host resource observation");

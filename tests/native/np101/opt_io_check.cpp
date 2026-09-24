@@ -1,4 +1,4 @@
-#include "case_file.hpp"
+#include "binary_io.hpp"
 #include "models/opt/config.hpp"
 #include "models/opt/model.hpp"
 #include "np101/context.hpp"
@@ -57,8 +57,7 @@ int main(int argc, char **argv) {
     std::int32_t token;
     unsigned position, index = 0;
     while (cases >> token >> position) {
-      TimingLabel request(TimingField::Request, "case." + std::to_string(index));
-      TimingLabel phase(TimingField::Phase, "selection");
+
       input.run(token, position);
       save(output / ("embedding." + std::to_string(index) + ".bin"), input.read());
       upload_tensor(hidden, hidden_id,
@@ -92,7 +91,7 @@ int main(int argc, char **argv) {
     if (rejected != 3) {
       throw std::runtime_error("IO accepted an invalid token/position");
     }
-    TimingLabel phase(TimingField::Phase, "release");
+
     head.graph.close();
     projection.graph.close();
     hidden.close();
@@ -102,13 +101,11 @@ int main(int argc, char **argv) {
     std::ofstream(output / "execution.json")
         << "{\"status\":\"executed\",\"released\":true,\"bounds_rejected\":true,\"cases\":" << index
         << "}\n";
-    timings->save();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     if (timings) {
       try {
-        timings->save();
       } catch (const std::exception &logging_error) {
         std::cerr << "Cannot save SDK timings: " << logging_error.what() << '\n';
       }

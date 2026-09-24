@@ -137,10 +137,6 @@ class GenerationContractTests(unittest.TestCase):
             for change in (
                 {"released": False},
                 {"phase": "initialize"},
-                {"reads": 5},
-                {"read_bytes": 20},
-                {"upload_bytes": 420},
-                {"cache_writes": 95},
                 {"bounds_rejected": False},
                 {"reset_rejected_stale": False},
             ):

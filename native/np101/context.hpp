@@ -25,8 +25,6 @@ public:
 
   MemoryBudget &memory() { return memory_; }
 
-  void save_memory_report() const;
-
 private:
   MemoryBudget memory_;
   vsi_nn_context_t handle_ = nullptr;
@@ -49,7 +47,6 @@ public:
   MemoryBudget::Lease reserve(bool constant, std::size_t bytes);
   void record_storage(vsi_nn_tensor_id_t id, MemoryBudget::Lease lease);
   void alias_storage(vsi_nn_tensor_id_t id, const Graph &owner, vsi_nn_tensor_id_t source);
-  void save_memory_report() const;
 
 private:
   Context &context_;

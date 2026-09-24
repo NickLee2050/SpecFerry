@@ -1,320 +1,199 @@
-#include "case_file.hpp"
+#include "binary_io.hpp"
+#include "models/opt/decoder.hpp"
 #include "models/qwen3_5/decoder.hpp"
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
+#include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <ios>
 #include <iostream>
-#include <ostream>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace {
-using namespace specferry::np101;
-using namespace specferry::models::qwen3_5;
 namespace fs = std::filesystem;
-using Clock = std::chrono::steady_clock;
+using namespace specferry;
+
+struct DecoderCase {
+  fs::path output;
+  unsigned count, capacity;
+  std::size_t uploads = 1, control_bytes = 0;
+  std::vector<std::vector<std::uint8_t>> inputs{};
+  std::map<unsigned, std::vector<std::string>> fields{};
+};
 
 bool checkpoint(unsigned step, unsigned count) {
   return step == 0 || step == 1 || step == 3 || step == 7 || step == 31 || step == 255 ||
          step == 511 || step + 1 == count;
 }
 
-struct Progress {
-  fs::path directory;
-  unsigned first_layer;
-  Config config{};
-  std::vector<unsigned> selected;
-  unsigned attention_layers = 0;
-  std::string phase = "validate";
-  std::string sequence = "none";
-  unsigned completed_steps = 0;
-  unsigned completed_sequences = 0;
-  std::size_t readback_bytes = 0;
-  std::size_t step_upload_bytes = 0;
-  std::size_t step_uploads = 0;
-  std::size_t step_reads = 0;
-  std::size_t cache_writes = 0;
-  std::size_t revalidations = 0;
-  bool capacity_rejected = false;
-  bool invalid_input_rejected = false;
-  bool empty_output_rejected = false;
-  bool released = false;
-  double execution_seconds = 0;
-  double initialization_seconds = 0;
-  double reset_seconds = 0;
-  double release_seconds = 0;
-  std::vector<DecoderMetrics> layers;
-
-  explicit Progress(fs::path output) : directory(std::move(output)), first_layer(0) {}
-
-  void save(const std::string &status = "running") const {
-    std::ofstream file(directory / "execution.json");
-    file << std::boolalpha << "{\"status\":\"" << status << "\",\"phase\":\"" << phase
-         << "\",\"sequence\":\"" << sequence << "\",\"completed_steps\":" << completed_steps
-         << ",\"completed_sequences\":" << completed_sequences << ",\"first_layer\":" << first_layer
-         << ",\"cache_writes\":" << cache_writes
-         << ",\"copy_graph_revalidations\":" << revalidations
-         << ",\"capacity_rejected\":" << capacity_rejected
-         << ",\"invalid_input_rejected\":" << invalid_input_rejected
-         << ",\"empty_output_rejected\":" << empty_output_rejected << ",\"released\":" << released
-         << ",\"application_readback_bytes\":" << readback_bytes
-         << ",\"step_upload_bytes\":" << step_upload_bytes << ",\"step_uploads\":" << step_uploads
-         << ",\"step_reads\":" << step_reads
-         << ",\"boundary_upload_bytes\":" << completed_steps * config.hidden * 2ULL
-         << ",\"attention_control_upload_bytes\":" << completed_steps * attention_layers * 8ULL
-         << ",\"explicit_kv_copy_bytes\":"
-         << cache_writes * config.kv.heads * config.kv.head_dim * 4ULL
-         << ",\"execution_seconds\":" << execution_seconds
-         << ",\"initialization_seconds\":" << initialization_seconds
-         << ",\"reset_seconds\":" << reset_seconds << ",\"release_seconds\":" << release_seconds
-         << ",\"layers\":[";
-    for (std::size_t index = 0; index < layers.size(); ++index) {
-      const auto &layer = layers[index];
-      if (index) {
-        file << ',';
-      }
-      file << "{\"layer\":" << selected[index] << ",\"steps\":" << layer.steps
-           << ",\"normalization_seconds\":" << layer.normalization_seconds
-           << ",\"mixer_seconds\":" << layer.mixer_seconds
-           << ",\"feed_forward_seconds\":" << layer.feed_forward_seconds
-           << ",\"cache_write_seconds\":" << layer.cache_write_seconds
-           << ",\"cache_revalidation_seconds\":" << layer.cache_revalidation_seconds << '}';
-    }
-    file << "]}\n";
-    if (!file) {
-      throw std::runtime_error("cannot write decoder report");
-    }
+template <class Exception, class Action> void rejects(Action action) {
+  try {
+    action();
+  } catch (const Exception &) {
+    return;
   }
-
-  void enter(const std::string &next) {
-    phase = next;
-    std::cout << sequence << ": " << phase << " steps=" << completed_steps << std::endl;
-    save();
-  }
-
-  void collect(const DecoderGroup &model) {
-    const auto current = model.metrics();
-    if (layers.empty()) {
-      layers.resize(current.size());
-    }
-    for (std::size_t index = 0; index < current.size(); ++index) {
-      auto &total = layers[index];
-      const auto &value = current[index];
-      total.steps += value.steps;
-      total.normalization_seconds += value.normalization_seconds;
-      total.mixer_seconds += value.mixer_seconds;
-      total.feed_forward_seconds += value.feed_forward_seconds;
-      total.cache_write_seconds += value.cache_write_seconds;
-      total.cache_revalidation_seconds += value.cache_revalidation_seconds;
-      cache_writes += value.cache_writes;
-      revalidations += value.cache_revalidations;
-    }
-  }
-};
-
-double elapsed(Clock::time_point start) {
-  return std::chrono::duration<double>(Clock::now() - start).count();
+  throw std::runtime_error("decoder accepted an invalid operation");
 }
 
-void capture(DecoderGroup &model, unsigned index, Progress &progress) {
-  for (unsigned layer : progress.selected) {
-    std::vector<std::string> outputs{"normalized", "mixer", "residual",
-                                     "post_norm",  "mlp",   "output"};
-    if (progress.config.mixer(layer) == MixerKind::Attention) {
-      outputs.insert(outputs.end(), {"keys", "values"});
-    } else {
-      outputs.insert(outputs.end(), {"recurrent", "convolution"});
+template <class Model>
+void sequence(Model &model, const DecoderCase &test, const std::string &name, unsigned count,
+              bool final_only) {
+  std::cout << name << ": " << count << " steps" << std::endl;
+  for (unsigned step = 0; step < count; ++step) {
+    const auto before = np101::tensor_transfers();
+    model.step(test.inputs[step]);
+    const auto after = np101::tensor_transfers();
+    if (after.uploads - before.uploads != test.uploads ||
+        after.upload_bytes - before.upload_bytes != test.inputs[step].size() + test.control_bytes ||
+        after.reads != before.reads || model.length() != step + 1) {
+      throw std::runtime_error("unexpected decoder position or host transfers");
     }
-    for (const auto &name : outputs) {
-      const auto bytes = model.read(layer, name);
-      progress.readback_bytes += bytes.size();
-      const auto filename = progress.sequence + ".layer." + std::to_string(layer) + "." + name +
-                            "." + std::to_string(index) + ".bin";
-      std::ofstream file(progress.directory / filename, std::ios::binary);
-      if (!file.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) {
-        throw std::runtime_error("cannot write decoder output");
+    if (final_only ? step + 1 != count : !checkpoint(step, count)) {
+      continue;
+    }
+    for (const auto &[layer, fields] : test.fields) {
+      for (const auto &field : fields) {
+        const auto data = model.read(layer, field);
+        const auto filename = name + ".layer." + std::to_string(layer) + "." + field + "." +
+                              std::to_string(step) + ".bin";
+        std::ofstream out(test.output / filename, std::ios::binary);
+        if (!out.write(reinterpret_cast<const char *>(data.data()), data.size())) {
+          throw std::runtime_error("cannot save " + filename);
+        }
       }
     }
   }
 }
 
-void run_sequence(DecoderGroup &model, const std::vector<std::vector<std::uint8_t>> &inputs,
-                  unsigned count, const std::string &name, bool final_only, Progress &progress) {
-  progress.sequence = name;
-  for (unsigned index = 0; index < count; ++index) {
-    progress.enter("execute");
-    const auto start = Clock::now();
-    const auto transfers_before = tensor_transfers();
-    model.step(inputs[index]);
-    const auto transfers_after = tensor_transfers();
-    const auto uploads = transfers_after.uploads - transfers_before.uploads;
-    const auto upload_bytes = transfers_after.upload_bytes - transfers_before.upload_bytes;
-    const auto reads = transfers_after.reads - transfers_before.reads;
-    progress.step_uploads += uploads;
-    progress.step_upload_bytes += upload_bytes;
-    progress.step_reads += reads;
-    if (uploads != 1 + 2 * progress.attention_layers ||
-        upload_bytes != progress.config.hidden_spec().bytes() + 8 * progress.attention_layers ||
-        reads != 0) {
-      throw std::runtime_error("decoder step performed unexpected explicit host tensor transfers");
+template <class Factory> void trajectories(Factory create, const DecoderCase &test) {
+  auto model = create();
+  sequence(*model, test, "zero", test.count, false);
+  rejects<std::invalid_argument>([&] { model->step({}); });
+  if (test.count == test.capacity) {
+    rejects<std::out_of_range>([&] { model->step(test.inputs.front()); });
+  }
+  if (model->length() != test.count) {
+    throw std::runtime_error("invalid input changed decoder position");
+  }
+  for (const auto *name : {"reset", "final"}) {
+    model->reset();
+    rejects<std::logic_error>([&] { model->read(test.fields.begin()->first, "output"); });
+    if (model->length()) {
+      throw std::runtime_error("reset retained the old position");
     }
-    progress.execution_seconds += elapsed(start);
-    ++progress.completed_steps;
-    if (model.length() != index + 1) {
-      throw std::runtime_error("decoder group committed the wrong position");
-    }
-    if ((final_only && index + 1 == count) || (!final_only && checkpoint(index, count))) {
-      progress.enter("readback");
-      capture(model, index, progress);
-    }
+    const bool final_only = std::string(name) == "final";
+    sequence(*model, test, name, std::min(final_only ? 32U : 8U, test.count), final_only);
   }
-  ++progress.completed_sequences;
-}
-
-void check_rejections(DecoderGroup &model, const std::vector<std::uint8_t> &input,
-                      Progress &progress) {
-  const auto length = model.length();
-  const auto before = model.metrics();
-  try {
-    model.step({});
-  } catch (const std::invalid_argument &) {
-    progress.invalid_input_rejected = true;
-  }
-  if (length == progress.config.kv.capacity) {
-    try {
-      model.step(input);
-    } catch (const std::out_of_range &) {
-      progress.capacity_rejected = true;
-    }
-    if (!progress.capacity_rejected) {
-      throw std::runtime_error("decoder accepted an out-of-capacity token");
-    }
-  }
-  const auto after = model.metrics();
-  if (!progress.invalid_input_rejected || model.length() != length) {
-    throw std::runtime_error("invalid input changed group state");
-  }
-  for (std::size_t index = 0; index < before.size(); ++index) {
-    if (before[index].steps != after[index].steps ||
-        before[index].cache_writes != after[index].cache_writes) {
-      throw std::runtime_error("rejected input executed a decoder layer");
-    }
-  }
-}
-
-void reset(DecoderGroup &model, Progress &progress) {
-  progress.enter("reset");
-  const auto start = Clock::now();
-  model.reset();
-  progress.reset_seconds += elapsed(start);
-  bool rejected = false;
-  try {
-    model.read(progress.first_layer, "output");
-  } catch (const std::logic_error &) {
-    rejected = true;
-  }
-  if (!rejected || model.length() != 0) {
-    throw std::runtime_error("reset exposed stale decoder output");
-  }
-  progress.empty_output_rejected = true;
-}
-
-void release(DecoderGroup &model, Progress &progress) {
-  progress.collect(model);
-  progress.enter("release");
-  const auto start = Clock::now();
-  model.close();
-  progress.release_seconds += elapsed(start);
+  model->close();
+  model = create();
+  sequence(*model, test, "fresh", std::min(8U, test.count), false);
+  model->close();
 }
 } // namespace
 
 int main(int argc, char **argv) {
   if (argc != 6) {
-    std::cerr << "usage: np101_decoder_check DEPLOYMENT FIXTURE OUTPUT STEPS FIRST_LAYER\n";
-    return 1;
+    std::cerr << "usage: np101_decoder_check opt|qwen DEPLOYMENT FIXTURE OUTPUT STEPS\n";
+    return 2;
   }
-  Progress progress{argv[3]};
   try {
-    const std::string count_text = argv[4], layer_text = argv[5];
-    if (count_text.empty() || count_text.find_first_not_of("0123456789") != std::string::npos ||
-        (layer_text.empty() || layer_text.find_first_not_of("0123456789") != std::string::npos)) {
-      throw std::invalid_argument("steps and first layer must be unsigned integers");
+    const std::string profile(argv[1]);
+    const fs::path fixture(argv[3]), output(argv[4]);
+    const auto counts = np101::parse_shape(argv[5]);
+    if (counts.size() != 1 || counts[0] < 2) {
+      throw std::invalid_argument("invalid step count");
     }
-    const auto count = std::stoul(count_text);
-    if (count < 2 || count > 512) {
-      throw std::invalid_argument("steps must be 2-512");
+    std::vector<unsigned> layers;
+    std::ifstream selected(fixture / "layers.txt");
+    unsigned layer;
+    while (selected >> layer) {
+      layers.push_back(layer);
     }
-    progress.first_layer = std::stoul(layer_text);
-    fs::create_directories(progress.directory);
-    progress.enter("validate");
-    const auto config = read_config(fs::path(argv[2]) / "components.txt");
-    if (count > config.kv.capacity) {
-      throw std::invalid_argument("steps exceed configured capacity");
+    if (!selected.eof() || layers.empty() || layers.size() > 4) {
+      throw std::invalid_argument("expected one to four layer indices");
     }
-    progress.config = config;
-    std::ifstream layer_file(fs::path(argv[2]) / "layers.txt");
-    unsigned index;
-    while (layer_file >> index) {
-      progress.selected.push_back(index);
-    }
-    if (!layer_file.eof() || progress.selected.empty() ||
-        progress.selected.front() != progress.first_layer) {
-      throw std::invalid_argument("invalid decoder layer list");
-    }
-    for (auto layer : progress.selected) {
-      progress.attention_layers += config.mixer(layer) == MixerKind::Attention;
-    }
-    WeightStore weights(argv[1]);
+    fs::create_directories(output);
+    DecoderCase test{output, counts[0], 0};
+    np101::WeightStore weights(argv[2]);
     weights.verify();
-    std::vector<std::vector<std::uint8_t>> inputs;
-    for (unsigned index = 0; index < count; ++index) {
-      inputs.push_back(specferry::testing::read_bytes(
-          argv[2], "input." + std::to_string(index) + ".bin", config.hidden_spec().bytes()));
+    // Input/config validation occurs before the factory opens the SDK context.
+    const auto load_inputs = [&](const np101::TensorSpec &spec) {
+      if (test.count > test.capacity) {
+        throw std::invalid_argument("steps exceed capacity");
+      }
+      for (unsigned i = 0; i < test.count; ++i) {
+        test.inputs.push_back(
+            testing::read_bytes(fixture, "input." + std::to_string(i) + ".bin", spec.bytes()));
+      }
+    };
+    np101::SdkTimings timings(output);
+    if (profile == "opt") {
+      const auto config = models::opt::read_config(fixture / "components.txt");
+      test.capacity = config.capacity;
+      test.uploads += layers.size();
+      test.control_bytes = 4 * layers.size();
+      for (auto index : layers) {
+        test.fields[index] = {"query",          "key",
+                              "value",          "probabilities",
+                              "mixer",          "attention_residual",
+                              "attention_norm", "fc1",
+                              "activation",     "mlp",
+                              "ffn_residual",   "output",
+                              "keys",           "values"};
+      }
+      load_inputs(config.hidden_spec());
+      models::opt::validate_weights(weights, config, layers);
+      np101::Context context;
+      trajectories(
+          [&] {
+            return std::make_unique<models::opt::DecoderSlice>(context, weights, config, layers);
+          },
+          test);
+      context.close();
+    } else if (profile == "qwen") {
+      const auto config = models::qwen3_5::read_config(fixture / "components.txt");
+      test.capacity = config.kv.capacity;
+      for (auto index : layers) {
+        auto &fields = test.fields[index];
+        fields = {"normalized", "mixer", "residual", "post_norm", "mlp", "output"};
+        if (config.mixer(index) == models::qwen3_5::MixerKind::Attention) {
+          fields.insert(fields.end(), {"keys", "values"});
+          test.uploads += 2;
+          test.control_bytes += 8;
+        } else {
+          fields.insert(fields.end(), {"recurrent", "convolution"});
+        }
+      }
+      load_inputs(config.hidden_spec());
+      np101::Context context;
+      trajectories(
+          [&] {
+            return std::make_unique<models::qwen3_5::DecoderGroup>(context, weights, config,
+                                                                   layers);
+          },
+          test);
+      context.close();
+    } else {
+      throw std::invalid_argument("unknown model profile");
     }
-
-    progress.enter("initialize");
-    Context context;
-    auto start = Clock::now();
-    DecoderGroup model(context, weights, config, progress.selected);
-    progress.initialization_seconds += elapsed(start);
-    run_sequence(model, inputs, count, "zero", false, progress);
-    check_rejections(model, inputs.front(), progress);
-
-    reset(model, progress);
-    run_sequence(model, inputs, std::min<unsigned>(8, count), "reset", false, progress);
-    reset(model, progress);
-    run_sequence(model, inputs, std::min<unsigned>(32, count), "final", true, progress);
-    release(model, progress);
-
-    progress.enter("recreate");
-    start = Clock::now();
-    DecoderGroup fresh(context, weights, config, progress.selected);
-    progress.initialization_seconds += elapsed(start);
-    run_sequence(fresh, inputs, std::min<unsigned>(8, count), "fresh", false, progress);
-    release(fresh, progress);
-    context.close();
-    progress.released = true;
-    progress.enter("complete");
-    progress.save("executed");
-    return 0;
+    std::ofstream out(output / "execution.json");
+    out << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"sequences\":4,"
+           "\"steps\":"
+        << test.count + std::min(32U, test.count) + 2 * std::min(8U, test.count) << "}\n";
+    return out ? 0 : 1;
   } catch (const std::exception &error) {
-    std::cerr << progress.phase << ": " << error.what() << '\n';
-    try {
-      progress.save("failed");
-    } catch (...) {
-      // Preserve the original fixture/SDK failure if report writing also fails.
-    }
+    std::cerr << error.what() << '\n';
     return 1;
   }
 }

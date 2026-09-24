@@ -7,7 +7,6 @@
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
-#include <chrono>
 #include <map>
 #include <stdexcept>
 
@@ -16,12 +15,7 @@ using namespace np101;
 using namespace np101::ops;
 
 namespace {
-using Clock = std::chrono::steady_clock;
 constexpr auto f16 = DataType::Float16;
-
-double elapsed(Clock::time_point start) {
-  return std::chrono::duration<double>(Clock::now() - start).count();
-}
 
 // Qwen chooses the norm convention; the arithmetic is shared with other callers.
 class DecoderGraph : public GraphBuilder {
@@ -56,7 +50,6 @@ struct DecoderLayer::Impl {
   std::unique_ptr<DeltaNet> delta;
   std::unique_ptr<Attention> attention;
   DecoderGraph feed_forward;
-  DecoderMetrics timings;
   std::size_t completed = 0;
   bool failed = false;
 
@@ -121,20 +114,13 @@ void DecoderLayer::step() {
     throw std::logic_error("decoder mixer position is inconsistent");
   }
   state.failed = true;
-  auto start = Clock::now();
   check(vsi_nn_RunGraph(state.normalization.graph.get()), "decoder input normalization");
-  state.timings.normalization_seconds += elapsed(start);
-  start = Clock::now();
   if (state.delta) {
     state.delta->step();
   } else {
     state.attention->step();
   }
-  state.timings.mixer_seconds += elapsed(start);
-  start = Clock::now();
   check(vsi_nn_RunGraph(state.feed_forward.graph.get()), "decoder residual and MLP");
-  state.timings.feed_forward_seconds += elapsed(start);
-  ++state.timings.steps;
   ++state.completed;
   state.failed = false;
 }
@@ -177,20 +163,6 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name) {
     return read_tensor(impl_->feed_forward.graph, outputs.at(name).id);
   }
   return impl_->delta ? impl_->delta->read(name) : impl_->attention->read(name);
-}
-
-DecoderMetrics DecoderLayer::metrics() const {
-  if (!impl_) {
-    return {};
-  }
-  auto result = impl_->timings;
-  if (impl_->attention) {
-    result.cache_writes = impl_->attention->cache_writes();
-    result.cache_revalidations = impl_->attention->cache_revalidations();
-    result.cache_write_seconds = impl_->attention->cache_write_seconds();
-    result.cache_revalidation_seconds = impl_->attention->cache_revalidation_seconds();
-  }
-  return result;
 }
 
 void DecoderLayer::close() {
@@ -313,16 +285,6 @@ std::vector<std::uint8_t> DecoderGroup::read(unsigned layer, const std::string &
     throw std::out_of_range("layer not in this decoder slice");
   }
   return impl_->layers.at(found - impl_->selected.begin())->read(name);
-}
-
-std::vector<DecoderMetrics> DecoderGroup::metrics() const {
-  std::vector<DecoderMetrics> result;
-  if (impl_) {
-    for (const auto &layer : impl_->layers) {
-      result.push_back(layer->metrics());
-    }
-  }
-  return result;
 }
 
 void DecoderGroup::close() {

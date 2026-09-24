@@ -256,18 +256,6 @@ std::vector<std::uint8_t> Attention::read(const std::string &name) {
   throw std::invalid_argument("unknown attention output: " + name);
 }
 
-std::size_t Attention::cache_writes() const { return impl_ ? impl_->cache.writes() : 0; }
-
-std::size_t Attention::cache_revalidations() const {
-  return impl_ ? impl_->cache.revalidations() : 0;
-}
-
-double Attention::cache_write_seconds() const { return impl_ ? impl_->cache.write_seconds() : 0; }
-
-double Attention::cache_revalidation_seconds() const {
-  return impl_ ? impl_->cache.revalidation_seconds() : 0;
-}
-
 void Attention::close() {
   if (impl_) {
     impl_->reader.graph.close();

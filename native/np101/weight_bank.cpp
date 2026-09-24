@@ -1,8 +1,5 @@
 #include "np101/weight_bank.hpp"
 
-#include <cstdlib>
-#include <fstream>
-#include <iostream>
 #include <stdexcept>
 
 namespace specferry::np101 {
@@ -35,47 +32,14 @@ vsi_nn_tensor_id_t WeightBank::bind(Graph &receiver, const WeightStore &store,
 
 std::size_t WeightBank::payload_bytes() const { return bytes_; }
 
-void WeightBank::verify_if_requested(const char *phase) {
-  const auto *path = std::getenv("SPECFERRY_WEIGHT_READBACK_REPORT");
-  if (!path || !*path || tensors_.empty()) {
-    return;
-  }
-  std::ofstream report(path, std::ios::app);
-  std::cout << "Checking all shared weights " << phase << ": " << bytes_ << " bytes" << std::endl;
-  std::size_t mismatches = 0;
+void WeightBank::verify() {
   for (const auto &[key, chunk] : tensors_) {
     const auto &[name, offset, shape] = key;
     const auto expected = source_->read(source_->find(name), offset, chunk.bytes);
-    const auto actual = read_tensor(storage_, chunk.id);
-    if (actual.size() != expected.size()) {
-      throw std::runtime_error("weight readback size differs: " + name);
+    if (read_tensor(storage_, chunk.id) != expected) {
+      throw std::runtime_error("shared weight readback mismatch: " + name + " at chunk offset " +
+                               std::to_string(offset));
     }
-    std::size_t different = 0, first = 0;
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-      if (actual[index] != expected[index]) {
-        if (!different) {
-          first = index;
-        }
-        ++different;
-      }
-    }
-    // Offsets refer to checkpoint tensor bytes, never physical addresses.
-    report << phase << '\t' << name << '\t' << offset << '\t' << chunk.bytes << '\t' << different
-           << '\t';
-    if (different) {
-      report << offset + first;
-    } else {
-      report << '-';
-    }
-    report << std::endl;
-    if (!report) {
-      throw std::runtime_error("cannot save shared weight readback");
-    }
-    mismatches += different;
-  }
-  if (mismatches) {
-    throw std::runtime_error(std::string("shared weight corruption ") + phase + ": " +
-                             std::to_string(mismatches) + " bytes; see weight-readback.tsv");
   }
 }
 

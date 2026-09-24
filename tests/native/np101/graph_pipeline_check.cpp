@@ -1,4 +1,4 @@
-#include "case_file.hpp"
+#include "binary_io.hpp"
 #include "models/opt/config.hpp"
 #include "models/opt/graph_model.hpp"
 #include "models/opt/layer.hpp"
@@ -140,7 +140,7 @@ void lookup_check(Context &context, const WeightStore &weights, const fs::path &
       throw std::out_of_range("lookup fixture position exceeds capacity");
     }
     const auto prefix = "case." + std::to_string(step);
-    TimingLabel request(TimingField::Request, prefix);
+
     report.phase(prefix);
     upload_tensor(g.graph, controls.id, integers({id, index, index}));
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(g.graph.get()); }),
@@ -167,7 +167,7 @@ void lookup_check(Context &context, const WeightStore &weights, const fs::path &
     throw std::runtime_error("lookup fixture has no cases");
   }
   report.compare("weight.after_run", read_tensor(g.graph, blocks.front().id), first_block, f16);
-  bank.verify_if_requested("after_run");
+  bank.verify();
   report.phase("release");
   g.graph.close();
   bank.close();
@@ -220,7 +220,7 @@ void layer_check(Context &context, const WeightStore &weights, const fs::path &f
 
   for (unsigned step = 0; step < 2; ++step) {
     const auto label = "step." + std::to_string(step);
-    TimingLabel request(TimingField::Request, label);
+
     report.phase(label);
     auto input = specferry::testing::read_bytes(fixture, "input." + std::to_string(step) + ".bin",
                                                 hidden.spec.bytes());
@@ -254,7 +254,7 @@ void layer_check(Context &context, const WeightStore &weights, const fs::path &f
       break;
     }
   }
-  bank.verify_if_requested("after_run");
+  bank.verify();
   report.phase("release");
   g.graph.close();
   storage.close();
@@ -324,7 +324,6 @@ int main(int argc, char **argv) {
     }
     context.close();
     report.phase(report.failures ? "numerical_failure" : "complete", true);
-    timings.save();
     std::cout << report.checks << " checks; " << report.failures << " failures" << std::endl;
     return report.failures ? 1 : 0;
   } catch (const std::exception &error) {

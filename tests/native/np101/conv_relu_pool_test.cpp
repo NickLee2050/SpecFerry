@@ -1,85 +1,32 @@
-#include "gc_hal.h"
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <exception>
-#include <fstream>
 #include <initializer_list>
-#include <iomanip>
-#include <ios>
 #include <iostream>
 #include <memory>
-#include <ratio>
-#include <sstream>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 using specferry::np101::check;
-using Clock = std::chrono::steady_clock;
-
-struct Options {
-  std::string output;
-  unsigned repeats = 10;
-};
-
-struct DeviceInfo {
-  std::string target;
-  std::array<char, VX_MAX_IMPLEMENTATION_NAME> implementation{};
-  vx_status implementation_status{};
-  gceSTATUS memory_status{};
-  gctSIZE_T internal_bytes = 0;
-  gctSIZE_T external_bytes = 0;
-  gctSIZE_T contiguous_bytes = 0;
-};
 
 struct ConvolutionData {
   std::vector<float> input, weights, bias;
-  // Keep tensor initialization buffers alive until the graph is released.
-  std::vector<uint8_t> input_fp16, weights_fp16, bias_fp16;
+  std::vector<std::uint8_t> input_fp16, weights_fp16, bias_fp16;
 };
 
 struct GraphIO {
-  vsi_nn_tensor_id_t input;
-  vsi_nn_tensor_id_t output;
+  vsi_nn_tensor_id_t input, output;
 };
-
-struct PhaseTimings {
-  double initialize_ms = 0;
-  double setup_ms = 0;
-  double verify_ms = 0;
-  double release_ms = 0;
-};
-
-static double elapsed(Clock::time_point start) {
-  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-}
-
-static std::string quote(const std::string &value) {
-  std::ostringstream out;
-  out << '"';
-  for (unsigned char c : value) {
-    if (c == '"' || c == '\\') {
-      out << '\\' << c;
-    } else if (c < 32) {
-      out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(c);
-    } else {
-      out << c;
-    }
-  }
-  out << '"';
-  return out.str();
-}
 
 static vsi_nn_dtype_t dtype() {
   vsi_nn_dtype_t d{};
@@ -160,52 +107,6 @@ static std::vector<float> golden(const std::vector<float> &x, const std::vector<
   return out;
 }
 
-static void parse_options(int argc, char **argv, Options &options) {
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    if (arg == "--output" && i + 1 < argc) {
-      options.output = argv[++i];
-    } else if (arg == "--repeats" && i + 1 < argc) {
-      std::string value = argv[++i];
-      size_t used = 0;
-      unsigned long n = std::stoul(value, &used);
-      if (used != value.size() || n < 1 || n > 1000) {
-        throw std::runtime_error("invalid repeats");
-      }
-      options.repeats = n;
-    } else {
-      throw std::runtime_error(
-          "usage: np101_conv_relu_pool_test --output report.json [--repeats 10]");
-    }
-  }
-  if (options.output.empty()) {
-    throw std::runtime_error("--output is required");
-  }
-}
-
-static void write_running_report(const std::string &output) {
-  std::ofstream report(output);
-  if (!report) {
-    throw std::runtime_error("cannot write report: " + output);
-  }
-  report << "{\"status\":\"running\"}\n";
-}
-
-static DeviceInfo query_device_info(const specferry::np101::Context &context) {
-  DeviceInfo info;
-  info.target.assign(context.get()->config.target_name,
-                     strnlen(context.get()->config.target_name, VSI_NN_MAX_TARGET_NAME));
-  info.implementation_status =
-      vxQueryContext(context.get()->c, VX_CONTEXT_IMPLEMENTATION, info.implementation.data(),
-                     info.implementation.size());
-
-  gctUINT32 internal_name = 0, external_name = 0, contiguous_name = 0;
-  info.memory_status =
-      gcoHAL_QueryVideoMemory(nullptr, &internal_name, &info.internal_bytes, &external_name,
-                              &info.external_bytes, &contiguous_name, &info.contiguous_bytes);
-  return info;
-}
-
 static ConvolutionData make_test_data() {
   std::srand(42);
   auto random_data = [](size_t n) {
@@ -284,137 +185,50 @@ static GraphIO build_convolution_graph(specferry::np101::Graph &owner, Convoluti
   return {input, output};
 }
 
-static void run_iterations(vsi_nn_graph_t *graph, const GraphIO &io, const ConvolutionData &data,
-                           unsigned repeats, std::string &phase, std::ostringstream &records) {
-  records << std::setprecision(10);
-  for (unsigned iteration = 0; iteration < repeats; ++iteration) {
-    // Vary input while reusing the graph and weights to detect stale output.
-    auto current = data.input;
-    for (auto &value : current) {
-      value += static_cast<float>(iteration) * .03125f;
-    }
-    auto expected = golden(current, data.weights, data.bias);
-    auto input_bytes = f16(current);
-
-    // Measure input upload, SDK execution, and output readback separately.
-    auto start = Clock::now();
-    check(vsi_nn_CopyDataToTensor(graph, vsi_nn_GetTensor(graph, io.input), input_bytes.data()),
-          "CopyDataToTensor(iteration)");
-    double upload_ms = elapsed(start);
-
-    phase = "run[" + std::to_string(iteration) + "]";
-    start = Clock::now();
-    check(vsi_nn_RunGraph(graph), "RunGraph");
-    double run_ms = elapsed(start);
-
-    start = Clock::now();
-    std::unique_ptr<float, decltype(&std::free)> values(
-        vsi_nn_ConvertTensorToFloat32Data(graph, vsi_nn_GetTensor(graph, io.output)), &std::free);
-    if (!values) {
-      throw std::runtime_error("readback returned null");
-    }
-    double readback_ms = elapsed(start);
-
-    // Compare every output with the FP32 CPU reference before recording success.
-    double max_error = 0, output_sum = 0;
-    for (size_t i = 0; i < expected.size(); ++i) {
-      if (!std::isfinite(values.get()[i]) || !std::isfinite(expected[i])) {
-        throw std::runtime_error("nonfinite output at " + std::to_string(i));
-      }
-      double error = std::abs(values.get()[i] - expected[i]);
-      output_sum += values.get()[i];
-      max_error = std::max(max_error, error);
-      if (error > .1) {
-        throw std::runtime_error("FP16 comparison failed at " + std::to_string(i));
-      }
-    }
-
-    if (iteration) {
-      records << ',';
-    }
-    records << "{\"iteration\":" << iteration << ",\"run_ms\":" << run_ms
-            << ",\"input_upload_ms\":" << upload_ms << ",\"readback_ms\":" << readback_ms
-            << ",\"output_sum\":" << output_sum << ",\"max_abs_error\":" << max_error << '}';
-    std::cout << "iteration=" << iteration << " run_ms=" << run_ms << " max_abs_error=" << max_error
-              << '\n';
-  }
-}
-
-static void write_success_report(const std::string &output, const DeviceInfo &device,
-                                 const PhaseTimings &timings, const std::string &records) {
-  std::ofstream report(output);
-  report << "{\"status\":\"numerical_pass\",\"hardware_execution_proven\":false,"
-         << "\"evidence_note\":\"Correlate this run with driver trace; SDK target alone is "
-            "insufficient.\","
-         << "\"graph\":\"CONV2D-RELU-POOL\",\"dtype\":\"FP16\",\"output_shape\":[1,4,4,4],"
-         << "\"atol\":0.1,\"context_target\":" << quote(device.target)
-         << ",\"implementation_query_status\":" << device.implementation_status
-         << ",\"implementation\":" << quote(device.implementation.data())
-         << ",\"memory_query\":{\"status\":" << device.memory_status
-         << ",\"internal_bytes\":" << device.internal_bytes
-         << ",\"external_bytes\":" << device.external_bytes
-         << ",\"contiguous_bytes\":" << device.contiguous_bytes
-         << ",\"meaning\":\"HAL pool sizes; not measured free model memory\"},"
-         << "\"initialize_ms\":" << timings.initialize_ms << ",\"setup_ms\":" << timings.setup_ms
-         << ",\"verify_ms\":" << timings.verify_ms << ",\"release_ms\":" << timings.release_ms
-         << ",\"handles_cleared\":true,\"iterations\":[" << records << "]}\n";
-  if (!report) {
-    throw std::runtime_error("report write failed");
-  }
-}
-
-int main(int argc, char **argv) {
-  std::cout << std::unitbuf;
-  Options options;
-  PhaseTimings timings;
-  std::string phase = "arguments";
-  std::ostringstream records;
-
+int main() {
   try {
-    // Validate arguments and create the report before opening the device.
-    parse_options(argc, argv, options);
-    write_running_report(options.output);
-
-    // Initialize the SDK, capture device information, and construct the graph.
-    phase = "initialize";
-    auto start = Clock::now();
-    specferry::np101::Context context;
-    auto device = query_device_info(context);
+    specferry::np101::SdkTimings timings(".");
     auto data = make_test_data();
+    specferry::np101::Context context;
     specferry::np101::Graph graph(context, 6, 3);
-    auto io = build_convolution_graph(graph, data);
-    timings.initialize_ms = elapsed(start);
-
-    // Prepare and verify once; every iteration reuses this graph.
-    phase = "setup";
-    start = Clock::now();
-    check(vsi_nn_SetupGraph(graph.get(), FALSE), "SetupGraph");
-    timings.setup_ms = elapsed(start);
-
-    phase = "verify";
-    start = Clock::now();
-    check(vsi_nn_VerifyGraph(graph.get()), "VerifyGraph");
-    timings.verify_ms = elapsed(start);
-
-    // Run varying inputs, compare SDK outputs with CPU references, and collect timings.
-    run_iterations(graph.get(), io, data, options.repeats, phase, records);
-
-    // Release the graph before its context, then publish the completed report.
-    phase = "release";
-    start = Clock::now();
+    const auto io = build_convolution_graph(graph, data);
+    check(specferry::np101::sdk_call("vsi_nn_SetupGraph",
+                                     [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
+          "SetupGraph");
+    check(specferry::np101::sdk_call("vsi_nn_VerifyGraph",
+                                     [&] { return vsi_nn_VerifyGraph(graph.get()); }),
+          "VerifyGraph");
+    for (unsigned iteration = 0; iteration < 2; ++iteration) {
+      auto input = data.input;
+      for (auto &value : input) {
+        value += iteration * .03125f;
+      }
+      const auto expected = golden(input, data.weights, data.bias);
+      specferry::np101::upload_tensor(graph, io.input, f16(input));
+      check(specferry::np101::sdk_call("vsi_nn_RunGraph",
+                                       [&] { return vsi_nn_RunGraph(graph.get()); }),
+            "RunGraph");
+      std::unique_ptr<float, decltype(&std::free)> actual(
+          vsi_nn_ConvertTensorToFloat32Data(graph.get(), vsi_nn_GetTensor(graph.get(), io.output)),
+          &std::free);
+      if (!actual) {
+        throw std::runtime_error("null convolution readback");
+      }
+      float maximum = 0;
+      for (std::size_t i = 0; i < expected.size(); ++i) {
+        const auto error = std::abs(actual.get()[i] - expected[i]);
+        if (!std::isfinite(actual.get()[i]) || error > .1f) {
+          throw std::runtime_error("convolution mismatch at output " + std::to_string(i));
+        }
+        maximum = std::max(maximum, error);
+      }
+      std::cout << "PASS iteration=" << iteration << " max_abs_error=" << maximum << std::endl;
+    }
     graph.close();
     context.close();
-    timings.release_ms = elapsed(start);
-    write_success_report(options.output, device, timings, records.str());
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "FAIL phase=" << phase << ": " << error.what() << '\n';
-    if (!options.output.empty()) {
-      std::ofstream failed(options.output);
-      failed << "{\"status\":\"failed\",\"phase\":" << quote(phase)
-             << ",\"error\":" << quote(error.what()) << ",\"iterations\":[" << records.str()
-             << "]}\n";
-    }
+    std::cerr << error.what() << '\n';
     return 1;
   }
 }

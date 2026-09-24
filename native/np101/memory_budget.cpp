@@ -44,10 +44,4 @@ std::size_t MemoryBudget::live(bool constant) const { return state_->live[consta
 
 std::size_t MemoryBudget::peak(bool constant) const { return state_->peak[constant]; }
 
-void MemoryBudget::write(std::ostream &output) const {
-  output << "{\"policy\":\"const-and-nonconst-1gib\",\"segment_limit_bytes\":" << state_->limit
-         << ",\"const_live_bytes\":" << live(true) << ",\"const_peak_bytes\":" << peak(true)
-         << ",\"nonconst_live_bytes\":" << live(false) << ",\"nonconst_peak_bytes\":" << peak(false)
-         << ",\"sdk_internal_allocations_included\":false,\"physical_limit_proven\":false}\n";
-}
 } // namespace specferry::np101

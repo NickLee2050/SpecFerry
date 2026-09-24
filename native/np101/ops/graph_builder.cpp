@@ -321,10 +321,6 @@ Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float s
 }
 
 void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
-  graph.save_memory_report();
-  if (weights_) {
-    weights_->verify_if_requested("before_setup");
-  }
   std::vector<vsi_nn_tensor_id_t> input_ids, output_ids;
   for (const auto &input : inputs) {
     input_ids.push_back(input.id);
@@ -339,13 +335,7 @@ void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<
   }
   check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
         "SetupGraph");
-  if (weights_) {
-    weights_->verify_if_requested("after_setup");
-  }
   check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(graph.get()); }),
         "VerifyGraph");
-  if (weights_) {
-    weights_->verify_if_requested("after_verify");
-  }
 }
 } // namespace specferry::np101::ops

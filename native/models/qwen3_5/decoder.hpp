@@ -16,17 +16,6 @@ using np101::Context;
 using np101::TensorBinding;
 using np101::WeightStore;
 
-struct DecoderMetrics {
-  std::size_t steps = 0;
-  std::size_t cache_writes = 0;
-  std::size_t cache_revalidations = 0;
-  double cache_write_seconds = 0;
-  double cache_revalidation_seconds = 0;
-  double normalization_seconds = 0;
-  double mixer_seconds = 0;
-  double feed_forward_seconds = 0;
-};
-
 // One complete layer, with an immutable input binding and fixed output storage.
 // Context and input owner outlive the layer. Execution is synchronous.
 class DecoderLayer {
@@ -42,7 +31,6 @@ public:
   std::size_t length() const;
   TensorBinding output();
   std::vector<std::uint8_t> read(const std::string &name);
-  DecoderMetrics metrics() const;
   void close();
 
 private:
@@ -65,7 +53,6 @@ public:
   void reset();
   std::size_t length() const;
   std::vector<std::uint8_t> read(unsigned layer, const std::string &name);
-  std::vector<DecoderMetrics> metrics() const;
   void close();
 
 private:

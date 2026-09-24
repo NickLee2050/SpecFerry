@@ -32,9 +32,6 @@ public:
   void reset();
   unsigned length() const;
   std::size_t cache_writes() const;
-  double cache_write_seconds() const;
-  double cache_revalidation_seconds() const;
-  std::size_t cache_revalidations() const;
   std::vector<std::uint8_t> read(unsigned layer, const std::string &name);
   void close();
 

@@ -4,7 +4,6 @@
 #include "np101/tensor_spec.hpp"
 
 #include <array>
-#include <chrono>
 #include <stdexcept>
 
 namespace specferry::np101 {
@@ -53,8 +52,6 @@ struct KvCache::Impl {
   Graph copy;
   std::size_t completed_writes = 0;
   std::size_t revalidations = 0;
-  double write_seconds = 0;
-  double revalidation_seconds = 0;
 
   Impl(Context &context, Graph &producer, vsi_nn_tensor_id_t key, vsi_nn_tensor_id_t value,
        KvSpec requested_spec)
@@ -121,7 +118,6 @@ void KvCache::write(unsigned position) {
     throw std::out_of_range("KV write position exceeds capacity or cache is closed");
   }
   auto graph = impl_->copy.get()->g;
-  const auto start = std::chrono::steady_clock::now();
   check(sdk_call("vxSetGraphParameterByIndex.key",
                  [&] {
                    return vxSetGraphParameterByIndex(
@@ -137,17 +133,12 @@ void KvCache::write(unsigned position) {
                  }),
         "select value slot");
   if (!vxIsGraphVerified(graph)) {
-    const auto verify_start = std::chrono::steady_clock::now();
     ++impl_->revalidations;
     check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(graph); }),
           "reverify KV slot-copy graph");
-    impl_->revalidation_seconds +=
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - verify_start).count();
   }
   check(sdk_call("vxProcessGraph", [&] { return vxProcessGraph(graph); }), "write KV slot");
   ++impl_->completed_writes;
-  impl_->write_seconds +=
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
 vsi_nn_tensor_id_t KvCache::retain_keys(Graph &reader) {
@@ -190,10 +181,6 @@ unsigned KvCache::capacity() const { return impl_ ? impl_->capacity : 0; }
 std::size_t KvCache::writes() const { return impl_ ? impl_->completed_writes : 0; }
 
 std::size_t KvCache::revalidations() const { return impl_ ? impl_->revalidations : 0; }
-
-double KvCache::write_seconds() const { return impl_ ? impl_->write_seconds : 0; }
-
-double KvCache::revalidation_seconds() const { return impl_ ? impl_->revalidation_seconds : 0; }
 
 void KvCache::close() {
   if (impl_) {
