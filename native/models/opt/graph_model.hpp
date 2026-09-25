@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace specferry::models::opt {
@@ -22,6 +23,10 @@ public:
   GraphModel &operator=(const GraphModel &) = delete;
 
   inference::Generation generate(const std::vector<std::int32_t> &prompt, unsigned maximum);
+  // Advance one teacher-forced token without resetting the existing cache.
+  void step(std::int32_t token);
+  // Diagnostic readback of existing tensors; no extra graph outputs or nodes.
+  std::vector<std::uint8_t> read_input(const std::string &name);
   std::vector<std::uint8_t> read_cache(unsigned layer, bool values);
   std::size_t launches() const;
   std::size_t weight_bytes() const;

@@ -10,10 +10,104 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from specferry.models.opt.graph_validation import evaluate
+from specferry.data.checkpoint import sha256
+from specferry.models.opt.config import Components
+from specferry.models.opt.graph_validation import evaluate, validate_prefix_fixture
 from specferry.models.opt.metrics import summarize
 from specferry.validation.allocation import MIB, capacity_result, check_segment_budget
 from specferry.validation.arrays import compare_arrays
+
+
+class PrefixFixtureTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        config = {
+            "hidden_size": 4,
+            "ffn_dim": 8,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "word_embed_proj_dim": 2,
+            "vocab_size": 5,
+            "max_position_embeddings": 8,
+            "bos_token_id": 2,
+            "eos_token_id": 2,
+            "pad_token_id": 1,
+        }
+        (self.root / "deployment-manifest.json").write_text(json.dumps({"config": config}))
+        Components(4, 8, 2, 1, 4).write(self.root / "components.txt")
+        (self.root / "model.txt").write_text("specferry-opt-model 1\n2 5 8 2 4096 2 2 1\n")
+        (self.root / "tokens.txt").write_text("2 3\n")
+        observations = {}
+        for step in range(2):
+            shapes = {
+                "lookup": (1, 1, 2),
+                "input_projection": (1, 1, 4),
+                "position_embedding": (1, 1, 4),
+                "embedding": (1, 1, 4),
+                "projected": (1, 1, 2),
+                "logits": (1, 1, 5),
+                "layer.0": (1, 1, 4),
+                "layer.0.keys": (2, step + 1, 2),
+                "layer.0.values": (2, step + 1, 2),
+            }
+            for name, shape in shapes.items():
+                key = f"teacher.{step}.{name}"
+                values = np.ones(shape, dtype="<f2")
+                values.tofile(self.root / f"{key}.bin")
+                observations[key] = {"shape": list(shape), "dtype": "<f2", "bytes": values.nbytes}
+        self.metadata = {
+            "mode": "prefix",
+            "layers": 1,
+            "count": 2,
+            "capacity": 4,
+            "tokens": [0, 0],
+            "observations": observations,
+            "manifest_sha256": sha256(self.root / "deployment-manifest.json"),
+            "reference_checks": {"cached_logits": {"passed": True}},
+            "fixture_sha256": {path.name: sha256(path) for path in self.root.iterdir()},
+        }
+        self.save()
+
+    def save(self):
+        (self.root / "reference.json").write_text(json.dumps(self.metadata))
+
+    def validate(self, layers=1):
+        return validate_prefix_fixture(self.root, self.root, layers)
+
+    def test_truncated_reference_accepts_only_matching_depth_and_valid_prefix_shapes(self):
+        self.assertEqual(self.validate()["layers"], 1)
+        with self.assertRaisesRegex(ValueError, "layer count"):
+            self.validate(layers=2)
+        key = "teacher.1.layer.0.keys"
+        self.metadata["observations"][key]["shape"] = [2, 4, 2]
+        self.save()
+        with self.assertRaisesRegex(ValueError, "shape"):
+            self.validate()
+
+    def test_stale_files_and_full_model_native_configuration_are_rejected(self):
+        path = self.root / "teacher.0.lookup.bin"
+        path.write_bytes(bytes(path.stat().st_size))
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.validate()
+        self.metadata["fixture_sha256"][path.name] = sha256(path)
+        Components(4, 8, 2, 2, 4).write(self.root / "components.txt")
+        self.metadata["fixture_sha256"]["components.txt"] = sha256(self.root / "components.txt")
+        self.save()
+        with self.assertRaisesRegex(ValueError, "native configuration"):
+            self.validate()
+
+    def test_unchecked_cpu_reference_and_wrong_expected_token_are_rejected(self):
+        self.metadata["reference_checks"]["cached_logits"]["passed"] = False
+        self.save()
+        with self.assertRaisesRegex(ValueError, "consistency"):
+            self.validate()
+        self.metadata["reference_checks"]["cached_logits"]["passed"] = True
+        self.metadata["tokens"][1] = 4
+        self.save()
+        with self.assertRaisesRegex(ValueError, "logits"):
+            self.validate()
 
 
 class ValidationTests(unittest.TestCase):

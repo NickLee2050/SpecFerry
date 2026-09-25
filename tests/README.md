@@ -52,8 +52,11 @@ and FP32 recurrent-state reference policies. No Qwen full-model deployment is cl
 python scripts/check_np101.py lookup --output .cache/runs/lookup
 python scripts/check_np101.py layer --fixture .cache/runs/opt-prepared/fixture \
   --output .cache/runs/layer
-python scripts/check_np101.py prefix --fixture .cache/runs/teacher-prepared/fixture \
-  --layer-count 1 --timeout 360 --output .cache/runs/prefix
+python scripts/check_np101.py prefix --layer-count 1 --steps 2 --capacity 16 \
+  --prepare-only --output .cache/runs/prefix-prepared
+# Run only after device recovery has been confirmed:
+python scripts/check_np101.py prefix --fixture .cache/runs/prefix-prepared/fixture \
+  --layer-count 1 --sdk-timing --output .cache/runs/prefix
 python scripts/generate_opt.py --backend graph --block 1 --capacity 16 \
   --max-new-tokens 4 --output .cache/runs/graph-decode
 ```
@@ -61,6 +64,29 @@ python scripts/generate_opt.py --backend graph --block 1 --capacity 16 \
 Run one case at a time after device recovery. `layer` requires layer 0 with at least
 two reference steps. For real-weight lookup, prepare `io --prepare-only`, then pass
 its fixture to `lookup --fixture`. Partial-prefix predictions are diagnostic, not meaningful text.
+`prefix` requires its own reference with exactly the requested layer count and two
+teacher-forced tokens. A full-model `teacher` fixture is rejected. Preparation checks
+cached CPU logits/KV against a fresh forward of the same truncated model; reuse checks
+file hashes, dimensions, FP16 data and the native configuration before opening NP101.
+The default process deadline is 360 s for `prefix` (the previous one-layer Verify alone
+took 158 s), and 120 s for other cases. A deadline does not guarantee safe device recovery.
+
+The prefix diagnostic reads existing token/position/slot, lookup, input projection,
+position embedding and decoder-input tensors after each step, stopping at the first
+mismatch. It adds no SDK nodes or graph outputs, and leaves normal generation free of
+these readbacks. It then retains the existing final KV-prefix comparison. Passing this
+input/KV diagnosis is not acceptance of the layer outputs or LM head.
+
+The native reference-size check is also available without opening the device:
+
+```bash
+build/tests/np101_graph_pipeline_check .cache/np101/opt-350m \
+  .cache/runs/prefix-prepared/fixture .cache/runs/prefix-preflight prefix 1 --check-fixture
+```
+
+Real-weight lookup checks row selection exactly, including FP16 subnormal values;
+block selection must not add or otherwise round the selected row. Prefix checks
+compare only consumed KV rows within each head, excluding unused cache capacity.
 The production path no longer performs automatic weight readback while compiling;
 lookup/layer tests explicitly verify their shared weight banks after execution.
 

@@ -10,6 +10,7 @@
 #include "vsi_nn_pub.h"
 
 #include <cstring>
+#include <map>
 #include <stdexcept>
 
 namespace specferry::models::opt {
@@ -60,6 +61,7 @@ class ExecutionGraph : public GraphBuilder {
 public:
   const unsigned block;
   Tensor controls, selected;
+  std::map<std::string, Tensor> input_tensors;
 
   ExecutionGraph(Context &context, const WeightStore &weights, WeightBank &bank,
                  CacheStorage &cache, const ModelConfig &config, unsigned tokens)
@@ -77,11 +79,18 @@ public:
     auto limits = binary(VSI_NN_OP_ADD, positions, integer(1));
     auto table = vocabulary(weights, config);
     auto embedding = lookup_blocks(*this, table, ids);
-    auto hidden = project(embedding, weights, weights.find("decoder.project_in.weight"));
+    auto projected_input = project(embedding, weights, weights.find("decoder.project_in.weight"));
     const auto &record = weights.find("decoder.embed_positions.weight");
     auto learned = gather(weight(weights, record, record.spec),
                           binary(VSI_NN_OP_ADD, positions, integer(config.position_offset)), 1);
-    hidden = binary(VSI_NN_OP_ADD, hidden, learned);
+    auto hidden = binary(VSI_NN_OP_ADD, projected_input, learned);
+    input_tensors = {{"token", ids},
+                     {"position", positions},
+                     {"slot", slot},
+                     {"lookup", embedding},
+                     {"input_projection", projected_input},
+                     {"position_embedding", learned},
+                     {"embedding", hidden}};
 
     for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
       const auto qkv = build_projections(*this, weights, config.decoder, layer, hidden);
@@ -230,6 +239,21 @@ inference::Generation GraphModel::generate(const std::vector<std::int32_t> &prom
          }
        }},
       prompt, maximum);
+}
+
+void GraphModel::step(std::int32_t token) {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("closed or failed graph model");
+  }
+  impl_->consume({token});
+}
+
+std::vector<std::uint8_t> GraphModel::read_input(const std::string &name) {
+  if (!impl_ || impl_->failed || !impl_->latest) {
+    throw std::logic_error("no completed graph input is available");
+  }
+  auto &execution = *impl_->latest;
+  return read_tensor(execution.graph, execution.input_tensors.at(name).id);
 }
 
 std::vector<std::uint8_t> GraphModel::read_cache(unsigned layer, bool values) {

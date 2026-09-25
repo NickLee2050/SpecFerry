@@ -29,7 +29,7 @@ def prepare(args, fixture):
             args.model,
             args.checkpoint,
             fixture,
-            "teacher" if args.case != "io" else "io",
+            args.case,
             args.layer_count if args.case in ("teacher", "prefix") else 24,
             args.capacity,
             args.steps,
@@ -78,7 +78,7 @@ def main():
     parser.add_argument("--layer-count", type=int, default=1, help="teacher/prefix layer count")
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--capacity", type=int, default=16)
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--timeout", type=int, help="seconds; default: prefix 360, other cases 120")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--sdk-timing", action="store_true")
     parser.add_argument("--trace-driver", action="store_true")
@@ -105,8 +105,10 @@ def main():
         raise ValueError("fixture and deployment manifest differ")
     if args.case == "layer" and (0 not in metadata["layers"] or metadata["steps"] < 2):
         raise ValueError("integrated layer diagnosis requires layer 0 and two reference steps")
-    if args.case == "prefix" and args.layer_count > metadata["layers"]:
-        raise ValueError("prefix exceeds prepared reference layers")
+    if args.case == "prefix":
+        from specferry.models.opt.graph_validation import validate_prefix_fixture
+
+        metadata = validate_prefix_fixture(args.model, fixture, args.layer_count)
     if args.prepare_only:
         print(f"Prepared: {fixture}")
         return 0
@@ -154,7 +156,7 @@ def main():
             arguments,
             device,
             Path("/usr/lib/ljmicro"),
-            args.timeout,
+            args.timeout if args.timeout is not None else (360 if args.case == "prefix" else 120),
             sdk_timing=args.sdk_timing,
             trace_driver=args.trace_driver,
         )

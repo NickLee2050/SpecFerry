@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -261,34 +263,97 @@ void layer_check(Context &context, const WeightStore &weights, const fs::path &f
   bank.close();
 }
 
-void prefix_check(Context &context, const WeightStore &weights, const fs::path &fixture,
-                  Report &report, unsigned layers) {
-  auto config = opt::read_model_config(fixture);
-  if (!layers || layers > config.decoder.layers) {
-    throw std::invalid_argument("diagnostic prefix exceeds decoder layer count");
+struct PrefixReference {
+  opt::ModelConfig config;
+  std::vector<std::int32_t> tokens = std::vector<std::int32_t>(2);
+  std::vector<std::map<std::string, std::vector<std::uint8_t>>> steps{2};
+
+  PrefixReference(const fs::path &fixture, unsigned layers)
+      : config(opt::read_model_config(fixture)) {
+    if (!layers || layers != config.decoder.layers || config.decoder.capacity < tokens.size()) {
+      throw std::invalid_argument("prepare a prefix fixture with exactly the requested layers");
+    }
+    std::ifstream source(fixture / "tokens.txt");
+    std::string extra;
+    if (!(source >> tokens[0] >> tokens[1]) || source >> extra) {
+      throw std::invalid_argument("prefix fixture needs exactly two teacher tokens");
+    }
+    // Validate all reference sizes before Context opens the board, including
+    // truncated-model outputs reserved for the subsequent head diagnosis.
+    for (unsigned step = 0; step < tokens.size(); ++step) {
+      config.validate_token(tokens[step]);
+      auto read = [&](const std::string &name, std::size_t elements) {
+        steps[step][name] = specferry::testing::read_bytes(
+            fixture, "teacher." + std::to_string(step) + "." + name + ".bin", elements * 2);
+      };
+      read("lookup", config.embedding);
+      for (const auto *name : {"input_projection", "position_embedding", "embedding"}) {
+        read(name, config.decoder.hidden);
+      }
+      read("projected", config.embedding);
+      read("logits", config.vocabulary);
+      for (unsigned layer = 0; layer < layers; ++layer) {
+        const auto prefix = "layer." + std::to_string(layer);
+        read(prefix, config.decoder.hidden);
+        for (const auto *name : {"keys", "values"}) {
+          read(prefix + "." + name, config.decoder.hidden * (step + 1));
+        }
+      }
+    }
   }
-  // This is a diagnostic truncation, not a supported text-generation model.
-  // KV in a prefix is independent of later layers and can use the full CPU oracle.
-  config.decoder.layers = layers;
-  std::ifstream source(fixture / "tokens.txt");
-  std::vector<std::int32_t> prompt(2);
-  if (!(source >> prompt[0] >> prompt[1])) {
-    throw std::invalid_argument("prefix fixture needs two teacher tokens");
+};
+
+bool compare_inputs(opt::GraphModel &model, const PrefixReference &reference, unsigned step,
+                    Report &report) {
+  const auto prefix = "teacher." + std::to_string(step) + ".";
+  for (const auto *name : {"token", "position", "slot"}) {
+    const auto expected =
+        std::string(name) == "token" ? reference.tokens[step] : std::int32_t(step);
+    if (!report.compare(prefix + name, model.read_input(name), integers({expected}),
+                        DataType::Int32)) {
+      return false;
+    }
   }
+  for (const auto *name : {"lookup", "input_projection", "position_embedding", "embedding"}) {
+    const bool exact = std::string(name) == "lookup" || std::string(name) == "position_embedding";
+    if (!report.compare(prefix + name, model.read_input(name), reference.steps[step].at(name), f16,
+                        exact ? 0 : 0.08f, exact ? 0 : 0.02f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void prefix_check(Context &context, const WeightStore &weights, const PrefixReference &reference,
+                  Report &report) {
+  const auto &config = reference.config;
   report.phase("setup");
   opt::GraphModel model(context, weights, config, 1);
-  report.phase("execute");
-  const auto generated = model.generate(prompt, 1);
-  std::cout << "Diagnostic prefix prediction (not a model acceptance): " << generated.tokens.at(0)
-            << std::endl;
-  for (unsigned layer = 0; layer < layers; ++layer) {
+  for (unsigned step = 0; step < reference.tokens.size(); ++step) {
+    report.phase("teacher." + std::to_string(step));
+    model.step(reference.tokens[step]);
+    if (!compare_inputs(model, reference, step, report)) {
+      break;
+    }
+  }
+  const auto row_bytes = config.decoder.kv_spec().head_dim * dtype_bytes(f16);
+  const auto head_bytes = row_bytes * config.decoder.capacity;
+  const auto prefix_bytes = row_bytes * reference.tokens.size();
+  for (unsigned layer = 0; !report.failures && layer < config.decoder.layers; ++layer) {
     for (bool values : {false, true}) {
       const auto name = "layer." + std::to_string(layer) + (values ? ".values" : ".keys");
       const auto actual = model.read_cache(layer, values);
-      report.compare(
-          name, actual,
-          specferry::testing::read_bytes(fixture, "teacher.1." + name + ".bin", actual.size()), f16,
-          0.08f, 0.02f);
+      if (actual.size() != config.decoder.heads * head_bytes) {
+        throw std::runtime_error("unexpected cache byte count: " + name);
+      }
+      // Native storage is [head, capacity, width]; the CPU saves only consumed
+      // rows. Skip each head's unused suffix instead of treating it as tokens.
+      std::vector<std::uint8_t> prefix;
+      for (unsigned head = 0; head < config.decoder.heads; ++head) {
+        const auto begin = actual.begin() + head * head_bytes;
+        prefix.insert(prefix.end(), begin, begin + prefix_bytes);
+      }
+      report.compare(name, prefix, reference.steps.back().at(name), f16, 0.08f, 0.02f);
     }
   }
   report.phase("release");
@@ -297,14 +362,28 @@ void prefix_check(Context &context, const WeightStore &weights, const fs::path &
 } // namespace
 
 int main(int argc, char **argv) {
-  if ((argc != 5 && argc != 6) ||
+  const bool check_fixture =
+      argc == 7 && std::string(argv[4]) == "prefix" && std::string(argv[6]) == "--check-fixture";
+  if ((argc != 5 && argc != 6 && !check_fixture) ||
       (std::string(argv[4]) != "lookup" && std::string(argv[4]) != "layer" &&
        std::string(argv[4]) != "prefix")) {
     std::cerr << "usage: np101_graph_pipeline_check DEPLOYMENT FIXTURE OUTPUT lookup|layer|prefix "
-                 "[LAYERS]\n";
+                 "[LAYERS [--check-fixture]]\n";
     return 2;
   }
   try {
+    std::optional<PrefixReference> reference;
+    if (std::string(argv[4]) == "prefix") {
+      const auto layers = parse_shape(argc >= 6 ? argv[5] : "1");
+      if (layers.size() != 1) {
+        throw std::invalid_argument("expected one layer count");
+      }
+      reference.emplace(argv[2], layers.front());
+      if (check_fixture) {
+        std::cout << "Prefix reference sizes and configuration passed; device not opened.\n";
+        return 0;
+      }
+    }
     fs::create_directories(argv[3]);
     Report report(argv[3]);
     SdkTimings timings(argv[3]);
@@ -316,11 +395,7 @@ int main(int argc, char **argv) {
     } else if (std::string(argv[4]) == "layer") {
       layer_check(context, weights, argv[2], report);
     } else {
-      const auto layers = parse_shape(argc == 6 ? argv[5] : "1");
-      if (layers.size() != 1) {
-        throw std::invalid_argument("expected one layer count");
-      }
-      prefix_check(context, weights, argv[2], report, layers[0]);
+      prefix_check(context, weights, *reference, report);
     }
     context.close();
     report.phase(report.failures ? "numerical_failure" : "complete", true);

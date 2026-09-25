@@ -47,10 +47,13 @@ Tensor lookup_blocks(GraphBuilder &g, const std::vector<Tensor> &blocks, Tensor 
         VSI_NN_RELATIONAL_OPS_GREAT_EQUAL;
     g.node(VSI_NN_OP_RELATIONAL_OPS, {local, g.integer(block.spec.shape[1])}, upper)
         ->nn_param.relational_ops.op = VSI_NN_RELATIONAL_OPS_LESS;
-    auto selected = g.tensor(embedding.spec), masked = g.tensor(embedding.spec);
-    g.node(VSI_NN_OP_SELECT, {g.reshape(lower, {1, count}), embedding, g.scalar(0, f16)}, selected);
-    g.node(VSI_NN_OP_SELECT, {g.reshape(upper, {1, count}), selected, g.scalar(0, f16)}, masked);
-    result = offset ? g.binary(VSI_NN_OP_ADD, result, masked) : masked;
+    // Select rows without FP16 arithmetic: adding masked blocks can flush
+    // subnormal embedding values to zero even when only one block is nonzero.
+    auto previous = offset ? result : g.scalar(0, f16);
+    auto selected = g.tensor(embedding.spec);
+    result = g.tensor(embedding.spec);
+    g.node(VSI_NN_OP_SELECT, {g.reshape(lower, {1, count}), embedding, previous}, selected);
+    g.node(VSI_NN_OP_SELECT, {g.reshape(upper, {1, count}), selected, previous}, result);
     offset += block.spec.shape[1];
   }
   return result;

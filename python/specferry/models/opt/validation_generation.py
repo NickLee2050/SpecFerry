@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -85,9 +86,16 @@ def prepare(
         raise ValueError("reference checkpoint and deployment have different sources")
     directory.mkdir(parents=True, exist_ok=False)
     components = write_config(directory, manifest["config"], capacity)
-    if not 1 <= layers <= components.layers or (mode == "teacher" and not 1 <= steps <= capacity):
+    if not 1 <= layers <= components.layers or (
+        mode in ("teacher", "prefix") and not 1 <= steps <= capacity
+    ):
         raise ValueError("invalid layer or step count")
+    if mode == "prefix":
+        if steps != 2 or (input_ids is not None and len(input_ids) != 2):
+            raise ValueError("prefix diagnosis requires exactly two teacher-forced tokens")
+        replace(components, layers=layers).write(directory / "components.txt")
     observations, tokens = {}, []
+    reference_checks = {}
     decoder = model.model.decoder
     if mode == "io":
         cases = [
@@ -124,7 +132,7 @@ def prepare(
                 record(directory, f"{name}.{index}", value, observations)
             tokens.append(int(logits.argmax(-1).item()))
         count = len(cases)
-    elif mode == "teacher":
+    elif mode in ("teacher", "prefix"):
         # Fixed BOS + prompt prefix. Long trajectories deliberately repeat token IDs.
         seed = [2, 2061, 32, 52, 259, 13, 1768, 116]
         input_ids = input_ids or [seed[index % len(seed)] for index in range(steps)]
@@ -142,6 +150,23 @@ def prepare(
                 )
             cache = result.past_key_values
             record(directory, f"teacher.{index}.embedding", captured["layer.0.input"], observations)
+            if mode == "prefix":
+                lookup = decoder.embed_tokens(torch.tensor([[token]]))
+                projected_input = decoder.project_in(lookup)
+                positions = decoder.embed_positions.weight[index + decoder.embed_positions.offset]
+                positions = positions.view(1, 1, -1)
+                for name, value in (
+                    ("lookup", lookup),
+                    ("input_projection", projected_input),
+                    ("position_embedding", positions),
+                ):
+                    record(directory, f"teacher.{index}.{name}", value, observations)
+                reference_checks[f"input.{index}"] = compare_arrays(
+                    (projected_input + positions).numpy(),
+                    captured["layer.0.input"].numpy(),
+                    atol=0,
+                    rtol=0,
+                )
             for layer in selected:
                 record(
                     directory,
@@ -161,6 +186,22 @@ def prepare(
             record(directory, f"teacher.{index}.logits", result.logits, observations)
             tokens.append(int(result.logits.argmax(-1).item()))
         count = steps
+        if mode == "prefix":
+            # Check the truncated reference itself: cached steps must agree with
+            # a fresh full-prefix forward through the same official model.
+            fresh = model(input_ids=torch.tensor([input_ids]), use_cache=True)
+            reference_checks["cached_logits"] = compare_arrays(
+                result.logits.numpy(), fresh.logits[:, -1:].numpy(), **TOLERANCES["cpu"]
+            )
+            for layer in selected:
+                for name in ("keys", "values"):
+                    reference_checks[f"cached.{layer}.{name}"] = compare_arrays(
+                        getattr(cache.layers[layer], name).numpy(),
+                        getattr(fresh.past_key_values.layers[layer], name).numpy(),
+                        **TOLERANCES["cpu"],
+                    )
+            if not all(check["passed"] for check in reference_checks.values()):
+                raise ValueError("truncated CPU reference failed its consistency checks")
     else:
         raise ValueError("unknown generation validation mode")
     metadata = {
@@ -182,6 +223,8 @@ def prepare(
         "kv_payload_bytes": components.state_bytes(range(layers)),
         "fixture_sha256": {p.name: fingerprint(p) for p in sorted(directory.iterdir())},
     }
+    if mode == "prefix":
+        metadata["reference_checks"] = reference_checks
     write_json(directory / "reference.json", metadata)
     return metadata
 
