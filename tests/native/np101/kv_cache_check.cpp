@@ -1,8 +1,10 @@
 #include "np101/component_spec.hpp"
 #include "np101/context.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
+#include "test_support.hpp"
 #include "vsi_nn_pub.h"
 
 #include <array>
@@ -19,21 +21,11 @@
 
 namespace {
 using namespace specferry::np101;
-
-std::vector<std::uint8_t> fp16(const std::vector<float> &values) {
-  vsi_nn_dtype_t dtype{};
-  dtype.vx_type = VSI_NN_TYPE_FLOAT16;
-  dtype.qnt_type = VSI_NN_QNT_TYPE_NONE;
-  std::vector<std::uint8_t> bytes(values.size() * 2);
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    check(vsi_nn_Float32ToDtype(values[index], bytes.data() + index * 2, &dtype), "encode FP16");
-  }
-  return bytes;
-}
+using namespace specferry::testing;
 
 void require_equal(const std::vector<std::uint8_t> &actual, const std::vector<float> &expected,
                    const char *label) {
-  auto bytes = fp16(expected);
+  auto bytes = encode_floats(expected);
   if (actual != bytes) {
     std::size_t first = 0;
     while (first < actual.size() && first < bytes.size() && actual[first] == bytes[first]) {
@@ -83,8 +75,10 @@ void run(const std::filesystem::path &directory, KvSpec spec) {
       !vsi_nn_SetGraphOutputs(reader.get(), &output, 1)) {
     throw std::runtime_error("cannot declare fixed KV reader IO");
   }
-  check(vsi_nn_SetupGraph(reader.get(), FALSE), "setup fixed KV reader");
-  check(vsi_nn_VerifyGraph(reader.get()), "verify fixed KV reader");
+  check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(reader.get(), FALSE); }),
+        "setup fixed KV reader");
+  check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(reader.get()); }),
+        "verify fixed KV reader");
 
   std::vector<float> expected_keys(spec.tensor().elements(), 0.0f);
   std::vector<float> expected_values(expected_keys.size(), 0.0f);
@@ -107,10 +101,11 @@ void run(const std::filesystem::path &directory, KvSpec spec) {
           expected_sum[offset] = next_key[index] + next_value[index];
         }
       }
-      upload_tensor(producer, key, fp16(next_key));
-      upload_tensor(producer, value, fp16(next_value));
+      upload_tensor(producer, key, encode_floats(next_key));
+      upload_tensor(producer, value, encode_floats(next_value));
       cache.write(position);
-      check(vsi_nn_RunGraph(reader.get()), "run fixed KV reader");
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(reader.get()); }),
+            "run fixed KV reader");
       if (pass == 0 || iteration + 1 == positions.size()) {
         require_equal(read_tensor(reader, output), expected_sum, "fixed reader");
         require_equal(cache.read_keys(), expected_keys, "key storage");
@@ -154,7 +149,6 @@ int main(int argc, char **argv) {
     return 1;
   }
   try {
-    std::filesystem::create_directories(argv[1]);
     KvSpec spec{2, 256, 512};
     if (argc == 5) {
       auto dimension = [](const char *argument) {
@@ -166,8 +160,7 @@ int main(int argc, char **argv) {
       };
       spec = {dimension(argv[2]), dimension(argv[3]), dimension(argv[4])};
     }
-    run(argv[1], spec);
-    return 0;
+    return run_test(argv[1], [&] { run(argv[1], spec); });
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

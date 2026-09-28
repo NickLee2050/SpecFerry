@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
     {
       CopyGraph copy;
       initialize_copy(copy, context, storage, source, parent);
+      std::uint64_t first_copy_rss = 0, last_copy_rss = 0;
 
       for (unsigned iteration = 0; iteration < iterations; ++iteration) {
         auto phase = [&](const char *name, auto action) {
@@ -126,8 +127,9 @@ int main(int argc, char **argv) {
           action();
           const auto seconds =
               std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-          std::cout << iteration << ' ' << name << ' ' << rss_bytes() << ' ' << seconds
-                    << std::endl;
+          const auto rss = rss_bytes();
+          std::cout << iteration << ' ' << name << ' ' << rss << ' ' << seconds << std::endl;
+          return rss;
         };
         const auto slot = mode == "advance" ? iteration % copy.views.size() : 0;
         phase("bind", [&] {
@@ -142,12 +144,19 @@ int main(int argc, char **argv) {
             check(vxVerifyGraph(copy.graph), "reverify");
           }
         });
-        phase("process", [&] { check(vxProcessGraph(copy.graph), "copy slot"); });
+        last_copy_rss = phase("process", [&] { check(vxProcessGraph(copy.graph), "copy slot"); });
+        if (iteration == 0) {
+          first_copy_rss = last_copy_rss;
+        }
         for (unsigned head = 0; head < 16; ++head) {
           std::fill_n(expected.begin() + (head * 8 + slot) * 64 * 2, 64 * 2, 0x30);
         }
       }
 
+      const auto growth = std::int64_t(last_copy_rss) - std::int64_t(first_copy_rss);
+      std::cout << "Loop RSS, after copy 0 -> " << iterations - 1 << ": " << first_copy_rss
+                << " -> " << last_copy_rss << " bytes; growth: " << growth << " bytes ("
+                << double(growth) / (1024 * 1024) << " MiB)\n";
       // Read only after the final copy; untouched slots must remain zero.
       auto actual = read_tensor(storage, parent);
       if (actual != expected) {

@@ -67,10 +67,7 @@ void sequence(Model &model, const DecoderCase &test, const std::string &name, un
         const auto data = model.read(layer, field);
         const auto filename = name + ".layer." + std::to_string(layer) + "." + field + "." +
                               std::to_string(step) + ".bin";
-        std::ofstream out(test.output / filename, std::ios::binary);
-        if (!out.write(reinterpret_cast<const char *>(data.data()), data.size())) {
-          throw std::runtime_error("cannot save " + filename);
-        }
+        testing::write_bytes(test.output / filename, data);
       }
     }
   }

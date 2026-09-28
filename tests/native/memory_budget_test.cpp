@@ -55,12 +55,28 @@ void aliases_and_temporary_backing() {
   wrapper.reset();
   require(budget.live(false) == 0, "last alias did not release storage");
 }
+
+void explicit_capacity_probe() {
+  const auto target = 4 * segment_payload_limit;
+  auto budget = MemoryBudget::for_capacity_probe(target);
+  auto payload = budget.reserve(true, target);
+  expect_rejected(budget, true, 1);
+  payload.reset();
+  require(budget.live(true) == 0, "capacity probe release lost accounting");
+  try {
+    MemoryBudget model_budget(target);
+  } catch (const std::invalid_argument &) {
+    return;
+  }
+  throw std::runtime_error("ordinary model budget accepted the diagnostic limit");
+}
 } // namespace
 
 int main() {
   try {
     independent_segments_and_boundaries();
     aliases_and_temporary_backing();
+    explicit_capacity_probe();
     std::cout << "Segment limits, shared storage and temporary allocation accounting passed\n";
     return 0;
   } catch (const std::exception &error) {

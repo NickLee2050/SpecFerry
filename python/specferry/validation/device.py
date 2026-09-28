@@ -10,6 +10,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from specferry.data.checkpoint import sha256
+
 RECOVERY_ROOT = Path(__file__).resolve().parents[3] / ".cache/runs"
 
 
@@ -135,11 +137,26 @@ def run_device(
     evidence = {
         "command": command,
         "boot_id": host_boot_id(),
+        "binary_sha256": sha256(binary),
+        "sdk_library_directory": str(sdk_lib.resolve()),
+        "sdk_library_sha256": {
+            name: sha256(sdk_lib / name)
+            for name in (
+                "libovxlib.so",
+                "libOpenVX.so",
+                "libGAL.so",
+                "libArchModelSw.so",
+                "libNNArchPerf.so",
+            )
+            if (sdk_lib / name).is_file()
+        },
         "timeout": False,
         "driver_traced": trace_driver,
         "sdk_timing": sdk_timing,
         "hardware_execution_proven": False,
     }
+    # Preserve the exact executable/SDK identity even if the test crashes.
+    write_json(output / "execution-evidence.json", evidence)
     print(f"Running {binary.name}; timeout {timeout}s; log: {output / 'sdk.log'}", flush=True)
     started = time.monotonic()
     with (output / "sdk.log").open("w") as log:

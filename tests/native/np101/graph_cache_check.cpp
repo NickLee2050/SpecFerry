@@ -1,16 +1,17 @@
+#include "binary_io.hpp"
 #include "inference/generation.hpp"
 #include "np101/diagnostics.hpp"
 #include "np101/ops/cache_update.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "np101/tensor.hpp"
+#include "test_support.hpp"
 #include "vsi_nn_pub.h"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -22,24 +23,9 @@
 namespace {
 using namespace specferry::np101;
 using namespace specferry::np101::ops;
+using namespace specferry::testing;
 constexpr unsigned width = 8, heads = 2, capacity = 8;
 constexpr auto f16 = DataType::Float16;
-
-template <class T> std::vector<std::uint8_t> bytes(const std::vector<T> &values) {
-  std::vector<std::uint8_t> result(values.size() * sizeof(T));
-  std::memcpy(result.data(), values.data(), result.size());
-  return result;
-}
-
-std::vector<std::uint8_t> half_bytes(const std::vector<float> &values) {
-  vsi_nn_dtype_t dtype{};
-  dtype.vx_type = VSI_NN_TYPE_FLOAT16;
-  std::vector<std::uint8_t> result(values.size() * 2);
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    check(vsi_nn_Float32ToDtype(values[i], result.data() + i * 2, &dtype), "encode FP16");
-  }
-  return result;
-}
 
 class AppendGraph : public GraphBuilder {
 public:
@@ -75,13 +61,13 @@ public:
   }
 };
 
-bool append_experiment(Context &context, const std::filesystem::path &output, unsigned block) {
+void check_cache_attention(Context &context, const std::filesystem::path &output, unsigned block) {
   Graph storage(context, heads * 2, 0);
   const TensorSpec spec{f16, {width, capacity}};
   std::vector<Tensor> parents;
   std::vector<std::vector<float>> expected(heads * 2, std::vector<float>(spec.elements()));
   for (unsigned index = 0; index < heads * 2; ++index) {
-    parents.push_back({add_tensor(storage, spec, false, half_bytes(expected[index])), spec});
+    parents.push_back({add_tensor(storage, spec, false, encode_floats(expected[index])), spec});
   }
   AppendGraph decode(context, storage, parents, 1);
   std::unique_ptr<AppendGraph> prefill;
@@ -108,10 +94,10 @@ bool append_experiment(Context &context, const std::filesystem::path &output, un
           }
         }
       }
-      upload_tensor(g.graph, g.input.id, half_bytes(source));
+      upload_tensor(g.graph, g.input.id, encode_floats(source));
       upload_tensor(g.graph, g.index.id,
-                    bytes<std::int32_t>({std::int32_t(chunk.begin / g.block)}));
-      upload_tensor(g.graph, g.limits.id, bytes(limits));
+                    as_bytes<std::int32_t>({std::int32_t(chunk.begin / g.block)}));
+      upload_tensor(g.graph, g.limits.id, as_bytes(limits));
       if (!vxIsGraphVerified(g.graph.get()->g)) {
         throw std::runtime_error("indexed append invalidated its fixed graph");
       }
@@ -143,7 +129,7 @@ bool append_experiment(Context &context, const std::filesystem::path &output, un
       }
     }
     for (unsigned index = 0; index < parents.size(); ++index) {
-      if (read_tensor(storage, parents[index].id) != half_bytes(expected[index])) {
+      if (read_tensor(storage, parents[index].id) != encode_floats(expected[index])) {
         throw std::runtime_error("indexed cache lost history or changed an untouched suffix");
       }
     }
@@ -162,7 +148,6 @@ bool append_experiment(Context &context, const std::filesystem::path &output, un
   if (!report) {
     throw std::runtime_error("cannot save indexed cache result");
   }
-  return true;
 }
 } // namespace
 
@@ -171,15 +156,9 @@ int main(int argc, char **argv) {
     std::cerr << "usage: np101_graph_cache_check OUTPUT stack|stack-block\n";
     return 2;
   }
-  try {
-    std::filesystem::create_directories(argv[1]);
+  return run_test(argv[1], [&] {
     Context context;
-    const bool passed =
-        append_experiment(context, argv[1], std::string(argv[2]) == "stack" ? 1 : 4);
+    check_cache_attention(context, argv[1], std::string(argv[2]) == "stack" ? 1 : 4);
     context.close();
-    return passed ? 0 : 1;
-  } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  });
 }

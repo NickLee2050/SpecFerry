@@ -5,7 +5,6 @@ import math
 from pathlib import Path
 
 from specferry.data.checkpoint import sha256 as fingerprint
-from specferry.export.weights import verify_weight_pack
 
 from .device import clean_execution
 
@@ -65,6 +64,8 @@ def state_payload_bytes(path: Path) -> int:
 
 def prepare_weight_check(deployment: Path, state_spec: Path | None, output: Path) -> dict:
     """Bind a model-independent readback check to a verified pack and optional states."""
+    from specferry.export.weights import verify_weight_pack
+
     verified = verify_weight_pack(deployment)
     if not verified["tensors"]:
         raise ValueError("weight check requires a nonempty pack")
@@ -114,12 +115,49 @@ def capacity_result(report, evidence, target, storage, dtype, readback):
         and report.get("verified_bytes") == uploaded
         and not report.get("readback_error")
     )
+    full_scan = (
+        allocated
+        and readback == "all"
+        and report.get("scanned_bytes") == uploaded
+        and report.get("scanned_blocks", 0) == report.get("retained_tensors", -1)
+        and report.get("size_mismatch_blocks", 0) == 0
+    )
+    intact = intact and (readback != "all" or full_scan)
     return {
         "allocation_and_release_passed": allocated,
         "readback_and_release_passed": intact,
+        "target_reached": allocated and uploaded == target,
+        "next_block_rejected": allocated and report.get("rejected_block_bytes", 0) > 0,
+        "full_scan_completed": full_scan,
         "retained_payload_bytes": uploaded,
+        "scanned_bytes": report.get("scanned_bytes", 0),
+        "mismatched_bytes": report.get("mismatched_bytes") if readback == "all" else None,
+        "mismatched_blocks": report.get("mismatched_blocks") if readback == "all" else None,
+        "mismatched_ranges": report.get("mismatched_ranges") if readback == "all" else None,
+        "matching_bytes": uploaded - report["mismatched_bytes"] if full_scan else None,
         "physical_memory_limit_proven": False,
     }
+
+
+def print_capacity_summary(result, report):
+    retained = result["retained_payload_bytes"]
+    print(f"Retained payload: {retained / MIB:g} / {report.get('target_bytes', 0) / MIB:g} MiB")
+    if result["next_block_rejected"]:
+        print(f"Next block rejected during {report['rejection_phase']}; see SDK error in sdk.log")
+    else:
+        print("No next-block rejection recorded; the allocation limit is not established.")
+    if report.get("readback_mode") == "all":
+        print(
+            f"Readback coverage: {result['scanned_bytes']} / {retained} bytes; "
+            f"{report.get('scanned_blocks', 0)} / {report.get('retained_tensors', 0)} blocks"
+        )
+        print(f"Full scan completed: {'yes' if result['full_scan_completed'] else 'no'}")
+        print(
+            f"Differences: {result['mismatched_bytes']} bytes in "
+            f"{result['mismatched_blocks']} blocks, {result['mismatched_ranges']} byte ranges"
+        )
+        print("All scanned block results: readback-blocks.jsonl (including blocks with no errors)")
+    print("Coverage describes retained application tensors, not all physical board memory.")
 
 
 def weights_complete(report, evidence, storage, expected):

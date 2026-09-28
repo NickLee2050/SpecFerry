@@ -2,6 +2,7 @@
 #include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
+#include "test_support.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -10,11 +11,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using specferry::np101::check;
@@ -34,18 +35,6 @@ static vsi_nn_dtype_t dtype() {
   d.qnt_type = VSI_NN_QNT_TYPE_NONE;
   d.fmt = VSI_NN_DIM_FMT_NCHW;
   return d;
-}
-
-static std::vector<uint8_t> f16(const std::vector<float> &data) {
-  std::vector<uint8_t> result(data.size() * 2);
-  auto d = dtype();
-  for (size_t i = 0; i < data.size(); ++i) {
-    if (!std::isfinite(data[i])) {
-      throw std::runtime_error("nonfinite input");
-    }
-    check(vsi_nn_Float32ToDtype(data[i], result.data() + 2 * i, &d), "Float32ToDtype");
-  }
-  return result;
 }
 
 static vsi_nn_tensor_id_t tensor(specferry::np101::Graph &graph,
@@ -121,9 +110,9 @@ static ConvolutionData make_test_data() {
   data.input = random_data(192);
   data.weights = random_data(108);
   data.bias = random_data(4);
-  data.input_fp16 = f16(data.input);
-  data.weights_fp16 = f16(data.weights);
-  data.bias_fp16 = f16(data.bias);
+  data.input_fp16 = specferry::testing::encode_floats(data.input);
+  data.weights_fp16 = specferry::testing::encode_floats(data.weights);
+  data.bias_fp16 = specferry::testing::encode_floats(data.bias);
   return data;
 }
 
@@ -186,12 +175,13 @@ static GraphIO build_convolution_graph(specferry::np101::Graph &owner, Convoluti
 }
 
 int main() {
-  try {
-    specferry::np101::SdkTimings timings(".");
+  return specferry::testing::run_test(".", [] {
     auto data = make_test_data();
     specferry::np101::Context context;
     specferry::np101::Graph graph(context, 6, 3);
     const auto io = build_convolution_graph(graph, data);
+    std::cout << "Graph: CONV2D -> RELU -> MAXPOOL; " << graph.get()->cur_nid << " nodes, "
+              << graph.get()->cur_tid << " tensors; FP16\n";
     check(specferry::np101::sdk_call("vsi_nn_SetupGraph",
                                      [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
           "SetupGraph");
@@ -204,7 +194,7 @@ int main() {
         value += iteration * .03125f;
       }
       const auto expected = golden(input, data.weights, data.bias);
-      specferry::np101::upload_tensor(graph, io.input, f16(input));
+      specferry::np101::upload_tensor(graph, io.input, specferry::testing::encode_floats(input));
       check(specferry::np101::sdk_call("vsi_nn_RunGraph",
                                        [&] { return vsi_nn_RunGraph(graph.get()); }),
             "RunGraph");
@@ -226,9 +216,5 @@ int main() {
     }
     graph.close();
     context.close();
-    return 0;
-  } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  });
 }

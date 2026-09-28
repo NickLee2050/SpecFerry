@@ -1,3 +1,4 @@
+#include "binary_io.hpp"
 #include "models/opt/config.hpp"
 #include "models/qwen3_5/config.hpp"
 #include "np101/component_spec.hpp"
@@ -8,9 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <functional>
-#include <ios>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +18,7 @@
 
 namespace {
 using namespace specferry::np101;
+using namespace specferry::testing;
 
 void require(bool condition, const std::string &message) {
   if (!condition) {
@@ -49,10 +49,16 @@ struct TemporaryDirectory {
   }
 };
 
-void write(const std::filesystem::path &path, const std::string &data) {
-  std::ofstream output(path, std::ios::binary);
-  output.write(data.data(), data.size());
-  require(bool(output), "test fixture write failed");
+void binary_io_contract() {
+  TemporaryDirectory directory;
+  const auto bytes = as_bytes<std::uint16_t>({0, 0x8000, 1, 0xffff});
+  const auto file = directory.path / "bits.bin";
+  write_bytes(file, bytes);
+  require(read_bytes(directory.path, "bits.bin", bytes.size()) == bytes,
+          "binary IO changed signed zero or non-text bytes");
+  rejects([&] { read_bytes(directory.path, "bits.bin", bytes.size() + 1); },
+          "truncated fixture must fail");
+  rejects([&] { write_bytes(directory.path, bytes); }, "write failure must propagate");
 }
 
 void tensor_boundaries() {
@@ -71,8 +77,8 @@ void weight_integrity() {
   const std::string payload("\1\2\3\4\5\6\7\10", 8);
   const std::string record = "block.projection.weight F16 2,2 0 8 "
                              "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n";
-  write(directory.path / "weights.bin", payload);
-  write(directory.path / "weights.index", "specferry-np101-weights 1\n" + record);
+  write_text(directory.path / "weights.bin", payload);
+  write_text(directory.path / "weights.index", "specferry-np101-weights 1\n" + record);
   WeightStore store(directory.path);
   store.verify();
   const auto &embedding = store.find("block.projection.weight");
@@ -83,12 +89,12 @@ void weight_integrity() {
   rejects([&] { store.read(embedding, UINT64_MAX, 1); }, "overflowing read offset");
   auto forged = embedding;
   rejects([&] { store.read(forged, 0, 1); }, "foreign record");
-  write(directory.path / "weights.bin", std::string(8, '\0'));
+  write_text(directory.path / "weights.bin", std::string(8, '\0'));
   rejects([&] { store.verify(); }, "same-size corruption");
-  write(directory.path / "weights.bin", payload.substr(0, 7));
+  write_text(directory.path / "weights.bin", payload.substr(0, 7));
   rejects([&] { WeightStore truncated(directory.path); }, "truncated payload");
-  write(directory.path / "weights.bin", payload);
-  write(directory.path / "weights.index", "specferry-np101-weights 1\n" + record + record);
+  write_text(directory.path / "weights.bin", payload);
+  write_text(directory.path / "weights.index", "specferry-np101-weights 1\n" + record + record);
   rejects([&] { WeightStore duplicate(directory.path); }, "duplicate tensor and overlap");
 }
 
@@ -117,7 +123,7 @@ void component_contracts() {
   TemporaryDirectory directory;
   const auto path = directory.path / "components.txt";
   const std::string parameters = "64 96 4 2 16 8 8 10000 1e-6 2 8 8 3";
-  write(path, "specferry-qwen-components 1\n" + parameters + "\ndelta attention\n");
+  write_text(path, "specferry-qwen-components 1\n" + parameters + "\ndelta attention\n");
   auto config = specferry::models::qwen3_5::read_config(path);
   require(config.hidden_spec().bytes() == 128 && config.delta.channels() == 48,
           "component parser must preserve dimensions");
@@ -129,10 +135,10 @@ void component_contracts() {
   rejects([&] { extended.validate(); }, "Qwen adapter retains its existing cache limit");
   for (const auto &record : {"-1" + parameters.substr(2), parameters + " extra",
                              std::string("64 96 3 2 16 8 8 10000 1e-6 2 8 8 3")}) {
-    write(path, "specferry-qwen-components 1\n" + record + "\ndelta attention\n");
+    write_text(path, "specferry-qwen-components 1\n" + record + "\ndelta attention\n");
     rejects([&] { specferry::models::qwen3_5::read_config(path); }, "invalid component record");
   }
-  write(path, "specferry-qwen-components 1\n" + parameters + "\nunknown\n");
+  write_text(path, "specferry-qwen-components 1\n" + parameters + "\nunknown\n");
   rejects([&] { specferry::models::qwen3_5::read_config(path); }, "unknown mixer");
 }
 
@@ -140,11 +146,11 @@ void opt_contracts() {
   TemporaryDirectory directory;
   const auto path = directory.path / "components.txt";
   const std::string header = "specferry-opt-components 1\n";
-  write(path, header + "1024 4096 16 24 512 1e-5\n");
+  write_text(path, header + "1024 4096 16 24 512 1e-5\n");
   const auto config = specferry::models::opt::read_config(path);
   require(config.kv_spec().head_dim == 64, "OPT heads must retain their configured width");
   rejects([&] { config.prefix(24); }, "OPT layer outside configured range");
-  write(directory.path / "model.txt", "specferry-opt-model 1\n512 50272 2048 2 4096 2 2 1\n");
+  write_text(directory.path / "model.txt", "specferry-opt-model 1\n512 50272 2048 2 4096 2 2 1\n");
   auto model = specferry::models::opt::read_model_config(directory.path);
   model.validate_token(0);
   model.validate_token(50271);
@@ -153,21 +159,22 @@ void opt_contracts() {
   for (const auto *record : {"512 50272 2048 0 4096 2 2 1", "512 50272 511 2 4096 2 2 1",
                              "512 50272 2048 2 0 2 2 1", "512 50272 2048 2 4096 50272 2 1",
                              "512 50272 2048 2 4096 2 2 2", "512 50272 2048 2 4096 2 2 1 extra"}) {
-    write(directory.path / "model.txt", std::string("specferry-opt-model 1\n") + record + "\n");
+    write_text(directory.path / "model.txt",
+               std::string("specferry-opt-model 1\n") + record + "\n");
     rejects([&] { specferry::models::opt::read_model_config(directory.path); },
             "invalid model IO configuration rejected before device initialization");
   }
   for (const auto *record :
        {"1024 4096 0 24 512 1e-5", "1024 4096 16 24 2049 1e-5", "1024 4096 16 24 512 -1",
         "1024 4096 16 24 512 1e-5 extra", "-1 4096 16 24 512 1e-5", "1024 4097 16 24 512 1e-5"}) {
-    write(path, header + record + "\n");
+    write_text(path, header + record + "\n");
     rejects([&] { specferry::models::opt::read_config(path); }, "invalid OPT contract");
   }
   // An otherwise well-formed package lacking projection biases cannot build a layer.
-  write(directory.path / "weights.bin", std::string("\1\2\3\4\5\6\7\10", 8));
-  write(directory.path / "weights.index",
-        "specferry-np101-weights 1\ndecoder.layers.0.self_attn.q_proj.weight F16 2,2 0 8 "
-        "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n");
+  write_text(directory.path / "weights.bin", std::string("\1\2\3\4\5\6\7\10", 8));
+  write_text(directory.path / "weights.index",
+             "specferry-np101-weights 1\ndecoder.layers.0.self_attn.q_proj.weight F16 2,2 0 8 "
+             "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n");
   WeightStore weights(directory.path);
   const specferry::models::opt::Config small{2, 4, 1, 1, 2, 1e-5f};
   rejects([&] { specferry::models::opt::validate_weights(weights, small, {0}); },
@@ -178,6 +185,7 @@ void opt_contracts() {
 
 int main() {
   try {
+    binary_io_contract();
     tensor_boundaries();
     weight_integrity();
     component_contracts();

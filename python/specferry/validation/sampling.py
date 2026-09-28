@@ -14,9 +14,16 @@ def evaluate(directory, dtype, classes, count, evidence):
         path = directory / f"{name}.bin"
         valid = path.is_file() and path.stat().st_size == count * 4
         values = np.fromfile(path, dtype="<i4") if valid else np.array([], dtype="<i4")
-        valid = valid and bool(np.all((values >= 0) & (values < classes)))
+        in_range = (values >= 0) & (values < classes)
+        valid = valid and bool(np.all(in_range))
         arrays[name] = values
-        checks[f"{name}.range"] = {"passed": valid}
+        checks[f"{name}.range"] = {
+            "passed": valid,
+            "sample_count": int(values.size),
+            "out_of_range": int(np.count_nonzero(~in_range)),
+            "minimum": int(values.min()) if values.size else None,
+            "maximum": int(values.max()) if values.size else None,
+        }
 
     def equal(left, right):
         return bool(np.array_equal(arrays[left], arrays[right]))

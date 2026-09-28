@@ -19,6 +19,15 @@ MemoryBudget::MemoryBudget(std::size_t limit) : state_(std::make_shared<State>()
   state_->limit = limit;
 }
 
+MemoryBudget MemoryBudget::for_capacity_probe(std::size_t limit) {
+  if (!limit || limit > std::size_t{4096} * 1024 * 1024) {
+    throw std::invalid_argument("capacity probe limit must be in 1..4 GiB");
+  }
+  MemoryBudget budget;
+  budget.state_->limit = limit;
+  return budget;
+}
+
 MemoryBudget::Allocation::Allocation(std::shared_ptr<State> state, bool constant, std::size_t bytes)
     : state_(std::move(state)), constant_(constant), bytes_(bytes) {}
 

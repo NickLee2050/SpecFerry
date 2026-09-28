@@ -12,19 +12,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-namespace {
-void save(const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes) {
-  std::ofstream stream(path, std::ios::binary);
-  if (!stream.write(reinterpret_cast<const char *>(bytes.data()), bytes.size())) {
-    throw std::runtime_error("cannot save IO observation");
-  }
-}
-} // namespace
 
 int main(int argc, char **argv) {
   if (argc != 4) {
@@ -35,11 +25,12 @@ int main(int argc, char **argv) {
   using namespace specferry::np101;
   using namespace specferry::np101::ops;
   using namespace specferry::models::opt;
+  using specferry::testing::read_bytes;
+  using specferry::testing::write_bytes;
   const fs::path fixture(argv[2]), output(argv[3]);
-  std::unique_ptr<SdkTimings> timings;
   try {
     fs::create_directories(output);
-    timings = std::make_unique<SdkTimings>(output);
+    SdkTimings timings(output);
     auto config = read_model_config(fixture);
     WeightStore weights(argv[1]);
     weights.verify();
@@ -59,17 +50,16 @@ int main(int argc, char **argv) {
     while (cases >> token >> position) {
 
       input.run(token, position);
-      save(output / ("embedding." + std::to_string(index) + ".bin"), input.read());
+      write_bytes(output / ("embedding." + std::to_string(index) + ".bin"), input.read());
       upload_tensor(hidden, hidden_id,
-                    specferry::testing::read_bytes(fixture,
-                                                   "hidden." + std::to_string(index) + ".bin",
-                                                   config.decoder.hidden_spec().bytes()));
+                    read_bytes(fixture, "hidden." + std::to_string(index) + ".bin",
+                               config.decoder.hidden_spec().bytes()));
       projection.run();
       tokens << head.select() << '\n';
       auto projected = projection.binding();
-      save(output / ("projected." + std::to_string(index) + ".bin"),
-           read_tensor(projected.owner, projected.id));
-      save(output / ("logits." + std::to_string(index) + ".bin"), head.read_logits());
+      write_bytes(output / ("projected." + std::to_string(index) + ".bin"),
+                  read_tensor(projected.owner, projected.id));
+      write_bytes(output / ("logits." + std::to_string(index) + ".bin"), head.read_logits());
       ++index;
     }
     if (!cases.eof() || !index || !tokens) {
@@ -104,12 +94,6 @@ int main(int argc, char **argv) {
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
-    if (timings) {
-      try {
-      } catch (const std::exception &logging_error) {
-        std::cerr << "Cannot save SDK timings: " << logging_error.what() << '\n';
-      }
-    }
     return 1;
   }
 }

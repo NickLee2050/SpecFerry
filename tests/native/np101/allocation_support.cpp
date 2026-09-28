@@ -1,10 +1,10 @@
 #include "allocation_support.hpp"
+#include "binary_io.hpp"
 #include "np101/context.hpp"
 #include "sys/resource.h"
 
 #include <algorithm>
 #include <exception>
-#include <fstream>
 #include <ios>
 #include <ostream>
 #include <stdexcept>
@@ -16,15 +16,6 @@ std::uint64_t mix_bits(std::uint64_t value) {
   value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
   value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
   return value ^ (value >> 31);
-}
-
-void save_bytes(const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes) {
-  std::ofstream output(path, std::ios::binary);
-  output.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-  output.close();
-  if (!output) {
-    throw std::runtime_error("cannot save readback evidence: " + path.string());
-  }
 }
 
 void optional_byte(std::ostream &output, const std::optional<std::uint8_t> &value) {
@@ -162,8 +153,8 @@ bool AllocationOutcome::verify(const ReadbackLocation &where,
     mismatch = difference;
     location = where;
     failure_phase = phase;
-    save_bytes(report.parent_path() / "first-mismatch-expected.bin", expected);
-    save_bytes(report.parent_path() / "first-mismatch-actual.bin", actual);
+    write_bytes(report.parent_path() / "first-mismatch-expected.bin", expected);
+    write_bytes(report.parent_path() / "first-mismatch-actual.bin", actual);
   }
   return false;
 }

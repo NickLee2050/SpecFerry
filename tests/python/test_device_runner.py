@@ -87,10 +87,6 @@ class DeviceRecoveryTests(unittest.TestCase):
             process = Mock(pid=123456)
             process.wait.side_effect = wait_results
             with (
-                patch.object(device.shutil, "which", return_value=None),
-                patch.object(
-                    device.subprocess, "run", return_value=Mock(stdout="mock linked libraries")
-                ),
                 patch.object(device.subprocess, "Popen", return_value=process),
                 patch.object(
                     device,
@@ -98,7 +94,6 @@ class DeviceRecoveryTests(unittest.TestCase):
                     return_value=members,
                 ),
                 patch.object(device.os, "killpg") as terminate,
-                patch.object(device.time, "sleep"),
                 patch.object(device, "RECOVERY_ROOT", root / "recovery"),
             ):
                 result = device.run_device(binary, [], root / "result", root, timeout=1)

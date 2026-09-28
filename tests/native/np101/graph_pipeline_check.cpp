@@ -27,15 +27,10 @@
 namespace {
 using namespace specferry::np101;
 using namespace specferry::np101::ops;
+using namespace specferry::testing;
 namespace opt = specferry::models::opt;
 namespace fs = std::filesystem;
 constexpr auto f16 = DataType::Float16;
-
-std::vector<std::uint8_t> integers(const std::vector<std::int32_t> &values) {
-  std::vector<std::uint8_t> result(values.size() * sizeof(std::int32_t));
-  std::memcpy(result.data(), values.data(), result.size());
-  return result;
-}
 
 class Report {
 public:
@@ -91,9 +86,9 @@ public:
     failures += !passed;
     rows_ << name << '\t' << passed << '\t' << actual.size() / dtype_bytes(type) << '\t' << nonzero
           << '\t' << maximum << std::endl;
-    std::ofstream bytes(directory / (name + ".bin"), std::ios::binary);
-    if (!bytes.write(reinterpret_cast<const char *>(actual.data()), actual.size()) || !rows_) {
-      throw std::runtime_error("cannot save pipeline diagnostic");
+    write_bytes(directory / (name + ".bin"), actual);
+    if (!rows_) {
+      throw std::runtime_error("cannot save pipeline comparison");
     }
     if (!passed) {
       std::cout << "FAIL " << name << ": max_abs_error=" << maximum << std::endl;
@@ -144,22 +139,22 @@ void lookup_check(Context &context, const WeightStore &weights, const fs::path &
     const auto prefix = "case." + std::to_string(step);
 
     report.phase(prefix);
-    upload_tensor(g.graph, controls.id, integers({id, index, index}));
+    upload_tensor(g.graph, controls.id, as_bytes<std::int32_t>({id, index, index}));
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(g.graph.get()); }),
           "run packed lookup graph");
-    report.compare(prefix + ".token", read_tensor(g.graph, token.id), integers({id}),
+    report.compare(prefix + ".token", read_tensor(g.graph, token.id), as_bytes<std::int32_t>({id}),
                    DataType::Int32);
-    report.compare(prefix + ".position", read_tensor(g.graph, position.id), integers({index}),
-                   DataType::Int32);
-    report.compare(prefix + ".slot", read_tensor(g.graph, slot.id), integers({index}),
+    report.compare(prefix + ".position", read_tensor(g.graph, position.id),
+                   as_bytes<std::int32_t>({index}), DataType::Int32);
+    report.compare(prefix + ".slot", read_tensor(g.graph, slot.id), as_bytes<std::int32_t>({index}),
                    DataType::Int32);
     report.compare(
         prefix + ".lookup", read_tensor(g.graph, embedding.id),
         weights.read(table, std::size_t(id) * config.embedding * 2, embedding.spec.bytes()), f16);
-    report.compare(prefix + ".embedding", read_tensor(g.graph, hidden.id),
-                   specferry::testing::read_bytes(
-                       fixture, "embedding." + std::to_string(step) + ".bin", hidden.spec.bytes()),
-                   f16, 0.08f, 0.02f);
+    report.compare(
+        prefix + ".embedding", read_tensor(g.graph, hidden.id),
+        read_bytes(fixture, "embedding." + std::to_string(step) + ".bin", hidden.spec.bytes()), f16,
+        0.08f, 0.02f);
     ++step;
     if (report.failures) {
       break;
@@ -224,18 +219,18 @@ void layer_check(Context &context, const WeightStore &weights, const fs::path &f
     const auto label = "step." + std::to_string(step);
 
     report.phase(label);
-    auto input = specferry::testing::read_bytes(fixture, "input." + std::to_string(step) + ".bin",
-                                                hidden.spec.bytes());
+    auto input = read_bytes(fixture, "input." + std::to_string(step) + ".bin", hidden.spec.bytes());
     upload_tensor(g.graph, hidden.id, input);
-    upload_tensor(g.graph, controls.id, integers({std::int32_t(step), std::int32_t(step + 1)}));
+    upload_tensor(g.graph, controls.id,
+                  as_bytes<std::int32_t>({std::int32_t(step), std::int32_t(step + 1)}));
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(g.graph.get()); }),
           "run integrated decoder layer");
     report.compare(label + ".input", read_tensor(g.graph, hidden.id), input, f16);
     for (const auto &[name, tensor] : outputs) {
       report.compare(label + "." + name, read_tensor(g.graph, tensor.id),
-                     specferry::testing::read_bytes(
-                         fixture, "zero.layer.0." + name + "." + std::to_string(step) + ".bin",
-                         tensor.spec.bytes()),
+                     read_bytes(fixture,
+                                "zero.layer.0." + name + "." + std::to_string(step) + ".bin",
+                                tensor.spec.bytes()),
                      f16, 0.08f, 0.02f);
     }
     for (unsigned kind = 0; kind < 3; ++kind) {
@@ -246,11 +241,11 @@ void layer_check(Context &context, const WeightStore &weights, const fs::path &f
         data.insert(data.end(), part.begin(), part.end());
       }
       const std::string name = kind == 0 ? "keys" : kind == 1 ? "values" : "probabilities";
-      report.compare(
-          label + "." + name, data,
-          specferry::testing::read_bytes(
-              fixture, "zero.layer.0." + name + "." + std::to_string(step) + ".bin", data.size()),
-          f16, 0.08f, 0.02f);
+      report.compare(label + "." + name, data,
+                     read_bytes(fixture,
+                                "zero.layer.0." + name + "." + std::to_string(step) + ".bin",
+                                data.size()),
+                     f16, 0.08f, 0.02f);
     }
     if (report.failures) {
       break;
@@ -283,7 +278,7 @@ struct PrefixReference {
     for (unsigned step = 0; step < tokens.size(); ++step) {
       config.validate_token(tokens[step]);
       auto read = [&](const std::string &name, std::size_t elements) {
-        steps[step][name] = specferry::testing::read_bytes(
+        steps[step][name] = read_bytes(
             fixture, "teacher." + std::to_string(step) + "." + name + ".bin", elements * 2);
       };
       read("lookup", config.embedding);
@@ -309,7 +304,7 @@ bool compare_inputs(opt::GraphModel &model, const PrefixReference &reference, un
   for (const auto *name : {"token", "position", "slot"}) {
     const auto expected =
         std::string(name) == "token" ? reference.tokens[step] : std::int32_t(step);
-    if (!report.compare(prefix + name, model.read_input(name), integers({expected}),
+    if (!report.compare(prefix + name, model.read_input(name), as_bytes<std::int32_t>({expected}),
                         DataType::Int32)) {
       return false;
     }

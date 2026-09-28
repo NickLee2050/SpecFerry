@@ -35,6 +35,9 @@ struct CapacityProgress {
   std::size_t scanned_blocks = 0;
   std::size_t mismatched_bytes = 0;
   std::size_t mismatched_blocks = 0;
+  std::size_t mismatched_ranges = 0;
+  std::size_t size_mismatch_blocks = 0;
+  bool probe_limit = false;
 
   void save(const std::string &status = "running") const {
     std::ofstream output(outcome.report);
@@ -53,6 +56,9 @@ struct CapacityProgress {
            << ",\"scanned_bytes\":" << scanned << ",\"scanned_blocks\":" << scanned_blocks
            << ",\"mismatched_bytes\":" << mismatched_bytes
            << ",\"mismatched_blocks\":" << mismatched_blocks
+           << ",\"mismatched_ranges\":" << mismatched_ranges
+           << ",\"size_mismatch_blocks\":" << size_mismatch_blocks
+           << ",\"probe_limit\":" << (probe_limit ? "true" : "false")
            << ",\"rejected_block_bytes\":" << rejected << ",\"retained_tensors\":" << tensors
            << ",\"rejection_phase\":";
     json_string(output, rejection_phase);
@@ -172,8 +178,14 @@ void verify_blocks(Graph &graph, const std::vector<Block> &retained, CapacityPro
       throw std::runtime_error("cannot open readback scan");
     }
   }
-  // Verify after every successful block coexists, including after an SDK rejection.
+  // Scan every retained block after allocation stops, including after SDK rejection.
+  // Never stop at the first corrupt block in all mode: later bytes are part of P5.
   progress.outcome.phase = "readback";
+  std::cout << "Readback: " << retained.size() << " retained blocks, " << progress.uploaded / mib
+            << " MiB; "
+            << (progress.readback == "all" ? "scan all bytes, continue after mismatches"
+                                           : "stop at the first mismatched block")
+            << std::endl;
   progress.save();
   for (unsigned index = 0; index < retained.size(); ++index) {
     const auto &block = retained[index];
@@ -184,10 +196,17 @@ void verify_blocks(Graph &graph, const std::vector<Block> &retained, CapacityPro
         expected);
     progress.scanned += block.bytes;
     ++progress.scanned_blocks;
+    progress.size_mismatch_blocks += actual.size() != block.bytes;
     if (progress.readback == "all") {
       const auto scan = scan_readback(actual, expected);
       write_scan(scans, block, index, actual, scan);
       progress.mismatched_bytes += scan.mismatched_bytes;
+      progress.mismatched_ranges += scan.range_count;
+      for (const auto &range : scan.ranges) {
+        std::cout << "block " << index << ": local bytes [" << range.begin << ", " << range.end
+                  << "), length " << range.end - range.begin << "; logical payload offset "
+                  << std::size_t(index) * allocation_block_bytes + range.begin << std::endl;
+      }
     }
     if (!matched) {
       ++progress.mismatched_blocks;
@@ -205,7 +224,18 @@ void verify_blocks(Graph &graph, const std::vector<Block> &retained, CapacityPro
 
 void probe(CapacityProgress &progress) {
   progress.save();
+  std::cout << "Requested payload: " << progress.target / mib
+            << " MiB; storage: " << storage_name(progress.storage)
+            << "; dtype: " << dtype_name(progress.dtype)
+            << "; block: " << allocation_block_bytes / mib << " MiB\n"
+            << "Allocate/write all blocks before readback; retain them until the scan finishes.\n"
+            << "Offsets refer to application payload, not physical addresses." << std::endl;
+  // Validate the diagnostic exception before opening the device. Ordinary model
+  // budgets cannot exceed 1 GiB; only --probe-limit uses this separate constructor.
+  auto budget =
+      progress.probe_limit ? MemoryBudget::for_capacity_probe(progress.target) : MemoryBudget();
   Context context;
+  context.memory() = budget;
   Graph graph(context, (progress.target + allocation_block_bytes - 1) / allocation_block_bytes + 1,
               1);
   try {
@@ -220,9 +250,9 @@ void probe(CapacityProgress &progress) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 5 && argc != 6) {
+  if (argc < 5 || argc > 7) {
     std::cerr << "usage: np101_capacity_check REPORT_JSON constant|mutable F16|F32 TARGET_MIB "
-                 "[first|all|none]\n";
+                 "[first|all|none] [--probe-limit]\n";
     return 2;
   }
   CapacityProgress progress;
@@ -230,12 +260,18 @@ int main(int argc, char **argv) {
   try {
     progress.storage = parse_storage(argv[2]);
     progress.dtype = parse_dtype(argv[3]);
-    if (argc == 6) {
+    if (argc >= 6) {
       progress.readback = argv[5];
       if (progress.readback != "first" && progress.readback != "all" &&
           progress.readback != "none") {
         throw std::invalid_argument("readback must be first, all or none");
       }
+    }
+    if (argc == 7) {
+      if (std::string(argv[6]) != "--probe-limit") {
+        throw std::invalid_argument("expected --probe-limit");
+      }
+      progress.probe_limit = true;
     }
     const std::string target(argv[4]);
     if (target.empty() || target.find_first_not_of("0123456789") != std::string::npos ||
@@ -243,8 +279,10 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("expected F16/F32 and an integer target");
     }
     const auto size = std::stoul(target);
-    if (size == 0 || size > segment_payload_limit / mib) {
-      throw std::invalid_argument("target must be between 1 and 1024 MiB (application policy)");
+    const auto limit_mib = progress.probe_limit ? 4096 : segment_payload_limit / mib;
+    if (size == 0 || size > limit_mib) {
+      throw std::invalid_argument(
+          "target must be 1..1024 MiB, or up to 4096 MiB with --probe-limit");
     }
     progress.target = size * mib;
     probe(progress);

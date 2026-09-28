@@ -1,3 +1,4 @@
+#include "binary_io.hpp"
 #include "models/opt/model.hpp"
 #include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
@@ -25,10 +26,7 @@ struct Report {
 
 void capture(Model &model, const std::string &prefix, unsigned layers, const fs::path &directory) {
   auto save = [&](const std::string &name, const std::vector<std::uint8_t> &data) {
-    std::ofstream out(directory / (prefix + name + ".bin"), std::ios::binary);
-    if (!out.write(reinterpret_cast<const char *>(data.data()), data.size())) {
-      throw std::runtime_error("cannot save model diagnostic");
-    }
+    specferry::testing::write_bytes(directory / (prefix + name + ".bin"), data);
   };
   for (const auto *name : {"embedding", "projected", "logits"}) {
     save(name, model.read(name));

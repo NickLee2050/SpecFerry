@@ -47,7 +47,11 @@ class SamplingReportTests(unittest.TestCase):
             self.assertEqual(check({"device_recovery_required": True})["status"], "failed")
             for value in (8, 0):
                 np.full(count, value, dtype="<i4").tofile(directory / "weighted.bin")
-                self.assertEqual(check()["status"], "failed")
+                report = check()
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(
+                    report["checks"]["weighted.range"]["out_of_range"], count if value == 8 else 0
+                )
             (directory / "weighted.bin").write_bytes(b"")
             self.assertFalse(check()["checks"]["weighted.range"]["passed"])
 

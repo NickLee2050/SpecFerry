@@ -147,6 +147,38 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(
             result(broken, evidence | {"returncode": 1}, "all")["readback_and_release_passed"]
         )
+        # A complete scan can find corruption and still cover every retained block,
+        # including blocks after the first error and after a final allocation refusal.
+        scanned = broken | {
+            "uploaded_bytes": 24 * MIB,
+            "verified_bytes": 16 * MIB,
+            "retained_tensors": 3,
+            "scanned_bytes": 24 * MIB,
+            "scanned_blocks": 3,
+            "size_mismatch_blocks": 0,
+            "mismatched_bytes": 24,
+            "mismatched_blocks": 1,
+            "mismatched_ranges": 3,
+            "rejected_block_bytes": 8 * MIB,
+            "rejection_phase": "allocate",
+        }
+        completed = result(scanned, evidence | {"returncode": 1}, "all")
+        self.assertTrue(completed["full_scan_completed"])
+        self.assertTrue(completed["next_block_rejected"])
+        self.assertFalse(completed["target_reached"])
+        self.assertFalse(completed["readback_and_release_passed"])
+        self.assertEqual(completed["matching_bytes"], 24 * MIB - 24)
+        for changed in (
+            {"scanned_bytes": 16 * MIB},
+            {"scanned_blocks": 2},
+            {"size_mismatch_blocks": 1},
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(
+                    result(scanned | changed, evidence | {"returncode": 1}, "all")[
+                        "full_scan_completed"
+                    ]
+                )
         self.assertFalse(result(e=evidence | {"returncode": -11})["allocation_and_release_passed"])
         self.assertFalse(result(r=report | {"released": False})["allocation_and_release_passed"])
         with self.assertRaises(ValueError):
