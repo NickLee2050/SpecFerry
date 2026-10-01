@@ -1,4 +1,5 @@
 #include "inference/generation.hpp"
+#include "np101/diagnostics.hpp"
 
 #include <chrono>
 #include <limits>
@@ -37,27 +38,36 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
       throw std::invalid_argument("prompt token exceeds vocabulary");
     }
   }
-  executor.reset();
+  {
+    np101::SdkScope phase("phase", "reset");
+    executor.reset();
+  }
   Generation result;
   result.stop_reason = "max_new_tokens";
   if (!maximum_new_tokens) {
     return result;
   }
   const auto start = std::chrono::steady_clock::now();
-  if (executor.prefill) {
-    executor.prefill(ids);
-    result.consumed = ids.size();
-  } else {
-    for (auto token : ids) {
-      executor.consume(token);
-      ++result.consumed;
+  {
+    np101::SdkScope phase("phase", "prefill");
+    if (executor.prefill) {
+      executor.prefill(ids);
+      result.consumed = ids.size();
+    } else {
+      for (auto token : ids) {
+        executor.consume(token);
+        ++result.consumed;
+      }
     }
   }
   result.prefill_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   auto previous = start;
   for (unsigned index = 0; index < maximum_new_tokens; ++index) {
-    const auto token = executor.predict();
+    const auto token = [&] {
+      np101::SdkScope phase("phase", index == 0 ? "prefill" : "decode");
+      return executor.predict();
+    }();
     if (token < 0 || unsigned(token) >= policy.vocabulary) {
       throw std::runtime_error("generation executor returned an invalid token");
     }
@@ -84,7 +94,10 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
       break;
     }
     previous = now;
-    executor.consume(token);
+    {
+      np101::SdkScope phase("phase", "decode");
+      executor.consume(token);
+    }
     ++result.consumed;
   }
   result.total_seconds =

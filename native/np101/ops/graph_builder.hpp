@@ -6,9 +6,11 @@
 #include "np101/weights.hpp"
 #include "vsi_nn_pub.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 namespace specferry::np101 {
@@ -23,24 +25,32 @@ struct Tensor {
   TensorSpec spec;
 };
 
+// Default uses the supplied bank, or local const storage when no bank is supplied.
+enum class WeightStorage { Default, SharedMutable, LocalConst, LocalMutable };
+
 // Adds nodes to one graph. Parameter arrays outlive the graph that borrows them.
 // This is a construction helper, not an execution engine or model registry.
 class GraphBuilder {
   std::deque<Shape> parameters_;
   WeightBank *weights_;
-  std::vector<vsi_nn_tensor_id_t> shared_weight_inputs_;
+  WeightStorage weight_storage_;
+  std::vector<vsi_nn_tensor_id_t> mutable_weight_inputs_;
+  std::size_t local_weight_bytes_ = 0;
+  std::vector<vsi_nn_tensor_id_t> input_ids_, output_ids_;
 
 public:
   Graph graph;
 
-  GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights = nullptr);
+  GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights = nullptr,
+               WeightStorage weight_storage = WeightStorage::Default);
   Tensor tensor(TensorSpec spec);
   Tensor constant(TensorSpec spec, const std::vector<std::uint8_t> &bytes);
   Tensor floats(const std::vector<float> &values, Shape shape, DataType type);
   Tensor scalar(float value, DataType type = DataType::Float32);
   Tensor weight(const WeightStore &store, const WeightRecord &record, TensorSpec expected);
   Tensor weight_chunk(const WeightStore &store, const WeightRecord &record, TensorSpec spec,
-                      std::size_t offset);
+                      std::size_t offset, WeightStorage storage = WeightStorage::Default);
+  std::size_t local_weight_bytes() const;
   Tensor share(GraphBuilder &owner, Tensor source);
   Tensor bind(TensorBinding source, TensorSpec expected);
   vsi_nn_node_t *node(vsi_nn_op_t op, std::initializer_list<Tensor> inputs, Tensor output);
@@ -48,8 +58,9 @@ public:
   Tensor convert(Tensor input, DataType type);
   Tensor binary(vsi_nn_op_t op, Tensor left, Tensor right);
   Tensor reshape(Tensor input, Shape shape);
+  Tensor permute(Tensor input, Shape order);
   Tensor slice(Tensor input, Shape start, Shape length);
-  Tensor concat(Tensor left, Tensor right);
+  Tensor concat(Tensor left, Tensor right, unsigned axis = 0);
   Tensor reduce(Tensor input, bool mean, unsigned axis = 0);
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);

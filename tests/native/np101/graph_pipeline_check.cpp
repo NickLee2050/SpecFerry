@@ -1,17 +1,17 @@
 #include "binary_io.hpp"
+#include "inference/generation_io.hpp"
 #include "models/opt/config.hpp"
-#include "models/opt/graph_model.hpp"
-#include "models/opt/layer.hpp"
+#include "models/opt/partitioned_graph_model.hpp"
+#include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
-#include "np101/ops/cache_update.hpp"
-#include "np101/ops/graph_builder.hpp"
-#include "np101/ops/mixers.hpp"
-#include "np101/ops/vocabulary.hpp"
-#include "np101/weight_bank.hpp"
+#include "np101/memory_budget.hpp"
+#include "np101/tensor.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -19,18 +19,110 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
 using namespace specferry::np101;
-using namespace specferry::np101::ops;
 using namespace specferry::testing;
 namespace opt = specferry::models::opt;
 namespace fs = std::filesystem;
 constexpr auto f16 = DataType::Float16;
+using SplitVariant = opt::PartitionedGraphModel::Variant;
+
+const char *variant_name(SplitVariant variant) {
+  switch (variant) {
+  case SplitVariant::MergedKv:
+    return "merged-kv";
+  case SplitVariant::MergedKvLocalConst:
+    return "merged-kv-local-const";
+  case SplitVariant::MergedKvLocalMutable:
+    return "merged-kv-local-mutable";
+  }
+  throw std::invalid_argument("unknown partitioned-model diagnostic variant");
+}
+
+SplitVariant parse_variant(const std::string &name) {
+  for (const auto variant : {SplitVariant::MergedKv, SplitVariant::MergedKvLocalConst,
+                             SplitVariant::MergedKvLocalMutable}) {
+    if (name == variant_name(variant)) {
+      return variant;
+    }
+  }
+  throw std::invalid_argument("unknown partitioned-model diagnostic variant: " + name);
+}
+
+struct SplitReadback {
+  std::string mode = "outputs";
+  std::vector<unsigned> boundary_layers;
+
+  unsigned planned_checks(unsigned layers) const {
+    if (mode == "outputs-kv") {
+      return 10 * layers + 4;
+    }
+    return 2 * (2 + boundary_layers.size());
+  }
+};
+
+unsigned parse_positive_integer(const std::string &text) {
+  unsigned value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !value) {
+    throw std::invalid_argument("expected a positive integer: " + text);
+  }
+  return value;
+}
+
+std::vector<unsigned> parse_boundary_layers(const std::string &text) {
+  std::vector<unsigned> layers;
+  std::size_t start = 0;
+  while (true) {
+    const auto end = text.find(',', start);
+    const auto layer = parse_positive_integer(text.substr(start, end - start));
+    if (!layers.empty() && layer <= layers.back()) {
+      throw std::invalid_argument("boundary layers must be strictly increasing and unique");
+    }
+    layers.push_back(layer);
+    if (end == std::string::npos) {
+      return layers;
+    }
+    start = end + 1;
+  }
+}
+
+struct PrefixOptions {
+  unsigned layers = 1;
+  unsigned decoder_group_size = 1;
+  SplitVariant variant = SplitVariant::MergedKv;
+  bool check_fixture = false, repeat = false;
+  SplitReadback readback;
+};
+
+PrefixOptions parse_prefix_options(const fs::path &directory) {
+  specferry::inference::RunSettings settings(directory);
+  PrefixOptions options;
+  options.layers =
+      settings.number("layers", opt::read_model_config(directory).decoder.layers, 1, 32);
+  options.decoder_group_size = settings.number("decoder_group_size", 1, 1, 2);
+  options.variant = parse_variant(settings.text("variant", "merged-kv"));
+  options.check_fixture = settings.number("check_fixture", 0, 0, 1);
+  options.repeat = settings.number("repeat", 0, 0, 1);
+  options.readback.mode = settings.text("readback", "outputs");
+  const auto boundaries = settings.text("boundary_layers", "");
+  if (!boundaries.empty()) {
+    options.readback.boundary_layers = parse_boundary_layers(boundaries);
+  }
+  settings.finish();
+  if ((options.readback.mode != "outputs" && options.readback.mode != "outputs-kv" &&
+       options.readback.mode != "boundaries") ||
+      ((options.readback.mode == "boundaries") != !boundaries.empty()) ||
+      (!boundaries.empty() && options.readback.boundary_layers.back() > options.layers)) {
+    throw std::invalid_argument("invalid prefix readback scope");
+  }
+  return options;
+}
 
 class Report {
 public:
@@ -49,12 +141,25 @@ public:
     if (!stream) {
       throw std::runtime_error("cannot save pipeline progress");
     }
-    std::cout << name << std::endl;
+  }
+
+  void memory(const std::string &name, Context &context, std::size_t loaded_weight_payload_bytes) {
+    const auto &budget = context.memory();
+    std::ofstream stream(directory / ("memory." + name + ".json"));
+    stream << "{\"application_segment_limit_bytes\":" << segment_payload_limit
+           << ",\"loaded_weight_payload_bytes\":" << loaded_weight_payload_bytes
+           << ",\"const_live_bytes\":" << budget.live(true)
+           << ",\"const_peak_bytes\":" << budget.peak(true)
+           << ",\"nonconst_live_bytes\":" << budget.live(false)
+           << ",\"nonconst_peak_bytes\":" << budget.peak(false) << "}\n";
+    if (!stream) {
+      throw std::runtime_error("cannot save application memory accounting");
+    }
   }
 
   bool compare(const std::string &name, const std::vector<std::uint8_t> &actual,
                const std::vector<std::uint8_t> &expected, DataType type, float atol = 0,
-               float rtol = 0) {
+               float rtol = 0, bool exact_bits = false) {
     if (actual.size() != expected.size() || actual.size() % dtype_bytes(type)) {
       throw std::runtime_error("comparison shape mismatch: " + name);
     }
@@ -82,6 +187,9 @@ public:
         throw std::invalid_argument("diagnostic comparison requires FP16 or INT32");
       }
     }
+    if (exact_bits) {
+      passed &= actual == expected;
+    }
     ++checks;
     failures += !passed;
     rows_ << name << '\t' << passed << '\t' << actual.size() / dtype_bytes(type) << '\t' << nonzero
@@ -91,7 +199,11 @@ public:
       throw std::runtime_error("cannot save pipeline comparison");
     }
     if (!passed) {
-      std::cout << "FAIL " << name << ": max_abs_error=" << maximum << std::endl;
+      std::cout << "FAIL " << name << ": max_abs_error=" << maximum;
+      if (exact_bits && actual != expected) {
+        std::cout << "; bytes differ";
+      }
+      std::cout << std::endl;
     }
     return passed;
   }
@@ -100,167 +212,106 @@ private:
   std::ofstream rows_;
 };
 
-void lookup_check(Context &context, const WeightStore &weights, const fs::path &fixture,
-                  Report &report) {
-  const auto config = opt::read_model_config(fixture);
-  WeightBank bank(context);
-  GraphBuilder g(context, 512, 256, &bank);
-  auto controls = g.tensor({DataType::Int32, {3}});
-  auto token = g.slice(controls, {0}, {1});
-  auto position = g.slice(controls, {1}, {1});
-  auto slot = g.slice(controls, {2}, {1});
-  const auto &table = weights.find("decoder.embed_tokens.weight");
-  std::vector<Tensor> blocks;
-  for (unsigned first = 0; first < config.vocabulary; first += config.block_rows) {
-    const auto rows = std::min(config.block_rows, config.vocabulary - first);
-    blocks.push_back(g.weight_chunk(weights, table, {f16, {config.embedding, rows}},
-                                    std::size_t(first) * config.embedding * 2));
-  }
-  const auto first_block = weights.read(table, 0, blocks.front().spec.bytes());
-  report.compare("weight.before_setup", read_tensor(g.graph, blocks.front().id), first_block, f16);
-  auto embedding = lookup_blocks(g, blocks, token);
-  auto projected = g.project(embedding, weights, weights.find("decoder.project_in.weight"));
-  const auto &positions = weights.find("decoder.embed_positions.weight");
-  auto learned = g.gather(g.weight(weights, positions, positions.spec),
-                          g.binary(VSI_NN_OP_ADD, position, g.integer(config.position_offset)), 1);
-  auto hidden = g.binary(VSI_NN_OP_ADD, projected, learned);
-  report.phase("setup");
-  g.compile({controls}, {token, position, slot, embedding, hidden});
-  report.compare("weight.after_setup", read_tensor(g.graph, blocks.front().id), first_block, f16);
+class SplitValidation {
+public:
+  std::size_t loaded_weight_payload_bytes = 0;
 
-  std::ifstream cases(fixture / "cases.txt");
-  std::int32_t id, index;
-  unsigned step = 0;
-  while (cases >> id >> index) {
-    config.validate_token(id);
-    if (index < 0 || unsigned(index) >= config.decoder.capacity) {
-      throw std::out_of_range("lookup fixture position exceeds capacity");
-    }
-    const auto prefix = "case." + std::to_string(step);
+  SplitValidation(Report &report, const SplitReadback &readback, unsigned layers,
+                  unsigned decoder_group_size, SplitVariant variant)
+      : report_(report), readback_(readback), layers_(layers),
+        decoder_group_size_(decoder_group_size), variant_(variant), before_(tensor_transfers()) {
+    save();
+  }
 
-    report.phase(prefix);
-    upload_tensor(g.graph, controls.id, as_bytes<std::int32_t>({id, index, index}));
-    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(g.graph.get()); }),
-          "run packed lookup graph");
-    report.compare(prefix + ".token", read_tensor(g.graph, token.id), as_bytes<std::int32_t>({id}),
-                   DataType::Int32);
-    report.compare(prefix + ".position", read_tensor(g.graph, position.id),
-                   as_bytes<std::int32_t>({index}), DataType::Int32);
-    report.compare(prefix + ".slot", read_tensor(g.graph, slot.id), as_bytes<std::int32_t>({index}),
-                   DataType::Int32);
-    report.compare(
-        prefix + ".lookup", read_tensor(g.graph, embedding.id),
-        weights.read(table, std::size_t(id) * config.embedding * 2, embedding.spec.bytes()), f16);
-    report.compare(
-        prefix + ".embedding", read_tensor(g.graph, hidden.id),
-        read_bytes(fixture, "embedding." + std::to_string(step) + ".bin", hidden.spec.bytes()), f16,
-        0.08f, 0.02f);
-    ++step;
-    if (report.failures) {
-      break;
+  ~SplitValidation() {
+    try {
+      save();
+    } catch (...) {
+      // Explicit saves report IO errors; unwinding must preserve the original error.
     }
   }
-  if (!step) {
-    throw std::runtime_error("lookup fixture has no cases");
-  }
-  report.compare("weight.after_run", read_tensor(g.graph, blocks.front().id), first_block, f16);
-  bank.verify();
-  report.phase("release");
-  g.graph.close();
-  bank.close();
-}
 
-void layer_check(Context &context, const WeightStore &weights, const fs::path &fixture,
-                 Report &report) {
-  const auto config = opt::read_config(fixture / "components.txt");
-  if (config.capacity < 2) {
-    throw std::invalid_argument("layer diagnostic requires two cache slots");
+  void begin_step(unsigned index) {
+    steps_.push_back({index, false, report_.checks, report_.failures, tensor_transfers()});
+    save();
   }
-  opt::validate_weights(weights, config, {0});
-  WeightBank bank(context);
-  Graph storage(context, config.heads * 2, 0);
-  GraphBuilder g(context, 2048, 1024, &bank);
-  auto hidden = g.tensor(config.hidden_spec());
-  auto controls = g.tensor({DataType::Int32, {2}});
-  auto slot = g.slice(controls, {0}, {1});
-  auto limit = g.slice(controls, {1}, {1});
-  auto qkv = opt::build_projections(g, weights, config, 0, hidden);
-  const unsigned dimension = config.kv_spec().head_dim;
-  std::vector<Tensor> parents, probabilities;
-  Tensor attended{};
-  for (unsigned head = 0; head < config.heads; ++head) {
-    std::vector<Tensor> caches;
-    for (unsigned kind = 0; kind < 2; ++kind) {
-      const TensorSpec shape{f16, {dimension, config.capacity}};
-      auto id = add_tensor(storage, shape, false, std::vector<std::uint8_t>(shape.bytes()));
-      parents.push_back({id, shape});
-      auto parent = g.bind({storage, id}, shape);
-      auto column = g.slice(kind ? qkv.value : qkv.key, {head * dimension, 0}, {dimension, 1});
-      auto updated = indexed_append(g, g.reshape(column, {dimension, 1}), slot, parent);
-      caches.push_back(storage_reshape(g, updated, {dimension, config.capacity, 1}));
-    }
-    auto query = g.slice(qkv.query, {head * dimension, 0}, {dimension, 1});
-    auto attention =
-        attention_core(g, g.reshape(query, {dimension, 1, 1}), caches[0], caches[1], limit, 1);
-    probabilities.push_back(attention.probabilities);
-    auto current = g.reshape(attention.attended, {dimension, 1});
-    attended = head ? g.concat(attended, current) : current;
-  }
-  auto outputs = opt::build_decoder_tail(g, weights, config, 0, hidden, attended);
-  outputs.emplace("query", qkv.query);
-  outputs.emplace("key", qkv.key);
-  outputs.emplace("value", qkv.value);
-  report.phase("setup");
-  // Match production: only the final value is a graph output. Read ordinary
-  // intermediate tensors diagnostically after execution, without extra nodes.
-  g.compile({hidden, controls}, {outputs.at("output")});
 
-  for (unsigned step = 0; step < 2; ++step) {
-    const auto label = "step." + std::to_string(step);
+  void executed_step() {
+    steps_.back().executed = true;
+    save();
+  }
 
-    report.phase(label);
-    auto input = read_bytes(fixture, "input." + std::to_string(step) + ".bin", hidden.spec.bytes());
-    upload_tensor(g.graph, hidden.id, input);
-    upload_tensor(g.graph, controls.id,
-                  as_bytes<std::int32_t>({std::int32_t(step), std::int32_t(step + 1)}));
-    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(g.graph.get()); }),
-          "run integrated decoder layer");
-    report.compare(label + ".input", read_tensor(g.graph, hidden.id), input, f16);
-    for (const auto &[name, tensor] : outputs) {
-      report.compare(label + "." + name, read_tensor(g.graph, tensor.id),
-                     read_bytes(fixture,
-                                "zero.layer.0." + name + "." + std::to_string(step) + ".bin",
-                                tensor.spec.bytes()),
-                     f16, 0.08f, 0.02f);
+  void save() {
+    if (!steps_.empty()) {
+      auto &step = steps_.back();
+      step.checks = report_.checks - step.checks_before;
+      step.failures = report_.failures - step.failures_before;
+      step.after = tensor_transfers();
     }
-    for (unsigned kind = 0; kind < 3; ++kind) {
-      std::vector<std::uint8_t> data;
-      for (unsigned head = 0; head < config.heads; ++head) {
-        const auto tensor = kind == 2 ? probabilities[head] : parents[head * 2 + kind];
-        auto part = read_tensor(kind == 2 ? g.graph : storage, tensor.id);
-        data.insert(data.end(), part.begin(), part.end());
-      }
-      const std::string name = kind == 0 ? "keys" : kind == 1 ? "values" : "probabilities";
-      report.compare(label + "." + name, data,
-                     read_bytes(fixture,
-                                "zero.layer.0." + name + "." + std::to_string(step) + ".bin",
-                                data.size()),
-                     f16, 0.08f, 0.02f);
+    std::ofstream stream(report_.directory / "validation.json");
+    stream << "{\"mode\":\"" << readback_.mode << "\",\"boundary_layers\":[";
+    for (std::size_t index = 0; index < readback_.boundary_layers.size(); ++index) {
+      stream << (index ? "," : "") << readback_.boundary_layers[index];
     }
-    if (report.failures) {
-      break;
+    const bool cache_readback = readback_.mode == "outputs-kv";
+    const auto completed_steps =
+        std::count_if(steps_.begin(), steps_.end(), [](const Step &step) { return step.executed; });
+    stream << "],\"layer_count\":" << layers_ << ",\"decoder_group_size\":" << decoder_group_size_
+           << ",\"variant\":\"" << variant_name(variant_) << '"' << ",\"execution_graphs\":"
+           << 2 + (layers_ + decoder_group_size_ - 1) / decoder_group_size_
+           << ",\"planned_steps\":2,\"planned_checks\":" << readback_.planned_checks(layers_)
+           << ",\"completed_steps\":" << completed_steps << ",\"checks\":" << report_.checks
+           << ",\"failures\":" << report_.failures
+           << ",\"kv_checks_requested\":" << (cache_readback ? "true" : "false")
+           << ",\"loaded_weight_payload_bytes\":" << loaded_weight_payload_bytes
+           << ",\"transfer_scope\":\"explicit_tensor_helpers_excluding_sdk_internal_and_"
+              "addtensor_initialization\",\"transfers\":{";
+    write_transfers(stream, before_, tensor_transfers());
+    stream << "},\"steps\":[";
+    for (std::size_t index = 0; index < steps_.size(); ++index) {
+      const auto &step = steps_[index];
+      stream << (index ? "," : "") << "{\"index\":" << step.index
+             << ",\"executed\":" << (step.executed ? "true" : "false")
+             << ",\"checks\":" << step.checks << ",\"failures\":" << step.failures << ',';
+      write_transfers(stream, step.before, step.after);
+      stream << '}';
+    }
+    stream << "]}\n";
+    if (!stream) {
+      throw std::runtime_error("cannot save split-prefix validation scope");
     }
   }
-  bank.verify();
-  report.phase("release");
-  g.graph.close();
-  storage.close();
-  bank.close();
-}
+
+private:
+  struct Step {
+    unsigned index;
+    bool executed;
+    unsigned checks_before, failures_before;
+    TensorTransfers before;
+    unsigned checks = 0, failures = 0;
+    TensorTransfers after{};
+  };
+
+  static void write_transfers(std::ostream &stream, TensorTransfers before, TensorTransfers after) {
+    stream << "\"reads\":" << after.reads - before.reads
+           << ",\"read_bytes\":" << after.read_bytes - before.read_bytes
+           << ",\"uploads\":" << after.uploads - before.uploads
+           << ",\"upload_bytes\":" << after.upload_bytes - before.upload_bytes;
+  }
+
+  Report &report_;
+  const SplitReadback &readback_;
+  unsigned layers_;
+  unsigned decoder_group_size_;
+  SplitVariant variant_;
+  TensorTransfers before_;
+  std::vector<Step> steps_;
+};
 
 struct PrefixReference {
   opt::ModelConfig config;
   std::vector<std::int32_t> tokens = std::vector<std::int32_t>(2);
+  std::vector<std::int32_t> predictions = std::vector<std::int32_t>(2);
   std::vector<std::map<std::string, std::vector<std::uint8_t>>> steps{2};
 
   PrefixReference(const fs::path &fixture, unsigned layers)
@@ -273,19 +324,19 @@ struct PrefixReference {
     if (!(source >> tokens[0] >> tokens[1]) || source >> extra) {
       throw std::invalid_argument("prefix fixture needs exactly two teacher tokens");
     }
+    std::ifstream predicted(fixture / "predictions.txt");
+    if (!(predicted >> predictions[0] >> predictions[1]) || predicted >> extra) {
+      throw std::invalid_argument("prefix fixture needs exactly two predicted tokens");
+    }
     // Validate all reference sizes before Context opens the board, including
-    // truncated-model outputs reserved for the subsequent head diagnosis.
+    // intermediate tensors reserved for fine-grained readback.
     for (unsigned step = 0; step < tokens.size(); ++step) {
       config.validate_token(tokens[step]);
+      config.validate_token(predictions[step]);
       auto read = [&](const std::string &name, std::size_t elements) {
         steps[step][name] = read_bytes(
             fixture, "teacher." + std::to_string(step) + "." + name + ".bin", elements * 2);
       };
-      read("lookup", config.embedding);
-      for (const auto *name : {"input_projection", "position_embedding", "embedding"}) {
-        read(name, config.decoder.hidden);
-      }
-      read("projected", config.embedding);
       read("logits", config.vocabulary);
       for (unsigned layer = 0; layer < layers; ++layer) {
         const auto prefix = "layer." + std::to_string(layer);
@@ -298,100 +349,163 @@ struct PrefixReference {
   }
 };
 
-bool compare_inputs(opt::GraphModel &model, const PrefixReference &reference, unsigned step,
-                    Report &report) {
-  const auto prefix = "teacher." + std::to_string(step) + ".";
-  for (const auto *name : {"token", "position", "slot"}) {
-    const auto expected =
-        std::string(name) == "token" ? reference.tokens[step] : std::int32_t(step);
-    if (!report.compare(prefix + name, model.read_input(name), as_bytes<std::int32_t>({expected}),
-                        DataType::Int32)) {
-      return false;
-    }
+using SplitPrefixModel = opt::PartitionedGraphModel;
+
+std::vector<std::uint8_t> cache_rows(const std::vector<std::uint8_t> &data, unsigned heads,
+                                     unsigned capacity, std::size_t row_bytes, unsigned first,
+                                     unsigned end,
+                                     const char *error = "invalid head-major cache slice") {
+  if (first > end || end > capacity || data.size() != std::size_t(heads) * capacity * row_bytes) {
+    throw std::runtime_error(error);
   }
-  for (const auto *name : {"lookup", "input_projection", "position_embedding", "embedding"}) {
-    const bool exact = std::string(name) == "lookup" || std::string(name) == "position_embedding";
-    if (!report.compare(prefix + name, model.read_input(name), reference.steps[step].at(name), f16,
-                        exact ? 0 : 0.08f, exact ? 0 : 0.02f)) {
-      return false;
+  std::vector<std::uint8_t> result;
+  result.reserve(std::size_t(heads) * (end - first) * row_bytes);
+  for (unsigned head = 0; head < heads; ++head) {
+    const auto begin = data.begin() + (std::size_t(head) * capacity + first) * row_bytes;
+    result.insert(result.end(), begin, begin + std::size_t(end - first) * row_bytes);
+  }
+  return result;
+}
+
+std::vector<std::uint8_t> valid_prefix(const std::vector<std::uint8_t> &data, unsigned heads,
+                                       unsigned capacity, std::size_t row_bytes, unsigned length) {
+  // Native reads contain full capacity per head; CPU references contain valid rows only.
+  return cache_rows(data, heads, capacity, row_bytes, 0, length,
+                    "invalid head-major diagnostic tensor size");
+}
+
+bool compare_cache_lifecycle(SplitPrefixModel &model, const PrefixReference &reference,
+                             unsigned step,
+                             std::map<std::string, std::vector<std::uint8_t>> &previous_cache,
+                             Report &report) {
+  const auto &config = reference.config.decoder;
+  const auto row_bytes = config.kv_spec().head_dim * 2;
+  for (unsigned layer = 0; layer < config.layers; ++layer) {
+    for (bool values : {false, true}) {
+      const auto boundary = "layer." + std::to_string(layer) + (values ? ".values" : ".keys");
+      const auto prefix = "teacher." + std::to_string(step) + "." + boundary;
+      // Merged KV variants perform exactly one SDK read here. All subsequent
+      // comparisons and saved views use these same normalized head-major bytes.
+      const auto actual = model.read_cache(layer, values);
+      write_bytes(report.directory / (prefix + ".backing.bin"), actual);
+      const auto current =
+          cache_rows(actual, config.heads, config.capacity, row_bytes, step, step + 1);
+      const auto expected = cache_rows(reference.steps[step].at(boundary), config.heads, step + 1,
+                                       row_bytes, step, step + 1);
+      if (!report.compare(prefix + ".current", current, expected, f16, 0.08f, 0.02f)) {
+        return false;
+      }
+      if (step) {
+        const auto history = valid_prefix(actual, config.heads, config.capacity, row_bytes, step);
+        if (!report.compare(prefix + ".history", history, previous_cache.at(boundary), f16, 0, 0,
+                            true)) {
+          return false;
+        }
+      }
+      const auto suffix =
+          cache_rows(actual, config.heads, config.capacity, row_bytes, step + 1, config.capacity);
+      if (!report.compare(prefix + ".suffix", suffix, std::vector<std::uint8_t>(suffix.size()), f16,
+                          0, 0, true)) {
+        return false;
+      }
+      previous_cache[boundary] =
+          valid_prefix(actual, config.heads, config.capacity, row_bytes, step + 1);
     }
   }
   return true;
 }
 
-void prefix_check(Context &context, const WeightStore &weights, const PrefixReference &reference,
-                  Report &report) {
-  const auto &config = reference.config;
+void split_prefix_check(Context &context, const WeightStore &weights,
+                        const PrefixReference &reference, Report &report,
+                        const SplitReadback &readback, unsigned decoder_group_size,
+                        SplitVariant variant) {
+  const auto &config = reference.config.decoder;
+  SplitValidation validation(report, readback, config.layers, decoder_group_size, variant);
   report.phase("setup");
-  opt::GraphModel model(context, weights, config, 1);
+  SplitPrefixModel model(context, weights, reference.config, {}, decoder_group_size, variant);
+  validation.loaded_weight_payload_bytes = model.weight_bytes();
+  report.memory("initialized", context, validation.loaded_weight_payload_bytes);
+  validation.save();
+  std::map<std::string, std::vector<std::uint8_t>> previous_cache;
   for (unsigned step = 0; step < reference.tokens.size(); ++step) {
-    report.phase("teacher." + std::to_string(step));
-    model.step(reference.tokens[step]);
-    if (!compare_inputs(model, reference, step, report)) {
+    if (report.failures) {
       break;
     }
-  }
-  const auto row_bytes = config.decoder.kv_spec().head_dim * dtype_bytes(f16);
-  const auto head_bytes = row_bytes * config.decoder.capacity;
-  const auto prefix_bytes = row_bytes * reference.tokens.size();
-  for (unsigned layer = 0; !report.failures && layer < config.decoder.layers; ++layer) {
-    for (bool values : {false, true}) {
-      const auto name = "layer." + std::to_string(layer) + (values ? ".values" : ".keys");
-      const auto actual = model.read_cache(layer, values);
-      if (actual.size() != config.decoder.heads * head_bytes) {
-        throw std::runtime_error("unexpected cache byte count: " + name);
-      }
-      // Native storage is [head, capacity, width]; the CPU saves only consumed
-      // rows. Skip each head's unused suffix instead of treating it as tokens.
-      std::vector<std::uint8_t> prefix;
-      for (unsigned head = 0; head < config.decoder.heads; ++head) {
-        const auto begin = actual.begin() + head * head_bytes;
-        prefix.insert(prefix.end(), begin, begin + prefix_bytes);
-      }
-      report.compare(name, prefix, reference.steps.back().at(name), f16, 0.08f, 0.02f);
+    report.phase("teacher." + std::to_string(step));
+    validation.begin_step(step);
+    model.step(reference.tokens[step]);
+    validation.executed_step();
+    const auto prefix = "teacher." + std::to_string(step) + ".";
+    report.compare(prefix + "logits", model.read_output("logits"),
+                   reference.steps[step].at("logits"), f16, 0.08f, 0.02f);
+    report.compare(prefix + "selected", model.read_output("selected"),
+                   as_bytes<std::int32_t>({reference.predictions[step]}), DataType::Int32);
+    if (readback.mode == "outputs-kv" && !report.failures) {
+      compare_cache_lifecycle(model, reference, step, previous_cache, report);
     }
+    for (const auto boundary : readback.boundary_layers) {
+      const auto name = "layer." + std::to_string(boundary - 1);
+      report.compare(prefix + name, model.read_layer(boundary - 1, "output"),
+                     reference.steps[step].at(name), f16, 0.08f, 0.02f);
+    }
+    validation.save();
   }
   report.phase("release");
   model.close();
+  report.memory("released", context, validation.loaded_weight_payload_bytes);
+  validation.save();
 }
+
 } // namespace
 
 int main(int argc, char **argv) {
-  const bool check_fixture =
-      argc == 7 && std::string(argv[4]) == "prefix" && std::string(argv[6]) == "--check-fixture";
-  if ((argc != 5 && argc != 6 && !check_fixture) ||
-      (std::string(argv[4]) != "lookup" && std::string(argv[4]) != "layer" &&
-       std::string(argv[4]) != "prefix")) {
-    std::cerr << "usage: np101_graph_pipeline_check DEPLOYMENT FIXTURE OUTPUT lookup|layer|prefix "
-                 "[LAYERS [--check-fixture]]\n";
+  if (argc != 4) {
+    std::cerr << "usage: np101_graph_pipeline_check DEPLOYMENT FIXTURE OUTPUT\n";
     return 2;
   }
   try {
-    std::optional<PrefixReference> reference;
-    if (std::string(argv[4]) == "prefix") {
-      const auto layers = parse_shape(argc >= 6 ? argv[5] : "1");
-      if (layers.size() != 1) {
-        throw std::invalid_argument("expected one layer count");
-      }
-      reference.emplace(argv[2], layers.front());
-      if (check_fixture) {
-        std::cout << "Prefix reference sizes and configuration passed; device not opened.\n";
-        return 0;
-      }
+    const auto prefix_options = parse_prefix_options(argv[2]);
+    const PrefixReference reference(argv[2], prefix_options.layers);
+    if (prefix_options.check_fixture) {
+      std::cout << "Prefix reference sizes and configuration passed; device not opened.\n"
+                << "Variant: " << variant_name(prefix_options.variant)
+                << "; decoder group size: " << prefix_options.decoder_group_size
+                << "; execution graphs: "
+                << 2 + (prefix_options.layers + prefix_options.decoder_group_size - 1) /
+                           prefix_options.decoder_group_size
+                << '\n';
+      return 0;
     }
     fs::create_directories(argv[3]);
     Report report(argv[3]);
     SdkTimings timings(argv[3]);
     WeightStore weights(argv[1]);
     weights.verify();
-    Context context;
-    if (std::string(argv[4]) == "lookup") {
-      lookup_check(context, weights, argv[2], report);
-    } else if (std::string(argv[4]) == "layer") {
-      layer_check(context, weights, argv[2], report);
-    } else {
-      prefix_check(context, weights, *reference, report);
+    if (prefix_options.repeat) {
+      for (unsigned cycle = 0; cycle < 2; ++cycle) {
+        const auto name = "cycle." + std::to_string(cycle);
+        report.phase(name);
+        const auto directory = fs::path(argv[3]) / name;
+        fs::create_directories(directory);
+        Report cycle_report(directory);
+        Context cycle_context;
+        split_prefix_check(cycle_context, weights, reference, cycle_report, prefix_options.readback,
+                           prefix_options.decoder_group_size, prefix_options.variant);
+        cycle_context.close();
+        cycle_report.phase(cycle_report.failures ? "numerical_failure" : "complete", true);
+        report.checks += cycle_report.checks;
+        report.failures += cycle_report.failures;
+        if (report.failures) {
+          break;
+        }
+      }
+      report.phase(report.failures ? "numerical_failure" : "complete", true);
+      std::cout << report.checks << " checks; " << report.failures << " failures" << std::endl;
+      return report.failures ? 1 : 0;
     }
+    Context context;
+    split_prefix_check(context, weights, reference, report, prefix_options.readback,
+                       prefix_options.decoder_group_size, prefix_options.variant);
     context.close();
     report.phase(report.failures ? "numerical_failure" : "complete", true);
     std::cout << report.checks << " checks; " << report.failures << " failures" << std::endl;

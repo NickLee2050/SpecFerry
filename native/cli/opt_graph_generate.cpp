@@ -1,15 +1,18 @@
 #include "inference/generation_io.hpp"
 #include "models/opt/config.hpp"
-#include "models/opt/graph_model.hpp"
+#include "models/opt/partitioned_graph_model.hpp"
 #include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
+#include "np101/memory_budget.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 #include "sys/resource.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -18,23 +21,106 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 namespace fs = std::filesystem;
 using namespace specferry;
 using Clock = std::chrono::steady_clock;
+using PartitionedModel = models::opt::PartitionedGraphModel;
 
-unsigned number(const char *value) {
-  const std::string text(value);
-  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
-    throw std::invalid_argument("expected a positive integer");
+struct ExecutionCounts {
+  std::size_t decode_steps = 0;
+  std::size_t prefill_steps = 0;
+  std::size_t head_runs = 0;
+};
+
+struct BenchmarkRun {
+  std::string name;
+  unsigned request_index;
+  unsigned iteration;
+  unsigned prompt_length;
+  bool warmup;
+  bool tokens_match;
+};
+
+ExecutionCounts execution_counts(const PartitionedModel &model, ExecutionCounts before = {}) {
+  return {model.decode_steps() - before.decode_steps, model.prefill_steps() - before.prefill_steps,
+          model.head_runs() - before.head_runs};
+}
+
+PartitionedModel::Variant parse_variant(const std::string &name) {
+  using Variant = PartitionedModel::Variant;
+  const std::pair<const char *, Variant> variants[] = {
+      {"merged-kv", Variant::MergedKv},
+      {"merged-kv-local-const", Variant::MergedKvLocalConst},
+      {"merged-kv-local-mutable", Variant::MergedKvLocalMutable}};
+  for (const auto &[label, variant] : variants) {
+    if (name == label) {
+      return variant;
+    }
   }
-  const auto result = std::stoul(text);
-  if (!result || result > 32) {
-    throw std::out_of_range("experimental block/output limit must be 1..32");
+  throw std::invalid_argument("unknown or retired partitioned graph variant: " + name);
+}
+
+bool same_transfers(np101::TensorTransfers before, np101::TensorTransfers after) {
+  return before.uploads == after.uploads && before.upload_bytes == after.upload_bytes &&
+         before.reads == after.reads && before.read_bytes == after.read_bytes;
+}
+
+template <class Exception>
+void check_rejected_step(PartitionedModel &model, std::int32_t token, unsigned &checks,
+                         unsigned &rejections, const char *message) {
+  const auto transfers = np101::tensor_transfers();
+  const auto launches = model.launches();
+  ++checks;
+  try {
+    model.step(token);
+  } catch (const Exception &) {
+    ++rejections;
   }
-  return result;
+  if (checks != rejections || !same_transfers(transfers, np101::tensor_transfers()) ||
+      model.launches() != launches) {
+    throw std::runtime_error(message);
+  }
+}
+
+void save_diagnostic(const fs::path &path, const std::vector<std::uint8_t> &bytes,
+                     const char *message) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+  if (!out) {
+    throw std::runtime_error(message);
+  }
+}
+
+void write_memory(std::ostream &out, const np101::MemoryBudget &budget) {
+  out << ",\"application_segment_limit_bytes\":" << np101::segment_payload_limit
+      << ",\"const_live_bytes\":" << budget.live(true)
+      << ",\"const_peak_bytes\":" << budget.peak(true)
+      << ",\"nonconst_live_bytes\":" << budget.live(false)
+      << ",\"nonconst_peak_bytes\":" << budget.peak(false);
+}
+
+void save_benchmark(const fs::path &directory, unsigned warmups, unsigned repeats,
+                    unsigned requests, const std::vector<BenchmarkRun> &runs, bool passed) {
+  std::ofstream out(directory / "benchmark.json");
+  out << "{\"schema_version\":1,\"warmups\":" << warmups << ",\"repeats\":" << repeats
+      << ",\"request_count\":" << requests << ",\"completed\":" << (passed ? "true" : "false")
+      << ",\"runs\":[";
+  for (std::size_t index = 0; index < runs.size(); ++index) {
+    const auto &run = runs[index];
+    out << (index ? "," : "") << "{\"name\":\"" << run.name
+        << "\",\"request_index\":" << run.request_index << ",\"iteration\":" << run.iteration
+        << ",\"prompt_length\":" << run.prompt_length << ",\"kind\":\""
+        << (run.warmup ? "warmup" : "measured") << "\",\"result_file\":\"" << run.name
+        << ".json\",\"tokens_match\":" << (run.tokens_match ? "true" : "false") << '}';
+  }
+  out << "]}\n";
+  if (!out) {
+    throw std::runtime_error("cannot save resident benchmark manifest");
+  }
 }
 
 std::vector<std::vector<std::int32_t>> read_requests(const fs::path &path,
@@ -55,19 +141,21 @@ std::vector<std::vector<std::int32_t>> read_requests(const fs::path &path,
     }
     requests.push_back(tokens);
   }
-  if (!input.eof() || requests.empty() || requests.size() > 3) {
-    throw std::invalid_argument("expected one to three request lines");
+  if (!input.eof() || requests.empty() || requests.size() > 64) {
+    throw std::invalid_argument("expected one to 64 request lines");
   }
   return requests;
 }
 
-void progress(const fs::path &directory, const std::string &phase, const char *status = "running") {
+void progress(const fs::path &directory, const std::string &phase, const char *status = "running",
+              bool released = false) {
   const auto temporary = directory / "execution.json.tmp";
   std::ofstream out(temporary);
   const auto now =
       std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
   out << std::setprecision(17) << "{\"status\":\"" << status << "\",\"phase\":\"" << phase
-      << "\",\"phase_started_at\":" << now << "}\n";
+      << "\",\"phase_started_at\":" << now << ",\"released\":" << (released ? "true" : "false")
+      << "}\n";
   out.close();
   if (!out) {
     throw std::runtime_error("cannot save experimental progress");
@@ -77,14 +165,17 @@ void progress(const fs::path &directory, const std::string &phase, const char *s
 
 void save_generation(const fs::path &path, const inference::Generation &result,
                      std::size_t launches, np101::TensorTransfers before,
-                     np101::TensorTransfers after) {
+                     np101::TensorTransfers after, unsigned prefill_block, ExecutionCounts counts) {
   std::ofstream out(path);
   out << '{';
   inference::write_generation(out, result);
   out << ",\"launches\":" << launches << ",\"uploads\":" << after.uploads - before.uploads
       << ",\"upload_bytes\":" << after.upload_bytes - before.upload_bytes
       << ",\"reads\":" << after.reads - before.reads
-      << ",\"read_bytes\":" << after.read_bytes - before.read_bytes << "}\n";
+      << ",\"read_bytes\":" << after.read_bytes - before.read_bytes
+      << ",\"prefill_block\":" << prefill_block << ",\"decode_steps\":" << counts.decode_steps
+      << ",\"prefill_steps\":" << counts.prefill_steps << ",\"head_runs\":" << counts.head_runs
+      << "}\n";
   if (!out) {
     throw std::runtime_error("cannot save experimental generation");
   }
@@ -92,22 +183,36 @@ void save_generation(const fs::path &path, const inference::Generation &result,
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 8) {
-    std::cerr << "usage: specferry_opt_graph_generate DEPLOYMENT REQUEST OUTPUT BLOCK MAX_NEW "
-                 "CACHE_READBACK EXPECTED_TOKENS\n"
-                 "Experimental, unvalidated hardware path; CACHE_READBACK is prefix or none.\n";
+  if (argc != 4) {
+    std::cerr << "usage: specferry_opt_graph_generate DEPLOYMENT REQUEST OUTPUT\n";
     return 2;
   }
-  const fs::path directory(argv[3]);
+  const fs::path root(argv[3]);
+  auto directory = root;
   try {
-    const auto block = number(argv[4]), maximum = number(argv[5]);
-    const std::string readback(argv[6]);
-    if (readback != "prefix" && readback != "none") {
-      throw std::invalid_argument("cache readback must be prefix or none");
+    const auto options = inference::read_run_options(argv[2], true);
+    const auto benchmark = options.benchmark, lifecycle_check = options.lifecycle;
+    const auto warmups = options.warmups, repeats = options.repeats;
+    const auto *guard = std::getenv("SPECFERRY_VERIFY_REQUIRE_OPERATIONS");
+    if (lifecycle_check && (!guard || std::string(guard) != "1")) {
+      throw std::invalid_argument("lifecycle diagnostics require the pinned compilation guard");
     }
+    const auto block = options.block, maximum = options.maximum;
+    const auto &readback = options.readback;
+    const auto &variant_name = options.variant;
+    const auto variant = parse_variant(variant_name);
+    const auto decoder_group_size = options.decoder_group_size;
+    const auto &head_policy_name = options.prefill_head;
+    const auto head_policy = head_policy_name == "last-token"
+                                 ? PartitionedModel::PrefillHeadPolicy::LastToken
+                                 : PartitionedModel::PrefillHeadPolicy::EveryToken;
     const auto config = models::opt::read_model_config(argv[2]);
+    const auto cache_first = options.cache_first, cache_last = options.cache_last;
+    if (cache_last > config.decoder.layers) {
+      throw std::invalid_argument("cache layer range must be within the configured model");
+    }
     const auto requests = read_requests(fs::path(argv[2]) / "requests.txt", config);
-    const auto expected = read_requests(argv[7], config);
+    const auto expected = read_requests(fs::path(argv[2]) / "expected.txt", config);
     if (expected.size() != requests.size()) {
       throw std::invalid_argument("expected token rows must match request rows");
     }
@@ -121,88 +226,211 @@ int main(int argc, char **argv) {
     fs::create_directories(directory);
     progress(directory, "initialize");
     np101::SdkTimings timings(directory);
-    const auto start = Clock::now();
-    np101::Context context;
-    models::opt::GraphModel model(context, weights, config, block);
-    const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
-    const auto weight_bytes = model.weight_bytes();
-    {
-      std::ofstream initialized(directory / "initialization.json");
-      initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
-                  << ",\"weight_payload_bytes\":" << weight_bytes << "}\n";
-      if (!initialized) {
-        throw std::runtime_error("cannot save initialization observation");
-      }
-    }
-    bool tokens_match = true;
-
-    for (unsigned index = 0; index < requests.size(); ++index) {
-      const auto name = "measured." + std::to_string(index);
-      progress(directory, name);
-
-      const auto before = np101::tensor_transfers();
-      const auto launches = model.launches();
-      const auto result = model.generate(requests[index], maximum);
-      save_generation(directory / (name + ".json"), result, model.launches() - launches, before,
-                      np101::tensor_transfers());
-      // Diagnostics run after generation, outside its transfer/time contract.
-      if (readback == "prefix") {
-
-        for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
-          for (bool values : {false, true}) {
-            auto bytes = model.read_cache(layer, values);
-            auto path = directory / (name + ".layer." + std::to_string(layer) +
-                                     (values ? ".values.bin" : ".keys.bin"));
-            std::ofstream out(path, std::ios::binary);
-            out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-            if (!out) {
-              throw std::runtime_error("cannot save cache diagnostic");
-            }
-          }
+    // A closed SDK Context retains registration slots; each rebuild needs a fresh Context.
+    const unsigned cycles = lifecycle_check ? 2 : 1;
+    for (unsigned cycle = 0; cycle < cycles; ++cycle) {
+      np101::SdkScope initialization_scope("phase", "initialize");
+      directory = lifecycle_check ? root / ("cycle." + std::to_string(cycle)) : root;
+      fs::create_directories(directory);
+      progress(root, lifecycle_check ? "cycle." + std::to_string(cycle) : "initialize");
+      const auto start = Clock::now();
+      np101::Context context;
+      PartitionedModel model(context, weights, config, {}, decoder_group_size, variant, head_policy,
+                             block);
+      const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
+      const auto weight_bytes = model.weight_bytes();
+      const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
+      {
+        std::ofstream initialized(directory / "initialization.json");
+        initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
+                    << ",\"weight_payload_bytes\":" << weight_bytes << ",\"variant\":\""
+                    << variant_name << "\",\"decoder_group_size\":" << decoder_group_size
+                    << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
+                    << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
+                    << ",\"decode_steps\":" << model.decode_steps()
+                    << ",\"prefill_steps\":" << model.prefill_steps()
+                    << ",\"head_runs\":" << model.head_runs()
+                    << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request;
+        write_memory(initialized, context.memory());
+        initialized << "}\n";
+        if (!initialized) {
+          throw std::runtime_error("cannot save initialization observation");
         }
       }
-      // Keep the first failing request's KV, then release normally. Further
-      // requests cannot pass the gate once the independent token oracle fails.
-      if (result.tokens != expected[index]) {
-        tokens_match = false;
-        std::cerr << "Request " << index << " token mismatch; expected ";
-        inference::write_array(std::cerr, expected[index]);
-        std::cerr << ", got ";
-        inference::write_array(std::cerr, result.tokens);
-        std::cerr << ". Skipping remaining requests and releasing the model.\n";
-        break;
+      bool tokens_match = true;
+      bool cache_suffix_matches = true;
+      std::size_t cache_suffix_checked_bytes = 0;
+      unsigned capacity_checks = 0, capacity_rejections = 0;
+      unsigned closed_checks = 0, closed_rejections = 0;
+      np101::TensorTransfers diagnostic_transfers;
+      std::vector<BenchmarkRun> benchmark_runs;
+
+      for (unsigned index = 0; index < requests.size(); ++index) {
+        for (unsigned repetition = 0; repetition < warmups + repeats; ++repetition) {
+          const bool warmup = repetition < warmups;
+          const unsigned iteration = warmup ? repetition : repetition - warmups;
+          const auto name = (warmup ? "warmup." : "measured.") + std::to_string(index) +
+                            (benchmark ? "." + std::to_string(iteration) : "");
+          progress(directory, name);
+
+          np101::SdkScope request_scope("request", name);
+          const auto before = np101::tensor_transfers();
+          const auto launches = model.launches();
+          const auto counts_before = execution_counts(model);
+          const auto result = model.generate(requests[index], maximum);
+          const auto completed = model.launches();
+          const auto request_counts = execution_counts(model, counts_before);
+          save_generation(directory / (name + ".json"), result, completed - launches, before,
+                          np101::tensor_transfers(), block, request_counts);
+          // Diagnostics run after generation, outside its transfer/time contract.
+          {
+            np101::SdkScope diagnostic_scope("phase", "diagnostic");
+            const auto diagnostic_before = np101::tensor_transfers();
+            if (readback == "logits") {
+              const auto logits = model.read_output("logits");
+              save_diagnostic(directory / (name + ".logits.bin"), logits,
+                              "cannot save final logits diagnostic");
+            }
+            if (result.consumed == config.decoder.capacity) {
+              check_rejected_step<std::out_of_range>(
+                  model, requests[index].front(), capacity_checks, capacity_rejections,
+                  "capacity rejection performed IO or changed model state");
+            }
+            if (readback == "kv") {
+              for (unsigned layer = cache_first - 1; layer < cache_last; ++layer) {
+                for (bool values : {false, true}) {
+                  auto bytes = model.read_cache(layer, values);
+                  const auto head_dimension = config.decoder.kv_spec().head_dim;
+                  const auto row_bytes = std::size_t(head_dimension) * 2;
+                  const auto head_bytes = row_bytes * config.decoder.capacity;
+                  if (bytes.size() != head_bytes * config.decoder.heads) {
+                    throw std::runtime_error(
+                        "cache readback shape differs from configured capacity");
+                  }
+                  for (unsigned head = 0; head < config.decoder.heads; ++head) {
+                    const auto begin =
+                        bytes.begin() + head * head_bytes + result.consumed * row_bytes;
+                    const auto end = bytes.begin() + (head + 1) * head_bytes;
+                    cache_suffix_matches =
+                        std::all_of(begin, end, [](std::uint8_t value) { return value == 0; }) &&
+                        cache_suffix_matches;
+                    cache_suffix_checked_bytes += end - begin;
+                  }
+                  auto path = directory / (name + ".layer." + std::to_string(layer) +
+                                           (values ? ".values.bin" : ".keys.bin"));
+                  save_diagnostic(path, bytes, "cannot save cache diagnostic");
+                }
+              }
+            }
+            const auto diagnostic_after = np101::tensor_transfers();
+            diagnostic_transfers.reads += diagnostic_after.reads - diagnostic_before.reads;
+            diagnostic_transfers.read_bytes +=
+                diagnostic_after.read_bytes - diagnostic_before.read_bytes;
+          }
+          if (benchmark) {
+            benchmark_runs.push_back({name, index, iteration,
+                                      static_cast<unsigned>(requests[index].size()), warmup,
+                                      result.tokens == expected[index]});
+          }
+          // Keep the first failing request's KV, then release normally. Further
+          // requests cannot pass the gate once the independent token oracle fails.
+          if (result.tokens != expected[index]) {
+            tokens_match = false;
+            std::cerr << "Request " << index << " token mismatch; expected ";
+            inference::write_array(std::cerr, expected[index]);
+            std::cerr << ", got ";
+            inference::write_array(std::cerr, result.tokens);
+            std::cerr << ". Skipping remaining requests and releasing the model.\n";
+            break;
+          }
+          if (!cache_suffix_matches) {
+            std::cerr << "Request " << index << " has nonzero unwritten KV cache slots.\n";
+            break;
+          }
+        }
+        if (!tokens_match || !cache_suffix_matches) {
+          break;
+        }
+      }
+      const auto launches = model.launches();
+      const auto counts = execution_counts(model);
+      progress(directory, "release");
+      {
+        np101::SdkScope release_scope("phase", "release");
+        model.close();
+        check_rejected_step<std::logic_error>(
+            model, requests.front().front(), closed_checks, closed_rejections,
+            "closed model rejection performed IO or changed model state");
+        if (context.memory().live(true) || context.memory().live(false)) {
+          throw std::runtime_error("model close left application tensor storage alive");
+        }
+        context.close();
+      }
+      const bool passed = tokens_match && cache_suffix_matches;
+      if (benchmark) {
+        save_benchmark(directory, warmups, repeats, requests.size(), benchmark_runs, passed);
+      }
+      rusage usage{};
+      if (getrusage(RUSAGE_SELF, &usage)) {
+        throw std::runtime_error("cannot read host resource observation");
+      }
+      std::ofstream out(directory / "run.json");
+      out << std::setprecision(17) << "{\"status\":\""
+          << (passed ? "executed" : "numerical_mismatch")
+          << "\",\"released\":true,\"layers\":" << config.decoder.layers
+          << ",\"graph_layout\":\"partitioned\",\"variant\":\"" << variant_name << "\""
+          << ",\"decoder_group_size\":" << decoder_group_size << ",\"prefill_head_policy\":\""
+          << head_policy_name << "\""
+          << ",\"head_runs\":" << counts.head_runs << ",\"prefill_block\":" << block
+          << ",\"capacity\":" << config.decoder.capacity << ",\"launches\":" << launches
+          << ",\"weight_payload_bytes\":" << weight_bytes
+          << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request
+          << ",\"initialize_seconds\":" << initialize
+          << ",\"host_peak_rss_kib\":" << usage.ru_maxrss
+          << ",\"capacity_checks\":" << capacity_checks
+          << ",\"capacity_rejections\":" << capacity_rejections
+          << ",\"closed_checks\":" << closed_checks
+          << ",\"closed_rejections\":" << closed_rejections
+          << ",\"cache_suffix_checked_bytes\":" << cache_suffix_checked_bytes
+          << ",\"cache_suffix_matches\":" << (cache_suffix_matches ? "true" : "false")
+          << ",\"cache_readback\":\"" << readback << "\""
+          << ",\"cache_first_layer\":" << cache_first << ",\"cache_last_layer\":" << cache_last
+          << ",\"diagnostic_reads\":" << diagnostic_transfers.reads
+          << ",\"diagnostic_read_bytes\":" << diagnostic_transfers.read_bytes
+          << ",\"decode_steps\":" << counts.decode_steps
+          << ",\"prefill_steps\":" << counts.prefill_steps;
+      write_memory(out, context.memory());
+      out << "}\n";
+      out.close();
+      if (!out) {
+        throw std::runtime_error("cannot save experimental lifecycle");
+      }
+      progress(directory, "complete", passed ? "executed" : "failed", true);
+      if (!passed) {
+        timings.flush();
+        progress(root, "failed", "failed", true);
+        return 1;
       }
     }
-    const auto launches = model.launches();
-    progress(directory, "release");
-    {
-
-      model.close();
-      context.close();
+    timings.flush();
+    if (lifecycle_check) {
+      std::ofstream summary(root / "lifecycle.json");
+      summary << "{\"cycles\":2,\"reused_context\":false,\"recreated_context\":true,"
+                 "\"released\":true}\n";
+      if (!summary) {
+        throw std::runtime_error("cannot save lifecycle summary");
+      }
     }
-    rusage usage{};
-    if (getrusage(RUSAGE_SELF, &usage)) {
-      throw std::runtime_error("cannot read host resource observation");
-    }
-    std::ofstream out(directory / "run.json");
-    out << std::setprecision(17) << "{\"status\":\""
-        << (tokens_match ? "executed" : "numerical_mismatch")
-        << "\",\"released\":true,\"layers\":" << config.decoder.layers
-        << ",\"prefill_block\":" << block << ",\"capacity\":" << config.decoder.capacity
-        << ",\"launches\":" << launches << ",\"weight_payload_bytes\":" << weight_bytes
-        << ",\"initialize_seconds\":" << initialize << ",\"host_peak_rss_kib\":" << usage.ru_maxrss
-        << "}\n";
-    out.close();
-    if (!out) {
-      throw std::runtime_error("cannot save experimental lifecycle");
-    }
-    progress(directory, "complete", tokens_match ? "executed" : "failed");
-    return tokens_match ? 0 : 1;
+    progress(root, "complete", "executed", true);
+    return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     if (fs::is_directory(directory)) {
       try {
         progress(directory, "failed", "failed");
+        if (directory != root) {
+          progress(root, "failed", "failed");
+        }
       } catch (...) {
         // Preserve the original SDK/IO error.
       }

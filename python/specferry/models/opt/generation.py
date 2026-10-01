@@ -74,10 +74,13 @@ def resolve_selection(checkpoint, *, sample=False, seed=0):
     }
 
 
-def write_config(directory, config, capacity=512, block_rows=4096):
+def write_config(directory, config, capacity=512, block_rows=4096, *, layers=None):
     if capacity > config["max_position_embeddings"]:
         raise ValueError("capacity exceeds the checkpoint's learned position table")
-    components = replace(validate_config(config), capacity=capacity)
+    full = validate_config(config)
+    if layers is not None and not 1 <= layers <= full.layers:
+        raise ValueError("requested OPT layer count exceeds the checkpoint")
+    components = replace(full, capacity=capacity, layers=layers or full.layers)
     components.write(directory / "components.txt")
     directory.joinpath("model.txt").write_text(
         "specferry-opt-model 1\n"
@@ -106,6 +109,7 @@ def prepare_request(
     sample=False,
     seed=0,
     prompt_tokens=None,
+    layers=None,
 ):
     verify_export(deployment)
     manifest = json.loads((deployment / "deployment-manifest.json").read_text())
@@ -114,7 +118,7 @@ def prepare_request(
         if selection["resolved_config"][name] != manifest["config"][name]:
             raise ValueError(f"generation {name} differs from the native model contract")
     directory.mkdir(parents=True, exist_ok=False)
-    components = write_config(directory, manifest["config"], capacity)
+    components = write_config(directory, manifest["config"], capacity, layers=layers)
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint, local_files_only=True, trust_remote_code=False
     )
@@ -137,7 +141,12 @@ def prepare_request(
         "selection": selection,
         "attention_policy": "every supplied token is attended; no padded batches",
         "consumed_policy": "last predicted token is returned but not yet appended to KV",
-        "weight_bytes": sum(item["bytes"] for item in manifest["tensors"]),
+        "weight_bytes": sum(
+            item["bytes"]
+            for item in manifest["tensors"]
+            if not item["name"].startswith("decoder.layers.")
+            or int(item["name"].split(".")[2]) < components.layers
+        ),
         "kv_bytes": components.state_bytes(range(components.layers)),
         "hardware_execution_proven": False,
     }

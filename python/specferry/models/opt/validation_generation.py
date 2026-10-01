@@ -168,6 +168,37 @@ def prepare(
                     rtol=0,
                 )
             for layer in selected:
+                if mode == "prefix":
+                    layer_prefix = f"layer.{layer}."
+                    for short, name in (("q", "query"), ("k", "key"), ("v", "value")):
+                        value = captured[layer_prefix + short]
+                        if short == "q":
+                            value = value * components.head_dim**-0.5
+                        record(
+                            directory, f"teacher.{index}.{layer_prefix}{name}", value, observations
+                        )
+                    for name in (
+                        "attended",
+                        "mixer",
+                        "attention_residual",
+                        "attention_norm",
+                        "fc1",
+                        "activation",
+                        "mlp",
+                        "ffn_residual",
+                    ):
+                        record(
+                            directory,
+                            f"teacher.{index}.{layer_prefix}{name}",
+                            captured[layer_prefix + name],
+                            observations,
+                        )
+                    record(
+                        directory,
+                        f"teacher.{index}.{layer_prefix}probabilities",
+                        captured[layer_prefix + "probabilities"],
+                        observations,
+                    )
                 record(
                     directory,
                     f"teacher.{index}.layer.{layer}",
@@ -187,6 +218,7 @@ def prepare(
             tokens.append(int(result.logits.argmax(-1).item()))
         count = steps
         if mode == "prefix":
+            (directory / "predictions.txt").write_text(" ".join(map(str, tokens)) + "\n")
             # Check the truncated reference itself: cached steps must agree with
             # a fresh full-prefix forward through the same official model.
             fresh = model(input_ids=torch.tensor([input_ids]), use_cache=True)

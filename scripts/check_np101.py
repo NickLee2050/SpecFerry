@@ -22,7 +22,9 @@ def parse_args():
         "projection",
         "sampling",
         "kv",
-        "cache-attention",
+        "cache-packed",
+        "cache-packed64",
+        "cache-packed-block4",
         "cache-append",
         "fp16-preservation",
     ):
@@ -38,8 +40,6 @@ def parse_args():
             case.add_argument("--dtype", choices=("F16", "F32", "F16_TO_F32"), default="F16_TO_F32")
             case.add_argument("--classes", type=int, default=8)
             case.add_argument("--samples", type=int, default=4096)
-        elif name == "cache-attention":
-            case.add_argument("--block", type=int, choices=(1, 4), default=1)
         elif name == "cache-append":
             case.add_argument("--rank", type=int, choices=(2, 3), required=True)
     args = parser.parse_args()
@@ -60,7 +60,9 @@ def main():
         "projection": "projection_check",
         "sampling": "sampling_check",
         "kv": "kv_cache_check",
-        "cache-attention": "graph_cache_check",
+        "cache-packed": "graph_cache_check",
+        "cache-packed64": "graph_cache_check",
+        "cache-packed-block4": "graph_cache_check",
         "cache-append": "cache_append_check",
         "fp16-preservation": "fp16_preservation_check",
     }
@@ -71,10 +73,10 @@ def main():
         arguments = []
     elif args.case in ("lookup", "projection", "fp16-preservation"):
         arguments += [args.operator]
-    elif args.case == "cache-attention":
-        arguments += ["stack" if args.block == 1 else "stack-block"]
     elif args.case == "cache-append":
         arguments += [args.rank]
+    elif args.case in ("cache-packed", "cache-packed64", "cache-packed-block4"):
+        arguments += [args.case.removeprefix("cache-")]
     elif args.case == "sampling":
         from specferry.validation.sampling import evaluate as evaluate_samples
 

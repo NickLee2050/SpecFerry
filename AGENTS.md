@@ -1,25 +1,36 @@
 # SpecFerry project constraints
 
-- Write human-readable, high-quality code. Use descriptive names, focused functions, explicit ownership and error handling, and comments that explain non-obvious decisions. Separate logical blocks and keep formatting consistent; do not compress code at the expense of readability.
-- Write technical reports in neutral, concrete language: state what operation failed, what was expected, what occurred, and how to reproduce it. Explain necessary terms; avoid abstract summaries and conversational history.
-- Use the P1–P10 numbering in `docs/np101-sdk-driver-validation-report.md` for current discussion and documentation. Historical evidence files retain their original names and issue IDs; do not infer current numbering from those paths.
-- Avoid tensor-handle swapping unless necessary; use fixed tensor bindings and existing buffer reuse by default.
-- Format C++ with the repository LLVM-based, 100-column clang-format rules, including braces for every control-statement body. Format Python with Ruff at 100 columns, apply safe lint fixes, and sort imports using `scripts/format_python.py`; verify with `--check` before delivery.
-- For a matching `.hpp`/`.cpp` pair, put dependencies needed by the header's declarations or definitions in `.hpp`; put implementation-only dependencies in `.cpp`. The `.cpp` must include its matching header and must not repeat that header's direct includes. SDK callers must explicitly include the SDK header unless their matching header already includes it directly; do not rely on unrelated headers to provide SDK declarations. Remove unused includes. Use quoted includes for project, SDK, third-party and platform headers, followed by angle-bracket includes for C/C++ standard headers. Separate the two groups with one blank line and sort each group alphabetically (case-sensitive); do not give the matching header special priority.
-- Use the chip team's `demo/ref_op_api_guide.md` as a reference when operator or API semantics are unclear, together with `demo/main.c` and the installed SDK headers. An operator's presence in the guide is not a complete specification of its parameters or proof that a particular configuration executes on hardware.
-- Prefer the APIs and operators documented in that guide. Avoid undocumented APIs/operators unless the required semantics substantially exceed the documented interfaces or the documented approach has a significant, predictable performance cost. Explain the specific limitation or cost and validate the alternative before adopting it; a successful diagnostic alone does not make an undocumented path the default implementation.
-- Preserve SDK-owned node state initialized by `vsi_nn_AddNode`. Set individual public parameters; never zero or replace the entire `nn_param` structure or overwrite/free `pool.local`.
-- Do not use sudo without explicit authorization for the particular action. The one-time authorization for `sudo journalctl -xe` on 2026-09-09 has been consumed; passwordless sudo is not continuing authorization.
-- Before the next intentional reproduction of the P3/selection hang, remind the user to cold-restart both the host and NP101. Warm restarts have not eliminated it. This reminder does not prevent other diagnostics explicitly authorized by the user.
+## Code and tools
 
-- Use the Conda environment `SpecFerry` with Python 3.12 for project Python tools, downloads, references, and tests. Define its dependencies in `environment.yml` and the referenced requirements files; do not create or configure venv environments.
-- Use `facebook/opt-350m` as the active DLM, as explicitly selected by the user on 2026-09-21. It is the only enabled download; keep other model downloads commented out until their phase starts. Preserve the existing Qwen3.5 implementation, cached checkpoint, and validation evidence as a regression baseline while separating reusable operators from model-specific composition.
-- Keep model names, checkpoint tensor paths, and architecture-specific layer ordering in model adapters. Shared NP101 operators and storage must take explicit dimensions, tensor contracts, and precision policies instead of assuming one model's structure. Do not claim support for an unvalidated configuration.
-- During the segmented-memory regression requested on 2026-09-24, cap application tensor payload separately at 1 GiB for const and non-const storage. Count shared backing once and temporary allocations at their peak; do not silently switch `is_const` to bypass a limit. Hidden SDK workspace/copies and physical addresses remain unknown. Preserve historical larger-allocation evidence, but do not run above-limit probes unless the user changes this policy.
-- The user has authorized P5 synthetic capacity/integrity probes near the v106 allocation limit. Only these diagnostics may use explicit `--probe-limit` with a ceiling of 4096 MiB; retain and scan every successfully written block after SDK rejection. Model inference and ordinary memory checks retain the 1 GiB segment policy. Logical payload offsets are not physical addresses.
-- Default text generation to the checkpoint's generation policy, resolving omitted fields with the pinned reference library. Keep sampling experiments as explicit overrides, record the effective policy, and reject unsupported generation settings instead of silently substituting another strategy.
-- Permanently exclude all Llama model generations and known Llama-derived checkpoints from recommendations, downloads, and experiments in this project, unless the user explicitly reverses this preference. This does not prohibit the unrelated `llama.cpp` software project.
-- The first implementation milestone is the complete text-generation computation of the selected DLM on NP101, including prompt processing, token embedding, every decoder layer, state/cache updates, final normalization, LM head, and greedy token selection. CPU reference and partial offload are debugging stages, not completion of this milestone.
-- Tokenization, command dispatch, initialization, and text display may remain on the host. Record hardware execution evidence; a successful SDK call or software-model run alone is insufficient.
-- Do not introduce quantization research, training, MLIR, custom ISA generation, or low-level mapping optimization into the first milestone. Preserve necessary reference precision in sensitive state operations and verify NP101 support before claiming full deployment.
-- Keep planning documents focused on concrete implementation steps, dependencies, deliverables, checks, and acceptance criteria. Keep model-selection discussion in the conversation.
+- Use descriptive names, focused functions, explicit ownership/errors, and comments for non-obvious decisions. Separate logical blocks; never reduce readability to cut lines.
+- C++: repository LLVM clang-format, 100 columns, braces on all control statements. Python: Conda `SpecFerry` (3.12), Ruff at 100 columns; run `scripts/format_python.py` for safe fixes/imports and `--check` before delivery. Declare dependencies in `environment.yml` and requirements files; no venvs.
+- Headers own declaration/definition dependencies. `.cpp` includes its matching header plus implementation dependencies, without repeating that header's direct includes. SDK callers include SDK headers unless their matching header already does. Remove unused includes. Quote project/SDK/third-party/platform headers before angle-bracket standard headers; separate groups and sort case-sensitively, without prioritizing the matching header.
+
+## SDK and device
+
+- Prefer fixed tensor bindings and buffer reuse; swap handles only when necessary.
+- Resolve API/operator semantics from `demo/ref_op_api_guide.md`, `demo/main.c` and installed headers. Operator listing alone neither specifies parameters nor proves hardware execution.
+- Prefer documented interfaces. Undocumented alternatives require missing necessary semantics or substantial, predictable cost in documented interfaces; explain and validate before adoption. A passing diagnostic alone does not justify a new default.
+- Preserve `vsi_nn_AddNode` initialization: set individual public parameters; never zero/replace `nn_param` or overwrite/free `pool.local`.
+- Sudo requires explicit authorization for the action; passwordless access and consumed one-time grants do not authorize it.
+- Before intentional P3/selection-hang reproduction, remind the user to cold-restart host and NP101; warm restarts failed. Other explicitly authorized diagnostics may proceed.
+
+## Memory
+
+- Cap application const/nonconst tensor payload separately at 1 GiB; count shared backing once and temporary peak allocations. Never change `is_const` to bypass limits. Preserve larger-allocation evidence; no above-limit probes without a policy change, except P5 below. Hidden SDK workspace/copies and physical addresses are unknown; logical offsets are not physical addresses.
+- Authorized synthetic P5 capacity/integrity probes near the v106 limit may use `--probe-limit` up to 4096 MiB. After SDK rejection retain/scan all successfully written blocks. Model inference and ordinary checks keep the 1 GiB limits.
+
+## Models and milestone
+
+- Active DLM: `facebook/opt-350m`, the only enabled download. Keep others commented until their phase. Preserve Qwen3.5 implementation, cached checkpoint and validation evidence for regression.
+- Separate reusable operators/storage from model composition. Adapters own names, checkpoint paths and architecture ordering; shared NP101 code takes explicit dimensions, tensor contracts and precision policies. Do not claim unvalidated configurations.
+- Default to checkpoint generation policy; resolve omitted fields with the pinned reference library. Sampling needs explicit overrides; record effective policy and reject unsupported settings without silent strategy substitution.
+- Exclude every Llama generation and known Llama-derived checkpoint from recommendations/downloads/experiments unless explicitly reversed. Unrelated `llama.cpp` software is allowed.
+- First milestone: NP101 executes complete DLM prompt processing, embedding, every decoder, state/cache updates, final normalization, LM head and greedy selection. CPU reference/partial offload are debugging stages. Tokenization, dispatch, initialization and text display may stay on host. Require hardware evidence; SDK success/software-model runs are insufficient.
+- Exclude quantization research, training, MLIR, custom ISA and low-level mapping optimization from this milestone. Preserve necessary reference precision in sensitive state operations; validate NP101 support before claiming full deployment.
+
+## Reports and plans
+
+- Use current P1–P10 IDs from `docs/np101-sdk-driver-validation-report.md`; preserve historical names/IDs, never infer current numbering from paths.
+- Report failing operation, expected/actual results and reproduction neutrally; explain terms without abstract summaries or conversation history.
+- Plans specify steps, dependencies, deliverables, checks and acceptance; keep model selection in conversation. Current evidence and task context live in `docs/np101-status.md` and `TODO.md`.

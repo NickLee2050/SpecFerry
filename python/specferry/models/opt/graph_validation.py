@@ -1,6 +1,8 @@
-"""A/B/A CPU token and KV oracle for experimental fixed-graph inference."""
+"""Independent CPU token, logit and KV oracle for fixed-graph request matrices."""
 
 import json
+import shutil
+from functools import partial
 
 import numpy as np
 import torch
@@ -8,10 +10,27 @@ from transformers import GenerationConfig
 
 from specferry.data.checkpoint import sha256
 from specferry.validation.arrays import compare_arrays
-from specferry.validation.device import write_json
+from specferry.validation.device import clean_execution, write_json
 
 from .config import EPSILON, TOLERANCES
 from .reference import load_model
+
+
+def _record_check(checks, name, passed, reason):
+    checks[name] = {"passed": bool(passed)}
+    if not passed:
+        checks[name]["reason"] = reason
+
+
+def _prefix_result(scope, checks, native_validation, evidence):
+    return {
+        "status": "numerical_pass" if all(item["passed"] for item in checks.values()) else "failed",
+        "scope": scope,
+        "checks": checks,
+        "native_validation": native_validation,
+        "evidence": evidence,
+        "full_model_lifecycle_accepted": False,
+    }
 
 
 def validate_prefix_fixture(deployment, directory, layers):
@@ -32,8 +51,9 @@ def validate_prefix_fixture(deployment, directory, layers):
     if not checks or not all(item["passed"] for item in checks.values()):
         raise ValueError("prefix fixture lacks passing CPU consistency checks")
     hashes = metadata["fixture_sha256"]
-    for name in ("components.txt", "model.txt", "tokens.txt"):
-        if hashes.get(name) != sha256(directory / name):
+    for name in ("components.txt", "model.txt", "tokens.txt", "predictions.txt"):
+        path = directory / name
+        if not path.is_file() or hashes.get(name) != sha256(path):
             raise ValueError(f"prefix fixture changed: {name}")
     components = (directory / "components.txt").read_text().split()
     dimensions = [
@@ -81,6 +101,21 @@ def validate_prefix_fixture(deployment, directory, layers):
         }
         for layer in range(layers):
             shapes[f"layer.{layer}"] = [1, 1, hidden]
+            for name in (
+                "query",
+                "key",
+                "value",
+                "attended",
+                "mixer",
+                "attention_residual",
+                "attention_norm",
+                "ffn_residual",
+            ):
+                shapes[f"layer.{layer}.{name}"] = [1, 1, hidden]
+            shapes[f"layer.{layer}.mlp"] = [1, hidden]
+            for name in ("fc1", "activation"):
+                shapes[f"layer.{layer}.{name}"] = [1, config["ffn_dim"]]
+            shapes[f"layer.{layer}.probabilities"] = [1, heads, 1, step + 1]
             for name in ("keys", "values"):
                 shapes[f"layer.{layer}.{name}"] = [heads, step + 1, hidden // heads]
         expected.update({f"teacher.{step}.{name}": shape for name, shape in shapes.items()})
@@ -98,27 +133,369 @@ def validate_prefix_fixture(deployment, directory, layers):
         if not np.isfinite(np.fromfile(path, dtype="<f2")).all():
             raise ValueError(f"nonfinite prefix reference: {name}")
     predictions = metadata["tokens"]
-    if len(predictions) != 2 or any(
-        int(np.fromfile(directory / f"teacher.{step}.logits.bin", dtype="<f2").argmax()) != token
-        for step, token in enumerate(predictions)
+    saved_predictions = [
+        int(value) for value in (directory / "predictions.txt").read_text().split()
+    ]
+    if (
+        len(predictions) != 2
+        or predictions != saved_predictions
+        or any(
+            int(np.fromfile(directory / f"teacher.{step}.logits.bin", dtype="<f2").argmax())
+            != token
+            for step, token in enumerate(predictions)
+        )
     ):
         raise ValueError("prefix token expectations disagree with truncated logits")
     return metadata
 
 
+def prefix_readback_scope(
+    metadata, readback, boundary_layers, repeat=False, decoder_group_size=1, variant="merged-kv"
+):
+    """Describe requested coverage independently of native success or exit status."""
+    layers = metadata["layers"]
+    if type(decoder_group_size) is not int or decoder_group_size not in (1, 2):
+        raise ValueError("decoder group size must be 1 or 2")
+    if variant not in (
+        "merged-kv",
+        "merged-kv-local-const",
+        "merged-kv-local-mutable",
+    ):
+        raise ValueError("unknown partitioned-model diagnostic variant")
+    boundaries = list(boundary_layers)
+    if readback not in ("outputs", "outputs-kv", "boundaries"):
+        raise ValueError("unknown prefix readback mode")
+    if boundaries != sorted(set(boundaries)) or any(not 1 <= n <= layers for n in boundaries):
+        raise ValueError("boundary layers must be ordered unique one-based layer numbers")
+    if (readback == "boundaries") != bool(boundaries):
+        raise ValueError("only boundaries mode requires explicit boundary layers")
+    planned = 2 * (2 + len(boundaries))
+    if readback == "outputs-kv":
+        planned = 10 * layers + 4
+    cycles = 2 if repeat else 1
+    graph_outputs = [
+        min(first + decoder_group_size, layers) for first in range(0, layers, decoder_group_size)
+    ]
+    return {
+        "mode": readback,
+        "boundary_layers": boundaries,
+        "layer_count": layers,
+        "decoder_group_size": decoder_group_size,
+        "variant": variant,
+        "execution_graphs": 2 + (layers + decoder_group_size - 1) // decoder_group_size,
+        "decoder_graph_output_layers": graph_outputs,
+        "intermediate_decoder_readback_layers": [
+            layer for layer in boundaries if layer not in graph_outputs
+        ],
+        "teacher_steps_per_cycle": 2,
+        "cycles": cycles,
+        "planned_checks_per_cycle": planned,
+        "planned_checks": cycles * planned,
+        "final_logits_and_selected_requested": True,
+        "kv_checks_requested": readback == "outputs-kv",
+        "description": (
+            "Two teacher-forced tokens per cycle; the selected readback scope does not "
+            "establish continuous-generation, request-isolation, or capacity-boundary acceptance."
+            " Decoder outputs inside a group are intermediate tensors, not declared graph outputs."
+            + (
+                " Cache backings are read after final outputs; current slots use CPU tolerance, "
+                "history is bit-exact, and unwritten suffixes must contain zero bits."
+                if readback == "outputs-kv"
+                else ""
+            )
+        ),
+    }
+
+
+def evaluate_prefix_readback(
+    fixture,
+    device,
+    metadata,
+    evidence,
+    readback,
+    boundary_layers,
+    repeat=False,
+    decoder_group_size=1,
+    variant="merged-kv",
+):
+    """Validate requested native coverage and independently check saved final outputs."""
+    scope = prefix_readback_scope(
+        metadata, readback, boundary_layers, repeat, decoder_group_size, variant
+    )
+    checks = {}
+    native_validation = {}
+    planned = scope["planned_checks_per_cycle"]
+    layers = scope["layer_count"]
+
+    require = partial(_record_check, checks)
+
+    def read_json(path, label):
+        try:
+            record = json.loads(path.read_text())
+            if not isinstance(record, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, ValueError) as error:
+            require(label, False, f"cannot read {path.name}: {error}")
+            return None
+        require(label, True, "")
+        return record
+
+    def execution_check(directory, label, expected_checks):
+        execution = read_json(directory / "execution.json", label + ".file")
+        if execution is not None:
+            require(
+                label,
+                execution.get("phase") == "complete"
+                and execution.get("released") is True
+                and execution.get("checks") == expected_checks
+                and execution.get("failures") == 0,
+                "execution must complete, release, and report every planned check without failures",
+            )
+
+    def valid_transfers(record):
+        return isinstance(record, dict) and all(
+            type(record.get(field)) is int and record[field] >= 0
+            for field in ("reads", "read_bytes", "uploads", "upload_bytes")
+        )
+
+    require("process", clean_execution(evidence), "native process did not exit cleanly")
+    try:
+        configuration = (fixture / "model.txt").read_text().split()
+        vocabulary = int(configuration[3])
+        block_rows = int(configuration[6])
+        components = (fixture / "components.txt").read_text().split()
+        hidden, heads, capacity = (int(components[index]) for index in (2, 4, 6))
+        if min(vocabulary, block_rows, hidden, heads) <= 0 or capacity < 2 or hidden % heads:
+            raise ValueError("nonpositive tensor dimension")
+        predictions = metadata["tokens"]
+        if len(predictions) != 2:
+            raise ValueError("expected two reference predictions")
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        require("reference_configuration", False, str(error))
+        return _prefix_result(scope, checks, native_validation, evidence)
+
+    boundary_count = len(boundary_layers)
+    expected_reads = (vocabulary + block_rows - 1) // block_rows + 1 + boundary_count
+    expected_read_bytes = vocabulary * 2 + 4 + boundary_count * hidden * 2
+    if readback == "outputs-kv":
+        expected_reads += 2 * layers
+        expected_read_bytes += 2 * layers * capacity * hidden * 2
+    transfer_scope = "explicit_tensor_helpers_excluding_sdk_internal_and_addtensor_initialization"
+    for cycle in range(scope["cycles"]):
+        label = f"cycle.{cycle}"
+        directory = device / label if repeat else device
+        execution_check(directory, label + ".execution", planned)
+        validation = read_json(directory / "validation.json", label + ".validation_file")
+        if validation is not None:
+            native_validation[label] = validation
+            expected = {
+                "mode": readback,
+                "boundary_layers": list(boundary_layers),
+                "layer_count": layers,
+                "decoder_group_size": decoder_group_size,
+                "variant": variant,
+                "execution_graphs": scope["execution_graphs"],
+                "planned_steps": 2,
+                "planned_checks": planned,
+                "completed_steps": 2,
+                "checks": planned,
+                "failures": 0,
+                "kv_checks_requested": readback == "outputs-kv",
+                "loaded_weight_payload_bytes": metadata.get("weight_payload_bytes"),
+                "transfer_scope": transfer_scope,
+            }
+            for field, value in expected.items():
+                require(
+                    f"{label}.native.{field}",
+                    value is not None and validation.get(field) == value,
+                    f"native {field} differs from requested or expected value {value!r}",
+                )
+            require(
+                label + ".native.transfer_record",
+                valid_transfers(validation.get("transfers")),
+                "total transfer counts must contain four nonnegative integers",
+            )
+            steps = validation.get("steps")
+            valid_steps = isinstance(steps, list) and len(steps) == 2
+            require(label + ".native.steps", valid_steps, "expected two completed step records")
+            if valid_steps:
+                for index, step in enumerate(steps):
+                    step_checks = planned // 2
+                    if readback == "outputs-kv":
+                        step_checks = 2 + (4 + 2 * index) * layers
+                    require(
+                        f"{label}.native.step.{index}",
+                        isinstance(step, dict)
+                        and step.get("index") == index
+                        and step.get("executed") is True
+                        and step.get("checks") == step_checks
+                        and step.get("failures") == 0
+                        and valid_transfers(step),
+                        "step index, execution, or numerical-check count differs",
+                    )
+                    require(
+                        f"{label}.native.step.{index}.transfers",
+                        isinstance(step, dict)
+                        and step.get("reads") == expected_reads
+                        and step.get("read_bytes") == expected_read_bytes
+                        and step.get("uploads") == 1
+                        and step.get("upload_bytes") == 12,
+                        "explicit step transfers differ from the requested readback scope",
+                    )
+            require(
+                label + ".native.transfers",
+                validation.get("transfers")
+                == {
+                    "reads": 2 * expected_reads,
+                    "read_bytes": 2 * expected_read_bytes,
+                    "uploads": 2,
+                    "upload_bytes": 24,
+                },
+                "explicit total transfers include missing or additional reads/uploads",
+            )
+
+        for step in range(2):
+            prefix = f"teacher.{step}."
+            for name, dtype, elements in (("logits", "<f2", vocabulary), ("selected", "<i4", 1)):
+                path = directory / (prefix + name + ".bin")
+                key = f"{label}.{prefix}{name}"
+                try:
+                    if path.stat().st_size != elements * np.dtype(dtype).itemsize:
+                        raise ValueError("wrong-size saved tensor")
+                    actual = np.fromfile(path, dtype=dtype)
+                    if name == "logits":
+                        reference_path = fixture / (prefix + name + ".bin")
+                        if reference_path.stat().st_size != vocabulary * 2:
+                            raise ValueError("wrong-size reference logits")
+                        reference = np.fromfile(reference_path, dtype=dtype)
+                        checks[key] = compare_arrays(actual, reference, **TOLERANCES["device"])
+                    else:
+                        require(
+                            key,
+                            int(actual[0]) == predictions[step],
+                            "selected token differs from the exact CPU expectation",
+                        )
+                except (OSError, ValueError, IndexError) as error:
+                    require(key, False, f"cannot validate {path.name}: {error}")
+
+        if readback == "outputs-kv":
+            previous_cache = {}
+            for step in range(2):
+                for layer in range(layers):
+                    for kind in ("keys", "values"):
+                        name = f"teacher.{step}.layer.{layer}.{kind}"
+                        key = f"{label}.{name}"
+                        try:
+                            path = directory / f"{name}.backing.bin"
+                            if path.stat().st_size != capacity * hidden * 2:
+                                raise ValueError("wrong-size cache backing")
+                            actual = np.fromfile(path, dtype="<f2").reshape(
+                                heads, capacity, hidden // heads
+                            )
+                            reference_path = fixture / f"{name}.bin"
+                            if reference_path.stat().st_size != (step + 1) * hidden * 2:
+                                raise ValueError("wrong-size cache reference")
+                            reference = np.fromfile(reference_path, dtype="<f2").reshape(
+                                heads, step + 1, hidden // heads
+                            )
+                            checks[key + ".current"] = compare_arrays(
+                                actual[:, step], reference[:, step], **TOLERANCES["device"]
+                            )
+                            if step:
+                                previous = previous_cache.get((layer, kind))
+                                require(
+                                    key + ".history",
+                                    previous is not None
+                                    and np.array_equal(
+                                        actual[:, :step].view("<u2"), previous.view("<u2")
+                                    ),
+                                    "cache history differs from the preceding saved backing",
+                                )
+                            require(
+                                key + ".suffix",
+                                not np.any(actual[:, step + 1 :].view("<u2")),
+                                "unwritten cache slots must contain zero bits",
+                            )
+                            previous_cache[layer, kind] = actual[:, : step + 1].copy()
+                        except (OSError, ValueError, IndexError) as error:
+                            require(key + ".backing", False, str(error))
+
+    if repeat:
+        execution_check(device, "aggregate_execution", scope["planned_checks"])
+    return _prefix_result(scope, checks, native_validation, evidence)
+
+
+def generation_cache_layers(readback, layers, layer_range=None):
+    """Resolve explicit diagnostic scope; ranges are inclusive and one-based at the CLI."""
+    if readback not in ("none", "logits", "kv"):
+        raise ValueError("cache readback must be none, logits or kv")
+    if (readback == "kv") != (layer_range is not None):
+        raise ValueError("kv readback requires an explicit cache layer range")
+    if readback == "kv":
+        if (
+            len(layer_range) != 2
+            or any(type(value) is not int for value in layer_range)
+            or not 1 <= layer_range[0] <= layer_range[1] <= layers
+        ):
+            raise ValueError("cache layer range must be within the configured model")
+        return range(layer_range[0] - 1, layer_range[1])
+    return range(0)
+
+
 @torch.inference_mode()
-def prepare(checkpoint, request, directory, maximum):
+def prepare(
+    checkpoint,
+    request,
+    directory,
+    maximum,
+    *,
+    layers=None,
+    prefill_block=1,
+    cache_readback="none",
+    cache_layer_range=None,
+    request_tokens=None,
+):
+    if type(prefill_block) is not int or prefill_block not in (1, 4):
+        raise ValueError("prefill block must be 1 or 4")
+    if request["capacity"] % prefill_block:
+        raise ValueError("capacity must be divisible by prefill block")
     model, _ = load_model(checkpoint)
     model.generation_config = GenerationConfig.from_pretrained(checkpoint, local_files_only=True)
+    if layers is not None:
+        if not 1 <= layers <= model.config.num_hidden_layers:
+            raise ValueError("invalid truncated OPT layer count")
+        model.model.decoder.layers = model.model.decoder.layers[:layers]
+        model.config.num_hidden_layers = layers
+    cache_layers = generation_cache_layers(
+        cache_readback, model.config.num_hidden_layers, cache_layer_range
+    )
     if request["selection"]["mode"] != "greedy":
         raise ValueError("experimental graph requires greedy checkpoint policy")
-    requests = [
-        request["tokens"],
-        request["tokens"][: max(1, len(request["tokens"]) // 2)],
-        request["tokens"],
-    ]
+    requests = (
+        request_tokens
+        if request_tokens is not None
+        else [
+            request["tokens"],
+            request["tokens"][: max(1, len(request["tokens"]) // 2)],
+            request["tokens"],
+        ]
+    )
+    if not 1 <= len(requests) <= 64 or any(
+        not 1 <= len(ids) <= request["capacity"]
+        or any(type(token) is not int or not 0 <= token < model.config.vocab_size for token in ids)
+        for ids in requests
+    ):
+        raise ValueError("expected one to 64 nonempty requests within capacity and vocabulary")
     references = []
     for index, ids in enumerate(requests):
+        repeated = next((prior for prior in range(index) if requests[prior] == ids), None)
+        if repeated is not None:
+            # Identical inputs reuse the CPU oracle; the device still executes both requests.
+            for path in directory.glob(f"expected.{repeated}.*.bin"):
+                name = path.name.replace(f"expected.{repeated}.", f"expected.{index}.", 1)
+                shutil.copyfile(path, directory / name)
+            references.append(references[repeated] | {"repeat_of": repeated})
+            continue
         count = min(maximum, request["capacity"] - len(ids) + 1)
         generated = model.generate(
             input_ids=torch.tensor([ids]),
@@ -126,14 +503,28 @@ def prepare(checkpoint, request, directory, maximum):
             max_new_tokens=count,
         )[0, len(ids) :].tolist()
         trajectory = ids + generated[:-1]
-        cache = model(input_ids=torch.tensor([trajectory]), use_cache=True).past_key_values
-        for layer, state in enumerate(cache.layers):
-            for name in ("keys", "values"):
-                getattr(state, name)[0].contiguous().numpy().tofile(
-                    directory / f"expected.{index}.{layer}.{name}.bin"
+        # The reference processes the complete causal trajectory independently of
+        # the SDK's block schedule, including the last consumed decode token.
+        if cache_readback != "none":
+            reference = model(input_ids=torch.tensor([trajectory]), use_cache=True)
+            cache = reference.past_key_values
+            if cache_readback == "logits":
+                reference.logits[0, -1].to(torch.float16).contiguous().numpy().astype("<f2").tofile(
+                    directory / f"expected.{index}.logits.bin"
                 )
+            for layer in cache_layers:
+                state = cache.layers[layer]
+                for name in ("keys", "values"):
+                    getattr(state, name)[0].contiguous().numpy().tofile(
+                        directory / f"expected.{index}.{layer}.{name}.bin"
+                    )
         references.append(
-            {"tokens": generated, "consumed": len(trajectory), "prompt_length": len(ids)}
+            {
+                "tokens": generated,
+                "consumed": len(trajectory),
+                "prompt_length": len(ids),
+                "repeat_of": repeated,
+            }
         )
     (directory / "requests.txt").write_text(
         "".join(" ".join(map(str, ids)) + "\n" for ids in requests)
@@ -144,31 +535,238 @@ def prepare(checkpoint, request, directory, maximum):
     config = model.config
     metadata = {
         "requests": references,
-        "layers": config.num_hidden_layers,
+        "layers": len(model.model.decoder.layers),
         "heads": config.num_attention_heads,
         "width": config.hidden_size // config.num_attention_heads,
         "capacity": request["capacity"],
+        "prefill_block": prefill_block,
+        "cache_readback": cache_readback,
+        "cache_layer_range": cache_layer_range,
+        "vocabulary": config.vocab_size,
+        "logits_dtype": "<f2",
+        "logits_scope": "last_consumed_token",
     }
     write_json(directory / "reference.json", metadata)
     return metadata
 
 
-def evaluate(fixture, device, metadata, block):
+def evaluate(
+    fixture,
+    device,
+    metadata,
+    block,
+    reset_uploads_per_request=None,
+    variant=None,
+    decoder_group_size=None,
+    prefill_head_policy=None,
+    cache_readback="none",
+    cache_layer_range=None,
+):
+    cache_layers = generation_cache_layers(cache_readback, metadata["layers"], cache_layer_range)
+    read_logits = cache_readback == "logits"
+    if type(block) is not int or block not in (1, 4):
+        raise ValueError("prefill block must be 1 or 4")
+    if decoder_group_size is not None and (
+        type(decoder_group_size) is not int or decoder_group_size not in (1, 2)
+    ):
+        raise ValueError("expected decoder group size must be 1 or 2")
+    if prefill_head_policy is not None and prefill_head_policy not in (
+        "every-token",
+        "last-token",
+    ):
+        raise ValueError("expected prefill head policy must be every-token or last-token")
     checks, runs = {}, []
+    run_path = device / "run.json"
+    native_run = json.loads(run_path.read_text()) if run_path.is_file() else {}
+    if native_run.get("graph_layout") != "partitioned":
+        raise ValueError("graph validation requires partitioned execution")
+    checks["cache_readback"] = native_run.get("cache_readback") == cache_readback
+    if cache_readback == "none":
+        for field in ("diagnostic_reads", "diagnostic_read_bytes"):
+            observed = native_run.get(field)
+            checks[field] = type(observed) is int and observed == 0
+    if cache_readback in ("logits", "kv"):
+        per_request = 2 * len(cache_layers)
+        bytes_per_request = (
+            per_request * metadata["heads"] * metadata["capacity"] * metadata["width"] * 2
+        )
+        if read_logits:
+            # The head exposes one tensor per vocabulary block, including a short last block.
+            configuration = (fixture / "model.txt").read_text().split()
+            if len(configuration) != 10 or configuration[:2] != ["specferry-opt-model", "1"]:
+                raise ValueError("invalid OPT model configuration for logits readback")
+            vocabulary, block_rows = int(configuration[3]), int(configuration[6])
+            if vocabulary != metadata["vocabulary"] or block_rows <= 0:
+                raise ValueError("logits layout disagrees with the CPU reference")
+            per_request = (vocabulary + block_rows - 1) // block_rows
+            bytes_per_request = vocabulary * 2
+        expected_reads = len(metadata["requests"]) * per_request
+        for field, expected in (
+            ("diagnostic_reads", expected_reads),
+            ("diagnostic_read_bytes", len(metadata["requests"]) * bytes_per_request),
+        ):
+            checks[field] = type(native_run.get(field)) is int and native_run[field] == expected
+        if cache_readback == "kv":
+            for field, expected in zip(
+                ("cache_first_layer", "cache_last_layer"), cache_layer_range, strict=True
+            ):
+                checks[field] = type(native_run.get(field)) is int and native_run[field] == expected
+    block_prefill = block != 1
+    if block_prefill and (
+        block != 4
+        or variant != "merged-kv"
+        or decoder_group_size not in (None, 1)
+        or prefill_head_policy not in (None, "every-token")
+    ):
+        raise ValueError(
+            "partitioned block 4 requires merged-kv, decoder group size 1 and every-token heads"
+        )
+    if block_prefill and metadata["capacity"] % block:
+        raise ValueError("capacity must be divisible by prefill block")
+    if block_prefill or "prefill_block" in metadata:
+        checks["reference.prefill_block"] = (
+            type(metadata.get("prefill_block")) is int and metadata["prefill_block"] == block
+        )
+    if reset_uploads_per_request is None:
+        reset_uploads_per_request = native_run.get("kv_reset_uploads_per_request", 0)
+    if type(reset_uploads_per_request) is not int or reset_uploads_per_request < 0:
+        raise ValueError("reset upload count must be a nonnegative integer")
+    if variant is not None:
+        prefix_readback_scope(
+            {"layers": metadata["layers"]},
+            "outputs",
+            [],
+            decoder_group_size=decoder_group_size if decoder_group_size is not None else 1,
+            variant=variant,
+        )
+        expected_reset = 2 * metadata["layers"]
+        checks["variant"] = (
+            native_run.get("graph_layout") == "partitioned"
+            and native_run.get("variant") == variant
+            and native_run.get("kv_reset_uploads_per_request") == expected_reset
+            and reset_uploads_per_request == expected_reset
+        )
+    expected_options = {}
+    if decoder_group_size is not None:
+        expected_options["decoder_group_size"] = decoder_group_size
+    if prefill_head_policy is not None:
+        expected_options["prefill_head_policy"] = prefill_head_policy
+    if block_prefill:
+        expected_options.update(
+            prefill_block=block, decoder_group_size=1, prefill_head_policy="every-token"
+        )
+    if expected_options:
+        # Numerical equality alone cannot establish that an execution optimization ran.
+        # Only explicit expectations require the newer initialization/counter schema.
+        checks["execution_options.partitioned"] = native_run.get("graph_layout") == "partitioned"
+        if variant is not None:
+            expected_options["variant"] = variant
+        initialized_path = device / "initialization.json"
+        initialized = json.loads(initialized_path.read_text()) if initialized_path.is_file() else {}
+        for scope, observed in (("run", native_run), ("initialization", initialized)):
+            for name, expected_value in expected_options.items():
+                actual = observed.get(name)
+                checks[f"{scope}.{name}"] = (
+                    type(actual) is type(expected_value) and actual == expected_value
+                )
+    step_counts = []
+    for reference in metadata["requests"]:
+        length = reference["prompt_length"]
+        prefill_steps = length // block if block > 1 else 0
+        decode_steps = (length % block if block > 1 else length) + len(reference["tokens"]) - 1
+        step_counts.append(
+            {
+                "prefill_steps": prefill_steps,
+                "decode_steps": decode_steps,
+                "launches": prefill_steps + decode_steps,
+            }
+        )
+    if prefill_head_policy is not None or block_prefill:
+        expected_heads = sum(
+            len(reference["tokens"]) if prefill_head_policy == "last-token" else counts["launches"]
+            for reference, counts in zip(metadata["requests"], step_counts, strict=True)
+        )
+        observed_heads = native_run.get("head_runs")
+        checks["head_runs"] = type(observed_heads) is int and observed_heads == expected_heads
+    if read_logits:
+        checks["reference.logits_contract"] = (
+            type(metadata.get("vocabulary")) is int
+            and metadata["vocabulary"] > 0
+            and metadata.get("logits_dtype") == "<f2"
+            and metadata.get("logits_scope") == "last_consumed_token"
+        )
+    if block_prefill:
+        for name in ("launches", "prefill_steps", "decode_steps", "head_runs"):
+            initial = initialized.get(name)
+            checks[f"initialization.{name}"] = type(initial) is int and initial == 0
+            expected_count = (
+                expected_heads
+                if name == "head_runs"
+                else sum(counts[name] for counts in step_counts)
+            )
+            observed = native_run.get(name)
+            checks[f"run.{name}"] = type(observed) is int and observed == expected_count
     for index, reference in enumerate(metadata["requests"]):
         result = json.loads((device / f"measured.{index}.json").read_text())
         runs.append(result)
         prefix = reference["consumed"]
+        repeat_of = reference.get("repeat_of")
+        if repeat_of is not None and (type(repeat_of) is not int or not 0 <= repeat_of < index):
+            raise ValueError("repeat_of must refer to an earlier request")
         length = reference["prompt_length"]
-        launches = length // block + length % block + len(reference["tokens"]) - 1
+        launches = step_counts[index]["launches"]
         checks[f"request.{index}"] = (
-            result["tokens"] == reference["tokens"]
-            and result["consumed"] == prefix
-            and result["launches"] == launches
-            and result["uploads"] == launches
-            and result["reads"] == len(reference["tokens"])
+            result.get("tokens") == reference["tokens"]
+            and result.get("consumed") == prefix
+            and result.get("launches") == launches
+            and result.get("uploads") == launches + (reset_uploads_per_request if index else 0)
+            and result.get("reads") == len(reference["tokens"])
         )
-        for layer in range(metadata["layers"]):
+        if block_prefill:
+            checks[f"reference.{index}.consumed"] = (
+                type(length) is int
+                and bool(reference["tokens"])
+                and type(prefix) is int
+                and prefix == length + len(reference["tokens"]) - 1
+                and 1 <= length <= prefix <= metadata["capacity"]
+            )
+            for name, expected_count in (
+                step_counts[index] | {"prefill_block": block, "head_runs": launches}
+            ).items():
+                observed = result.get(name)
+                checks[f"request.{index}.{name}"] = (
+                    type(observed) is int and observed == expected_count
+                )
+        if cache_readback == "none":
+            checks[f"request.{index}.read_bytes"] = result.get("read_bytes") == 4 * len(
+                reference["tokens"]
+            )
+            continue
+        if read_logits:
+            logits_key = f"measured.{index}.logits"
+            try:
+                expected_path = fixture / f"expected.{index}.logits.bin"
+                actual_path = device / f"{logits_key}.bin"
+                expected_bytes = metadata.get("vocabulary", 0) * 2
+                if (
+                    not checks["reference.logits_contract"]
+                    or expected_path.stat().st_size != expected_bytes
+                    or actual_path.stat().st_size != expected_bytes
+                ):
+                    raise ValueError("missing or wrong-size final logits")
+                checks[logits_key] = compare_arrays(
+                    np.fromfile(actual_path, dtype="<f2"),
+                    np.fromfile(expected_path, dtype="<f2"),
+                    **TOLERANCES["device"],
+                )["passed"]
+                if repeat_of is not None:
+                    checks[logits_key + ".reset"] = (
+                        actual_path.read_bytes()
+                        == (device / f"measured.{repeat_of}.logits.bin").read_bytes()
+                    )
+            except (OSError, ValueError, TypeError):
+                checks[logits_key] = False
+        for layer in cache_layers:
             for name in ("keys", "values"):
                 key = f"measured.{index}.layer.{layer}.{name}"
                 expected = np.fromfile(
@@ -176,13 +774,16 @@ def evaluate(fixture, device, metadata, block):
                 )
                 actual = np.fromfile(device / f"{key}.bin", dtype="<f2")
                 # Ignore unconsumed slots while checking every head in the valid prefix.
-                actual = actual.reshape(metadata["heads"], metadata["capacity"], metadata["width"])[
-                    :, :prefix
-                ].reshape(-1)
+                actual = actual.reshape(metadata["heads"], metadata["capacity"], metadata["width"])
+                if block_prefill:
+                    checks[key + ".suffix"] = bool(np.all(actual[:, prefix:].view("u2") == 0))
+                actual = actual[:, :prefix].reshape(-1)
                 checks[key] = compare_arrays(actual, expected, **TOLERANCES["device"])["passed"]
-                if index == 2:
+                if repeat_of is not None:
                     previous = (
-                        np.fromfile(device / f"measured.0.layer.{layer}.{name}.bin", dtype="<f2")
+                        np.fromfile(
+                            device / f"measured.{repeat_of}.layer.{layer}.{name}.bin", dtype="<f2"
+                        )
                         .reshape(metadata["heads"], metadata["capacity"], metadata["width"])[
                             :, :prefix
                         ]
@@ -190,3 +791,150 @@ def evaluate(fixture, device, metadata, block):
                     )
                     checks[key + ".reset"] = np.array_equal(actual.view("u2"), previous.view("u2"))
     return checks, runs
+
+
+def evaluate_benchmark(
+    device,
+    metadata,
+    block,
+    *,
+    warmups,
+    repeats,
+    variant,
+    decoder_group_size,
+    prefill_head_policy,
+):
+    """Validate every resident repetition without requesting diagnostic tensor readback."""
+    if block not in (1, 4) or not 0 <= warmups <= 5 or not 1 <= repeats <= 20:
+        raise ValueError("invalid resident benchmark counts or prefill block")
+    if prefill_head_policy not in ("every-token", "last-token"):
+        raise ValueError("invalid prefill head policy")
+    manifest = json.loads((device / "benchmark.json").read_text())
+    native = json.loads((device / "run.json").read_text())
+    initialized = json.loads((device / "initialization.json").read_text())
+    checks = {
+        "benchmark.completed": manifest.get("completed") is True,
+        "benchmark.schema": manifest.get("schema_version") == 1,
+        "benchmark.warmups": manifest.get("warmups") == warmups,
+        "benchmark.repeats": manifest.get("repeats") == repeats,
+        "benchmark.request_count": manifest.get("request_count") == len(metadata["requests"]),
+        "released": native.get("released") is True and native.get("status") == "executed",
+        "closed_rejected": native.get("closed_checks") == native.get("closed_rejections") == 1,
+        "diagnostic_reads": native.get("diagnostic_reads") == 0,
+        "diagnostic_read_bytes": native.get("diagnostic_read_bytes") == 0,
+        "cache_readback": native.get("cache_readback") == "none",
+        "graph_layout": native.get("graph_layout") == "partitioned",
+        "reference.prefill_block": metadata.get("prefill_block") == block,
+    }
+    for segment in ("const", "nonconst"):
+        peak = native.get(f"{segment}_peak_bytes")
+        checks[f"memory.{segment}"] = (
+            native.get(f"{segment}_live_bytes") == 0 and type(peak) is int and 0 <= peak <= 2**30
+        )
+    options = {
+        "variant": variant,
+        "decoder_group_size": decoder_group_size,
+        "prefill_head_policy": prefill_head_policy,
+        "prefill_block": block,
+    }
+    for scope, observed in (("run", native), ("initialization", initialized)):
+        for name, expected in options.items():
+            actual = observed.get(name)
+            checks[f"{scope}.{name}"] = type(actual) is type(expected) and actual == expected
+    reset_uploads = 2 * metadata["layers"]
+    checks["reset_uploads"] = native.get("kv_reset_uploads_per_request") == reset_uploads
+    expected_records, measured = [], []
+    total_counts = dict(launches=0, prefill_steps=0, decode_steps=0, head_runs=0)
+    capacity_checks = 0
+    for index, reference in enumerate(metadata["requests"]):
+        length = reference["prompt_length"]
+        prefill = length // block if block > 1 else 0
+        decode = (length % block if block > 1 else length) + len(reference["tokens"]) - 1
+        counts = {
+            "launches": prefill + decode,
+            "prefill_steps": prefill,
+            "decode_steps": decode,
+            "head_runs": len(reference["tokens"])
+            if prefill_head_policy == "last-token"
+            else prefill + decode,
+        }
+        for kind, count in (("warmup", warmups), ("measured", repeats)):
+            for iteration in range(count):
+                name = f"{kind}.{index}.{iteration}"
+                try:
+                    result = json.loads((device / f"{name}.json").read_text())
+                except (OSError, ValueError):
+                    result = {}
+                expected_records.append(
+                    {
+                        "name": name,
+                        "request_index": index,
+                        "iteration": iteration,
+                        "prompt_length": length,
+                        "kind": kind,
+                        "result_file": f"{name}.json",
+                        "tokens_match": True,
+                    }
+                )
+                expected_result = counts | {
+                    "tokens": reference["tokens"],
+                    "consumed": reference["consumed"],
+                    "prefill_block": block,
+                    "uploads": counts["launches"]
+                    + (reset_uploads if len(expected_records) > 1 else 0),
+                    "reads": len(reference["tokens"]),
+                    "read_bytes": 4 * len(reference["tokens"]),
+                }
+                checks[name] = all(
+                    result.get(key) == value for key, value in expected_result.items()
+                )
+                for field in total_counts:
+                    total_counts[field] += counts[field]
+                capacity_checks += reference["consumed"] == metadata["capacity"]
+                if kind == "measured":
+                    measured.append(result | {"request_index": index, "iteration": iteration})
+    checks["benchmark.records"] = manifest.get("runs") == expected_records
+    for field, expected in total_counts.items():
+        checks[f"run.{field}"] = native.get(field) == expected
+        checks[f"initialization.{field}"] = initialized.get(field) == 0
+    checks["capacity_rejected"] = (
+        native.get("capacity_checks") == native.get("capacity_rejections") == capacity_checks
+    )
+    return checks, measured
+
+
+def evaluate_rebuild(device, metadata):
+    """Check release and exact final outputs across two fresh SDK Contexts."""
+    summary = json.loads((device / "lifecycle.json").read_text())
+    checks = {
+        "lifecycle.completed": summary
+        == {
+            "cycles": 2,
+            "reused_context": False,
+            "recreated_context": True,
+            "released": True,
+        }
+    }
+    for cycle in range(2):
+        directory = device / f"cycle.{cycle}"
+        native = json.loads((directory / "run.json").read_text())
+        checks[f"lifecycle.{cycle}.released"] = (
+            native.get("released") is True
+            and native.get("status") == "executed"
+            and native.get("closed_checks") == native.get("closed_rejections") == 1
+        )
+        for segment in ("const", "nonconst"):
+            checks[f"lifecycle.{cycle}.{segment}"] = (
+                native.get(f"{segment}_live_bytes") == 0
+                and 0 <= native.get(f"{segment}_peak_bytes", 2**40) <= 2**30
+            )
+        if cycle:
+            for index in range(len(metadata["requests"])):
+                baseline = device / "cycle.0" / f"measured.{index}.logits.bin"
+                actual = directory / baseline.name
+                checks[f"lifecycle.{cycle}.request.{index}.exact_logits"] = (
+                    baseline.is_file()
+                    and actual.is_file()
+                    and baseline.read_bytes() == actual.read_bytes()
+                )
+    return checks

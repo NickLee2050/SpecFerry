@@ -83,6 +83,9 @@ def capture_layers(layers, captured):
         ):
             handles.append(module.register_forward_hook(after(prefix + name)))
         handles.append(
+            layer.self_attn.out_proj.register_forward_pre_hook(before(prefix + "attended"))
+        )
+        handles.append(
             layer.self_attn_layer_norm.register_forward_pre_hook(
                 before(prefix + "attention_residual")
             )

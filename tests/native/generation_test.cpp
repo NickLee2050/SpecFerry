@@ -1,6 +1,10 @@
 #include "inference/generation.hpp"
+#include "inference/generation_io.hpp"
 
+#include <chrono>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -20,6 +24,53 @@ template <class Action> void rejects(Action action) {
     rejected = true;
   }
   require(rejected);
+}
+
+void run_options_contracts() {
+  namespace fs = std::filesystem;
+  using specferry::inference::read_run_options;
+  const auto directory =
+      fs::temp_directory_path() /
+      ("specferry-run-options-" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  fs::create_directory(directory);
+
+  struct Cleanup {
+    fs::path directory;
+
+    ~Cleanup() {
+      std::error_code ignored;
+      fs::remove_all(directory, ignored);
+    }
+  } cleanup{directory};
+
+  const auto defaults = read_run_options(directory, true);
+  require(defaults.maximum == 8 && defaults.block == 1 && defaults.readback == "none" &&
+          defaults.repeats == 1 && !defaults.sampling);
+  const auto parse = [&](const std::string &text, bool graph = true) {
+    {
+      std::ofstream output(directory / "run-options.txt");
+      output << text;
+      require(bool(output));
+    }
+    return read_run_options(directory, graph);
+  };
+  const auto benchmark = parse("block 4\nbenchmark 1\nwarmups 1\nrepeats 3\n");
+  require(benchmark.block == 4 && benchmark.benchmark && benchmark.warmups == 1 &&
+          benchmark.repeats == 3);
+  const auto cache = parse("readback kv\ncache_first_layer 2\ncache_last_layer 3\n");
+  require(cache.cache_first == 2 && cache.cache_last == 3);
+  const auto sampling = parse("seed 42\nmax_new_tokens 0\n", false);
+  require(sampling.sampling && sampling.seed == 42 && sampling.maximum == 0);
+  // Reject malformed or unsupported requests before a caller can create an SDK Context.
+  for (const auto *text :
+       {"unknown 1\n", "block 1\nblock 4\n", "block 1 extra\n", "block\n",
+        "max_new_tokens 4294967296\n", "max_new_tokens -1\n", "block 2.0\n", "seed 0\n",
+        "readback prefix\n", "readback kv\ncache_first_layer 3\ncache_last_layer 2\n",
+        "readback kv\ncache_last_layer 2\n", "block 4\ndecoder_group_size 2\n",
+        "block 4\nprefill_head last-token\n", "warmups 1\n"}) {
+    rejects([&] { parse(text); });
+  }
 }
 
 void contracts() {
@@ -107,6 +158,7 @@ void contracts() {
 
 int main() {
   try {
+    run_options_contracts();
     contracts();
     std::cout << "Generation BOS, EOS, capacity, limits and consumed-token contracts passed.\n";
     return 0;

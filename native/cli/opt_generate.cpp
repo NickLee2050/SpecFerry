@@ -2,6 +2,7 @@
 #include "models/opt/model.hpp"
 #include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
+#include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 
 #include <chrono>
@@ -10,38 +11,20 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace {
-unsigned number(const char *text) {
-  const std::string value(text);
-  if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
-    throw std::invalid_argument("expected an unsigned integer");
-  }
-  const auto parsed = std::stoull(value);
-  if (parsed > std::numeric_limits<unsigned>::max()) {
-    throw std::out_of_range("integer exceeds uint32");
-  }
-  return unsigned(parsed);
-}
-} // namespace
-
 int main(int argc, char **argv) {
-  if (argc != 7 && argc != 8) {
-    std::cerr << "usage: specferry_opt_generate DEPLOYMENT REQUEST OUTPUT MAX_NEW WARMUPS REPEATS "
-                 "[SEED]\n";
+  if (argc != 4) {
+    std::cerr << "usage: specferry_opt_generate DEPLOYMENT REQUEST OUTPUT\n";
     return 2;
   }
   try {
     const std::filesystem::path output(argv[3]);
     std::filesystem::create_directories(output);
-    const auto maximum = number(argv[4]), warmups = number(argv[5]), repeats = number(argv[6]);
-    if (warmups > 5 || repeats < 1 || repeats > 20) {
-      throw std::invalid_argument("expected 0..5 warmups and 1..20 repetitions");
-    }
+    const auto options = specferry::inference::read_run_options(argv[2], false);
     const auto config = specferry::models::opt::read_model_config(argv[2]);
     std::ifstream input(std::filesystem::path(argv[2]) / "tokens.txt");
     std::vector<std::int32_t> prompt;
@@ -57,32 +40,52 @@ int main(int argc, char **argv) {
     weights.verify();
     specferry::np101::SdkTimings timings(output);
     const auto start = std::chrono::steady_clock::now();
-    std::cout << "Initializing model" << std::endl;
-    specferry::np101::Context context;
-    specferry::models::opt::Model model(context, weights, config, config.decoder.layers,
-                                        {argc == 8, argc == 8 ? number(argv[7]) : 0});
+    std::unique_ptr<specferry::np101::Context> context;
+    std::unique_ptr<specferry::models::opt::Model> model;
+    {
+      const specferry::np101::SdkScope phase("phase", "initialize");
+      context = std::make_unique<specferry::np101::Context>();
+      model = std::make_unique<specferry::models::opt::Model>(
+          *context, weights, config, config.decoder.layers,
+          specferry::np101::ops::SamplingOptions{options.sampling, options.seed});
+    }
     const auto initialized =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    for (unsigned i = 0; i < warmups + repeats; ++i) {
-      const auto name = std::string(i < warmups ? "warmup." : "measured.") +
-                        std::to_string(i < warmups ? i : i - warmups);
-      std::cout << name << std::endl;
-      const auto result = model.generate(prompt, maximum);
+    for (unsigned i = 0; i < options.warmups + options.repeats; ++i) {
+      const auto name = std::string(i < options.warmups ? "warmup." : "measured.") +
+                        std::to_string(i < options.warmups ? i : i - options.warmups);
+      const specferry::np101::SdkScope request("request", name);
+      const auto before = specferry::np101::tensor_transfers();
+      const auto result = model->generate(prompt, options.maximum);
+      const auto after = specferry::np101::tensor_transfers();
       std::ofstream out(output / (name + ".json"));
       out << '{';
       specferry::inference::write_generation(out, result);
-      out << "}\n";
+      out << ",\"uploads\":" << after.uploads - before.uploads
+          << ",\"upload_bytes\":" << after.upload_bytes - before.upload_bytes
+          << ",\"reads\":" << after.reads - before.reads
+          << ",\"read_bytes\":" << after.read_bytes - before.read_bytes << "}\n";
       if (!out) {
         throw std::runtime_error("cannot save generated output");
       }
     }
-    std::cout << "Releasing model" << std::endl;
-    model.close();
-    context.close();
+    const auto release_started = std::chrono::steady_clock::now();
+    {
+      const specferry::np101::SdkScope phase("phase", "release");
+      model->close();
+      context->close();
+    }
+    const auto release_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - release_started).count();
+    timings.flush();
     std::ofstream out(output / "execution.json");
     out << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"initialize_"
            "seconds\":"
-        << initialized << "}\n";
+        << initialized << ",\"release_seconds\":" << release_seconds
+        << ",\"const_live_bytes\":" << context->memory().live(true)
+        << ",\"const_peak_bytes\":" << context->memory().peak(true)
+        << ",\"nonconst_live_bytes\":" << context->memory().live(false)
+        << ",\"nonconst_peak_bytes\":" << context->memory().peak(false) << "}\n";
     return out ? 0 : 1;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

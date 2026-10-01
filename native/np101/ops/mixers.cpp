@@ -20,8 +20,7 @@ AttentionResult attention_core(GraphBuilder &g, Tensor query, Tensor keys, Tenso
       query.spec.shape[2] != keys.spec.shape[2] || !std::isfinite(scale) || scale <= 0 ||
       query.spec.type != f16 || keys.spec.type != f16 || values.spec.type != f16 ||
       valid_length.spec.type != DataType::Int32 ||
-      (valid_length.spec.elements() != 1 &&
-       (keys.spec.shape[2] != 1 || valid_length.spec.elements() != query.spec.shape[1]))) {
+      (valid_length.spec.elements() != 1 && valid_length.spec.elements() != query.spec.shape[1])) {
     throw std::invalid_argument("attention Q/K/V contract mismatch");
   }
   const auto dimension = keys.spec.shape[0], capacity = keys.spec.shape[1];
@@ -38,7 +37,21 @@ AttentionResult attention_core(GraphBuilder &g, Tensor query, Tensor keys, Tenso
   auto positions = g.constant({DataType::Int32, {capacity, 1}}, bytes);
   const bool per_query = valid_length.spec.elements() != 1;
   auto limits = per_query ? g.reshape(valid_length, {1, groups}) : valid_length;
-  auto valid = g.tensor({DataType::Bool8, {capacity, per_query ? groups : 1}});
+  if (per_query) {
+    // A complete query sequence is repeated for each head. Doubling keeps the
+    // number of concat nodes logarithmic without relying on rank-three masking
+    // or a separate attention graph for every head.
+    unsigned copied_heads = 1;
+    while (copied_heads < kv_heads) {
+      const auto remaining = kv_heads - copied_heads;
+      const auto added_heads = remaining < copied_heads ? remaining : copied_heads;
+      auto repeated =
+          added_heads == copied_heads ? limits : g.slice(limits, {0, 0}, {1, groups * added_heads});
+      limits = g.concat(limits, repeated, 1);
+      copied_heads += added_heads;
+    }
+  }
+  auto valid = g.tensor({DataType::Bool8, {capacity, per_query ? groups * kv_heads : 1}});
   g.node(VSI_NN_OP_RELATIONAL_OPS, {positions, limits}, valid)->nn_param.relational_ops.op =
       VSI_NN_RELATIONAL_OPS_LESS;
   auto masked = g.tensor(scores.spec);

@@ -15,8 +15,17 @@ constexpr auto f16 = DataType::Float16;
 constexpr auto f32 = DataType::Float32;
 } // namespace
 
-GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights)
-    : weights_(weights), graph(context, tensors, nodes) {}
+GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights,
+                           WeightStorage weight_storage)
+    : weights_(weights),
+      weight_storage_(weight_storage == WeightStorage::Default
+                          ? (weights ? WeightStorage::SharedMutable : WeightStorage::LocalConst)
+                          : weight_storage),
+      graph(context, tensors, nodes) {
+  if (weight_storage_ == WeightStorage::SharedMutable && !weights_) {
+    throw std::invalid_argument("shared weight storage requires a weight bank");
+  }
+}
 
 Tensor GraphBuilder::tensor(TensorSpec spec) { return {add_tensor(graph, spec), std::move(spec)}; }
 
@@ -54,17 +63,36 @@ Tensor GraphBuilder::weight(const WeightStore &store, const WeightRecord &record
 }
 
 Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &record,
-                                  TensorSpec spec, std::size_t offset) {
+                                  TensorSpec spec, std::size_t offset, WeightStorage storage) {
   if (spec.type != record.spec.type) {
     throw std::invalid_argument("weight chunk changes dtype");
   }
-  if (weights_) {
-    const auto id = weights_->bind(graph, store, record, spec, offset);
-    shared_weight_inputs_.push_back(id);
-    return {id, spec};
+  if (storage == WeightStorage::Default) {
+    storage = weight_storage_;
   }
-  return constant(spec, store.read(record, offset, spec.bytes()));
+  vsi_nn_tensor_id_t id;
+  if (storage == WeightStorage::SharedMutable) {
+    if (!weights_) {
+      throw std::invalid_argument("shared weight storage requires a weight bank");
+    }
+    id = weights_->bind(graph, store, record, spec, offset);
+  } else if (storage == WeightStorage::LocalConst || storage == WeightStorage::LocalMutable) {
+    id = add_tensor(graph, spec, storage == WeightStorage::LocalConst,
+                    store.read(record, offset, spec.bytes()));
+  } else {
+    throw std::invalid_argument("unknown weight storage policy");
+  }
+  if (storage != WeightStorage::LocalConst) {
+    // Mutable weights must be declared inputs even when their owner is this graph.
+    mutable_weight_inputs_.push_back(id);
+  }
+  if (storage != WeightStorage::SharedMutable) {
+    local_weight_bytes_ += spec.bytes();
+  }
+  return {id, std::move(spec)};
 }
+
+std::size_t GraphBuilder::local_weight_bytes() const { return local_weight_bytes_; }
 
 Tensor GraphBuilder::share(GraphBuilder &owner, Tensor source) {
   return {retain_tensor(owner.graph, source.id, graph), source.spec};
@@ -134,6 +162,28 @@ Tensor GraphBuilder::reshape(Tensor input, Shape shape) {
   return output;
 }
 
+Tensor GraphBuilder::permute(Tensor input, Shape order) {
+  if (order.empty() || order.size() > VSI_NN_MAX_DIM_NUM ||
+      order.size() != input.spec.shape.size()) {
+    throw std::invalid_argument("permutation rank differs from input");
+  }
+  Shape shape(order.size());
+  std::vector<bool> seen(order.size(), false);
+  for (std::size_t axis = 0; axis < order.size(); ++axis) {
+    if (order[axis] >= order.size() || seen[order[axis]]) {
+      throw std::invalid_argument("permutation must contain each input axis exactly once");
+    }
+    seen[order[axis]] = true;
+    shape[axis] = input.spec.shape[order[axis]];
+  }
+  auto output = tensor({input.spec.type, std::move(shape)});
+  parameters_.push_back(std::move(order));
+  auto *operation = node(VSI_NN_OP_PERMUTE, {input}, output);
+  operation->nn_param.permute.perm = parameters_.back().data();
+  operation->nn_param.permute.dim_num = parameters_.back().size();
+  return output;
+}
+
 Tensor GraphBuilder::slice(Tensor input, Shape start, Shape length) {
   if (start.size() != input.spec.shape.size() || length.size() != start.size()) {
     throw std::invalid_argument("slice rank mismatch");
@@ -154,16 +204,21 @@ Tensor GraphBuilder::slice(Tensor input, Shape start, Shape length) {
   return output;
 }
 
-Tensor GraphBuilder::concat(Tensor left, Tensor right) {
+Tensor GraphBuilder::concat(Tensor left, Tensor right, unsigned axis) {
   auto shape = left.spec.shape;
   if (left.spec.type != right.spec.type || shape.size() != right.spec.shape.size() ||
-      !std::equal(shape.begin() + 1, shape.end(), right.spec.shape.begin() + 1) ||
-      right.spec.shape[0] > std::numeric_limits<std::uint32_t>::max() - shape[0]) {
+      axis >= shape.size() ||
+      right.spec.shape[axis] > std::numeric_limits<std::uint32_t>::max() - shape[axis]) {
     throw std::invalid_argument("concat shape/type mismatch");
   }
-  shape[0] += right.spec.shape[0];
+  for (std::size_t dimension = 0; dimension < shape.size(); ++dimension) {
+    if (dimension != axis && shape[dimension] != right.spec.shape[dimension]) {
+      throw std::invalid_argument("concat non-axis dimensions differ");
+    }
+  }
+  shape[axis] += right.spec.shape[axis];
   auto output = tensor({left.spec.type, shape});
-  node(VSI_NN_OP_CONCAT, {left, right}, output)->nn_param.concat.axis = 0;
+  node(VSI_NN_OP_CONCAT, {left, right}, output)->nn_param.concat.axis = axis;
   return output;
 }
 
@@ -321,16 +376,17 @@ Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float s
 }
 
 void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
-  std::vector<vsi_nn_tensor_id_t> input_ids, output_ids;
+  input_ids_.clear();
+  output_ids_.clear();
   for (const auto &input : inputs) {
-    input_ids.push_back(input.id);
+    input_ids_.push_back(input.id);
   }
-  input_ids.insert(input_ids.end(), shared_weight_inputs_.begin(), shared_weight_inputs_.end());
+  input_ids_.insert(input_ids_.end(), mutable_weight_inputs_.begin(), mutable_weight_inputs_.end());
   for (const auto &output : outputs) {
-    output_ids.push_back(output.id);
+    output_ids_.push_back(output.id);
   }
-  if (!vsi_nn_SetGraphInputs(graph.get(), input_ids.data(), input_ids.size()) ||
-      !vsi_nn_SetGraphOutputs(graph.get(), output_ids.data(), output_ids.size())) {
+  if (!vsi_nn_SetGraphInputs(graph.get(), input_ids_.data(), input_ids_.size()) ||
+      !vsi_nn_SetGraphOutputs(graph.get(), output_ids_.data(), output_ids_.size())) {
     throw std::runtime_error("graph IO declaration failed");
   }
   check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),

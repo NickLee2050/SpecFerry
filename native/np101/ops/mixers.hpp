@@ -11,7 +11,9 @@ struct AttentionResult {
 
 // SDK axes: Q [head_dim, query_groups, kv_heads], K/V [head_dim, capacity, kv_heads].
 // FP16 storage, FP32 masked softmax, then FP16 probabilities and output.
-// With one KV head, valid_length may contain one causal limit per query column.
+// valid_length is scalar or one causal limit per query column, shared across heads.
+// Flattened softmax columns are head * query_groups + query; attended has shape
+// [head_dim, query_groups * kv_heads] in that same order.
 AttentionResult attention_core(GraphBuilder &builder, Tensor query, Tensor keys, Tensor values,
                                Tensor valid_length, float scale);
 // Q/K/V are FP16 [dimension,1,heads]; state is FP32 [value_dim,key_dim,heads].

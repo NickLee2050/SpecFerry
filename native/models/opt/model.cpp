@@ -29,6 +29,7 @@ InputEmbedding::InputEmbedding(Context &context, const WeightStore &weights,
 }
 
 void InputEmbedding::run(std::int32_t token, unsigned position) {
+  const SdkScope timing_role("role", "embedding");
   config_.validate_token(token);
   if (position >= config_.decoder.capacity) {
     throw std::out_of_range("OPT position exceeds cache capacity");
@@ -56,6 +57,7 @@ OutputProjection::OutputProjection(Context &context, const WeightStore &weights,
 }
 
 void OutputProjection::run() {
+  const SdkScope timing_role("role", "output-projection");
   check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
         "OPT output projection");
 }

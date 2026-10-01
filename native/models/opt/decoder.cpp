@@ -61,23 +61,32 @@ public:
 };
 
 struct Layer {
+  const std::string timing_prefix;
   Projection producer;
   KvCache cache;
   DecoderTail tail;
 
   Layer(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
         TensorBinding input)
-      : producer(context, weights, config, layer, input),
+      : timing_prefix("decoder." + std::to_string(layer)),
+        producer(context, weights, config, layer, input),
         cache(context, producer.graph, producer.key.id, producer.value.id, config.kv_spec()),
         tail(context, weights, config, layer, producer, cache) {}
 
   void step(unsigned position) {
-    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(producer.graph.get()); }),
-          "OPT Q/K/V projections");
-    cache.write(position);
+    {
+      const SdkScope timing_role("role", timing_prefix + ".qkv");
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(producer.graph.get()); }),
+            "OPT Q/K/V projections");
+    }
+    {
+      const SdkScope timing_role("role", timing_prefix + ".kv");
+      cache.write(position);
+    }
     const auto length = static_cast<std::int32_t>(position + 1);
     std::vector<std::uint8_t> bytes(sizeof(length));
     std::memcpy(bytes.data(), &length, sizeof(length));
+    const SdkScope timing_role("role", timing_prefix + ".attention-ffn");
     upload_tensor(tail.graph, tail.valid_length.id, bytes);
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(tail.graph.get()); }),
           "OPT attention and feed-forward");
