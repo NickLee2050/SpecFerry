@@ -4,10 +4,12 @@ import contextlib
 import io
 import json
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -23,8 +25,129 @@ from specferry.models.opt.graph_validation import (
     validate_prefix_fixture,
 )
 from specferry.models.opt.metrics import summarize
+from specferry.validation import device as device_runner
+from specferry.validation import recovery_controls
 from specferry.validation.allocation import MIB, capacity_result, check_segment_budget
 from specferry.validation.arrays import compare_arrays
+
+
+class RecoveryControlTests(unittest.TestCase):
+    def test_running_child_is_stopped_when_health_monitor_reports_fault(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            process = Mock(pid=12345)
+            process.wait.side_effect = [subprocess.TimeoutExpired("control", 5), -15]
+            with (
+                patch.object(device_runner, "RECOVERY_ROOT", root),
+                patch.object(device_runner.subprocess, "Popen", return_value=process),
+                patch.object(device_runner, "terminate_group") as terminate,
+                patch.object(device_runner, "process_group_members", return_value=[]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                evidence = device_runner.run_device(
+                    Path(sys.executable),
+                    [],
+                    root / "device",
+                    root,
+                    60,
+                    abort_check=lambda: True,
+                )
+            terminate.assert_called_once()
+            self.assertFalse(evidence["timeout"])
+            self.assertTrue(evidence["device_recovery_required"])
+            self.assertIn("kernel fault", evidence["health_monitor_failure"])
+            self.assertTrue((root / "np101-recovery-required.json").exists())
+
+    def test_kernel_page_fault_and_watchdog_are_fatal_but_hdma_wait_is_not(self):
+        for line in (
+            "kernel: BUG: unable to handle page fault for address: 0000000100000008",
+            "kernel: Oops: 0000 [#1] SMP PTI",
+            "kernel: [galcore]: NP[0] hang, automatic recovery.",
+            "--------gckEDMA_StartTransfer---timeout---src:0x55c24e40",
+        ):
+            self.assertIsNotNone(recovery_controls.FAULT.search(line), line)
+        self.assertIsNone(recovery_controls.FAULT.search("kernel: Waiting for HDMA Transfer..."))
+
+    def test_delayed_fault_stops_before_llm_even_when_numbers_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options = SimpleNamespace(
+                prepare_only=False, sudo_read_only=False, cold_restarted=False, timeout=None
+            )
+            evidence = dict(
+                returncode=0,
+                timeout=False,
+                process_group_exited=True,
+                remaining_processes=[],
+                device_recovery_required=False,
+            )
+            healthy = dict(faults=[], owners="")
+            faulty = dict(faults=["NP[0] hang"], owners="")
+
+            def device_run(binary, arguments, output, sdk, deadline, **kwargs):
+                output.mkdir(parents=True)
+                return evidence
+
+            with (
+                patch.object(recovery_controls, "RECOVERY_ROOT", root),
+                patch.object(
+                    recovery_controls,
+                    "controls",
+                    return_value=[
+                        ("vendor-conv", Path("demo"), [], 60),
+                        ("old-component", Path("llm"), [], 180),
+                    ],
+                ),
+                patch.object(recovery_controls, "snapshot", side_effect=[healthy, healthy, faulty]),
+                patch.object(
+                    recovery_controls, "device_lock", return_value=contextlib.nullcontext()
+                ),
+                patch.object(recovery_controls, "run_device", side_effect=device_run) as runner,
+                patch.object(recovery_controls, "numerical_check", return_value=True),
+                patch.object(recovery_controls.time, "sleep"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(recovery_controls.run_controls(root / "output", options, True), 1)
+            self.assertEqual(runner.call_count, 1)
+            self.assertTrue((root / "np101-recovery-required.json").exists())
+            incident = json.loads((root / "output/vendor-conv/incident.json").read_text())
+            self.assertEqual(incident["kernel_gate"]["faults"], faulty["faults"])
+
+    def test_conv_rejects_nan_error_and_llm_rejects_wrong_tokens(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            device = Path(temporary)
+            (device / "sdk.log").write_text("total=64 mismatches=0 max_abs_err=nan")
+            self.assertFalse(recovery_controls.numerical_check("vendor-conv", device))
+            measured = dict(tokens=[78, 632], consumed=6, stop_reason="max_new_tokens")
+            execution = dict(
+                phase="complete",
+                released=True,
+                const_live_bytes=0,
+                nonconst_live_bytes=0,
+                const_peak_bytes=1,
+                nonconst_peak_bytes=1,
+            )
+            (device / "measured.0.json").write_text(json.dumps(measured))
+            (device / "execution.json").write_text(json.dumps(execution))
+            self.assertFalse(recovery_controls.numerical_check("old-component", device))
+
+    def test_prepare_only_never_checks_or_opens_device(self):
+        with (
+            patch.object(
+                recovery_controls, "controls", return_value=[("vendor-conv", Path("demo"), [], 60)]
+            ),
+            patch.object(recovery_controls, "snapshot") as snapshot,
+            patch.object(recovery_controls, "run_device") as runner,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                recovery_controls.run_controls(
+                    Path("unused"), SimpleNamespace(prepare_only=True, timeout=None), False
+                ),
+                0,
+            )
+        snapshot.assert_not_called()
+        runner.assert_not_called()
 
 
 def write_generation_cache(fixture, device, metadata, expected_values):
@@ -925,10 +1048,21 @@ class GraphBlockPrefillTests(GraphEvidenceFixture):
             {"variant": "baseline"},
             {"variant": "merged-kv-local-const"},
             {"decoder_group_size": 2},
-            {"prefill_head_policy": "last-token"},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.evaluate(**options)
+
+    def test_last_token_policy_requires_actual_head_skips_with_blocks_and_tails(self):
+        self.initialized["prefill_head_policy"] = "last-token"
+        self.native_run.update(prefill_head_policy="last-token", head_runs=8)
+        for result in self.results:
+            result["head_runs"] = len(result["tokens"])
+        self.save_metadata()
+        checks = self.evaluate(prefill_head_policy="last-token")
+        self.assertTrue(all(checks.values()), checks)
+        self.results[1]["head_runs"] += 1
+        self.save_metadata()
+        self.assertFalse(self.evaluate(prefill_head_policy="last-token")["request.1.head_runs"])
 
 
 class GenerationCommandTests(GraphEvidenceFixture):

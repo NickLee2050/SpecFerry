@@ -179,7 +179,7 @@ void verify_blocks(Graph &graph, const std::vector<Block> &retained, CapacityPro
     }
   }
   // Scan every retained block after allocation stops, including after SDK rejection.
-  // Never stop at the first corrupt block in all mode: later bytes are part of P5.
+  // Scan past corrupt blocks in all mode to preserve full integrity coverage.
   progress.outcome.phase = "readback";
   std::cout << "Readback: " << retained.size() << " retained blocks, " << progress.uploaded / mib
             << " MiB; "

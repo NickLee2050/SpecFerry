@@ -11,8 +11,38 @@ Each board command runs one bounded child process and uses a new output director
 checks are excluded from ordinary CTest. Timeouts, signals and lingering children leave a
 recovery marker: resolve the fault before another board command; do not delete it to force
 retries. Stop on kernel hang/BUG or residual ownership. Before intentionally reproducing
-P3/selection hang, cold-restart both host and NP101. Sudo needs explicit authorization.
+selection hang, cold-restart both host and NP101. Sudo needs explicit authorization.
+Use the [cold-restart incident ledger](../docs/np101-recovery-incidents.md) before each board run;
+after recovery, a small control and at least 45 seconds of delayed kernel postflight must pass.
 CPU references and `--prepare-only` do not open NP101; model wrappers accept `--cpu-threads N`.
+
+## 设备恢复检查 recovery controls
+
+```bash
+python scripts/check_np101.py conv --sudo-read-only --output .cache/runs/vendor-convolution-control
+python scripts/check_np101.py recovery --sudo-read-only --output .cache/runs/model-recovery-control
+python scripts/check_np101.py recovery --prepare-only --output .cache/runs/recovery-control-prepared
+```
+
+`conv` runs the unchanged vendor CONV2D→RELU→MAXPOOL binary once. `recovery` runs that control,
+then the frozen 2026-10-01 OPT component binary: all 24 layers, C16, prompt5, two output tokens
+`[78,631]`, no warmup and one request. Each control requires numerical agreement, clean exit,
+clear ownership and at least 45 seconds of delayed kernel checks. The lock covers both stages
+and their postflight; any failure stops the sequence. Default process deadlines are 60/180 seconds.
+Kernel health is polled every five seconds during a long child run; a fault or monitor failure
+terminates the child and preserves a recovery marker. Checks also recognize page faults/Oops.
+These are functional controls, not throughput measurements or proof that every NP unit is healthy.
+The rewritten C++ convolution control is retired; its source/binary and fault evidence are archived.
+
+`--sudo-read-only` explicitly authorizes only journalctl/fuser reads; use it only with permission.
+Without it, both reads must be accessible as the invoking user. If a recovery marker exists,
+confirm both host and NP101 cold restart with `--cold-restarted`; the boot must have changed,
+preflight must be clean, and the old marker is archived before the control opens the device.
+Binary, fixture, deployment manifest and SDK identities are pinned in `fixtures/np101-recovery-controls.json`.
+Required frozen files stay at their evidence paths under `.cache/runs/validated-opt-component-baseline-20261001/`;
+missing/changed files fail before device access. Do not clean those paths or substitute a rebuild.
+`--prepare-only` checks identities and prints commands without reading kernel logs or opening NP101.
+SDK/Verify/ioctl instrumentation is rejected for these controls.
 
 ## Generation and performance
 
@@ -24,11 +54,13 @@ python scripts/generate_opt.py --backend graph --block 4 --capacity 16 \
   --output .cache/runs/opt-benchmark
 ```
 
-Graph defaults to K/group1 and token-only readback. A/B/A or a JSON request matrix via
+Graph defaults to merged-kv/group1 and token-only readback. A/B/A or a JSON request matrix via
 `--request-tokens-file FILE` shares a resident model; explicit `repeat_of` identifies repeats.
 Block4 consumes four known consecutive tokens from one request, with block1 for tails/decode;
-weight/KV storage and both execution sets remain resident. Block4 currently requires K,
-group1, every-token and capacity divisible by four. Other graph candidates use block1.
+weight/KV storage and both execution sets remain resident. Block4 requires merged-kv, group1 and
+capacity divisible by four. It accepts `--prefill-head last-token` to skip unused prompt heads;
+its matched C16 timing/token screening and prompt4/15/4 complete-logit A/B/A acceptance passed.
+Every-token remains the default. Other graph candidates use block1.
 Checkpoint defaults govern generation; sampling is explicit and supported by the component
 FP32-logit path. Token-only success does not establish full logits/KV correctness.
 
@@ -73,7 +105,7 @@ omitting it selects greedy. Omitted options use these defaults:
 | `max_new_tokens`, `warmups`, `repeats` | `8`, `0`, `1` |
 | `block` | `1`; graph also supports `4` under the restrictions above |
 | `variant` | `merged-kv`; candidates `merged-kv-local-const`, `merged-kv-local-mutable` |
-| `decoder_group_size`, `prefill_head` | `1`, `every-token`; block1 candidates `2`, `last-token` |
+| `decoder_group_size`, `prefill_head` | `1`, `every-token`; group2 requires block1; last-token accepts block1/block4 |
 | `readback` | `none`; `logits`, or `kv` with explicit `cache_first_layer` / `cache_last_layer` |
 | `benchmark`, `lifecycle` | `0`; graph accepts `1`, mutually exclusive |
 
@@ -110,7 +142,8 @@ python scripts/generate_opt.py --backend graph --block 4 --capacity 16 \
 layers when fault investigation requires it; full-intermediate
 readback modes were retired. `prefix-split-repeat` rebuilds Context/model twice. Teacher
 checks do not replace generation reset/isolation, capacity acceptance or hardware evidence.
-K/group2 and WK/WcK are explicit candidates, not automatically accepted configurations.
+Two-decoder merged-kv graphs and merged-kv graphs with local const/mutable weights are
+explicit candidates, not automatically accepted configurations.
 Native prefix execution takes `np101_graph_pipeline_check DEPLOYMENT FIXTURE OUTPUT`;
 `FIXTURE/run-options.txt` carries `layers`, `readback` (`outputs`, `outputs-kv`, `boundaries`),
 comma-separated `boundary_layers`, `variant`, `decoder_group_size`, `repeat` and `check_fixture`.
@@ -129,6 +162,25 @@ submit / completion observations. It gates fixed v105 OpenVX/GAL hashes, rejects
 preloads and does not modify SDK objects. These traces are neither throughput baselines
 nor sufficient numerical/hardware proof by themselves. Only targeted fault investigation
 should use them; no automatic detail tracing on failure.
+For guarded timing, `SPECFERRY_VERIFY_EXECUTION_TRACE=0` disables only execution logging;
+Verify/node snapshots and the compilation guard remain active. Guard overhead is not calibrated.
+
+FFN collection diagnosis uses `np101_projection_check OUTPUT MODE DEPLOYMENT FIXTURE`,
+with `MODE` equal to `ffn-full`, `ffn-linear` or `ffn-linear-fc1-split2`. The fixture supplies
+OPT-350m `components.txt` and 24 validated `teacher.0.layer.N.attention_norm.bin` inputs.
+All retained modes use shared mutable weights; split fc1 uses the same linear builder as the
+model: two output-channel MatMul chunks, Concat, then the unchanged bias ADD/ReLU/fc2.
+Each collection runs four warmup sweeps and three measured batches of eight sweeps through
+24 layers. Whole-batch timing and process/main-thread user/system CPU counters exclude
+preparation, explicit IO and release. `execution.json` records budgets and release.
+Only `last-layer.bin` is read back: compare with `teacher.0.layer.23.bin` (full) or
+`teacher.0.layer.23.mlp.bin` (linear), and the matched baseline for split fc1.
+The native command does not itself check numerical agreement. Use the guarded device runner
+with execution logging and SDK call timing off. Input replay omits attention/KV gaps and
+cannot establish full-model throughput, pure device arithmetic time or core utilization.
+Pretransposed and full-window convolution modes are retired; results remain in the status
+and SDK issue documents, and their source is archived under
+`.cache/runs/diagnostic-cleanup-20261008/tests/native/np101/projection_check.cpp`.
 
 Retained Qwen3.5 regression uses the cached checkpoint:
 
@@ -143,18 +195,18 @@ python scripts/check_np101_model.py qwen --fixture .cache/runs/qwen-prepared/fix
 
 ## Operator, cache and memory diagnostics
 
-Use one selected case per process; [P1–P10](../docs/np101-sdk-driver-validation-report.md)
+Use one selected case per process; [SDK issues](../docs/np101-sdk-driver-validation-report.md)
 contains precise expected/actual results, crash/hang restrictions and reproduction arguments.
 
 | Launcher | Retained cases / responsibility |
 |---|---|
-| `check_np101.py` | lookup, projection, sampling, fp16-preservation, conv: atomic synthetic checks |
+| `check_np101.py` | lookup, projection, sampling, fp16-preservation: atomic synthetic checks; conv/recovery: frozen recovery controls |
 | `check_np101.py` | kv, cache-append, cache-packed, cache-packed64, cache-packed-block4: fixed writes, independent readers and causal attention |
 | `check_np101_memory.py` | capacity (allocation only), integrity (all retained bytes), accounting (SDK counters), growth (fixed/rebound RSS), weights (exported pack readback) |
 | `check_np101_model.py` | OPT/Qwen decoder regression, teacher component reference, selection/io composition and prefix integration |
 
 Memory payload remains separately capped at 1 GiB const/nonconst. Only explicitly authorized
-v106 synthetic P5 capacity/integrity probes use `--probe-limit` up to 4096 MiB; after refusal
+v106 synthetic capacity/integrity probes use `--probe-limit` up to 4096 MiB; after refusal
 scan all successfully written blocks, including those after mismatches. Full retained-data
 coverage is not physical board coverage. RSS/counters cannot prove leakage or transfer cost.
 Packed block4 uses a calibrated fixed writable `vxReshapeTensor` alias because ordinary

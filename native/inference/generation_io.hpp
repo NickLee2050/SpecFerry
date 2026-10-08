@@ -105,8 +105,9 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
         (result.benchmark && (result.lifecycle || result.readback != "none")) ||
         (result.lifecycle && result.readback != "logits") ||
         (!result.benchmark && (result.warmups || result.repeats != 1)) ||
-        (result.block == 4 && (result.variant != "merged-kv" || result.decoder_group_size != 1 ||
-                               result.prefill_head != "every-token"))) {
+        (result.block == 4 &&
+         ((result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2") ||
+          result.decoder_group_size != 1))) {
       throw std::invalid_argument("unsupported graph run options");
     }
   }

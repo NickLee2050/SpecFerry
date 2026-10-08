@@ -15,9 +15,8 @@ struct Projections {
 // All tensors have SDK shape [hidden,tokens]; no checkpoint policy lives in shared ops.
 Projections build_projections(np101::ops::GraphBuilder &graph, const np101::WeightStore &weights,
                               const Config &config, unsigned layer, np101::ops::Tensor hidden);
-std::map<std::string, np101::ops::Tensor> build_decoder_tail(np101::ops::GraphBuilder &graph,
-                                                             const np101::WeightStore &weights,
-                                                             const Config &config, unsigned layer,
-                                                             np101::ops::Tensor hidden,
-                                                             np101::ops::Tensor attended);
+std::map<std::string, np101::ops::Tensor>
+build_decoder_tail(np101::ops::GraphBuilder &graph, const np101::WeightStore &weights,
+                   const Config &config, unsigned layer, np101::ops::Tensor hidden,
+                   np101::ops::Tensor attended, bool split_fc1_output = false);
 } // namespace specferry::models::opt

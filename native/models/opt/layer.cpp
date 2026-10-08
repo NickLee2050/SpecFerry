@@ -10,8 +10,10 @@ using namespace np101::ops;
 namespace {
 constexpr auto f16 = DataType::Float16;
 
-Tensor linear(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name) {
-  return g.linear(input, weights, weights.find(name + ".weight"), weights.find(name + ".bias"));
+Tensor linear(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
+              bool split_output_channels = false) {
+  return g.linear(input, weights, weights.find(name + ".weight"), weights.find(name + ".bias"),
+                  split_output_channels);
 }
 
 Tensor norm(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
@@ -36,12 +38,13 @@ Projections build_projections(GraphBuilder &g, const WeightStore &weights, const
 
 std::map<std::string, Tensor> build_decoder_tail(GraphBuilder &g, const WeightStore &weights,
                                                  const Config &config, unsigned layer,
-                                                 Tensor hidden, Tensor attended) {
+                                                 Tensor hidden, Tensor attended,
+                                                 bool split_fc1_output) {
   const auto prefix = config.prefix(layer);
   auto mixer = linear(g, weights, attended, prefix + "self_attn.out_proj");
   auto residual = g.binary(VSI_NN_OP_ADD, hidden, mixer);
   auto normalized = norm(g, weights, residual, prefix + "self_attn_layer_norm", config.epsilon);
-  auto fc1 = linear(g, weights, normalized, prefix + "fc1");
+  auto fc1 = linear(g, weights, normalized, prefix + "fc1", split_fc1_output);
   auto activation = g.unary(VSI_NN_OP_RELU, fc1, f16);
   auto mlp = linear(g, weights, activation, prefix + "fc2");
   auto final_residual = g.binary(VSI_NN_OP_ADD, normalized, mlp);

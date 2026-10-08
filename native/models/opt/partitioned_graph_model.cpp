@@ -25,6 +25,7 @@ constexpr auto f16 = DataType::Float16;
 WeightStorage weight_storage(PartitionedGraphModel::Variant variant) {
   switch (variant) {
   case PartitionedGraphModel::Variant::MergedKv:
+  case PartitionedGraphModel::Variant::MergedKvFc1Split2:
     return WeightStorage::SharedMutable;
   case PartitionedGraphModel::Variant::MergedKvLocalConst:
     return WeightStorage::LocalConst;
@@ -182,7 +183,8 @@ struct PartitionedGraphModel::Impl {
     }
     attended = builder.reshape(attended, {decoder.hidden, block});
     stage.stages.emplace("attended", attended);
-    auto tail = build_decoder_tail(builder, weights, decoder, layer, hidden, attended);
+    auto tail = build_decoder_tail(builder, weights, decoder, layer, hidden, attended,
+                                   variant == Variant::MergedKvFc1Split2);
     stage.stages.insert(tail.begin(), tail.end());
     stage.hidden = tail.at("output");
     return stage;
@@ -190,6 +192,14 @@ struct PartitionedGraphModel::Impl {
 
   void build(Context &context, const WeightStore &weights, const PhaseObserver &phase) {
     const auto &decoder = config.decoder;
+    if (variant == Variant::MergedKvFc1Split2) {
+      // Load the large fc2 tensors before decoder graphs occupy SDK resources.
+      // Subsequent bindings reuse these same chunks and the same memory budget.
+      for (unsigned layer = 0; layer < decoder.layers; ++layer) {
+        const auto &matrix = weights.find(decoder.prefix(layer) + "fc2.weight");
+        bank.preload(weights, matrix, matrix.spec);
+      }
+    }
     const auto cache_count = 2 * decoder.layers;
     const TensorSpec cache_spec{f16, {decoder.hidden, decoder.capacity}};
     const std::vector<std::uint8_t> zeros(cache_spec.bytes());
@@ -442,10 +452,13 @@ PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore
   if (prefill_block != 1 && prefill_block != 4) {
     throw std::invalid_argument("partitioned OPT prefill block must be 1 or 4");
   }
+  if (variant == Variant::MergedKvFc1Split2 && config.decoder.intermediate % 2) {
+    throw std::invalid_argument("split-fc1 OPT requires an even intermediate width");
+  }
   if (prefill_block == 4 &&
-      (variant != Variant::MergedKv || decoder_group_size != 1 ||
-       prefill_head != PrefillHeadPolicy::EveryToken || config.decoder.capacity % prefill_block)) {
-    throw std::invalid_argument("block-4 prefill requires merged-kv, group 1, every-token heads "
+      ((variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2) ||
+       decoder_group_size != 1 || config.decoder.capacity % prefill_block)) {
+    throw std::invalid_argument("block-4 prefill requires a shared merged-kv variant, group 1 "
                                 "and capacity divisible by 4");
   }
   validate_model_weights(weights, config, config.decoder.layers);

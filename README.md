@@ -34,10 +34,10 @@ Generation follows checkpoint defaults; sampling needs explicit `--sample --seed
 and the component backend's validated FP32-logit path. `--prepare-only` accesses no board.
 
 The component backend remains the default regression baseline. The graph backend uses
-resident K/block1/block4 graphs with shared weights/KV and defaults to token-only readback.
-OPT F2/F3 and F4's measured C16/C64 scope are accepted with one analyzed precision exception;
-model rebuilding requires a fresh Context. See [current status](docs/np101-status.md)
-for exact scope, driver risks, evidence and F5.P1's graph inference baseline.
+resident merged-kv/block1/block4 graphs with shared weights/KV and defaults to token-only readback.
+OPT token decoding, block prefill and the measured C16/C64 model scope are accepted
+with one analyzed precision exception; model rebuilding requires a fresh Context. See [current status](docs/np101-status.md)
+for exact scope, driver risks, evidence and the graph inference performance baseline.
 
 ## Benchmark and checks
 
@@ -55,5 +55,5 @@ python scripts/format_cpp.py --check
 preparation/compilation/reset/explicit IO and includes SDK completion waits. Failed checks
 have no accepted metrics. Omit formatters' `--check` for safe formatting.
 [Test commands](tests/README.md) describe scoped diagnostics, native options and retained Qwen
-regression. [TODO](TODO.md) owns next steps; [SDK issues](docs/np101-sdk-driver-validation-report.md)
-own P1–P10. Raw historical outputs and recovery snapshots remain in `.cache/runs/`.
+regression. [TODO](TODO.md) owns next steps; [SDK issue details](docs/np101-sdk-driver-validation-report.md)
+describe the recorded failures. Raw historical outputs and recovery snapshots remain in `.cache/runs/`.

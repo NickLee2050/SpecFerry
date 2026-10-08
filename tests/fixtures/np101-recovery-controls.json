@@ -1,0 +1,22 @@
+{
+  "vendor_binary": "demo/op_demo_conv_relu_pool",
+  "vendor_sha256": "d51a13abb7f82594bbe3bc889ff9bf958690d6e028c9185ad751bb9b79174a9a",
+  "component_binary": ".cache/runs/validated-opt-component-baseline-20261001/bin/specferry_opt_generate",
+  "component_sha256": "536830eefedb969b525ce338cd4f996451b40ceb5a5e8af0f744463e923a9809",
+  "fixture": ".cache/runs/validated-opt-component-baseline-20261001/fixtures/decode-c16",
+  "deployment": ".cache/np101/opt-350m",
+  "sdk_sha256": {
+    "libovxlib.so": "fb8c5a734bf666d9c759058d26d45164b1ef93550aa86956224a74d04bf40d0d",
+    "libOpenVX.so": "2f7223e504b15886c1562889668a80af48b19d605461beac175d336d396ff108",
+    "libGAL.so": "e60c55cd8caebebbda238119ba8c9c4d88996048f62769421dd0b538325de5c7",
+    "libArchModelSw.so": "2d3cd42f3517976cdf68f331880694b525aca42f36a39e50f32603a9f253a401",
+    "libNNArchPerf.so": "6bbcb90de7c69df52570006e297cd3475fc07ee92a77a912bfa1f4fc6fa65294"
+  },
+  "fixture_sha256": {
+    "model.txt": "eb1977b68ae5c1c63eb33804dc126257cf782081346c3be0c14973fc843d228a",
+    "components.txt": "4c4bfce29dc82a662bfdec3559a0bba1e670efc1cd2858c2a195dc6d46dc9d2a",
+    "tokens.txt": "9c2150f5c8ea5fa914946934ca71152e2f42b65685e8d7bec125642cee00afc8",
+    "requests.txt": "9c2150f5c8ea5fa914946934ca71152e2f42b65685e8d7bec125642cee00afc8"
+  },
+  "deployment_manifest_sha256": "012cf8543b9ef2d50ad67acd475954aaed85c4717e301008ab4f935bbac80bd7"
+}

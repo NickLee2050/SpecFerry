@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one model-independent NP101 operator or cache check in a bounded process."""
+"""Run frozen recovery controls or one bounded NP101 operator/cache check."""
 
 import argparse
 import sys
@@ -17,6 +17,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     cases = parser.add_subparsers(dest="case", required=True)
     for name in (
+        "recovery",
         "conv",
         "lookup",
         "projection",
@@ -30,7 +31,16 @@ def parse_args():
     ):
         case = cases.add_parser(name)
         add_run_arguments(case)
-        if name == "lookup":
+        if name in ("conv", "recovery"):
+            case.add_argument(
+                "--cold-restarted", action="store_true", help="confirm host and NP101 cold restart"
+            )
+            case.add_argument(
+                "--sudo-read-only",
+                action="store_true",
+                help="authorize sudo journalctl/fuser reads",
+            )
+        elif name == "lookup":
             case.add_argument("--operator", choices=("gather", "embedding"), required=True)
         elif name == "projection":
             case.add_argument("--operator", choices=("matmul-add", "fcl"), required=True)
@@ -43,6 +53,12 @@ def parse_args():
         elif name == "cache-append":
             case.add_argument("--rank", type=int, choices=(2, 3), required=True)
     args = parser.parse_args()
+    if args.case in ("conv", "recovery") and (
+        args.sdk_timing or args.trace_driver or args.trace_verify
+    ):
+        parser.error(
+            "Recovery control uses frozen uninstrumented controls; tracing is not supported"
+        )
     if args.case == "sampling" and not (
         8 <= args.classes <= 50272 and args.classes % 8 == 0 and 1 <= args.samples <= 8192
     ):
@@ -53,9 +69,12 @@ def parse_args():
 def main():
     args = parse_args()
     output = args.output.resolve()
+    if args.case in ("conv", "recovery"):
+        from specferry.validation.recovery_controls import run_controls
+
+        return run_controls(output, args, include_llm=args.case == "recovery")
     device = output / "device"
     targets = {
-        "conv": "conv_relu_pool_test",
         "lookup": "lookup_check",
         "projection": "projection_check",
         "sampling": "sampling_check",
@@ -69,9 +88,7 @@ def main():
     binary = ROOT / "build/tests" / ("np101_" + targets[args.case])
     arguments = [device]
     evaluate = None
-    if args.case == "conv":
-        arguments = []
-    elif args.case in ("lookup", "projection", "fp16-preservation"):
+    if args.case in ("lookup", "projection", "fp16-preservation"):
         arguments += [args.operator]
     elif args.case == "cache-append":
         arguments += [args.rank]

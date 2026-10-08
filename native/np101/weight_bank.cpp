@@ -1,33 +1,55 @@
 #include "np101/weight_bank.hpp"
 
+#include <exception>
 #include <stdexcept>
 
 namespace specferry::np101 {
 WeightBank::WeightBank(Context &context) : storage_(context, 1024, 0) {}
 
+vsi_nn_tensor_id_t WeightBank::ensure_loaded(const WeightStore &store, const WeightRecord &record,
+                                             const TensorSpec &spec, std::size_t offset) {
+  try {
+    if (!storage_.get()) {
+      throw std::logic_error("shared weight bank is closed");
+    }
+    if ((source_ && source_ != &store) || spec.type != record.spec.type) {
+      throw std::invalid_argument("shared weight bank source/dtype differs");
+    }
+    source_ = &store;
+    std::string shape;
+    for (auto dimension : spec.shape) {
+      shape += std::to_string(dimension) + ",";
+    }
+    const auto key = std::make_tuple(record.name, offset, shape);
+    auto found = tensors_.find(key);
+    if (found == tensors_.end()) {
+      const auto data = store.read(record, offset, spec.bytes());
+      const auto id = add_tensor(storage_, spec, false, data);
+      found = tensors_.emplace(key, Chunk{id, data.size()}).first;
+      bytes_ += data.size();
+    }
+    return found->second.id;
+  } catch (const std::exception &error) {
+    throw std::runtime_error("shared weight load failed: " + record.name +
+                             " offset=" + std::to_string(offset) + ": " + error.what());
+  }
+}
+
+void WeightBank::preload(const WeightStore &store, const WeightRecord &record,
+                         const TensorSpec &spec, std::size_t offset) {
+  ensure_loaded(store, record, spec, offset);
+}
+
 vsi_nn_tensor_id_t WeightBank::bind(Graph &receiver, const WeightStore &store,
                                     const WeightRecord &record, const TensorSpec &spec,
                                     std::size_t offset) {
-  if (!storage_.get()) {
-    throw std::logic_error("shared weight bank is closed");
+  const auto id = ensure_loaded(store, record, spec, offset);
+  try {
+    return retain_tensor(storage_, id, receiver);
+  } catch (const std::exception &error) {
+    throw std::runtime_error("shared weight bind failed: " + record.name +
+                             " offset=" + std::to_string(offset) + ": " + error.what());
   }
-  if ((source_ && source_ != &store) || spec.type != record.spec.type) {
-    throw std::invalid_argument("shared weight bank source/dtype differs");
-  }
-  source_ = &store;
-  std::string shape;
-  for (auto dimension : spec.shape) {
-    shape += std::to_string(dimension) + ",";
-  }
-  const auto key = std::make_tuple(record.name, offset, shape);
-  auto found = tensors_.find(key);
-  if (found == tensors_.end()) {
-    const auto data = store.read(record, offset, spec.bytes());
-    const auto id = add_tensor(storage_, spec, false, data);
-    found = tensors_.emplace(key, Chunk{id, data.size()}).first;
-    bytes_ += data.size();
-  }
-  return retain_tensor(storage_, found->second.id, receiver);
 }
 
 std::size_t WeightBank::payload_bytes() const { return bytes_; }

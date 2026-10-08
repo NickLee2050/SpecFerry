@@ -58,6 +58,10 @@ void run_options_contracts() {
   const auto benchmark = parse("block 4\nbenchmark 1\nwarmups 1\nrepeats 3\n");
   require(benchmark.block == 4 && benchmark.benchmark && benchmark.warmups == 1 &&
           benchmark.repeats == 3);
+  const auto head_skip = parse("block 4\nprefill_head last-token\n");
+  require(head_skip.block == 4 && head_skip.prefill_head == "last-token");
+  const auto split_fc1 = parse("block 4\nvariant merged-kv-fc1-split2\n");
+  require(split_fc1.block == 4 && split_fc1.variant == "merged-kv-fc1-split2");
   const auto cache = parse("readback kv\ncache_first_layer 2\ncache_last_layer 3\n");
   require(cache.cache_first == 2 && cache.cache_last == 3);
   const auto sampling = parse("seed 42\nmax_new_tokens 0\n", false);
@@ -68,7 +72,7 @@ void run_options_contracts() {
         "max_new_tokens 4294967296\n", "max_new_tokens -1\n", "block 2.0\n", "seed 0\n",
         "readback prefix\n", "readback kv\ncache_first_layer 3\ncache_last_layer 2\n",
         "readback kv\ncache_last_layer 2\n", "block 4\ndecoder_group_size 2\n",
-        "block 4\nprefill_head last-token\n", "warmups 1\n"}) {
+        "prefill_head unknown\n", "warmups 1\n"}) {
     rejects([&] { parse(text); });
   }
 }

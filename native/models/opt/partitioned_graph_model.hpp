@@ -19,10 +19,10 @@ public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
   // All variants use merged KV and retain shared mutable vocabulary blocks.
-  enum class Variant { MergedKv, MergedKvLocalConst, MergedKvLocalMutable };
+  enum class Variant { MergedKv, MergedKvFc1Split2, MergedKvLocalConst, MergedKvLocalMutable };
 
   // Generation may skip unused prompt predictions; public step() always runs the head.
-  // Block-4 supports EveryToken only: each block runs the head for its final column.
+  // EveryToken runs the head for each consumed block's final column.
   enum class PrefillHeadPolicy { EveryToken, LastToken };
 
   PartitionedGraphModel(np101::Context &context, const np101::WeightStore &weights,

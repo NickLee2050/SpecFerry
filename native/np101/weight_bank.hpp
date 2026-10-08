@@ -17,6 +17,10 @@ namespace specferry::np101 {
 class WeightBank {
 public:
   explicit WeightBank(Context &context);
+  // Load a chunk into the shared bank before constructing consumer graphs.
+  // A later bind with the same record, offset and shape reuses this tensor.
+  void preload(const WeightStore &store, const WeightRecord &record, const TensorSpec &spec,
+               std::size_t offset = 0);
   vsi_nn_tensor_id_t bind(Graph &receiver, const WeightStore &store, const WeightRecord &record,
                           const TensorSpec &spec, std::size_t offset = 0);
   std::size_t payload_bytes() const;
@@ -30,6 +34,8 @@ private:
     std::size_t bytes;
   };
 
+  vsi_nn_tensor_id_t ensure_loaded(const WeightStore &store, const WeightRecord &record,
+                                   const TensorSpec &spec, std::size_t offset);
   Graph storage_;
   const WeightStore *source_ = nullptr;
   std::map<std::tuple<std::string, std::size_t, std::string>, Chunk> tensors_;

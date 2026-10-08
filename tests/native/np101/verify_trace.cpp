@@ -555,8 +555,19 @@ struct ProcessScope {
 thread_local ProcessScope current_process;
 std::atomic<std::uint64_t> next_process{0};
 
+bool execution_trace_enabled() {
+  static const bool enabled = [] {
+    const auto *setting = std::getenv("SPECFERRY_VERIFY_EXECUTION_TRACE");
+    return !setting || std::strcmp(setting, "0") != 0;
+  }();
+  return enabled;
+}
+
 void record_execution(const char *api, int status, void *argument = nullptr, int command = -1,
                       int hardware = -1, int interface_status = -1) {
+  if (!execution_trace_enabled()) {
+    return;
+  }
   // This stream records calls that actually execute, separately from Verify's configured targets.
   static std::FILE *output = [] {
     runtime(); // Check the pinned OpenVX build before reading any private layout.
@@ -588,14 +599,16 @@ extern "C" int vxProcessGraph(void *graph) {
   record_execution("vxProcessGraph.begin", 0);
   // In this pinned build, a nonzero graph+0x124 branches to ProcessInternal even
   // when captured commands exist. Keep this distinct from merely naming a target.
-  std::uint32_t internal = 1;
-  if (read_field(graph, 0x124, internal)) {
-    record_execution("process_internal_flag", static_cast<int>(internal));
-  }
-  const auto fields = snapshot(graph);
-  void *capture = nullptr;
-  if (fields.valid && read_field(fields.execution_table, 0x16280, capture)) {
-    record_execution("compiled_capture", static_cast<int>(fields.verified), capture);
+  if (execution_trace_enabled()) {
+    std::uint32_t internal = 1;
+    if (read_field(graph, 0x124, internal)) {
+      record_execution("process_internal_flag", static_cast<int>(internal));
+    }
+    const auto fields = snapshot(graph);
+    void *capture = nullptr;
+    if (fields.valid && read_field(fields.execution_table, 0x16280, capture)) {
+      record_execution("compiled_capture", static_cast<int>(fields.verified), capture);
+    }
   }
   const auto *guard = std::getenv("SPECFERRY_VERIFY_REQUIRE_OPERATIONS");
   const bool permitted =
@@ -638,12 +651,12 @@ extern "C" int gcoOS_DeviceControl(void *os, std::uint32_t code, void *input,
   using Control = int (*)(void *, std::uint32_t, void *, std::size_t, void *, std::size_t);
   static const auto control = reinterpret_cast<Control>(find_symbol("gcoOS_DeviceControl"));
   std::int32_t command = -1, hardware = -1, interface_status = -1;
-  if (current_process.graph && input_size >= 16) {
+  if (execution_trace_enabled() && current_process.graph && input_size >= 16) {
     read_field(input, 0, command);
     read_field(input, 4, hardware);
   }
   const auto status = control(os, code, input, input_size, output, output_size);
-  if (current_process.graph) {
+  if (execution_trace_enabled() && current_process.graph) {
     if (output_size >= 16) {
       read_field(output, 12, interface_status);
     }

@@ -70,7 +70,7 @@ public:
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
   // FP16 MatMul followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                const WeightRecord &bias);
+                const WeightRecord &bias, bool split_output_channels = false);
   Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);
   // FP32 square/reduce/rsqrt: mean=true is RMS; false is L2 normalization.
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);

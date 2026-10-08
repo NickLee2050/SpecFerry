@@ -158,6 +158,7 @@ def prefix_readback_scope(
         raise ValueError("decoder group size must be 1 or 2")
     if variant not in (
         "merged-kv",
+        "merged-kv-fc1-split2",
         "merged-kv-local-const",
         "merged-kv-local-mutable",
     ):
@@ -614,13 +615,10 @@ def evaluate(
     block_prefill = block != 1
     if block_prefill and (
         block != 4
-        or variant != "merged-kv"
+        or variant not in ("merged-kv", "merged-kv-fc1-split2")
         or decoder_group_size not in (None, 1)
-        or prefill_head_policy not in (None, "every-token")
     ):
-        raise ValueError(
-            "partitioned block 4 requires merged-kv, decoder group size 1 and every-token heads"
-        )
+        raise ValueError("partitioned block 4 requires a shared merged-kv variant and group 1")
     if block_prefill and metadata["capacity"] % block:
         raise ValueError("capacity must be divisible by prefill block")
     if block_prefill or "prefill_block" in metadata:
@@ -653,7 +651,9 @@ def evaluate(
         expected_options["prefill_head_policy"] = prefill_head_policy
     if block_prefill:
         expected_options.update(
-            prefill_block=block, decoder_group_size=1, prefill_head_policy="every-token"
+            prefill_block=block,
+            decoder_group_size=1,
+            prefill_head_policy=prefill_head_policy or "every-token",
         )
     if expected_options:
         # Numerical equality alone cannot establish that an execution optimization ran.
@@ -731,7 +731,13 @@ def evaluate(
                 and 1 <= length <= prefix <= metadata["capacity"]
             )
             for name, expected_count in (
-                step_counts[index] | {"prefill_block": block, "head_runs": launches}
+                step_counts[index]
+                | {
+                    "prefill_block": block,
+                    "head_runs": len(reference["tokens"])
+                    if prefill_head_policy == "last-token"
+                    else launches,
+                }
             ).items():
                 observed = result.get(name)
                 checks[f"request.{index}.{name}"] = (

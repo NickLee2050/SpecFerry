@@ -335,17 +335,32 @@ Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned 
 }
 
 Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                            const WeightRecord &bias) {
+                            const WeightRecord &bias, bool split_output_channels) {
   if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
       matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
       matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
       bias.spec.shape != Shape{matrix.spec.shape[1]}) {
     throw std::invalid_argument("linear requires FP16 [K,tokens], weight [K,N], bias [N]");
   }
+  if (split_output_channels && (!matrix.spec.shape[1] || matrix.spec.shape[1] % 2)) {
+    throw std::invalid_argument("split linear requires an even positive output width");
+  }
   // The installed SDK crashes while verifying even an isolated biased FCL.
   // Use documented MatMul/Add; FP16 projection rounds before the bias addition.
   // Keep this boundary visible in the independent model-level comparisons.
-  auto projected = project(input, store, matrix);
+  const auto projected = [&] {
+    if (!split_output_channels) {
+      return project(input, store, matrix);
+    }
+    const auto half_rows = matrix.spec.shape[1] / 2;
+    const TensorSpec half_spec{f16, {matrix.spec.shape[0], half_rows}};
+    const auto first = weight_chunk(store, matrix, half_spec, 0);
+    const auto second = weight_chunk(store, matrix, half_spec, half_spec.bytes());
+    const Shape output{half_rows, input.spec.shape[1]};
+    // SDK axis zero is contiguous: these chunks cover consecutive output channels.
+    return concat(matmul(input, first, output, false, true),
+                  matmul(input, second, output, false, true));
+  }();
   return binary(VSI_NN_OP_ADD, projected, weight(store, bias, bias.spec));
 }
 

@@ -7,6 +7,7 @@
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 #include "sys/resource.h"
+#include "sys/time.h"
 
 #include <algorithm>
 #include <chrono>
@@ -36,6 +37,39 @@ struct ExecutionCounts {
   std::size_t head_runs = 0;
 };
 
+struct CpuUsage {
+  double process_user_seconds = 0;
+  double process_system_seconds = 0;
+  double main_thread_user_seconds = 0;
+  double main_thread_system_seconds = 0;
+};
+
+struct CpuSnapshot {
+  rusage process{};
+  rusage main_thread{};
+};
+
+CpuSnapshot read_cpu_snapshot() {
+  CpuSnapshot snapshot;
+  if (getrusage(RUSAGE_SELF, &snapshot.process) ||
+      getrusage(RUSAGE_THREAD, &snapshot.main_thread)) {
+    throw std::runtime_error("cannot read host CPU usage");
+  }
+  return snapshot;
+}
+
+double elapsed_cpu_seconds(const timeval &before, const timeval &after) {
+  return static_cast<double>(after.tv_sec - before.tv_sec) +
+         static_cast<double>(after.tv_usec - before.tv_usec) * 1e-6;
+}
+
+CpuUsage cpu_usage_between(const CpuSnapshot &before, const CpuSnapshot &after) {
+  return {elapsed_cpu_seconds(before.process.ru_utime, after.process.ru_utime),
+          elapsed_cpu_seconds(before.process.ru_stime, after.process.ru_stime),
+          elapsed_cpu_seconds(before.main_thread.ru_utime, after.main_thread.ru_utime),
+          elapsed_cpu_seconds(before.main_thread.ru_stime, after.main_thread.ru_stime)};
+}
+
 struct BenchmarkRun {
   std::string name;
   unsigned request_index;
@@ -54,6 +88,7 @@ PartitionedModel::Variant parse_variant(const std::string &name) {
   using Variant = PartitionedModel::Variant;
   const std::pair<const char *, Variant> variants[] = {
       {"merged-kv", Variant::MergedKv},
+      {"merged-kv-fc1-split2", Variant::MergedKvFc1Split2},
       {"merged-kv-local-const", Variant::MergedKvLocalConst},
       {"merged-kv-local-mutable", Variant::MergedKvLocalMutable}};
   for (const auto &[label, variant] : variants) {
@@ -165,7 +200,8 @@ void progress(const fs::path &directory, const std::string &phase, const char *s
 
 void save_generation(const fs::path &path, const inference::Generation &result,
                      std::size_t launches, np101::TensorTransfers before,
-                     np101::TensorTransfers after, unsigned prefill_block, ExecutionCounts counts) {
+                     np101::TensorTransfers after, unsigned prefill_block, ExecutionCounts counts,
+                     CpuUsage cpu_usage) {
   std::ofstream out(path);
   out << '{';
   inference::write_generation(out, result);
@@ -175,7 +211,10 @@ void save_generation(const fs::path &path, const inference::Generation &result,
       << ",\"read_bytes\":" << after.read_bytes - before.read_bytes
       << ",\"prefill_block\":" << prefill_block << ",\"decode_steps\":" << counts.decode_steps
       << ",\"prefill_steps\":" << counts.prefill_steps << ",\"head_runs\":" << counts.head_runs
-      << "}\n";
+      << std::setprecision(17) << ",\"process_user_cpu_seconds\":" << cpu_usage.process_user_seconds
+      << ",\"process_system_cpu_seconds\":" << cpu_usage.process_system_seconds
+      << ",\"main_thread_user_cpu_seconds\":" << cpu_usage.main_thread_user_seconds
+      << ",\"main_thread_system_cpu_seconds\":" << cpu_usage.main_thread_system_seconds << "}\n";
   if (!out) {
     throw std::runtime_error("cannot save experimental generation");
   }
@@ -235,8 +274,10 @@ int main(int argc, char **argv) {
       progress(root, lifecycle_check ? "cycle." + std::to_string(cycle) : "initialize");
       const auto start = Clock::now();
       np101::Context context;
-      PartitionedModel model(context, weights, config, {}, decoder_group_size, variant, head_policy,
-                             block);
+      // Preserve the last compilation stage if initialization exceeds the device timeout.
+      PartitionedModel model(
+          context, weights, config, [&](const std::string &stage) { progress(directory, stage); },
+          decoder_group_size, variant, head_policy, block);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
@@ -277,11 +318,14 @@ int main(int argc, char **argv) {
           const auto before = np101::tensor_transfers();
           const auto launches = model.launches();
           const auto counts_before = execution_counts(model);
+          const auto cpu_before = read_cpu_snapshot();
           const auto result = model.generate(requests[index], maximum);
+          const auto cpu_after = read_cpu_snapshot();
           const auto completed = model.launches();
           const auto request_counts = execution_counts(model, counts_before);
           save_generation(directory / (name + ".json"), result, completed - launches, before,
-                          np101::tensor_transfers(), block, request_counts);
+                          np101::tensor_transfers(), block, request_counts,
+                          cpu_usage_between(cpu_before, cpu_after));
           // Diagnostics run after generation, outside its transfer/time contract.
           {
             np101::SdkScope diagnostic_scope("phase", "diagnostic");

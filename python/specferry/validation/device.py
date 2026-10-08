@@ -20,6 +20,10 @@ VERIFY_TRACE_OPENVX_SHA256 = "2f7223e504b15886c1562889668a80af48b19d605461beac17
 VERIFY_TRACE_GAL_SHA256 = "e60c55cd8caebebbda238119ba8c9c4d88996048f62769421dd0b538325de5c7"
 
 
+class DeviceHealthFailure(RuntimeError):
+    """A read-only health monitor failed or detected a fault during a child run."""
+
+
 def verify_trace_environment(library: Path, sdk_lib: Path, output: Path, environment: dict):
     """Private graph offsets are diagnostic-only and valid for one verified SDK build."""
     library = library.resolve(strict=True)
@@ -145,6 +149,7 @@ def run_device(
     trace_driver=False,
     verify_trace=None,
     require_compiled_operations=False,
+    abort_check=None,
 ):
     """Call under device_lock. A clean exit is not proof of exclusive NPU execution."""
     require_recovered_device(RECOVERY_ROOT)
@@ -231,9 +236,27 @@ def run_device(
             start_new_session=True,
         )
         try:
-            code = process.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    code = process.wait(timeout=min(5, remaining) if abort_check else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if not abort_check:
+                        raise
+                    try:
+                        failed = abort_check()
+                    except Exception as error:
+                        raise DeviceHealthFailure(f"Health monitor failed: {error}") from error
+                    if failed:
+                        raise DeviceHealthFailure("Health monitor detected a kernel fault")
+        except (subprocess.TimeoutExpired, KeyboardInterrupt, DeviceHealthFailure) as error:
             evidence["timeout"] = isinstance(error, subprocess.TimeoutExpired)
+            if isinstance(error, DeviceHealthFailure):
+                evidence["health_monitor_failure"] = str(error)
             evidence["interrupted_by_user"] = isinstance(error, KeyboardInterrupt)
             code = None
             for request in (signal.SIGTERM, signal.SIGKILL):
@@ -255,6 +278,7 @@ def run_device(
         or trace_aborted
         or evidence["timeout"]
         or evidence.get("interrupted_by_user", False)
+        or bool(evidence.get("health_monitor_failure"))
     )
     evidence.update(
         returncode=code,

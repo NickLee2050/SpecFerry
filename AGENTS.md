@@ -3,6 +3,8 @@
 ## Code and tools
 
 - Use descriptive names, focused functions, explicit ownership/errors, and comments for non-obvious decisions. Separate logical blocks; never reduce readability to cut lines.
+- Prioritize the core implementation goal; reuse validated code, references and existing tools. Add tests/scripts only for a concrete gap. Expand checks only for an observed failure, uncertainty that affects a decision, or a required acceptance gate; do not routinely repeat completed validation or add intermediate probes and broad matrices.
+- Measure performance over repeated operation collections with representative ordering and working sets; keep preparation, explicit IO and logging outside timed sections. Isolated-call timings are diagnostic and do not establish workload throughput.
 - C++: repository LLVM clang-format, 100 columns, braces on all control statements. Python: Conda `SpecFerry` (3.12), Ruff at 100 columns; run `scripts/format_python.py` for safe fixes/imports and `--check` before delivery. Declare dependencies in `environment.yml` and requirements files; no venvs.
 - Headers own declaration/definition dependencies. `.cpp` includes its matching header plus implementation dependencies, without repeating that header's direct includes. SDK callers include SDK headers unless their matching header already does. Remove unused includes. Quote project/SDK/third-party/platform headers before angle-bracket standard headers; separate groups and sort case-sensitively, without prioritizing the matching header.
 
@@ -13,12 +15,13 @@
 - Prefer documented interfaces. Undocumented alternatives require missing necessary semantics or substantial, predictable cost in documented interfaces; explain and validate before adoption. A passing diagnostic alone does not justify a new default.
 - Preserve `vsi_nn_AddNode` initialization: set individual public parameters; never zero/replace `nn_param` or overwrite/free `pool.local`.
 - Sudo requires explicit authorization for the action; passwordless access and consumed one-time grants do not authorize it.
-- Before intentional P3/selection-hang reproduction, remind the user to cold-restart host and NP101; warm restarts failed. Other explicitly authorized diagnostics may proceed.
+- Before intentional selection-hang reproduction, remind the user to cold-restart host and NP101; warm restarts failed. Other explicitly authorized diagnostics may proceed.
+- Before every NP101 run, consult `docs/np101-recovery-incidents.md` and apply its avoidance rules. For any event requiring a cold restart, create a separate incident entry with the boot ID, exact SDK-call and kernel timeline, evidence paths, established cause versus hypotheses, and a concrete rule for the next run. A correct output or driver "automatic recovery" does not clear the device gate. Preserve the recovery marker and stop board work; after confirmed host and NP101 cold restart, archive the marker and run the unchanged vendor convolution via `check_np101.py conv`; before model work use `check_np101.py recovery` to also run the frozen old OPT short request. Each control needs at least 45 seconds of delayed kernel checks. Do not use the retired rewritten convolution control. If that control fails again under unchanged conditions, stop repeated board attempts and analyze the saved evidence before another recovery cycle.
 
 ## Memory
 
-- Cap application const/nonconst tensor payload separately at 1 GiB; count shared backing once and temporary peak allocations. Never change `is_const` to bypass limits. Preserve larger-allocation evidence; no above-limit probes without a policy change, except P5 below. Hidden SDK workspace/copies and physical addresses are unknown; logical offsets are not physical addresses.
-- Authorized synthetic P5 capacity/integrity probes near the v106 limit may use `--probe-limit` up to 4096 MiB. After SDK rejection retain/scan all successfully written blocks. Model inference and ordinary checks keep the 1 GiB limits.
+- Cap application const/nonconst tensor payload separately at 1 GiB; count shared backing once and temporary peak allocations. Never change `is_const` to bypass limits. Preserve larger-allocation evidence; no above-limit probes without a policy change, except the synthetic capacity probe below. Hidden SDK workspace/copies and physical addresses are unknown; logical offsets are not physical addresses.
+- Authorized synthetic capacity/integrity probes near the v106 limit may use `--probe-limit` up to 4096 MiB. After SDK rejection retain/scan all successfully written blocks. Model inference and ordinary checks keep the 1 GiB limits.
 
 ## Models and milestone
 
@@ -31,6 +34,6 @@
 
 ## Reports and plans
 
-- Use current P1–P10 IDs from `docs/np101-sdk-driver-validation-report.md`; preserve historical names/IDs, never infer current numbering from paths.
+- Use descriptive functional names for source files, modules, fixtures, CLI cases, outputs and published documents; do not put conversational task codes in the repository. Update imports, tests and documentation together when renaming. Describe SDK issues by their failing operation. Preserve immutable original evidence under ignored cache paths; use descriptive aliases when referring to it.
 - Report failing operation, expected/actual results and reproduction neutrally; explain terms without abstract summaries or conversation history.
 - Plans specify steps, dependencies, deliverables, checks and acceptance; keep model selection in conversation. Current evidence and task context live in `docs/np101-status.md` and `TODO.md`.

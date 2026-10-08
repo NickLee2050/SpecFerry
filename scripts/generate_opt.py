@@ -95,6 +95,7 @@ def main():
         "--variant",
         choices=(
             "merged-kv",
+            "merged-kv-fc1-split2",
             "merged-kv-local-const",
             "merged-kv-local-mutable",
         ),
@@ -153,14 +154,10 @@ def main():
     if args.backend == "graph":
         if args.block != 1 and (
             args.block != 4
-            or args.variant != "merged-kv"
+            or args.variant not in ("merged-kv", "merged-kv-fc1-split2")
             or args.decoder_group_size != 1
-            or args.prefill_head != "every-token"
         ):
-            parser.error(
-                "partitioned block 4 requires --variant merged-kv "
-                "--decoder-group-size 1 --prefill-head every-token"
-            )
+            parser.error("partitioned block 4 requires a shared merged-kv variant and group 1")
     if args.graph_layers is not None and (args.backend != "graph" or args.graph_layers <= 0):
         parser.error("--graph-layers requires a positive count and partitioned graph mode")
     if args.sample and args.compare_cpu:
