@@ -18,7 +18,7 @@
 namespace specferry::inference {
 struct RunOptions {
   unsigned maximum = 8, warmups = 0, repeats = 1, seed = 0;
-  unsigned block = 1, decoder_group_size = 1, cache_first = 0, cache_last = 0;
+  unsigned block = 1, cache_first = 0, cache_last = 0;
   bool sampling = false, benchmark = false, lifecycle = false;
   std::string variant = "merged-kv", prefill_head = "every-token", readback = "none";
   std::string readback_transport = "sdk";
@@ -89,7 +89,6 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
   result.seed = settings.number("seed", 0, 0, std::numeric_limits<unsigned>::max());
   if (graph) {
     result.block = settings.number("block", 1, 1, 16);
-    result.decoder_group_size = settings.number("decoder_group_size", 1, 1, 2);
     result.variant = settings.text("variant", "merged-kv");
     result.prefill_head = settings.text("prefill_head", "every-token");
     result.readback = settings.text("readback", "none");
@@ -99,6 +98,7 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
     if (result.sampling ||
+        (result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2") ||
         (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
         (result.prefill_head != "every-token" && result.prefill_head != "last-token") ||
         (result.readback != "none" && result.readback != "logits" && result.readback != "kv") ||
@@ -109,10 +109,7 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
         result.cache_first > result.cache_last ||
         (result.benchmark && (result.lifecycle || result.readback != "none")) ||
         (result.lifecycle && result.readback != "logits") ||
-        (!result.benchmark && (result.warmups || result.repeats != 1)) ||
-        (result.block != 1 &&
-         ((result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2") ||
-          result.decoder_group_size != 1))) {
+        (!result.benchmark && (result.warmups || result.repeats != 1))) {
       throw std::invalid_argument("unsupported graph run options");
     }
   }

@@ -1,24 +1,13 @@
 # NP101 SDK 与驱动问题
 
-`v105` / `v106` 指匹配的驱动与 SDK 安装包 1.0.5 / 1.0.6，不是模块打印的版本字符串。
-库位于 `/usr/lib/ljmicro`；记录包含 boot ID、命令、二进制/SDK SHA256 和内核窗口。
-驱动 `galcore` srcversion 为 v105 `F53A3E6EFBB7D0FD7D4617C`、
-v106 `8D46803809F15FA0FD98A92`。当前模型结果见 [状态文档](np101-status.md)。
+本页保留失败契约、解释边界和证据索引；性能/已验配置见[实现总结](np101-status.md)，
+每次运行的约束及冷启动事故见[事件台账](np101-recovery-incidents.md)，命令见
+[测试手册](../tests/README.md)。以下是历史结果，不是自动复现清单；模型成功不关闭底层问题。
 
-## 复现规则
-
-按 [README](../README.md) 配置并构建。每次一个限时进程、一个新输出目录；合成算子与内存检查不加载模型。Setup/Verify/Run 分别为建图/验图/执行，Verify 未返回的用例没有推理结果。
-带 bias 的 FCL 和三维缓存追加是已知崩溃配置，单独运行并排在正常对照之后；崩溃、超时、hang、
-kernel BUG 或残留占用立即停测、保留恢复标记，不自动重试。**下一次有意复现 selection 验图 hang 前，先提醒用户冷重启主机与 NP101**；热重启未消除故障。数值通过也须核查内核日志。
-
-命令模板（下表给出 CASE / ARGS，每次自行选择一个，不能当作自动 sweep）。
-原厂卷积恢复检查不开 SDK 插桩，使用单列的 conv 命令；sudo 只读参数仍需授权：
-
-```text
-python scripts/check_np101.py CASE ARGS --sdk-timing --timeout 60 --output NEW_OUTPUT
-python scripts/check_np101.py conv --sudo-read-only --output NEW_CONTROL_OUTPUT
-python scripts/check_np101_memory.py CASE ARGS --timeout 120 --output NEW_OUTPUT
-```
+`v105/v106` 指匹配的驱动与SDK安装包1.0.5/1.0.6，不是模块打印字符串。
+库位于 `/usr/lib/ljmicro`；galcore srcversion分别为 `F53A3E6EFBB7D0FD7D4617C` /
+`8D46803809F15FA0FD98A92`。每份证据固定boot、命令、binary/SDK哈希和内核窗口。
+当前 `conv` 是固定仓库控制；表内原厂/旧改写数据按其原始身份解释，不重建替代。
 
 ## 建图、验图与数据问题
 
@@ -34,79 +23,45 @@ python scripts/check_np101_memory.py CASE ARGS --timeout 120 --output NEW_OUTPUT
 | SDK 内存计数 | 明确计数与实际板上分配关系，释放后恢复 | 两版 8 MiB tensor 使 `gpu_memory.currentSize` 增加 `2×8,388,608+4,672` B；524,288→17,306,176→524,288，读回正确。不能据此证明双份物理分配、泄漏或越界 | `check_np101_memory.py accounting --mib 8 --storage mutable --dtype F16`；旧版驱动回归 的 `memory-accounting/`、内存计数 |
 | 固定/重绑 copy 图的主机 RSS | 固定与重绑成本可解释，数据正确且释放 | 两版 128 轮，fixed 增量 0，same/advance 约 16 MiB，读回/释放通过；统计为第 127 轮减第 0 轮。RSS 是主机占用，不能推断板上占用、通信成本或泄漏 | `check_np101_memory.py growth --mode fixed --iterations 128`；单独改 `same` / `advance`；旧版驱动回归、重绑内存 |
 
-全窗口 1×1 CONV 的 FFN 候选首图 Verify 在固定 OpenVX ELF `0x2db0c2`
-（`vxoGraphOptimization_getKernelType+0x5d2`）SIGSEGV，与历史 FCL 同一指令。
-分支为 FULLY_CONNECTED_RELU，空的是必需 `enable_relu` scalar 的 parameter[7]，
-不是 bias。具体转换链及参数失效来源未知；该诊断入口已退役，不用于自动 sweep。
-原始证据在 `.cache/runs/ffn-convolution-and-parallelism-20261004/ffn-linear-conv1x1/`。
 
-两路 fc1 最终 logits 数值通过但同轮 EDMA 超时；改写卷积控制在确认冷启动后仍有
-Verify/Run hang，并在两次关机的 `gckEVENT_Submit+0x1ff` 中读取无效地址
-`0x100000008`。建图源码/target 已退役；按后续约定，恢复入口复用身份固定的归档
-自写卷积与冻结旧 OPT，原厂卷积仅作可选诊断。最近两项通过不表示驱动修复。
-离线调查已核对 AUTO/virtual、bias 维度传递及事件队列回收，尚未确定指针破坏来源。
-每项 boot、精确 SDK/内核时间、已证实原因与假设、证据及规避统一
-维护在 [独立事故台账](np101-recovery-incidents.md)，不在本页重复时间线。
+全窗口1×1 CONV的FFN候选也在首次Verify崩溃：固定OpenVX ELF `0x2db0c2`
+（`vxoGraphOptimization_getKernelType+0x5d2`）与历史FCL同一指令；FULLY_CONNECTED_RELU
+分支缺必需 `enable_relu` scalar parameter[7]，不是bias。参数丢失来源未知，入口已退役。
+证据 `ffn-convolution-and-parallelism-20261004/ffn-linear-conv1x1/`。保留MatMul+Add，
+不把卷积形式视为安全或快速NN路径保证。
 
-分块内存完整性使用 8 MiB 块，拒绝下一块后仍保留并完整扫描所有已写块，错误后继续扫描，再统一释放。
-扫描不覆盖 SDK 隐藏空间或未申请的物理内存；申请拒绝、读回失败、未完成扫描分别记录。
-此次第 109 块错误起始偏移为 1,340,216 / 1,340,280 / 1,340,344，各 8 B；历史 v106
-分别为 1,274,680 / 1,274,744 / 1,274,808，整体差 65,536 B。累计逻辑位置约
-873.278 / 873.216 MiB，**不是物理地址**，未定位原因。v106 1024 MiB 的 FP32 nonconst
-两次全扫通过，但 2840 MiB 失败，不能据此认定该配置始终正确。
-先测 64 MiB 控制；v105 不超过 1024 MiB。仅获授权的 v106 分块内存完整性合成探针可用
-`integrity --mib 4096 --probe-limit --storage constant --dtype F16 --timeout 180`；
-这不改变模型和普通检查的 const/nonconst 各 1 GiB 上限。
+分块完整性使用8 MiB块，拒绝下一块后仍全扫所有已写块，遇错继续扫描后统一释放。
+第109块三个错误偏移为1,340,216/1,340,280/1,340,344，各8B；历史v106对应位置差
+65,536 B，累计逻辑偏移约873.278/873.216 MiB，**不是物理地址**。v106的1024 MiB
+FP32 nonconst两次通过、2840 MiB失败，不能认定该配置总是安全。先测64 MiB控制；
+v105及模型/普通检查保持各段1 GiB上限。仅获授权的v106合成完整性探针可用
+`integrity --mib 4096 --probe-limit`；不覆盖SDK隐藏空间或未申请的物理内存。
 
-## Verify 成本与编译表缺项
+## 编译表缺项与共享槽位
 
-预期：Verify 时间可解释，返回成功时有完整可执行结果。历史单层 612 SDK 节点合图：
-v106 Verify 158.095/157.887 s，v105 140.917 s、增加诊断后 168.742 s，运行及数值通过。
-两层 993 节点到 758.233 s 截止仍未 Verify 完；批量 16 头单层 416 节点为 49.846 s、
-54 项通过；两层批量到 180 s 未完成。未进入 RunGraph 的测试不能判断数值。
-两层四张分图累计 Verify 11.026 s、88 项通过；合并 KV 24 层 26 图累计 14.221 s、244 项通过。
-缩小预留量没有显著收益；实际结构/边界非线性，O(n³) 仅经验猜想，不证明内部算法。
+逐头KV及const/mutable变体共1143个extension，前1024个operation非空、后119个缺失；
+执行表随后清空、跳过Tiling/命令生成，Verify仍成功，第23/24 decoder全零。
+反汇编发现user shader包装路径的1024槽，满后返回NULL、上层忽略失败码；尚未捕获
+运行时首次满槽/NULL，不能称为已证明越界写。这是共享包装资源，不是每图1024节点，
+也不是所有算子的统一额度，不能解释全部EDMA或分块内存损坏。
 
-历史逐头 KV 追加及其图内 const/mutable 权重变体：1143 个 extension 的前 1024 个 operation 非空、后 119 个缺失，
-执行表随后清空，跳过 Tiling/命令生成，Verify 仍成功，第 23/24 decoder 全零。
-只读反汇编找到用户 shader 包装路径的 1024 槽，满后 NULL、上层忽略失败码；
-这是共享包装资源，**不是每图最多 1024 个 SDK 节点**，也不是所有算子统一额度。
-尚未直接捕获运行时满槽/首次 NULL；不能称为已证明越界写，也不解释全部 EDMA/分块内存完整性故障。
-静态释放链未见单图归还，最后 Context 完整释放才清零。
-分析对应 OpenVX SHA256：`2f7223e504b15886c1562889668a80af48b19d605461beac175d336d396ff108`。
+固定OpenVX SHA256 `2f7223e504b15886c1562889668a80af48b19d605461beac175d336d396ff108`：
+`vxCreateContext@0x50795` 取进程级vxGlobalData，`0x507a5` 写Context+0xa8；
+`vxnneGetUserShaderExecutable@0x114410` 经它访问槽表。单图释放未见归还，最后Context
+释放才清零；并存Context共享预算。Verify可见锁在graph+0x20，槽函数内未见锁，
+完整外层锁路径及厂商并发合同仍缺失，不宣称已证实竞争、不实施并行Verify。
+多进程图移交/资源隔离也未验证。
 
-10-09 补查同哈希库：`vxCreateContext@0x50795` 取进程级 `vxGlobalData`，
-`0x507a5` 写入 Context+0xa8；`vxnneGetUserShaderExecutable@0x114410` 经该字段访问
-上述槽表。因此同进程同时常驻的多个 Context 共享槽表；顺序销毁最后 Context 后再建
-成功不能外推并存隔离。Verify 主体可见锁位于 graph+0x20，槽搜索/写入函数自身未见锁；
-未完成外层全部锁路径证明，不能宣称已经证实竞争。安装头文件未提供已查版本的
-Verify 并发保证，当前暂不实现双 worker 板卡试验。多进程的图导入/导出及设备资源
-隔离亦未验证。完整地址、头文件范围、历史故障未闭环点与厂商问题清单保存在
-`decode-static-audit-20261009/verify-and-incidents.md`，本轮没有新增故障复现或外发材料。
-
-合并 KV 图的 extension 降为 423，完整表与全层数值/生命周期通过；两套图为 846。
-完整模型验收保留 Context 重建出现 `846+178=1024`、缺 668 项，保护在运行前拒绝；新 Context
-两次各 846 完整且输出一致。已采用新 Context 重建策略，普通请求复用模型。
-详见 [状态与证据](np101-status.md)，编译表完整性尚未得到厂商解释，不与模型已测验收混淆。
-
-历史整图、图规模探针、逐头 KV、图内权重与去缓存 reshape 入口已退役。用 `cleanup-20261001/before-source.tar.gz` 中的
-嵌套旧记录和 `code-reduction-20260930/before-source.tar.gz` 恢复到独立目录才能复现，
-当前默认合并 KV 图 不能冒充旧结构。当前检查可用两层粗输出：
-
-```bash
-python scripts/check_np101_model.py prefix-split --layer-count 2 --steps 2 --capacity 16 \
-  --prepare-only --output .cache/runs/prefix-reference
-python scripts/check_np101_model.py prefix-split --layer-count 2 --readback outputs \
-  --fixture .cache/runs/prefix-reference/fixture --sdk-timing --timeout 180 \
-  --output .cache/runs/prefix-merged-kv
-```
+合并KV降到423 extension、两套图846；同Context重建出现 `846+178=1024` 后缺668项，
+编译保护在Run前拒绝。释放最后旧Context后两次各846完整、输出一致，采用此重建策略；
+普通请求复用模型。详细地址与未闭环点在 `decode-static-audit-20261009/verify-and-incidents.md`。
+图规模/Verify成本及已关闭结构候选的结果集中在实现总结。
 
 ## 原始证据索引
 
-路径均相对本机 `.cache/runs/`，使用描述功能的别名，不随 Git 分发；
-原始记录内容与目录保留不变，别名映射在本机 `evidence-directory-aliases.json`。
-复现材料需附对应 `result.json`、`sdk.log`、execution 哈希/退出记录及内核窗口；
-`sdk-calls.tsv` 是可选详细计时，`Waiting for HDMA Transfer...` 文本不提供等待时长。
+路径相对 `.cache/runs/`，别名映射为 `evidence-directory-aliases.json`。
+需复查时同时取result、sdk.log、execution身份/退出记录及内核窗口；仅有SDK成功不足以
+判定通过。`Waiting for HDMA Transfer...` 不提供等待时长。原始内容保持不变。
 
 | 索引 | 目录 / 文件 |
 |---|---|
@@ -121,6 +76,7 @@ python scripts/check_np101_model.py prefix-split --layer-count 2 --readback outp
 | 重绑内存 | `memory-integrated-{fixed,same,advance}/` |
 | 编译表完整性历史 | `incremental-model-checks-20260924/`、`incremental-model-warmboot-20260925/`、`incremental-cache-checks-v105-20260928/`、`weight-storage-and-cache-reshape-preparation-20260929/shader-limit/`、图规模/模型验收目录见状态文档 |
 
-卷积、FCL、追加、采样、FP16 保真、内存计数、重绑与编译表问题已有两版本结果；选择算子验图有同 binary SELECT 对照，v106 冷启动原 selection
-未补测；三维缓存追加 v106 单节点追加未补测。分块内存完整性两版实际保留量不同，申请拒绝没有记为读回通过。
-这些问题未因后续模型通过而自动关闭；分块 prompt 处理 EDMA/kernel BUG 与第 23 层编译缺项分别记录。
+
+三维追加的v106单节点及v106冷启动原selection仍未补测，不自动安排危险复现。
+退役结构需从历史归档独立恢复；当前固定图不能冒充旧实现。EDMA、控制hang与关机
+page fault的精确SDK/内核时间线由事故台账独立维护，根因均未因恢复检查通过而关闭。

@@ -118,11 +118,7 @@ struct FfnGraphs {
 void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
                           const std::string &mode) {
   const bool full = mode == "ffn-full";
-  const auto fc1_parts = mode == "ffn-linear-fc1-split4"   ? 4u
-                         : mode == "ffn-linear-fc1-split2" ? 2u
-                                                           : 1u;
-  const bool shared_layer_weights = mode == "ffn-linear-shared-weights";
-  const auto weight_sets = shared_layer_weights ? 1u : fixture.config.layers;
+  const auto fc1_parts = mode == "ffn-linear-fc1-split2" ? 2u : 1u;
   const auto started = Clock::now();
   Context context;
   WeightBank bank(context);
@@ -135,11 +131,13 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
            << (released ? "executed" : "running")
            << "\",\"released\":" << (released ? "true" : "false") << ",\"mode\":\"" << mode
            << "\",\"graph_count\":24,\"weight_policy\":\"shared-mutable\""
-           << ",\"weight_sets\":" << weight_sets << ",\"input_rows\":" << fixture.input_rows
+           << ",\"weight_sets\":" << fixture.config.layers
+           << ",\"input_rows\":" << fixture.input_rows
            << ",\"initialization_seconds\":" << initialization_seconds
            << ",\"release_seconds\":" << release_seconds
            << ",\"weight_payload_bytes\":" << bank.payload_bytes() << ",\"matrix_payload_bytes\":"
-           << std::size_t(fixture.config.hidden) * fixture.config.intermediate * 4 * weight_sets
+           << std::size_t(fixture.config.hidden) * fixture.config.intermediate * 4 *
+                  fixture.config.layers
            << ",\"application_segment_limit_bytes\":" << segment_payload_limit;
     for (const bool constant : {true, false}) {
       const auto name = constant ? "const" : "nonconst";
@@ -151,15 +149,11 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
   };
   for (unsigned layer = 0; layer < fixture.config.layers; ++layer) {
     report("initialize.layer." + std::to_string(layer));
-    auto owner =
-        std::make_unique<GraphBuilder>(context, 128, 96, &bank, WeightStorage::SharedMutable);
+    auto owner = std::make_unique<GraphBuilder>(context, 128, 96, &bank);
     auto &graph = *owner;
     const auto input = graph.tensor({f16, {fixture.config.hidden, fixture.input_rows}});
     upload_tensor(graph.graph, input.id, fixture.inputs[layer]);
-    // Reuse the last layer's backing without changing graph count, inputs or execution order.
-    // The final graph remains identical to the distinct-weight case and its existing oracle.
-    const auto prefix =
-        fixture.config.prefix(shared_layer_weights ? fixture.config.layers - 1 : layer);
+    const auto prefix = fixture.config.prefix(layer);
     const auto linear = [&](Tensor value, const char *name) {
       const auto &matrix = fixture.weights.find(prefix + name + ".weight");
       const auto &bias = fixture.weights.find(prefix + name + ".bias");
@@ -348,16 +342,14 @@ int main(int argc, char **argv) {
   // Reject unknown modes before opening the device; never fall back to FCL.
   const std::string mode = argc > 2 ? argv[2] : "";
   const bool batched = mode == "ffn-linear-batched";
-  const bool collection = mode == "ffn-full" || mode == "ffn-linear" ||
-                          mode == "ffn-linear-fc1-split2" || mode == "ffn-linear-fc1-split4" ||
-                          mode == "ffn-linear-shared-weights" || batched;
+  const bool collection =
+      mode == "ffn-full" || mode == "ffn-linear" || mode == "ffn-linear-fc1-split2" || batched;
   if ((collection && argc != (batched ? 6 : 5)) ||
       (!collection &&
        (argc != 3 || (mode != "fcl" && mode != "matmul-add" && mode != "mapped-readback")))) {
     std::cerr << "usage: np101_projection_check OUTPUT fcl|matmul-add|mapped-readback\n"
                  "   or: np101_projection_check OUTPUT "
-                 "ffn-full|ffn-linear|ffn-linear-fc1-split2|ffn-linear-fc1-split4|"
-                 "ffn-linear-shared-weights DEPLOYMENT FIXTURE\n"
+                 "ffn-full|ffn-linear|ffn-linear-fc1-split2 DEPLOYMENT FIXTURE\n"
                  "   or: np101_projection_check OUTPUT ffn-linear-batched DEPLOYMENT FIXTURE "
                  "4|8|16\n";
     return 2;

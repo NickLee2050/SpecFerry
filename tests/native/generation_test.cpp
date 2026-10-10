@@ -82,7 +82,8 @@ void run_options_contracts() {
         "readback prefix\n", "readback kv\ncache_first_layer 3\ncache_last_layer 2\n",
         "readback kv\ncache_last_layer 2\n", "block 4\ndecoder_group_size 2\n",
         "prefill_head unknown\n", "warmups 1\n", "readback_transport unknown\n",
-        "readback_transport mapped\n"}) {
+        "readback_transport mapped\n", "variant merged-kv-local-const\n",
+        "variant merged-kv-local-mutable\n", "decoder_group_size 1\n"}) {
     rejects([&] { parse(text); });
   }
 }

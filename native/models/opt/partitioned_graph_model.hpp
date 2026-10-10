@@ -8,20 +8,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace specferry::models::opt {
-// Fixed embedding/head graphs and one or two decoder layers per graph. Optional
+// Fixed embedding/head graphs and one decoder layer per graph. Optional
 // Block prefill uses a second graph set with the same weights and KV backing.
 class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
   // All variants use merged KV and retain shared mutable vocabulary blocks.
-  enum class Variant { MergedKv, MergedKvFc1Split2, MergedKvLocalConst, MergedKvLocalMutable };
+  enum class Variant { MergedKv, MergedKvFc1Split2 };
 
   // Generation may skip unused prompt predictions; public step() always runs the head.
   // EveryToken runs the head for each consumed block's final column.
@@ -29,7 +28,7 @@ public:
 
   PartitionedGraphModel(np101::Context &context, const np101::WeightStore &weights,
                         const ModelConfig &config, PhaseObserver phase = {},
-                        unsigned decoder_group_size = 1, Variant variant = Variant::MergedKv,
+                        Variant variant = Variant::MergedKv,
                         PrefillHeadPolicy prefill_head = PrefillHeadPolicy::EveryToken,
                         unsigned prefill_block = 1);
   ~PartitionedGraphModel();
@@ -39,8 +38,6 @@ public:
   void step(std::int32_t token);
   inference::Generation generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
                                  const inference::GenerationPhaseObserver &on_phase = {});
-  // Stage reads use the most recently executed graph set; block outputs retain all columns.
-  std::vector<std::uint8_t> read_layer(unsigned layer, const std::string &name);
   std::vector<std::uint8_t>
   read_cache(unsigned layer, bool values,
              np101::TensorReadback method = np101::TensorReadback::SdkCopy);
@@ -58,9 +55,6 @@ public:
   // Uploads required to reset a nonempty cache; the initial empty state needs none.
   std::size_t cache_reset_uploads_per_request() const;
   std::size_t weight_bytes() const;
-  // Explicit diagnostic before the first execution; not a physical-residency proof.
-  void verify_weight_preload(std::ostream &report);
-  Variant variant() const;
   void close();
 
 private:

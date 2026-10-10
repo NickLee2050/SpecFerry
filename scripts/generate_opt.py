@@ -94,15 +94,12 @@ def main():
         action="store_true",
         help="graph acceptance: build and release two fresh SDK Context instances",
     )
-    parser.add_argument("--decoder-group-size", type=int, choices=(1, 2))
     parser.add_argument("--prefill-head", choices=("every-token", "last-token"))
     parser.add_argument(
         "--variant",
         choices=(
             "merged-kv",
             "merged-kv-fc1-split2",
-            "merged-kv-local-const",
-            "merged-kv-local-mutable",
         ),
         help="explicit partitioned graph diagnostic variant (default: merged-kv)",
     )
@@ -116,7 +113,6 @@ def main():
     if args.backend != "graph" and any(
         option is not None
         for option in (
-            args.decoder_group_size,
             args.prefill_head,
             args.variant,
             args.cache_readback,
@@ -124,14 +120,13 @@ def main():
             args.cache_layer_range,
         )
     ):
-        parser.error("graph layout, variant, grouping, head and readback require --backend graph")
+        parser.error("graph variant, head and readback require --backend graph")
     if args.backend != "graph" and (args.request_tokens_file or args.lifecycle_check):
         parser.error("request matrix and lifecycle check require --backend graph")
     if args.benchmark and args.backend != "graph":
         parser.error("--benchmark requires --backend graph; component already supports repetitions")
     if args.benchmark and args.lifecycle_check:
         parser.error("benchmark and lifecycle diagnostics are mutually exclusive")
-    args.decoder_group_size = args.decoder_group_size or 1
     args.prefill_head = args.prefill_head or "every-token"
     args.variant = args.variant or "merged-kv"
     args.cache_readback = args.cache_readback or "none"
@@ -160,14 +155,6 @@ def main():
             parser.error("graph generation requires 1..32 predictions without sampling")
         if not args.benchmark and (args.warmups or args.repeats != 1):
             parser.error("graph warmups/repeats require --benchmark")
-    if args.backend == "graph":
-        if args.block != 1 and (
-            args.variant not in ("merged-kv", "merged-kv-fc1-split2")
-            or args.decoder_group_size != 1
-        ):
-            parser.error(
-                "partitioned block prefill requires a shared merged-kv variant and group 1"
-            )
     if args.graph_layers is not None and (args.backend != "graph" or args.graph_layers <= 0):
         parser.error("--graph-layers requires a positive count and partitioned graph mode")
     if args.sample and args.compare_cpu:
@@ -228,7 +215,6 @@ def main():
         settings.update(
             block=args.block,
             variant=args.variant,
-            decoder_group_size=args.decoder_group_size,
             prefill_head=args.prefill_head,
             readback=args.cache_readback,
             readback_transport=args.readback_transport,
@@ -281,7 +267,7 @@ def main():
             warmups=args.warmups,
             repeats=args.repeats,
             variant=args.variant,
-            decoder_group_size=args.decoder_group_size,
+            decoder_group_size=1,
             prefill_head_policy=args.prefill_head,
         )
     elif metadata:
@@ -298,7 +284,7 @@ def main():
                 metadata,
                 args.block,
                 variant=args.variant,
-                decoder_group_size=args.decoder_group_size,
+                decoder_group_size=1,
                 prefill_head_policy=args.prefill_head,
                 cache_readback=args.cache_readback,
                 cache_layer_range=args.cache_layer_range,

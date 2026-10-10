@@ -35,9 +35,10 @@ and the component backend's validated FP32-logit path. `--prepare-only` accesses
 
 The component backend remains the default regression baseline. The graph backend uses
 resident merged-kv/block1/block4 graphs with shared weights/KV and defaults to token-only readback.
-OPT token decoding, block prefill and the measured C16/C64 model scope are accepted
-with one analyzed precision exception; model rebuilding requires a fresh Context. See [current status](docs/np101-status.md)
-for exact scope, driver risks, evidence and the graph inference performance baseline.
+OPT token decoding, block prefill and the measured C16/C64 scope are accepted with one analyzed
+precision exception. Rebuilding requires releasing the last old Context before creating a new one.
+See [implementation and optimization conclusions](docs/np101-status.md) for scope, measured gains
+and remaining unknowns; [TODO](TODO.md) contains unfinished work only.
 
 ## Benchmark and checks
 
@@ -54,6 +55,7 @@ python scripts/format_cpp.py --check
 `result.json` separates generation wall time from `graph_metrics`; graph time excludes
 preparation/compilation/reset/explicit IO and includes SDK completion waits. Failed checks
 have no accepted metrics. Omit formatters' `--check` for safe formatting.
-[Test commands](tests/README.md) describe scoped diagnostics, native options and retained Qwen
-regression. [TODO](TODO.md) owns next steps; [SDK issue details](docs/np101-sdk-driver-validation-report.md)
-describe the recorded failures. Raw historical outputs and recovery snapshots remain in `.cache/runs/`.
+[Test commands](tests/README.md) describe diagnostics, native options and retained Qwen regression.
+[SDK issues](docs/np101-sdk-driver-validation-report.md) describe failing contracts;
+[the incident ledger](docs/np101-recovery-incidents.md) owns recovery gates and cold-restart events.
+Raw evidence and pre-consolidation documents remain under `.cache/runs/`.

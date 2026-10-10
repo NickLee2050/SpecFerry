@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -20,19 +19,6 @@ using namespace np101::ops;
 namespace {
 constexpr auto f16 = DataType::Float16;
 
-WeightStorage weight_storage(PartitionedGraphModel::Variant variant) {
-  switch (variant) {
-  case PartitionedGraphModel::Variant::MergedKv:
-  case PartitionedGraphModel::Variant::MergedKvFc1Split2:
-    return WeightStorage::SharedMutable;
-  case PartitionedGraphModel::Variant::MergedKvLocalConst:
-    return WeightStorage::LocalConst;
-  case PartitionedGraphModel::Variant::MergedKvLocalMutable:
-    return WeightStorage::LocalMutable;
-  }
-  throw std::invalid_argument("unknown partitioned OPT variant");
-}
-
 std::vector<std::uint8_t> integers(const std::vector<std::int32_t> &values) {
   std::vector<std::uint8_t> bytes(values.size() * sizeof(std::int32_t));
   std::memcpy(bytes.data(), values.data(), bytes.size());
@@ -41,12 +27,6 @@ std::vector<std::uint8_t> integers(const std::vector<std::int32_t> &values) {
 } // namespace
 
 struct PartitionedGraphModel::Impl {
-  struct LayerObservation {
-    std::size_t graph_index;
-    Tensor hidden;
-    std::map<std::string, Tensor> stages;
-  };
-
   struct ExecutionSet {
     explicit ExecutionSet(unsigned tokens)
         : block(tokens), timing_prefix("block" + std::to_string(tokens)) {}
@@ -57,7 +37,6 @@ struct PartitionedGraphModel::Impl {
     Tensor controls{}, embedded{};
     std::vector<std::unique_ptr<GraphBuilder>> decoder_graphs;
     std::vector<std::string> decoder_roles;
-    std::vector<LayerObservation> layers;
     std::unique_ptr<GraphBuilder> head;
     Tensor projected{}, selected{};
     std::vector<Tensor> logits;
@@ -69,7 +48,6 @@ struct PartitionedGraphModel::Impl {
         head->graph.close();
         head.reset();
       }
-      layers.clear();
       while (!decoder_graphs.empty()) {
         decoder_graphs.back()->graph.close();
         decoder_graphs.pop_back();
@@ -82,7 +60,6 @@ struct PartitionedGraphModel::Impl {
   };
 
   ModelConfig config;
-  unsigned decoder_group_size;
   Variant variant;
   PrefillHeadPolicy prefill_head_policy;
   unsigned prefill_block;
@@ -101,11 +78,10 @@ struct PartitionedGraphModel::Impl {
   bool closed = false;
 
   Impl(Context &context, const WeightStore &weights, const ModelConfig &spec,
-       const PhaseObserver &phase, unsigned group_size, Variant selected_variant,
-       PrefillHeadPolicy prefill_head, unsigned block)
-      : config(spec), decoder_group_size(group_size), variant(selected_variant),
-        prefill_head_policy(prefill_head), prefill_block(block), bank(context),
-        cache(context, 2 * spec.decoder.layers, 0) {
+       const PhaseObserver &phase, Variant selected_variant, PrefillHeadPolicy prefill_head,
+       unsigned block)
+      : config(spec), variant(selected_variant), prefill_head_policy(prefill_head),
+        prefill_block(block), bank(context), cache(context, 2 * spec.decoder.layers, 0) {
     try {
       build(context, weights, phase);
     } catch (...) {
@@ -152,23 +128,16 @@ struct PartitionedGraphModel::Impl {
     return {keys, values};
   }
 
-  LayerObservation build_decoder(GraphBuilder &builder, const WeightStore &weights, unsigned layer,
-                                 Tensor hidden, Tensor shared_controls, std::size_t graph_index,
-                                 unsigned block) {
+  Tensor build_decoder(GraphBuilder &builder, const WeightStore &weights, unsigned layer,
+                       Tensor hidden, Tensor shared_controls, unsigned block) {
     const auto &decoder = config.decoder;
     const auto dimension = decoder.kv_spec().head_dim;
-    LayerObservation stage;
-    stage.graph_index = graph_index;
-    // Keep each layer's control operators unchanged when grouping graphs.
     auto slot_index = builder.slice(shared_controls, {2 * block}, {1});
     auto current_position = builder.slice(shared_controls, {block}, {block});
     auto limit = builder.binary(VSI_NN_OP_ADD, current_position, builder.integer(1));
     auto qkv = build_projections(builder, weights, decoder, layer, hidden);
-    stage.stages = {{"query", qkv.query}, {"key", qkv.key}, {"value", qkv.value}};
     const auto [batched_keys, batched_values] =
         update_merged_cache(builder, layer, qkv.key, qkv.value, slot_index, block);
-    stage.stages.emplace("keys", batched_keys);
-    stage.stages.emplace("values", batched_values);
     auto query =
         block == 1 ? builder.reshape(qkv.query, {dimension, 1, decoder.heads})
                    : builder.permute(builder.reshape(qkv.query, {dimension, decoder.heads, block}),
@@ -180,12 +149,9 @@ struct PartitionedGraphModel::Impl {
           builder.permute(builder.reshape(attended, {dimension, block, decoder.heads}), {0, 2, 1});
     }
     attended = builder.reshape(attended, {decoder.hidden, block});
-    stage.stages.emplace("attended", attended);
     auto tail = build_decoder_tail(builder, weights, decoder, layer, hidden, attended,
                                    variant == Variant::MergedKvFc1Split2);
-    stage.stages.insert(tail.begin(), tail.end());
-    stage.hidden = tail.at("output");
-    return stage;
+    return tail.at("output");
   }
 
   void build(Context &context, const WeightStore &weights, const PhaseObserver &phase) {
@@ -218,8 +184,7 @@ struct PartitionedGraphModel::Impl {
                            const PhaseObserver &phase) {
     const auto &decoder = config.decoder;
     const auto block = execution.block;
-    const auto storage = weight_storage(variant);
-    execution.embedding = std::make_unique<GraphBuilder>(context, 512, 256, &bank, storage);
+    execution.embedding = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
     auto &entry = *execution.embedding;
     const auto controls = entry.tensor({DataType::Int32, {2 * block + 1}});
     execution.controls = controls;
@@ -231,8 +196,7 @@ struct PartitionedGraphModel::Impl {
     for (unsigned first = 0; first < config.vocabulary; first += config.block_rows) {
       const auto rows = std::min(config.block_rows, config.vocabulary - first);
       table.push_back(entry.weight_chunk(weights, record, {f16, {config.embedding, rows}},
-                                         std::size_t(first) * config.embedding * 2,
-                                         WeightStorage::SharedMutable));
+                                         std::size_t(first) * config.embedding * 2));
     }
     auto lookup = lookup_blocks(entry, table, token);
     auto input_projection =
@@ -251,38 +215,24 @@ struct PartitionedGraphModel::Impl {
 
     GraphBuilder *producer = execution.embedding.get();
     Tensor previous = embedded;
-    for (unsigned first = 0; first < decoder.layers; first += decoder_group_size) {
-      const auto count = std::min(decoder_group_size, decoder.layers - first);
-      auto owner =
-          std::make_unique<GraphBuilder>(context, 512 * count, 256 * count, &bank, storage);
+    for (unsigned layer = 0; layer < decoder.layers; ++layer) {
+      auto owner = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
       auto &builder = *owner;
       const auto group_input = builder.share(*producer, previous);
       auto shared_controls = builder.share(entry, controls);
-      auto hidden = group_input;
-      for (unsigned layer = first; layer < first + count; ++layer) {
-        auto stage = build_decoder(builder, weights, layer, hidden, shared_controls,
-                                   execution.decoder_graphs.size(), block);
-        // Inside a group the next decoder consumes the existing tensor directly.
-        // Only the group's final hidden state is declared as a graph output.
-        hidden = stage.hidden;
-        execution.layers.push_back(std::move(stage));
-      }
+      auto hidden = build_decoder(builder, weights, layer, group_input, shared_controls, block);
       if (phase) {
-        phase("setup." + execution.prefix() +
-              (count == 1
-                   ? "layer." + std::to_string(first)
-                   : "layers." + std::to_string(first) + "-" + std::to_string(first + count - 1)));
+        phase("setup." + execution.prefix() + "layer." + std::to_string(layer));
       }
       builder.compile({group_input, shared_controls}, {hidden});
       producer = owner.get();
       previous = hidden;
       execution.decoder_graphs.push_back(std::move(owner));
-      execution.decoder_roles.push_back(
-          execution.timing_prefix + ".decoder." + std::to_string(first) +
-          (count == 1 ? "" : "-" + std::to_string(first + count - 1)));
+      execution.decoder_roles.push_back(execution.timing_prefix + ".decoder." +
+                                        std::to_string(layer));
     }
 
-    execution.head = std::make_unique<GraphBuilder>(context, 512, 256, &bank, storage);
+    execution.head = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
     auto &output = *execution.head;
     auto shared_hidden = output.share(*producer, previous);
     auto hidden = block == 1 ? shared_hidden
@@ -292,8 +242,7 @@ struct PartitionedGraphModel::Impl {
     for (unsigned first = 0; first < config.vocabulary; first += config.block_rows) {
       const auto rows = std::min(config.block_rows, config.vocabulary - first);
       auto weight = output.weight_chunk(weights, record, {f16, {config.embedding, rows}},
-                                        std::size_t(first) * config.embedding * 2,
-                                        WeightStorage::SharedMutable);
+                                        std::size_t(first) * config.embedding * 2);
       execution.logits.push_back(
           output.matmul(execution.projected, weight, {rows, 1}, false, true));
     }
@@ -435,14 +384,12 @@ struct PartitionedGraphModel::Impl {
 
 PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore &weights,
                                              const ModelConfig &config, PhaseObserver phase,
-                                             unsigned decoder_group_size, Variant variant,
-                                             PrefillHeadPolicy prefill_head,
+                                             Variant variant, PrefillHeadPolicy prefill_head,
                                              unsigned prefill_block) {
-  if (decoder_group_size != 1 && decoder_group_size != 2) {
-    throw std::invalid_argument("partitioned OPT decoder group size must be 1 or 2");
-  }
   config.validate();
-  weight_storage(variant);
+  if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2) {
+    throw std::invalid_argument("unknown partitioned OPT variant");
+  }
   if (prefill_head != PrefillHeadPolicy::EveryToken &&
       prefill_head != PrefillHeadPolicy::LastToken) {
     throw std::invalid_argument("unknown partitioned OPT prefill head policy");
@@ -453,15 +400,12 @@ PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore
   if (variant == Variant::MergedKvFc1Split2 && config.decoder.intermediate % 2) {
     throw std::invalid_argument("split-fc1 OPT requires an even intermediate width");
   }
-  if (prefill_block != 1 &&
-      ((variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2) ||
-       decoder_group_size != 1 || config.decoder.capacity % prefill_block)) {
-    throw std::invalid_argument("block prefill requires a shared merged-kv variant, group 1 "
-                                "and capacity divisible by the block");
+  if (config.decoder.capacity % prefill_block) {
+    throw std::invalid_argument("capacity must be divisible by the prefill block");
   }
   validate_model_weights(weights, config, config.decoder.layers);
-  impl_ = std::make_unique<Impl>(context, weights, config, phase, decoder_group_size, variant,
-                                 prefill_head, prefill_block);
+  impl_ =
+      std::make_unique<Impl>(context, weights, config, phase, variant, prefill_head, prefill_block);
 }
 
 PartitionedGraphModel::~PartitionedGraphModel() = default;
@@ -491,14 +435,6 @@ PartitionedGraphModel::generate(const std::vector<std::int32_t> &prompt, unsigne
   return inference::generate_tokens(
       {config.vocabulary, config.decoder.capacity, config.bos, config.eos}, executor, prompt,
       maximum, {}, on_phase);
-}
-
-std::vector<std::uint8_t> PartitionedGraphModel::read_layer(unsigned layer,
-                                                            const std::string &name) {
-  require_impl().require_open();
-  auto &stage = impl_->latest->layers.at(layer);
-  auto &graph = impl_->latest->decoder_graphs.at(stage.graph_index)->graph;
-  return read_tensor(graph, stage.stages.at(name).id);
 }
 
 std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool values,
@@ -570,51 +506,7 @@ std::size_t PartitionedGraphModel::cache_reset_uploads_per_request() const {
 }
 
 std::size_t PartitionedGraphModel::weight_bytes() const {
-  if (!impl_) {
-    return 0;
-  }
-  std::size_t bytes = impl_->bank.payload_bytes();
-  for (const auto *execution : {impl_->decode.get(), impl_->prefill.get()}) {
-    if (!execution) {
-      continue;
-    }
-    bytes += execution->embedding->local_weight_bytes() + execution->head->local_weight_bytes();
-    for (const auto &graph : execution->decoder_graphs) {
-      bytes += graph->local_weight_bytes();
-    }
-  }
-  return bytes;
-}
-
-void PartitionedGraphModel::verify_weight_preload(std::ostream &report) {
-  auto &state = require_impl();
-  state.require_open();
-  if (state.completed_steps || weight_storage(state.variant) != WeightStorage::SharedMutable) {
-    throw std::logic_error("preload diagnostic requires an unexecuted shared-weight model");
-  }
-  const auto &decoder = state.config.decoder;
-  std::vector<std::string> names;
-  for (const auto layer : {0u, decoder.layers / 2, decoder.layers - 1}) {
-    names.push_back(decoder.prefix(layer) + "fc1.weight");
-    names.push_back(decoder.prefix(layer) + "fc2.weight");
-  }
-  names.push_back(decoder.prefix(decoder.layers - 1) + "self_attn.q_proj.weight");
-  std::vector<Graph *> consumers;
-  for (auto *execution : {state.decode.get(), state.prefill.get()}) {
-    if (!execution) {
-      continue;
-    }
-    consumers.push_back(&execution->embedding->graph);
-    for (const auto &graph : execution->decoder_graphs) {
-      consumers.push_back(&graph->graph);
-    }
-    consumers.push_back(&execution->head->graph);
-  }
-  state.bank.verify_preloaded(names, consumers, report);
-}
-
-PartitionedGraphModel::Variant PartitionedGraphModel::variant() const {
-  return require_impl().variant;
+  return impl_ ? impl_->bank.payload_bytes() : 0;
 }
 
 void PartitionedGraphModel::close() {

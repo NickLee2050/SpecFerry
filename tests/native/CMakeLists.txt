@@ -40,7 +40,6 @@ specferry_native_test(np101_memory_accounting_check np101/memory_accounting_chec
 specferry_native_test(np101_kv_cache_check np101/kv_cache_check.cpp np101_kv_cache)
 specferry_native_test(np101_graph_cache_check np101/graph_cache_check.cpp np101_ops specferry_generation)
 specferry_native_test(np101_cache_append_check np101/cache_append_check.cpp np101_ops)
-specferry_native_test(np101_graph_pipeline_check np101/graph_pipeline_check.cpp np101_opt_decoder)
 specferry_native_test(np101_decoder_check np101/decoder_check.cpp np101_decoder np101_opt_decoder)
 
 specferry_native_test(np101_opt_io_check np101/opt_io_check.cpp np101_opt_decoder)

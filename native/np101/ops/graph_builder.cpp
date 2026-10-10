@@ -15,17 +15,8 @@ constexpr auto f16 = DataType::Float16;
 constexpr auto f32 = DataType::Float32;
 } // namespace
 
-GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights,
-                           WeightStorage weight_storage)
-    : weights_(weights),
-      weight_storage_(weight_storage == WeightStorage::Default
-                          ? (weights ? WeightStorage::SharedMutable : WeightStorage::LocalConst)
-                          : weight_storage),
-      graph(context, tensors, nodes) {
-  if (weight_storage_ == WeightStorage::SharedMutable && !weights_) {
-    throw std::invalid_argument("shared weight storage requires a weight bank");
-  }
-}
+GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights)
+    : weights_(weights), graph(context, tensors, nodes) {}
 
 Tensor GraphBuilder::tensor(TensorSpec spec) { return {add_tensor(graph, spec), std::move(spec)}; }
 
@@ -63,33 +54,16 @@ Tensor GraphBuilder::weight(const WeightStore &store, const WeightRecord &record
 }
 
 Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &record,
-                                  TensorSpec spec, std::size_t offset, WeightStorage storage) {
-  if (storage == WeightStorage::Default) {
-    storage = weight_storage_;
-  }
+                                  TensorSpec spec, std::size_t offset) {
   vsi_nn_tensor_id_t id;
-  if (storage == WeightStorage::SharedMutable) {
-    if (!weights_) {
-      throw std::invalid_argument("shared weight storage requires a weight bank");
-    }
+  if (weights_) {
     id = weights_->bind(graph, store, record, spec, offset);
-  } else if (storage == WeightStorage::LocalConst || storage == WeightStorage::LocalMutable) {
-    id = add_tensor(graph, spec, storage == WeightStorage::LocalConst,
-                    prepare_weight_chunk(store, record, spec, offset));
-  } else {
-    throw std::invalid_argument("unknown weight storage policy");
-  }
-  if (storage != WeightStorage::LocalConst) {
-    // Mutable weights must be declared inputs even when their owner is this graph.
     mutable_weight_inputs_.push_back(id);
-  }
-  if (storage != WeightStorage::SharedMutable) {
-    local_weight_bytes_ += spec.bytes();
+  } else {
+    id = add_tensor(graph, spec, true, prepare_weight_chunk(store, record, spec, offset));
   }
   return {id, std::move(spec)};
 }
-
-std::size_t GraphBuilder::local_weight_bytes() const { return local_weight_bytes_; }
 
 Tensor GraphBuilder::share(GraphBuilder &owner, Tensor source) {
   return {retain_tensor(owner.graph, source.id, graph), source.spec};

@@ -99,10 +99,7 @@ ExecutionCounts execution_counts(const PartitionedModel &model, ExecutionCounts 
 PartitionedModel::Variant parse_variant(const std::string &name) {
   using Variant = PartitionedModel::Variant;
   const std::pair<const char *, Variant> variants[] = {
-      {"merged-kv", Variant::MergedKv},
-      {"merged-kv-fc1-split2", Variant::MergedKvFc1Split2},
-      {"merged-kv-local-const", Variant::MergedKvLocalConst},
-      {"merged-kv-local-mutable", Variant::MergedKvLocalMutable}};
+      {"merged-kv", Variant::MergedKv}, {"merged-kv-fc1-split2", Variant::MergedKvFc1Split2}};
   for (const auto &[label, variant] : variants) {
     if (name == label) {
       return variant;
@@ -253,9 +250,8 @@ int main(int argc, char **argv) {
   const fs::path root(argv[3]);
   auto directory = root;
   try {
-    const auto *preload_setting = std::getenv("SPECFERRY_VERIFY_WEIGHT_PRELOAD");
-    if (preload_setting && std::string(preload_setting) != "1") {
-      throw std::invalid_argument("weight preload diagnostic setting must be 1 or unset");
+    if (std::getenv("SPECFERRY_VERIFY_WEIGHT_PRELOAD")) {
+      throw std::invalid_argument("the weight preload diagnostic is retired");
     }
     const auto options = inference::read_run_options(argv[2], true);
     const auto benchmark = options.benchmark, lifecycle_check = options.lifecycle;
@@ -271,7 +267,6 @@ int main(int argc, char **argv) {
                                      : np101::TensorReadback::SdkCopy;
     const auto &variant_name = options.variant;
     const auto variant = parse_variant(variant_name);
-    const auto decoder_group_size = options.decoder_group_size;
     const auto &head_policy_name = options.prefill_head;
     const auto head_policy = head_policy_name == "last-token"
                                  ? PartitionedModel::PrefillHeadPolicy::LastToken
@@ -308,21 +303,15 @@ int main(int argc, char **argv) {
       // Preserve the last compilation stage if initialization exceeds the device timeout.
       PartitionedModel model(
           context, weights, config, [&](const std::string &stage) { progress(directory, stage); },
-          decoder_group_size, variant, head_policy, block);
+          variant, head_policy, block);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
-      if (preload_setting) {
-        progress(directory, "weight-preload");
-        np101::SdkScope preload_scope("phase", "weight-preload");
-        std::ofstream report(directory / "weight-preload.tsv");
-        model.verify_weight_preload(report);
-      }
       {
         std::ofstream initialized(directory / "initialization.json");
         initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
                     << ",\"weight_payload_bytes\":" << weight_bytes << ",\"variant\":\""
-                    << variant_name << "\",\"decoder_group_size\":" << decoder_group_size
+                    << variant_name << "\",\"decoder_group_size\":1"
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
@@ -468,8 +457,7 @@ int main(int argc, char **argv) {
           << (passed ? "executed" : "numerical_mismatch")
           << "\",\"released\":true,\"layers\":" << config.decoder.layers
           << ",\"graph_layout\":\"partitioned\",\"variant\":\"" << variant_name << "\""
-          << ",\"decoder_group_size\":" << decoder_group_size << ",\"prefill_head_policy\":\""
-          << head_policy_name << "\""
+          << ",\"decoder_group_size\":1,\"prefill_head_policy\":\"" << head_policy_name << "\""
           << ",\"head_runs\":" << counts.head_runs << ",\"prefill_block\":" << block
           << ",\"capacity\":" << config.decoder.capacity << ",\"launches\":" << launches
           << ",\"weight_payload_bytes\":" << weight_bytes
