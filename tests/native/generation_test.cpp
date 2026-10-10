@@ -60,10 +60,19 @@ void run_options_contracts() {
           benchmark.repeats == 3);
   const auto head_skip = parse("block 4\nprefill_head last-token\n");
   require(head_skip.block == 4 && head_skip.prefill_head == "last-token");
+  for (unsigned block : {8, 16}) {
+    const auto larger = parse("block " + std::to_string(block) +
+                              "\nvariant merged-kv-fc1-split2\nprefill_head last-token\n");
+    require(larger.block == block && larger.prefill_head == "last-token");
+  }
   const auto split_fc1 = parse("block 4\nvariant merged-kv-fc1-split2\n");
   require(split_fc1.block == 4 && split_fc1.variant == "merged-kv-fc1-split2");
   const auto cache = parse("readback kv\ncache_first_layer 2\ncache_last_layer 3\n");
   require(cache.cache_first == 2 && cache.cache_last == 3);
+  const auto mapped = parse("readback kv\ncache_first_layer 23\ncache_last_layer 24\n"
+                            "readback_transport mapped\n");
+  require(mapped.readback_transport == "mapped" && mapped.cache_first == 23 &&
+          mapped.cache_last == 24);
   const auto sampling = parse("seed 42\nmax_new_tokens 0\n", false);
   require(sampling.sampling && sampling.seed == 42 && sampling.maximum == 0);
   // Reject malformed or unsupported requests before a caller can create an SDK Context.
@@ -72,7 +81,8 @@ void run_options_contracts() {
         "max_new_tokens 4294967296\n", "max_new_tokens -1\n", "block 2.0\n", "seed 0\n",
         "readback prefix\n", "readback kv\ncache_first_layer 3\ncache_last_layer 2\n",
         "readback kv\ncache_last_layer 2\n", "block 4\ndecoder_group_size 2\n",
-        "prefill_head unknown\n", "warmups 1\n"}) {
+        "prefill_head unknown\n", "warmups 1\n", "readback_transport unknown\n",
+        "readback_transport mapped\n"}) {
     rejects([&] { parse(text); });
   }
 }
@@ -96,6 +106,19 @@ void contracts() {
   require(result.consumed == 4 && streamed == predictions && result.token_seconds.size() == 2);
   require(result.prefill_seconds >= 0 && result.first_token_seconds >= result.prefill_seconds &&
           result.total_seconds >= result.first_token_seconds);
+
+  std::vector<GenerationPhase> phases;
+  const auto observe = [&](GenerationPhase phase) { phases.push_back(phase); };
+  generate_tokens({10, 8, 2, 2}, executor, {2, 7}, 8, {}, observe);
+  require(phases == std::vector<GenerationPhase>({GenerationPhase::Reset, GenerationPhase::Prefill,
+                                                  GenerationPhase::Decode}));
+  phases.clear();
+  generate_tokens({10, 2, 2, 2}, executor, {2, 7}, 8, {}, observe);
+  require(phases ==
+          std::vector<GenerationPhase>({GenerationPhase::Reset, GenerationPhase::Prefill}));
+  phases.clear();
+  generate_tokens({10, 8, 2, 2}, executor, {2}, 0, {}, observe);
+  require(phases == std::vector<GenerationPhase>({GenerationPhase::Reset}));
 
   result = generate_tokens({10, 8, 2, 2}, executor, {}, 1, notify);
   require(consumed == std::vector<std::int32_t>({2}) &&
@@ -142,7 +165,7 @@ void contracts() {
   require(prefill_calls == 2 && consumed.empty());
 
   for (unsigned length = 0; length <= 128; ++length) {
-    for (unsigned block : {1, 4, 8}) {
+    for (unsigned block : {1, 4, 8, 16}) {
       unsigned end = 0;
       for (auto chunk : plan_prefill(length, block)) {
         require(chunk.begin == end && (chunk.count == block || chunk.count == 1));
@@ -156,7 +179,7 @@ void contracts() {
   const auto tail = plan_prefill(7, 4);
   require(tail.size() == 4 && tail[0].count == 4 && tail.back().begin == 6);
   rejects([&] { plan_prefill(8, 0); });
-  rejects([&] { plan_prefill(8, 9); });
+  rejects([&] { plan_prefill(8, 17); });
 }
 } // namespace
 

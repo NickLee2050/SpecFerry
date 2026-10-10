@@ -2,7 +2,10 @@
 #include "np101/tensor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -43,6 +46,77 @@ std::size_t tensor_bytes(vsi_nn_tensor_t *tensor) {
   }
   std::vector<std::uint32_t> shape(tensor->attr.size, tensor->attr.size + tensor->attr.dim_num);
   return TensorSpec{type, shape}.bytes();
+}
+
+std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_t element_bytes,
+                                             const std::vector<std::uint32_t> &region_start,
+                                             const std::vector<std::uint32_t> &region_end) {
+  const auto rank = tensor->attr.dim_num;
+  if (!tensor->t || tensor->attr.vtl || tensor->attr.is_created_from_handle || rank > 2 ||
+      tensor->attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE) {
+    throw std::invalid_argument("mapped readback requires an ordinary unquantized rank-1/2 tensor");
+  }
+  if (region_start.size() != rank || region_end.size() != rank) {
+    throw std::invalid_argument("mapped tensor region rank differs");
+  }
+  std::array<vx_size, 2> start{}, end{0, 1}, length{1, 1};
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    if (region_start[axis] >= region_end[axis] || region_end[axis] > tensor->attr.size[axis]) {
+      throw std::out_of_range("mapped tensor region exceeds storage");
+    }
+    start[axis] = region_start[axis];
+    end[axis] = region_end[axis];
+    length[axis] = end[axis] - start[axis];
+  }
+  const auto row_bytes = length[0] * element_bytes;
+  const auto bytes = row_bytes * length[1];
+  std::array<vx_size, 2> stride{};
+  std::vector<std::uint8_t> result(bytes);
+  void *pointer = nullptr;
+  vx_map_id map_id = 0;
+  check(sdk_call("vxMapTensorPatch",
+                 [&] {
+                   return vxMapTensorPatch(tensor->t, rank, start.data(), end.data(), &map_id,
+                                           stride.data(), &pointer, VX_READ_ONLY,
+                                           VX_MEMORY_TYPE_HOST);
+                 }),
+        "map tensor for host readback");
+
+  struct Mapping {
+    vx_tensor tensor;
+    vx_map_id id;
+    bool active = true;
+
+    ~Mapping() {
+      if (active) {
+        vxUnmapTensorPatch(tensor, id);
+      }
+    }
+
+    void close() {
+      active = false;
+      check(sdk_call("vxUnmapTensorPatch", [&] { return vxUnmapTensorPatch(tensor, id); }),
+            "unmap host tensor readback");
+    }
+  } mapping{tensor->t, map_id};
+
+  if (!pointer || stride[0] != element_bytes ||
+      (rank == 2 &&
+       (stride[1] < row_bytes || stride[1] > (std::numeric_limits<std::size_t>::max() - row_bytes) /
+                                                 std::max<vx_size>(1, length[1] - 1)))) {
+    throw std::runtime_error("mapped tensor pointer or strides violate the readback contract");
+  }
+  // Copy while mapped; the pointer expires at unmap. Honor padded rows without per-element IO.
+  if (rank == 1 || stride[1] == row_bytes) {
+    std::memcpy(result.data(), pointer, bytes);
+  } else {
+    for (vx_size row = 0; row < length[1]; ++row) {
+      std::memcpy(result.data() + row * row_bytes,
+                  static_cast<const std::uint8_t *>(pointer) + row * stride[1], row_bytes);
+    }
+  }
+  mapping.close();
+  return result;
 }
 } // namespace
 
@@ -102,9 +176,18 @@ void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::u
   transfers.upload_bytes += data.size();
 }
 
-std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
+std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id, TensorReadback method) {
   auto *tensor = get_tensor(graph, id);
   auto bytes = tensor_bytes(tensor);
+  if (method == TensorReadback::MappedHost) {
+    std::vector<std::uint32_t> start(tensor->attr.dim_num, 0);
+    const std::vector<std::uint32_t> end(tensor->attr.size,
+                                         tensor->attr.size + tensor->attr.dim_num);
+    return read_tensor_region(graph, id, start, end);
+  }
+  if (method != TensorReadback::SdkCopy) {
+    throw std::invalid_argument("unknown tensor readback method");
+  }
   std::unique_ptr<std::uint8_t, decltype(&std::free)> data(
       sdk_call("vsi_nn_ConvertTensorToData",
                [&] { return vsi_nn_ConvertTensorToData(graph.get(), tensor); }),
@@ -118,6 +201,22 @@ std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id) {
 }
 
 TensorTransfers tensor_transfers() { return transfers; }
+
+std::vector<std::uint8_t> read_tensor_region(Graph &graph, vsi_nn_tensor_id_t id,
+                                             const std::vector<std::uint32_t> &start,
+                                             const std::vector<std::uint32_t> &end) {
+  auto *tensor = get_tensor(graph, id);
+  const auto bytes = tensor_bytes(tensor);
+  const auto rank = tensor->attr.dim_num;
+  if (rank > 2) {
+    throw std::invalid_argument("mapped tensor regions require rank-1/2");
+  }
+  const auto elements = std::size_t(tensor->attr.size[0]) * (rank == 2 ? tensor->attr.size[1] : 1);
+  auto result = read_mapped_tensor(tensor, bytes / elements, start, end);
+  ++transfers.reads;
+  transfers.read_bytes += result.size();
+  return result;
+}
 
 vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver) {
   auto *source = get_tensor(owner, id);

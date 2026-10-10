@@ -7,6 +7,7 @@
 #include "sys/uio.h"
 #include "unistd.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -547,6 +548,126 @@ extern "C" int vxoGraph_PrepareParamMemory(void *graph) {
 }
 
 namespace {
+// Inclusive spans are nested: WaitSignal contains DeviceControl and Submit
+// contains Replay. Keep them separate; their totals must never be added together.
+enum class ExecutionSpan {
+  Process,
+  Submit,
+  Replay,
+  Wait,
+  TerminalWait,
+  Control,
+  UserSignal,
+  Commit,
+  Stall,
+  Layer,
+  Commands,
+  Count
+};
+constexpr std::array<const char *, static_cast<std::size_t>(ExecutionSpan::Count)> span_names{
+    "vxProcessGraph",
+    "vxoGraph_Submit",
+    "gcoVX_Replay",
+    "gcoOS_WaitSignal",
+    "post_submit_wait",
+    "gcoOS_DeviceControl",
+    "USER_SIGNAL",
+    "COMMIT",
+    "STALL",
+    "vxnneExecutionLayer_Execute",
+    "vxnneOperation_ExecuteCommands"};
+
+struct SpanTotal {
+  std::uint64_t calls = 0;
+  std::uint64_t failures = 0;
+  double seconds = 0;
+};
+
+struct ExecutionSample {
+  std::uint64_t sequence = 0;
+  void *graph = nullptr;
+  bool submitted = false;
+  std::array<SpanTotal, span_names.size()> spans{};
+};
+
+bool execution_summary_enabled() {
+  static const bool enabled = [] {
+    const auto *setting = std::getenv("SPECFERRY_VERIFY_EXECUTION_TRACE");
+    return setting && std::strcmp(setting, "summary") == 0;
+  }();
+  return enabled;
+}
+
+struct ExecutionSummary {
+  // Fixed host storage; no allocation, logging or SDK queries inside graph execution.
+  // Normal process exit writes the evidence. An interrupted run is not a timing sample.
+  std::array<ExecutionSample, 4096> samples{};
+  std::size_t used = 0;
+  std::mutex mutex;
+  std::FILE *output;
+
+  ExecutionSummary() {
+    runtime();
+    const std::string path =
+        std::string(std::getenv("SPECFERRY_VERIFY_TRACE")) + "-execution-summary.tsv";
+    output = std::fopen(path.c_str(), "wx");
+    if (!output) {
+      refuse_trace("cannot create execution summary output");
+    }
+  }
+
+  ~ExecutionSummary() {
+    std::fputs("process_id\tgraph\tapi\tcount\tfailures\ttotal_seconds\n", output);
+    for (std::size_t index = 0; index < used; ++index) {
+      const auto &sample = samples[index];
+      for (std::size_t api = 0; api < span_names.size(); ++api) {
+        const auto &span = sample.spans[api];
+        if (span.calls) {
+          std::fprintf(output, "%llu\t%p\t%s\t%llu\t%llu\t%.9f\n",
+                       static_cast<unsigned long long>(sample.sequence), sample.graph,
+                       span_names[api], static_cast<unsigned long long>(span.calls),
+                       static_cast<unsigned long long>(span.failures), span.seconds);
+        }
+      }
+    }
+    std::fclose(output);
+  }
+
+  void append(const ExecutionSample &sample) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (used == samples.size()) {
+      refuse_trace("execution summary capacity exceeded; shorten the diagnostic workload");
+    }
+    samples[used++] = sample;
+  }
+};
+
+ExecutionSummary &execution_summary() {
+  static ExecutionSummary summary;
+  return summary;
+}
+
+thread_local ExecutionSample *current_sample = nullptr;
+
+void accumulate(ExecutionSpan api, int status, double seconds) {
+  auto &span = current_sample->spans[static_cast<std::size_t>(api)];
+  ++span.calls;
+  span.failures += status != 0;
+  span.seconds += seconds;
+}
+
+template <typename Action> int measure_execution(ExecutionSpan api, Action action) {
+  if (!current_sample) {
+    return action();
+  }
+  const auto started = std::chrono::steady_clock::now();
+  const auto status = action();
+  const auto elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  accumulate(api, status, elapsed);
+  return status;
+}
+
 struct ProcessScope {
   std::uint64_t sequence = 0;
   void *graph = nullptr;
@@ -565,7 +686,7 @@ bool execution_trace_enabled() {
 
 void record_execution(const char *api, int status, void *argument = nullptr, int command = -1,
                       int hardware = -1, int interface_status = -1) {
-  if (!execution_trace_enabled()) {
+  if (!execution_trace_enabled() || execution_summary_enabled()) {
     return;
   }
   // This stream records calls that actually execute, separately from Verify's configured targets.
@@ -596,10 +717,18 @@ extern "C" int vxProcessGraph(void *graph) {
   static const auto execute = reinterpret_cast<GraphStatus>(find_symbol("vxProcessGraph"));
   const auto previous = current_process;
   current_process = {++next_process, graph};
+  ExecutionSample sample;
+  auto *previous_sample = current_sample;
+  if (execution_summary_enabled()) {
+    execution_summary(); // Initialize fixed storage and output during the warmup.
+    sample.sequence = current_process.sequence;
+    sample.graph = graph;
+    current_sample = &sample;
+  }
   record_execution("vxProcessGraph.begin", 0);
   // In this pinned build, a nonzero graph+0x124 branches to ProcessInternal even
   // when captured commands exist. Keep this distinct from merely naming a target.
-  if (execution_trace_enabled()) {
+  if (execution_trace_enabled() && !execution_summary_enabled()) {
     std::uint32_t internal = 1;
     if (read_field(graph, 0x124, internal)) {
       record_execution("process_internal_flag", static_cast<int>(internal));
@@ -615,11 +744,16 @@ extern "C" int vxProcessGraph(void *graph) {
       !guard || std::strcmp(guard, "1") != 0 || runtime().operation_integrity[graph];
   // Opt-in protection for same-process rebuild probes: return a normal API error
   // before execution if compilation lost entries. The caller can release normally.
-  const auto status = permitted ? execute(graph) : -1;
+  const auto status =
+      measure_execution(ExecutionSpan::Process, [&] { return permitted ? execute(graph) : -1; });
   if (!permitted) {
     record_execution("compile_integrity_guard", status);
   }
   record_execution("vxProcessGraph.end", status);
+  if (execution_summary_enabled()) {
+    execution_summary().append(sample);
+    current_sample = previous_sample;
+  }
   current_process = previous;
   return status;
 }
@@ -627,7 +761,7 @@ extern "C" int vxProcessGraph(void *graph) {
 extern "C" int vxnneExecutionLayer_Execute(void *layer) {
   static const auto execute =
       reinterpret_cast<GraphStatus>(find_symbol("vxnneExecutionLayer_Execute"));
-  const auto status = execute(layer);
+  const auto status = measure_execution(ExecutionSpan::Layer, [&] { return execute(layer); });
   if (current_process.graph) {
     record_execution("vxnneExecutionLayer_Execute", status, layer);
   }
@@ -637,7 +771,8 @@ extern "C" int vxnneExecutionLayer_Execute(void *layer) {
 extern "C" int vxnneOperation_ExecuteCommands(void *operation, void *commands) {
   static const auto execute =
       reinterpret_cast<GenerateCommands>(find_symbol("vxnneOperation_ExecuteCommands"));
-  const auto status = execute(operation, commands);
+  const auto status =
+      measure_execution(ExecutionSpan::Commands, [&] { return execute(operation, commands); });
   if (current_process.graph) {
     record_execution("vxnneOperation_ExecuteCommands", status, operation);
   }
@@ -651,12 +786,36 @@ extern "C" int gcoOS_DeviceControl(void *os, std::uint32_t code, void *input,
   using Control = int (*)(void *, std::uint32_t, void *, std::size_t, void *, std::size_t);
   static const auto control = reinterpret_cast<Control>(find_symbol("gcoOS_DeviceControl"));
   std::int32_t command = -1, hardware = -1, interface_status = -1;
-  if (execution_trace_enabled() && current_process.graph && input_size >= 16) {
+  if (current_sample && input && input_size >= 16) {
+    // The HAL caller supplies a valid interface buffer; avoid diagnostic read syscalls.
+    std::memcpy(&command, input, sizeof(command));
+  } else if (execution_trace_enabled() && current_process.graph && input_size >= 16) {
     read_field(input, 0, command);
     read_field(input, 4, hardware);
   }
+  const auto started =
+      current_sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const auto status = control(os, code, input, input_size, output, output_size);
-  if (execution_trace_enabled() && current_process.graph) {
+  if (current_sample) {
+    const auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (output && output_size >= 16) {
+      std::memcpy(&interface_status, static_cast<const char *>(output) + 12,
+                  sizeof(interface_status));
+    }
+    const auto failure = status != 0 || interface_status != 0;
+    accumulate(ExecutionSpan::Control, failure, elapsed);
+    // Command values follow the installed, pinned HAL enumeration. This is
+    // diagnostic categorization, not an ioctl-duration or transfer-byte counter.
+    if (command == 20) {
+      accumulate(ExecutionSpan::UserSignal, failure, elapsed);
+    } else if (command == 17) {
+      accumulate(ExecutionSpan::Commit, failure, elapsed);
+    } else if (command == 18) {
+      accumulate(ExecutionSpan::Stall, failure, elapsed);
+    }
+  }
+  if (execution_trace_enabled() && !execution_summary_enabled() && current_process.graph) {
     if (output_size >= 16) {
       read_field(output, 12, interface_status);
     }
@@ -667,7 +826,10 @@ extern "C" int gcoOS_DeviceControl(void *os, std::uint32_t code, void *input,
 
 extern "C" int vxoGraph_Submit(void *graph) {
   static const auto submit = reinterpret_cast<GraphStatus>(find_symbol("vxoGraph_Submit"));
-  const auto status = submit(graph);
+  const auto status = measure_execution(ExecutionSpan::Submit, [&] { return submit(graph); });
+  if (current_sample) {
+    current_sample->submitted = status == 0;
+  }
   if (current_process.graph) {
     record_execution("vxoGraph_Submit", status, graph);
   }
@@ -679,7 +841,8 @@ extern "C" int vxoGraph_Submit(void *graph) {
 extern "C" int gcoVX_Replay(void *buffer, std::uint32_t bytes) {
   using Replay = int (*)(void *, std::uint32_t);
   static const auto replay = reinterpret_cast<Replay>(find_symbol("gcoVX_Replay"));
-  const auto status = replay(buffer, bytes);
+  const auto status =
+      measure_execution(ExecutionSpan::Replay, [&] { return replay(buffer, bytes); });
   if (current_process.graph) {
     record_execution("gcoVX_Replay", status, buffer, static_cast<int>(bytes));
   }
@@ -689,7 +852,17 @@ extern "C" int gcoVX_Replay(void *buffer, std::uint32_t bytes) {
 extern "C" int gcoOS_WaitSignal(void *os, void *signal, std::uint32_t timeout) {
   using WaitSignal = int (*)(void *, void *, std::uint32_t);
   static const auto wait = reinterpret_cast<WaitSignal>(find_symbol("gcoOS_WaitSignal"));
+  const auto started =
+      current_sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const auto status = wait(os, signal, timeout);
+  if (current_sample) {
+    const auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    accumulate(ExecutionSpan::Wait, status, elapsed);
+    if (current_sample->submitted) {
+      accumulate(ExecutionSpan::TerminalWait, status, elapsed);
+    }
+  }
   if (current_process.graph) {
     record_execution("gcoOS_WaitSignal", status, signal);
   }

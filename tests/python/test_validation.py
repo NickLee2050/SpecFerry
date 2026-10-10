@@ -72,7 +72,11 @@ class RecoveryControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             options = SimpleNamespace(
-                prepare_only=False, sudo_read_only=False, cold_restarted=False, timeout=None
+                case="recovery",
+                prepare_only=False,
+                sudo_read_only=False,
+                cold_restarted=False,
+                timeout=None,
             )
             evidence = dict(
                 returncode=0,
@@ -131,6 +135,24 @@ class RecoveryControlTests(unittest.TestCase):
             (device / "execution.json").write_text(json.dumps(execution))
             self.assertFalse(recovery_controls.numerical_check("old-component", device))
 
+    def test_repository_conv_requires_both_finite_results_and_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            device = Path(temporary)
+            log = "PASS iteration=0 max_abs_error=0.003\nPASS iteration=1 max_abs_error=0.004\n"
+            complete = "Completed; graph/context released\n"
+            for text, expected in (
+                (log + complete, True),
+                (log, False),
+                (log.replace("0.004", "nan") + complete, False),
+                (log.replace("0.004", "0.2") + complete, False),
+                (log.splitlines(True)[0] + complete, False),
+            ):
+                with self.subTest(text=text):
+                    (device / "sdk.log").write_text(text)
+                    self.assertEqual(
+                        recovery_controls.numerical_check("repository-conv", device), expected
+                    )
+
     def test_prepare_only_never_checks_or_opens_device(self):
         with (
             patch.object(
@@ -142,7 +164,9 @@ class RecoveryControlTests(unittest.TestCase):
         ):
             self.assertEqual(
                 recovery_controls.run_controls(
-                    Path("unused"), SimpleNamespace(prepare_only=True, timeout=None), False
+                    Path("unused"),
+                    SimpleNamespace(case="conv", prepare_only=True, timeout=None),
+                    False,
                 ),
                 0,
             )
@@ -630,9 +654,44 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
             {"decoder_group_size": 3},
             {"prefill_head_policy": "unknown"},
             {"decoder_group_size": 2, "variant": "local-const"},
+            {"readback_transport": "unknown"},
+            {"readback_transport": "mapped"},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.evaluate(**options)
+
+    def test_readback_transport_must_match_both_initialization_and_execution(self):
+        options = self.options | {
+            "cache_readback": "kv",
+            "cache_layer_range": [1, 2],
+            "readback_transport": "mapped",
+        }
+        self.initialized["readback_transport"] = "mapped"
+        self.native_run.update(
+            readback_transport="mapped",
+            cache_readback="kv",
+            cache_first_layer=1,
+            cache_last_layer=2,
+            diagnostic_reads=12,
+            diagnostic_read_bytes=192,
+        )
+        for index, request in enumerate(self.metadata["requests"]):
+            for layer in range(2):
+                for name in ("keys", "values"):
+                    np.zeros(request["consumed"] * 2, dtype="<f2").tofile(
+                        self.fixture / f"expected.{index}.{layer}.{name}.bin"
+                    )
+                    np.zeros(8, dtype="<f2").tofile(
+                        self.device / f"measured.{index}.layer.{layer}.{name}.bin"
+                    )
+        self.save_metadata()
+        checks = self.evaluate(**options)
+        self.assertTrue(all(checks.values()), checks)
+        self.native_run["readback_transport"] = "sdk"
+        self.save_metadata()
+        checks = self.evaluate(**options)
+        self.assertFalse(checks["run.readback_transport"])
+        self.assertTrue(checks["initialization.readback_transport"])
 
 
 class GraphBenchmarkTests(GraphEvidenceFixture):

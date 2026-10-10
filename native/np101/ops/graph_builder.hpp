@@ -48,6 +48,8 @@ public:
   Tensor floats(const std::vector<float> &values, Shape shape, DataType type);
   Tensor scalar(float value, DataType type = DataType::Float32);
   Tensor weight(const WeightStore &store, const WeightRecord &record, TensorSpec expected);
+  // An explicit FP32 target widens FP16 checkpoint data once during initialization.
+  // Offsets refer to source bytes; shared backing is keyed by target dtype and shape.
   Tensor weight_chunk(const WeightStore &store, const WeightRecord &record, TensorSpec spec,
                       std::size_t offset, WeightStorage storage = WeightStorage::Default);
   std::size_t local_weight_bytes() const;
@@ -70,7 +72,7 @@ public:
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
   // FP16 MatMul followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                const WeightRecord &bias, bool split_output_channels = false);
+                const WeightRecord &bias, unsigned output_parts = 1);
   Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);
   // FP32 square/reduce/rsqrt: mean=true is RMS; false is L2 normalization.
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);

@@ -3,6 +3,7 @@
 #include "models/qwen3_5/config.hpp"
 #include "np101/component_spec.hpp"
 #include "np101/tensor_spec.hpp"
+#include "np101/weight_bank.hpp"
 #include "np101/weights.hpp"
 
 #include <chrono>
@@ -98,6 +99,34 @@ void weight_integrity() {
   rejects([&] { WeightStore duplicate(directory.path); }, "duplicate tensor and overlap");
 }
 
+void prepared_weight_contract() {
+  TemporaryDirectory directory;
+  const auto half = as_bytes<std::uint16_t>({0, 0x8000, 0x3c00, 0xbc00, 1, 0x3ff, 0x400, 0x7bff});
+  write_bytes(directory.path / "weights.bin", half);
+  write_text(directory.path / "weights.index",
+             "specferry-np101-weights 1\naffine F16 8 0 16 "
+             "02385339768572a52c275eb15d8442ea47075fdab3d2003ca6b2455e86d616d4\n");
+  WeightStore store(directory.path);
+  store.verify();
+  const auto &record = store.find("affine");
+  // IEEE values cover signed zero, normals, subnormals and the largest finite half.
+  const auto expected =
+      as_bytes<float>({0.0f, -0.0f, 1.0f, -1.0f, 0x1p-24f, 1023.0f * 0x1p-24f, 0x1p-14f, 65504.0f});
+  require(prepare_weight_chunk(store, record, {DataType::Float32, {8, 1}}) == expected,
+          "prepared affine values must preserve FP16 values exactly in FP32");
+  require(prepare_weight_chunk(store, record, {DataType::Float16, {8, 1}}) == half,
+          "identity preparation must preserve bytes");
+  require(prepare_weight_chunk(store, record, {DataType::Float32, {2, 1}}, 4) ==
+              as_bytes<float>({1.0f, -1.0f}),
+          "converted chunk offsets use source bytes");
+  rejects([&] { prepare_weight_chunk(store, record, {DataType::Int32, {8}}); },
+          "unvalidated conversion");
+  rejects([&] { prepare_weight_chunk(store, record, {DataType::Float32, {1}}, 1); },
+          "unaligned source offset");
+  rejects([&] { prepare_weight_chunk(store, record, {DataType::Float32, {9}}); },
+          "converted read must remain bounded by its source record");
+}
+
 void component_contracts() {
   const TensorSpec index{DataType::Int32, {1}}, storage{DataType::Float16, {8, 16}};
   validate_cache_append({DataType::Float16, {8, 1}}, index, storage);
@@ -188,6 +217,7 @@ int main() {
     binary_io_contract();
     tensor_boundaries();
     weight_integrity();
+    prepared_weight_contract();
     component_contracts();
     opt_contracts();
     std::cout << "Tensor boundaries, weight integrity, and fixture validation passed.\n";

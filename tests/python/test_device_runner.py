@@ -44,6 +44,15 @@ class DeviceRecoveryTests(unittest.TestCase):
                         library, root, root, {"LD_PRELOAD": "/unrelated.so"}
                     )
                 record = device.verify_trace_environment(library, root, root, environment)
+                environment["SPECFERRY_VERIFY_EXECUTION_TRACE"] = "summary"
+                summary = device.verify_trace_environment(
+                    library,
+                    root,
+                    root,
+                    {key: value for key, value in environment.items() if key != "LD_PRELOAD"},
+                )
+                self.assertEqual(summary["execution_mode"], "summary")
+                self.assertTrue(summary["execution_output"].endswith("-execution-summary.tsv"))
             self.assertEqual(environment["LD_PRELOAD"], str(library))
             self.assertEqual(environment["SPECFERRY_VERIFY_TRACE"], record["output"])
 
@@ -224,7 +233,10 @@ class DeviceRecoveryTests(unittest.TestCase):
                 self.assertFalse(result["timeout"])
                 self.assertEqual(result["device_recovery_required"], recovery)
                 self.assertEqual(marker is not None, recovery)
-                process.wait.assert_called_once_with(timeout=1)
+                process.wait.assert_called_once()
+                remaining = process.wait.call_args.kwargs["timeout"]
+                self.assertGreater(remaining, 0)
+                self.assertLessEqual(remaining, 1)
                 terminate.assert_not_called()
                 if recovery:
                     self.assertFalse(device.clean_execution(result, expected_returncode=125))

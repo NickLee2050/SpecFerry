@@ -35,12 +35,15 @@ def verify_trace_environment(library: Path, sdk_lib: Path, output: Path, environ
         raise ValueError("Verify tracing cannot be combined with another LD_PRELOAD")
     trace_path = output / "verify-internals.tsv"
     environment.update(LD_PRELOAD=str(library), SPECFERRY_VERIFY_TRACE=str(trace_path))
+    execution_mode = environment.get("SPECFERRY_VERIFY_EXECUTION_TRACE", "calls")
+    execution_suffix = "-execution-summary.tsv" if execution_mode == "summary" else "-execution.tsv"
     return {
         "library": str(library),
         "library_sha256": sha256(library),
         "output": str(trace_path),
         "node_snapshots_output": str(trace_path) + "-nodes.tsv",
-        "execution_output": str(trace_path) + "-execution.tsv",
+        "execution_mode": execution_mode,
+        "execution_output": str(trace_path) + execution_suffix if execution_mode != "0" else None,
         "private_layout_openvx_sha256": VERIFY_TRACE_OPENVX_SHA256,
         "execution_gal_sha256": VERIFY_TRACE_GAL_SHA256,
     }

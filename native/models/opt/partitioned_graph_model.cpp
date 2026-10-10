@@ -5,9 +5,7 @@
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "np101/ops/vocabulary.hpp"
-#include "np101/tensor.hpp"
 #include "np101/weight_bank.hpp"
-#include "vsi_nn_pub.h"
 
 #include <algorithm>
 #include <cstring>
@@ -449,17 +447,17 @@ PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore
       prefill_head != PrefillHeadPolicy::LastToken) {
     throw std::invalid_argument("unknown partitioned OPT prefill head policy");
   }
-  if (prefill_block != 1 && prefill_block != 4) {
-    throw std::invalid_argument("partitioned OPT prefill block must be 1 or 4");
+  if (prefill_block != 1 && prefill_block != 4 && prefill_block != 8 && prefill_block != 16) {
+    throw std::invalid_argument("partitioned OPT prefill block must be 1, 4, 8 or 16");
   }
   if (variant == Variant::MergedKvFc1Split2 && config.decoder.intermediate % 2) {
     throw std::invalid_argument("split-fc1 OPT requires an even intermediate width");
   }
-  if (prefill_block == 4 &&
+  if (prefill_block != 1 &&
       ((variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2) ||
        decoder_group_size != 1 || config.decoder.capacity % prefill_block)) {
-    throw std::invalid_argument("block-4 prefill requires a shared merged-kv variant, group 1 "
-                                "and capacity divisible by 4");
+    throw std::invalid_argument("block prefill requires a shared merged-kv variant, group 1 "
+                                "and capacity divisible by the block");
   }
   validate_model_weights(weights, config, config.decoder.layers);
   impl_ = std::make_unique<Impl>(context, weights, config, phase, decoder_group_size, variant,
@@ -477,8 +475,9 @@ PartitionedGraphModel::Impl &PartitionedGraphModel::require_impl() const {
 
 void PartitionedGraphModel::step(std::int32_t token) { require_impl().step(token); }
 
-inference::Generation PartitionedGraphModel::generate(const std::vector<std::int32_t> &prompt,
-                                                      unsigned maximum) {
+inference::Generation
+PartitionedGraphModel::generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
+                                const inference::GenerationPhaseObserver &on_phase) {
   const auto &config = require_impl().config;
   inference::GenerationExecutor executor{[&] { impl_->reset(); },
                                          [&](std::int32_t token) { impl_->step(token); },
@@ -491,7 +490,7 @@ inference::Generation PartitionedGraphModel::generate(const std::vector<std::int
   }
   return inference::generate_tokens(
       {config.vocabulary, config.decoder.capacity, config.bos, config.eos}, executor, prompt,
-      maximum);
+      maximum, {}, on_phase);
 }
 
 std::vector<std::uint8_t> PartitionedGraphModel::read_layer(unsigned layer,
@@ -502,14 +501,15 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_layer(unsigned layer,
   return read_tensor(graph, stage.stages.at(name).id);
 }
 
-std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool values) {
+std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool values,
+                                                            np101::TensorReadback method) {
   require_impl().require_open();
   const auto &decoder = impl_->config.decoder;
   if (layer >= decoder.layers) {
     throw std::out_of_range("partitioned OPT cache layer exceeds configuration");
   }
   const auto tensor = impl_->cache_tensors.at(layer * 2 + values);
-  const auto packed = read_tensor(impl_->cache, tensor.id);
+  const auto packed = read_tensor(impl_->cache, tensor.id, method);
   const auto row_bytes = std::size_t(decoder.kv_spec().head_dim) * dtype_bytes(f16);
   const auto slot_bytes = row_bytes * decoder.heads;
   if (packed.size() != slot_bytes * decoder.capacity) {
@@ -528,23 +528,24 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool
   return result;
 }
 
-std::vector<std::uint8_t> PartitionedGraphModel::read_output(const std::string &name) {
+std::vector<std::uint8_t> PartitionedGraphModel::read_output(const std::string &name,
+                                                             np101::TensorReadback method) {
   require_impl().require_open();
   if (!impl_->prediction_valid) {
     throw std::logic_error("no partitioned OPT prediction is available");
   }
   if (name == "projected") {
-    return read_tensor(impl_->latest->head->graph, impl_->latest->projected.id);
+    return read_tensor(impl_->latest->head->graph, impl_->latest->projected.id, method);
   }
   if (name == "selected") {
-    return read_tensor(impl_->latest->head->graph, impl_->latest->selected.id);
+    return read_tensor(impl_->latest->head->graph, impl_->latest->selected.id, method);
   }
   if (name != "logits") {
     throw std::invalid_argument("unknown partitioned OPT output");
   }
   std::vector<std::uint8_t> result;
   for (const auto &part : impl_->latest->logits) {
-    const auto bytes = read_tensor(impl_->latest->head->graph, part.id);
+    const auto bytes = read_tensor(impl_->latest->head->graph, part.id, method);
     result.insert(result.end(), bytes.begin(), bytes.end());
   }
   return result;
@@ -583,6 +584,33 @@ std::size_t PartitionedGraphModel::weight_bytes() const {
     }
   }
   return bytes;
+}
+
+void PartitionedGraphModel::verify_weight_preload(std::ostream &report) {
+  auto &state = require_impl();
+  state.require_open();
+  if (state.completed_steps || weight_storage(state.variant) != WeightStorage::SharedMutable) {
+    throw std::logic_error("preload diagnostic requires an unexecuted shared-weight model");
+  }
+  const auto &decoder = state.config.decoder;
+  std::vector<std::string> names;
+  for (const auto layer : {0u, decoder.layers / 2, decoder.layers - 1}) {
+    names.push_back(decoder.prefix(layer) + "fc1.weight");
+    names.push_back(decoder.prefix(layer) + "fc2.weight");
+  }
+  names.push_back(decoder.prefix(decoder.layers - 1) + "self_attn.q_proj.weight");
+  std::vector<Graph *> consumers;
+  for (auto *execution : {state.decode.get(), state.prefill.get()}) {
+    if (!execution) {
+      continue;
+    }
+    consumers.push_back(&execution->embedding->graph);
+    for (const auto &graph : execution->decoder_graphs) {
+      consumers.push_back(&graph->graph);
+    }
+    consumers.push_back(&execution->head->graph);
+  }
+  state.bank.verify_preloaded(names, consumers, report);
 }
 
 PartitionedGraphModel::Variant PartitionedGraphModel::variant() const {

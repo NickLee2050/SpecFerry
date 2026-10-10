@@ -7,8 +7,8 @@
 
 namespace specferry::inference {
 std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block) {
-  if (!block || block > 8) {
-    throw std::invalid_argument("prefill block must be in [1,8]");
+  if (!block || block > 16) {
+    throw std::invalid_argument("prefill block must be in [1,16]");
   }
   std::vector<PrefillChunk> result;
   unsigned position = 0;
@@ -22,7 +22,8 @@ std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block) {
 
 Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecutor &executor,
                            const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
-                           const std::function<void(std::int32_t)> &on_token) {
+                           const std::function<void(std::int32_t)> &on_token,
+                           const GenerationPhaseObserver &on_phase) {
   if (!policy.capacity || !policy.vocabulary ||
       policy.vocabulary > std::numeric_limits<std::int32_t>::max() ||
       policy.bos >= policy.vocabulary || policy.eos >= policy.vocabulary || !executor.reset ||
@@ -38,6 +39,9 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
       throw std::invalid_argument("prompt token exceeds vocabulary");
     }
   }
+  if (on_phase) {
+    on_phase(GenerationPhase::Reset);
+  }
   {
     np101::SdkScope phase("phase", "reset");
     executor.reset();
@@ -46,6 +50,9 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
   result.stop_reason = "max_new_tokens";
   if (!maximum_new_tokens) {
     return result;
+  }
+  if (on_phase) {
+    on_phase(GenerationPhase::Prefill);
   }
   const auto start = std::chrono::steady_clock::now();
   {
@@ -94,6 +101,10 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
       break;
     }
     previous = now;
+    // First prediction belongs to prefill; decode begins only if it is consumed.
+    if (!index && on_phase) {
+      on_phase(GenerationPhase::Decode);
+    }
     {
       np101::SdkScope phase("phase", "decode");
       executor.consume(token);

@@ -2,7 +2,6 @@
 
 #include "np101/context.hpp"
 #include "np101/tensor_spec.hpp"
-#include "vsi_nn_pub.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +34,18 @@ vsi_nn_tensor_id_t add_tensor(Graph &graph, const TensorSpec &spec, bool constan
 
 void upload_tensor(Graph &graph, vsi_nn_tensor_id_t id, const std::vector<std::uint8_t> &data);
 
-std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id);
+enum class TensorReadback { SdkCopy, MappedHost };
+
+// MappedHost is an explicit diagnostic path for ordinary, unquantized rank-1/2 tensors.
+// Call with no graph executing, including after initialization or synchronous completion.
+// There is no fallback to SDK DMA copy on failure.
+std::vector<std::uint8_t> read_tensor(Graph &graph, vsi_nn_tensor_id_t id,
+                                      TensorReadback method = TensorReadback::SdkCopy);
+
+// Explicit mapped diagnostic; half-open coordinates, ordinary unquantized rank-1/2 only.
+std::vector<std::uint8_t> read_tensor_region(Graph &graph, vsi_nn_tensor_id_t id,
+                                             const std::vector<std::uint32_t> &start,
+                                             const std::vector<std::uint32_t> &end);
 
 // Retain one materialized ordinary tensor in a second SDK wrapper before setup.
 // Each graph owns its own OpenVX reference. This does not copy tensor contents.

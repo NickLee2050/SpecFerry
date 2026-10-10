@@ -32,6 +32,9 @@ struct PrefillChunk {
   unsigned begin, count;
 };
 
+enum class GenerationPhase { Reset, Prefill, Decode };
+using GenerationPhaseObserver = std::function<void(GenerationPhase)>;
+
 // At most two fixed graph shapes: complete blocks and single-token tail steps.
 std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block);
 
@@ -39,5 +42,6 @@ std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block);
 // The last prediction is returned without consuming it into the model state.
 Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecutor &executor,
                            const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
-                           const std::function<void(std::int32_t)> &on_token = {});
+                           const std::function<void(std::int32_t)> &on_token = {},
+                           const GenerationPhaseObserver &on_phase = {});
 } // namespace specferry::inference

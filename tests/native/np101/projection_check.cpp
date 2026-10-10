@@ -60,9 +60,11 @@ struct FfnFixture {
   opt::Config config;
   WeightStore weights;
   std::vector<std::vector<std::uint8_t>> inputs;
+  unsigned input_rows;
 
-  FfnFixture(const fs::path &deployment, const fs::path &fixture, bool full)
-      : config(opt::read_config(fixture / "components.txt")), weights(deployment) {
+  FfnFixture(const fs::path &deployment, const fs::path &fixture, bool full, unsigned rows)
+      : config(opt::read_config(fixture / "components.txt")), weights(deployment),
+        input_rows(rows) {
     if (config.hidden != 1024 || config.intermediate != 4096 || config.heads != 16 ||
         config.layers != 24 || config.epsilon != 1e-5f) {
       throw std::invalid_argument("FFN collection requires OPT-350m 1024/4096/16/24/epsilon=1e-5");
@@ -84,7 +86,7 @@ struct FfnFixture {
       }
       auto input =
           read_bytes(fixture, "teacher.0.layer." + std::to_string(layer) + ".attention_norm.bin",
-                     config.hidden_spec().bytes());
+                     std::size_t(config.hidden) * input_rows * 2);
       for (std::size_t offset = 0; offset < input.size(); offset += 2) {
         const auto bits = unsigned(input[offset]) | (unsigned(input[offset + 1]) << 8);
         if ((bits & 0x7c00) == 0x7c00) {
@@ -116,7 +118,11 @@ struct FfnGraphs {
 void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
                           const std::string &mode) {
   const bool full = mode == "ffn-full";
-  const bool split_fc1 = mode == "ffn-linear-fc1-split2";
+  const auto fc1_parts = mode == "ffn-linear-fc1-split4"   ? 4u
+                         : mode == "ffn-linear-fc1-split2" ? 2u
+                                                           : 1u;
+  const bool shared_layer_weights = mode == "ffn-linear-shared-weights";
+  const auto weight_sets = shared_layer_weights ? 1u : fixture.config.layers;
   const auto started = Clock::now();
   Context context;
   WeightBank bank(context);
@@ -129,11 +135,11 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
            << (released ? "executed" : "running")
            << "\",\"released\":" << (released ? "true" : "false") << ",\"mode\":\"" << mode
            << "\",\"graph_count\":24,\"weight_policy\":\"shared-mutable\""
+           << ",\"weight_sets\":" << weight_sets << ",\"input_rows\":" << fixture.input_rows
            << ",\"initialization_seconds\":" << initialization_seconds
            << ",\"release_seconds\":" << release_seconds
            << ",\"weight_payload_bytes\":" << bank.payload_bytes() << ",\"matrix_payload_bytes\":"
-           << std::size_t(fixture.config.hidden) * fixture.config.intermediate * 4 *
-                  fixture.config.layers
+           << std::size_t(fixture.config.hidden) * fixture.config.intermediate * 4 * weight_sets
            << ",\"application_segment_limit_bytes\":" << segment_payload_limit;
     for (const bool constant : {true, false}) {
       const auto name = constant ? "const" : "nonconst";
@@ -148,14 +154,17 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
     auto owner =
         std::make_unique<GraphBuilder>(context, 128, 96, &bank, WeightStorage::SharedMutable);
     auto &graph = *owner;
-    const auto input = graph.tensor(fixture.config.hidden_spec());
+    const auto input = graph.tensor({f16, {fixture.config.hidden, fixture.input_rows}});
     upload_tensor(graph.graph, input.id, fixture.inputs[layer]);
-    const auto prefix = fixture.config.prefix(layer);
+    // Reuse the last layer's backing without changing graph count, inputs or execution order.
+    // The final graph remains identical to the distinct-weight case and its existing oracle.
+    const auto prefix =
+        fixture.config.prefix(shared_layer_weights ? fixture.config.layers - 1 : layer);
     const auto linear = [&](Tensor value, const char *name) {
       const auto &matrix = fixture.weights.find(prefix + name + ".weight");
       const auto &bias = fixture.weights.find(prefix + name + ".bias");
       return graph.linear(value, fixture.weights, matrix, bias,
-                          split_fc1 && std::string(name) == "fc1");
+                          std::string(name) == "fc1" ? fc1_parts : 1u);
     };
     auto value = linear(input, "fc1");
     value = graph.unary(VSI_NN_OP_RELU, value, f16);
@@ -181,7 +190,7 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
           << std::setprecision(17);
   const auto run_batch = [&](const char *phase, unsigned batch, unsigned sweeps) {
     report(std::string(phase) + "." + std::to_string(batch));
-    // Each sweep traverses distinct real weights; timing has no per-call instrumentation or IO.
+    // Timing covers the same graph sequence without per-call instrumentation or explicit IO.
     const auto cpu_before = read_cpu_snapshot();
     const auto begin = Clock::now();
     for (unsigned sweep = 0; sweep < sweeps; ++sweep) {
@@ -209,7 +218,8 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
     run_batch("measured", batch, 8);
   }
   report("readback");
-  write_bytes(output / "last-layer.bin", read_tensor(owners.graphs.back()->graph, last_output.id));
+  write_bytes(output / "last-layer.bin",
+              read_tensor(owners.graphs.back()->graph, last_output.id, TensorReadback::MappedHost));
   report("release");
   const auto release_started = Clock::now();
   owners.close();
@@ -299,24 +309,70 @@ void check_projection(Context &context, bool fused) {
   }
   graph.graph.close();
 }
+
+void check_mapped_readback(Context &context) {
+  // Match KV backing and full/tail logit blocks; rank 1 checks the public helper contract.
+  for (const Shape &shape : {Shape{1024, 16}, Shape{1, 4096}, Shape{1, 1120}, Shape{16}}) {
+    const TensorSpec spec{f16, shape};
+    GraphBuilder graph(context, 3, 1);
+    const auto input = graph.tensor(spec);
+    const auto bias = graph.floats(std::vector<float>(spec.elements(), 0.5f), shape, f16);
+    const auto output = graph.binary(VSI_NN_OP_ADD, input, bias);
+    upload_tensor(graph.graph, input.id, encode_floats(std::vector<float>(spec.elements(), 0)));
+    graph.compile({input}, {output});
+    for (unsigned iteration = 0; iteration < 4; ++iteration) {
+      std::vector<float> values(spec.elements()), expected(values.size());
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] = 0.125f * (int(index % 31) - 15) + (iteration % 2);
+        expected[index] = values[index] + 0.5f;
+      }
+      upload_tensor(graph.graph, input.id, encode_floats(values));
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.graph.get()); }),
+            "run mapped-readback calibration");
+      if (read_tensor(graph.graph, output.id, TensorReadback::MappedHost) !=
+          encode_floats(expected)) {
+        throw std::runtime_error("mapped device output differs from exact FP16 reference");
+      }
+      std::cout << "PASS: mapped readback rank=" << shape.size() << " bytes=" << spec.bytes()
+                << " iteration=" << iteration << std::endl;
+    }
+    graph.graph.close();
+  }
+  if (context.memory().live(true) || context.memory().live(false)) {
+    throw std::runtime_error("mapped-readback calibration retained application tensor storage");
+  }
+}
 } // namespace
 
 int main(int argc, char **argv) {
   // Reject unknown modes before opening the device; never fall back to FCL.
   const std::string mode = argc > 2 ? argv[2] : "";
-  const bool collection =
-      mode == "ffn-full" || mode == "ffn-linear" || mode == "ffn-linear-fc1-split2";
-  if ((collection && argc != 5) ||
-      (!collection && (argc != 3 || (mode != "fcl" && mode != "matmul-add")))) {
-    std::cerr << "usage: np101_projection_check OUTPUT fcl|matmul-add\n"
+  const bool batched = mode == "ffn-linear-batched";
+  const bool collection = mode == "ffn-full" || mode == "ffn-linear" ||
+                          mode == "ffn-linear-fc1-split2" || mode == "ffn-linear-fc1-split4" ||
+                          mode == "ffn-linear-shared-weights" || batched;
+  if ((collection && argc != (batched ? 6 : 5)) ||
+      (!collection &&
+       (argc != 3 || (mode != "fcl" && mode != "matmul-add" && mode != "mapped-readback")))) {
+    std::cerr << "usage: np101_projection_check OUTPUT fcl|matmul-add|mapped-readback\n"
                  "   or: np101_projection_check OUTPUT "
-                 "ffn-full|ffn-linear|ffn-linear-fc1-split2 "
-                 "DEPLOYMENT FIXTURE\n";
+                 "ffn-full|ffn-linear|ffn-linear-fc1-split2|ffn-linear-fc1-split4|"
+                 "ffn-linear-shared-weights DEPLOYMENT FIXTURE\n"
+                 "   or: np101_projection_check OUTPUT ffn-linear-batched DEPLOYMENT FIXTURE "
+                 "4|8|16\n";
     return 2;
   }
   if (collection) {
     try {
-      const FfnFixture fixture(argv[3], argv[4], mode == "ffn-full");
+      unsigned rows = 1;
+      if (batched) {
+        const std::string value = argv[5];
+        if (value != "4" && value != "8" && value != "16") {
+          throw std::invalid_argument("batched FFN input rows must be 4, 8 or 16");
+        }
+        rows = static_cast<unsigned>(std::stoul(value));
+      }
+      const FfnFixture fixture(argv[3], argv[4], mode == "ffn-full", rows);
       return run_test(argv[1], [&] { check_ffn_collection(argv[1], fixture, mode); });
     } catch (const std::exception &error) {
       std::cerr << "FAIL: " << error.what() << '\n';
@@ -326,7 +382,11 @@ int main(int argc, char **argv) {
   return run_test(argv[1], [&] {
     std::cout << "Requested mode: " << argv[2] << '\n';
     Context context;
-    check_projection(context, std::string(argv[2]) == "fcl");
+    if (mode == "mapped-readback") {
+      check_mapped_readback(context);
+    } else {
+      check_projection(context, mode == "fcl");
+    }
     context.close();
   });
 }

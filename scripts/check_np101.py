@@ -19,6 +19,7 @@ def parse_args():
     for name in (
         "recovery",
         "conv",
+        "vendor-conv",
         "lookup",
         "projection",
         "sampling",
@@ -31,7 +32,7 @@ def parse_args():
     ):
         case = cases.add_parser(name)
         add_run_arguments(case)
-        if name in ("conv", "recovery"):
+        if name in ("conv", "vendor-conv", "recovery"):
             case.add_argument(
                 "--cold-restarted", action="store_true", help="confirm host and NP101 cold restart"
             )
@@ -43,7 +44,9 @@ def parse_args():
         elif name == "lookup":
             case.add_argument("--operator", choices=("gather", "embedding"), required=True)
         elif name == "projection":
-            case.add_argument("--operator", choices=("matmul-add", "fcl"), required=True)
+            case.add_argument(
+                "--operator", choices=("matmul-add", "fcl", "mapped-readback"), required=True
+            )
         elif name == "fp16-preservation":
             case.add_argument("--operator", choices=("add", "select"), required=True)
         elif name == "sampling":
@@ -53,7 +56,7 @@ def parse_args():
         elif name == "cache-append":
             case.add_argument("--rank", type=int, choices=(2, 3), required=True)
     args = parser.parse_args()
-    if args.case in ("conv", "recovery") and (
+    if args.case in ("conv", "vendor-conv", "recovery") and (
         args.sdk_timing or args.trace_driver or args.trace_verify
     ):
         parser.error(
@@ -69,7 +72,7 @@ def parse_args():
 def main():
     args = parse_args()
     output = args.output.resolve()
-    if args.case in ("conv", "recovery"):
+    if args.case in ("conv", "vendor-conv", "recovery"):
         from specferry.validation.recovery_controls import run_controls
 
         return run_controls(output, args, include_llm=args.case == "recovery")

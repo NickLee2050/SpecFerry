@@ -456,8 +456,8 @@ def prepare(
     cache_layer_range=None,
     request_tokens=None,
 ):
-    if type(prefill_block) is not int or prefill_block not in (1, 4):
-        raise ValueError("prefill block must be 1 or 4")
+    if type(prefill_block) is not int or prefill_block not in (1, 4, 8, 16):
+        raise ValueError("prefill block must be 1, 4, 8 or 16")
     if request["capacity"] % prefill_block:
         raise ValueError("capacity must be divisible by prefill block")
     model, _ = load_model(checkpoint)
@@ -562,11 +562,12 @@ def evaluate(
     prefill_head_policy=None,
     cache_readback="none",
     cache_layer_range=None,
+    readback_transport=None,
 ):
     cache_layers = generation_cache_layers(cache_readback, metadata["layers"], cache_layer_range)
     read_logits = cache_readback == "logits"
-    if type(block) is not int or block not in (1, 4):
-        raise ValueError("prefill block must be 1 or 4")
+    if type(block) is not int or block not in (1, 4, 8, 16):
+        raise ValueError("prefill block must be 1, 4, 8 or 16")
     if decoder_group_size is not None and (
         type(decoder_group_size) is not int or decoder_group_size not in (1, 2)
     ):
@@ -614,11 +615,11 @@ def evaluate(
                 checks[field] = type(native_run.get(field)) is int and native_run[field] == expected
     block_prefill = block != 1
     if block_prefill and (
-        block != 4
-        or variant not in ("merged-kv", "merged-kv-fc1-split2")
-        or decoder_group_size not in (None, 1)
+        variant not in ("merged-kv", "merged-kv-fc1-split2") or decoder_group_size not in (None, 1)
     ):
-        raise ValueError("partitioned block 4 requires a shared merged-kv variant and group 1")
+        raise ValueError(
+            "partitioned block prefill requires a shared merged-kv variant and group 1"
+        )
     if block_prefill and metadata["capacity"] % block:
         raise ValueError("capacity must be divisible by prefill block")
     if block_prefill or "prefill_block" in metadata:
@@ -645,6 +646,12 @@ def evaluate(
             and reset_uploads_per_request == expected_reset
         )
     expected_options = {}
+    if readback_transport is not None:
+        if readback_transport not in ("sdk", "mapped"):
+            raise ValueError("unknown diagnostic readback transport")
+        if readback_transport == "mapped" and cache_readback == "none":
+            raise ValueError("mapped transport requires diagnostic readback")
+        expected_options["readback_transport"] = readback_transport
     if decoder_group_size is not None:
         expected_options["decoder_group_size"] = decoder_group_size
     if prefill_head_policy is not None:
@@ -811,7 +818,7 @@ def evaluate_benchmark(
     prefill_head_policy,
 ):
     """Validate every resident repetition without requesting diagnostic tensor readback."""
-    if block not in (1, 4) or not 0 <= warmups <= 5 or not 1 <= repeats <= 20:
+    if block not in (1, 4, 8, 16) or not 0 <= warmups <= 5 or not 1 <= repeats <= 20:
         raise ValueError("invalid resident benchmark counts or prefill block")
     if prefill_head_policy not in ("every-token", "last-token"):
         raise ValueError("invalid prefill head policy")

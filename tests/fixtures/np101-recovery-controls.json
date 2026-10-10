@@ -1,4 +1,8 @@
 {
+  "convolution_binary": ".cache/runs/retired-convolution-control-20261008/np101_conv_relu_pool_test",
+  "convolution_sha256": "e77822ba009fe29bd0c1279a98ea3125a619a6b1cb5d318a5ec8bfcaec55862f",
+  "convolution_source": ".cache/runs/retired-convolution-control-20261008/conv_relu_pool_test.cpp",
+  "convolution_source_sha256": "e431df1071d1ba76f51f049781cf6b1bdbc2717fe4bca1090761642c4427c68d",
   "vendor_binary": "demo/op_demo_conv_relu_pool",
   "vendor_sha256": "d51a13abb7f82594bbe3bc889ff9bf958690d6e028c9185ad751bb9b79174a9a",
   "component_binary": ".cache/runs/validated-opt-component-baseline-20261001/bin/specferry_opt_generate",

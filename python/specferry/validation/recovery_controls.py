@@ -1,6 +1,7 @@
 """Recovery controls use frozen successful workloads, without SDK instrumentation."""
 
 import json
+import math
 import os
 import re
 import shutil
@@ -29,10 +30,14 @@ FAULT = re.compile(
 )
 
 
-def controls(include_llm, output):
+def controls(include_llm, output, *, vendor=False):
     """Reject changed/missing controls before opening the device; never silently rebuild."""
     pinned = json.loads((ROOT / "tests/fixtures/np101-recovery-controls.json").read_text())
-    paths = {ROOT / pinned["vendor_binary"]: pinned["vendor_sha256"]}
+    prefix = "vendor" if vendor else "convolution"
+    binary = ROOT / pinned[prefix + "_binary"]
+    paths = {binary: pinned[prefix + "_sha256"]}
+    if not vendor:
+        paths[ROOT / pinned["convolution_source"]] = pinned["convolution_source_sha256"]
     if include_llm:
         paths[ROOT / pinned["component_binary"]] = pinned["component_sha256"]
         paths[ROOT / pinned["deployment"] / "deployment-manifest.json"] = pinned[
@@ -48,7 +53,7 @@ def controls(include_llm, output):
     for path, digest in paths.items():
         if sha256(path) != digest:
             raise ValueError(f"Recovery control requires the frozen successful file: {path}")
-    result = [("vendor-conv", ROOT / pinned["vendor_binary"], [], 60)]
+    result = [("vendor-conv" if vendor else "repository-conv", binary, [], 60)]
     if include_llm:
         device = output / "old-component/device"
         result.append(
@@ -93,6 +98,19 @@ def healthy(record):
 
 
 def numerical_check(name, device):
+    if name == "repository-conv":
+        log = (device / "sdk.log").read_text()
+        passes = re.findall(r"^PASS iteration=(\d+) max_abs_error=(\S+)$", log, re.M)
+        try:
+            return (
+                [index for index, _ in passes] == ["0", "1"]
+                and all(
+                    math.isfinite(float(error)) and 0 <= float(error) <= 0.1 for _, error in passes
+                )
+                and log.rstrip().endswith("Completed; graph/context released")
+            )
+        except ValueError:
+            return False
     if name == "vendor-conv":
         match = re.search(
             r"total=64 mismatches=0 max_abs_err=([\d.eE+-]+)", (device / "sdk.log").read_text()
@@ -131,7 +149,7 @@ def recovery_record(output, name, evidence, postflight):
 
 
 def run_controls(output, options, include_llm):
-    selected = controls(include_llm, output)
+    selected = controls(include_llm, output, vendor=options.case == "vendor-conv")
     if options.prepare_only:
         for name, binary, arguments, deadline in selected:
             print(name, "deadline", options.timeout or deadline, "command:", binary, *arguments)
@@ -175,8 +193,6 @@ def run_controls(output, options, include_llm):
                 raise
             execution_pass = clean_execution(evidence)
             gate_pass = execution_pass and healthy(immediate) and healthy(postflight)
-            if not gate_pass:
-                recovery_record(directory, name, evidence, postflight)
             report = {"control": name, "execution": evidence, "health_pass": gate_pass}
             try:
                 report["numerical_pass"] = execution_pass and numerical_check(
@@ -186,6 +202,8 @@ def run_controls(output, options, include_llm):
                 report["numerical_pass"] = False
             reports.append(report)
             passed = gate_pass and report["numerical_pass"]
+            if not passed:
+                recovery_record(directory, name, evidence, postflight)
             write_json(
                 output / "result.json",
                 {"status": "passed" if passed else "failed", "controls": reports},

@@ -44,6 +44,16 @@ def generation(*, consumed=8, total=13, tokens=None):
 
 
 class PerformanceSummaryTests(unittest.TestCase):
+    def test_mapping_timings_are_explicit_io_outside_graph_time(self):
+        rows = [
+            row("prefill", "vsi_nn_RunGraph", 4),
+            row("prefill", "vxMapTensorPatch", 0.1),
+            row("prefill", "vxUnmapTensorPatch", 0.2),
+        ]
+        sample = summarize_request(rows, "measured.0", generation(consumed=5, tokens=[21]), 5)
+        self.assertEqual(sample["graph_total_seconds"], 4)
+        self.assertAlmostEqual(sample["io_seconds_by_phase"]["prefill"], 0.3)
+
     def test_zero_generation_has_no_graph_metrics_but_partial_prompt_is_rejected(self):
         script = Path(__file__).resolve().parents[2] / "scripts/generate_opt.py"
         summarize_graph_metrics = runpy.run_path(str(script))["summarize_graph_metrics"]
@@ -102,6 +112,8 @@ class PerformanceSummaryTests(unittest.TestCase):
         self.assertEqual(result["graph_decode_ms_per_token"], 2000)
         self.assertEqual(result["graph_decode_tokens_per_second"], 0.5)
         self.assertEqual(result["graph_prefill_ms_per_input"], 800)
+        self.assertAlmostEqual(result["wall_output_tokens_per_second"], 4 / 13)
+        self.assertAlmostEqual(result["wall_decode_tokens_per_second"], 3 / (13 - 4.6))
         self.assertEqual(result["reset_seconds"], 1000)
         self.assertEqual(result["accounted_generation_sdk_seconds"], 12)
         self.assertEqual(result["unattributed_generation_seconds"], 1)
@@ -162,6 +174,8 @@ class PerformanceSummaryTests(unittest.TestCase):
         self.assertEqual(sample["decode_steps"], 0)
         self.assertIsNone(sample["graph_decode_ms_per_token"])
         self.assertIsNone(sample["graph_decode_tokens_per_second"])
+        self.assertEqual(sample["wall_output_tokens_per_second"], 1 / 5)
+        self.assertIsNone(sample["wall_decode_tokens_per_second"])
         self.assertFalse(sample["tokens_match_expected"])
         samples = [sample, sample | {"graph_total_seconds": 6}]
         summary = summarize_runs(samples)

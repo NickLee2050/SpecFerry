@@ -64,9 +64,6 @@ Tensor GraphBuilder::weight(const WeightStore &store, const WeightRecord &record
 
 Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &record,
                                   TensorSpec spec, std::size_t offset, WeightStorage storage) {
-  if (spec.type != record.spec.type) {
-    throw std::invalid_argument("weight chunk changes dtype");
-  }
   if (storage == WeightStorage::Default) {
     storage = weight_storage_;
   }
@@ -78,7 +75,7 @@ Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &
     id = weights_->bind(graph, store, record, spec, offset);
   } else if (storage == WeightStorage::LocalConst || storage == WeightStorage::LocalMutable) {
     id = add_tensor(graph, spec, storage == WeightStorage::LocalConst,
-                    store.read(record, offset, spec.bytes()));
+                    prepare_weight_chunk(store, record, spec, offset));
   } else {
     throw std::invalid_argument("unknown weight storage policy");
   }
@@ -335,49 +332,47 @@ Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned 
 }
 
 Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                            const WeightRecord &bias, bool split_output_channels) {
+                            const WeightRecord &bias, unsigned output_parts) {
   if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
       matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
       matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
       bias.spec.shape != Shape{matrix.spec.shape[1]}) {
     throw std::invalid_argument("linear requires FP16 [K,tokens], weight [K,N], bias [N]");
   }
-  if (split_output_channels && (!matrix.spec.shape[1] || matrix.spec.shape[1] % 2)) {
-    throw std::invalid_argument("split linear requires an even positive output width");
+  if (!output_parts || !matrix.spec.shape[1] || matrix.spec.shape[1] % output_parts) {
+    throw std::invalid_argument("linear output parts must evenly divide the positive output width");
   }
   // The installed SDK crashes while verifying even an isolated biased FCL.
   // Use documented MatMul/Add; FP16 projection rounds before the bias addition.
   // Keep this boundary visible in the independent model-level comparisons.
   const auto projected = [&] {
-    if (!split_output_channels) {
+    if (output_parts == 1) {
       return project(input, store, matrix);
     }
-    const auto half_rows = matrix.spec.shape[1] / 2;
-    const TensorSpec half_spec{f16, {matrix.spec.shape[0], half_rows}};
-    const auto first = weight_chunk(store, matrix, half_spec, 0);
-    const auto second = weight_chunk(store, matrix, half_spec, half_spec.bytes());
-    const Shape output{half_rows, input.spec.shape[1]};
+    const auto rows = matrix.spec.shape[1] / output_parts;
+    const TensorSpec chunk_spec{f16, {matrix.spec.shape[0], rows}};
+    const Shape output{rows, input.spec.shape[1]};
     // SDK axis zero is contiguous: these chunks cover consecutive output channels.
-    return concat(matmul(input, first, output, false, true),
-                  matmul(input, second, output, false, true));
+    auto projected = matmul(input, weight_chunk(store, matrix, chunk_spec, 0), output, false, true);
+    for (unsigned part = 1; part < output_parts; ++part) {
+      const auto chunk = weight_chunk(store, matrix, chunk_spec, part * chunk_spec.bytes());
+      projected = concat(projected, matmul(input, chunk, output, false, true));
+    }
+    return projected;
   }();
   return binary(VSI_NN_OP_ADD, projected, weight(store, bias, bias.spec));
 }
 
 Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {
   if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
-      scale.spec.type != f16 || bias.spec.type != f16 ||
-      scale.spec.shape != Shape{input.spec.shape[0]} || bias.spec.shape != scale.spec.shape) {
-    throw std::invalid_argument("layer norm requires FP16 [width,tokens] and affine vectors");
+      scale.spec.type != f32 || bias.spec.type != f32 ||
+      scale.spec.shape != Shape{input.spec.shape[0], 1} || bias.spec.shape != scale.spec.shape) {
+    throw std::invalid_argument("layer norm requires FP16 [width,tokens], FP32 [width,1] affine");
   }
   auto values = convert(input, f32);
   auto centered = binary(VSI_NN_OP_SUBTRACT, values, reduce(values, true));
   auto normalized = normalize(centered, true, epsilon);
-  const Shape affine_shape{input.spec.shape[0], 1};
-  auto multiplier = reshape(convert(scale, f32), affine_shape);
-  auto offset = reshape(convert(bias, f32), affine_shape);
-  return convert(binary(VSI_NN_OP_ADD, binary(VSI_NN_OP_MULTIPLY, normalized, multiplier), offset),
-                 f16);
+  return convert(binary(VSI_NN_OP_ADD, binary(VSI_NN_OP_MULTIPLY, normalized, scale), bias), f16);
 }
 
 Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float scale_offset,

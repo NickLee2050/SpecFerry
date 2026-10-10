@@ -21,6 +21,7 @@ struct RunOptions {
   unsigned block = 1, decoder_group_size = 1, cache_first = 0, cache_last = 0;
   bool sampling = false, benchmark = false, lifecycle = false;
   std::string variant = "merged-kv", prefill_head = "every-token", readback = "none";
+  std::string readback_transport = "sdk";
 };
 
 // Each CLI consumes its own keys, then rejects leftovers before initializing the SDK.
@@ -87,25 +88,29 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
   result.sampling = settings.contains("seed");
   result.seed = settings.number("seed", 0, 0, std::numeric_limits<unsigned>::max());
   if (graph) {
-    result.block = settings.number("block", 1, 1, 4);
+    result.block = settings.number("block", 1, 1, 16);
     result.decoder_group_size = settings.number("decoder_group_size", 1, 1, 2);
     result.variant = settings.text("variant", "merged-kv");
     result.prefill_head = settings.text("prefill_head", "every-token");
     result.readback = settings.text("readback", "none");
+    result.readback_transport = settings.text("readback_transport", "sdk");
     result.cache_first = settings.number("cache_first_layer", 0, 0, 32);
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
-    if (result.sampling || (result.block != 1 && result.block != 4) ||
+    if (result.sampling ||
+        (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
         (result.prefill_head != "every-token" && result.prefill_head != "last-token") ||
         (result.readback != "none" && result.readback != "logits" && result.readback != "kv") ||
+        (result.readback_transport != "sdk" && result.readback_transport != "mapped") ||
+        (result.readback_transport == "mapped" && result.readback == "none") ||
         ((result.readback == "kv") != (result.cache_first && result.cache_last)) ||
         (result.readback != "kv" && (result.cache_first || result.cache_last)) ||
         result.cache_first > result.cache_last ||
         (result.benchmark && (result.lifecycle || result.readback != "none")) ||
         (result.lifecycle && result.readback != "logits") ||
         (!result.benchmark && (result.warmups || result.repeats != 1)) ||
-        (result.block == 4 &&
+        (result.block != 1 &&
          ((result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2") ||
           result.decoder_group_size != 1))) {
       throw std::invalid_argument("unsupported graph run options");

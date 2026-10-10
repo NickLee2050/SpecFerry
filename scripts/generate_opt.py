@@ -73,6 +73,11 @@ def main():
         help="graph diagnostics: none (default), final logits, or selected KV",
     )
     parser.add_argument(
+        "--readback-transport",
+        choices=("sdk", "mapped"),
+        help="explicit graph diagnostic transfer path; mapped requires board calibration",
+    )
+    parser.add_argument(
         "--cache-layer-range",
         nargs=2,
         type=int,
@@ -101,7 +106,7 @@ def main():
         ),
         help="explicit partitioned graph diagnostic variant (default: merged-kv)",
     )
-    parser.add_argument("--block", type=int, choices=(1, 4), default=1)
+    parser.add_argument("--block", type=int, choices=(1, 4, 8, 16), default=1)
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/opt-350m")
     parser.add_argument("--checkpoint", type=Path, default=ROOT / ".cache/models/facebook/opt-350m")
     parser.add_argument("--output", type=Path, required=True)
@@ -115,6 +120,7 @@ def main():
             args.prefill_head,
             args.variant,
             args.cache_readback,
+            args.readback_transport,
             args.cache_layer_range,
         )
     ):
@@ -129,6 +135,9 @@ def main():
     args.prefill_head = args.prefill_head or "every-token"
     args.variant = args.variant or "merged-kv"
     args.cache_readback = args.cache_readback or "none"
+    args.readback_transport = args.readback_transport or "sdk"
+    if args.readback_transport == "mapped" and args.cache_readback == "none":
+        parser.error("mapped transport requires logits or KV diagnostic readback")
     if args.benchmark and args.cache_readback != "none":
         parser.error("benchmark requires --cache-readback none")
     if args.lifecycle_check and args.cache_readback != "logits":
@@ -153,11 +162,12 @@ def main():
             parser.error("graph warmups/repeats require --benchmark")
     if args.backend == "graph":
         if args.block != 1 and (
-            args.block != 4
-            or args.variant not in ("merged-kv", "merged-kv-fc1-split2")
+            args.variant not in ("merged-kv", "merged-kv-fc1-split2")
             or args.decoder_group_size != 1
         ):
-            parser.error("partitioned block 4 requires a shared merged-kv variant and group 1")
+            parser.error(
+                "partitioned block prefill requires a shared merged-kv variant and group 1"
+            )
     if args.graph_layers is not None and (args.backend != "graph" or args.graph_layers <= 0):
         parser.error("--graph-layers requires a positive count and partitioned graph mode")
     if args.sample and args.compare_cpu:
@@ -221,6 +231,7 @@ def main():
             decoder_group_size=args.decoder_group_size,
             prefill_head=args.prefill_head,
             readback=args.cache_readback,
+            readback_transport=args.readback_transport,
             benchmark=int(args.benchmark),
             lifecycle=int(args.lifecycle_check),
         )
@@ -291,6 +302,7 @@ def main():
                 prefill_head_policy=args.prefill_head,
                 cache_readback=args.cache_readback,
                 cache_layer_range=args.cache_layer_range,
+                readback_transport=args.readback_transport,
             )
             checks.update({f"cycle.{cycle}.{key}": value for key, value in cycle_checks.items()})
             runs.extend(cycle_runs)
@@ -349,6 +361,7 @@ def main():
         "validation_scope": (
             {
                 "cache_readback": args.cache_readback,
+                "readback_transport": args.readback_transport,
                 "tokens_checked": True,
                 "kv_checks_requested": args.cache_readback == "kv",
                 "cache_layer_range": args.cache_layer_range,

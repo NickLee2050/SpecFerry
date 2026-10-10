@@ -22,7 +22,14 @@ SUMMARY_COLUMNS = (
 COUNT_COLUMNS = ("count", "completed", "exceptions", "nested_count")
 SECONDS_COLUMNS = ("total_seconds", "min_seconds", "max_seconds")
 GRAPH_APIS = frozenset(("vsi_nn_RunGraph", "vxProcessGraph"))
-IO_APIS = frozenset(("vsi_nn_CopyDataToTensor", "vsi_nn_ConvertTensorToData"))
+IO_APIS = frozenset(
+    (
+        "vsi_nn_CopyDataToTensor",
+        "vsi_nn_ConvertTensorToData",
+        "vxMapTensorPatch",
+        "vxUnmapTensorPatch",
+    )
+)
 VERIFY_APIS = frozenset(("vsi_nn_VerifyGraph", "vxVerifyGraph"))
 SETUP_APIS = frozenset(("vsi_nn_SetupGraph",))
 COMPILATION_APIS = VERIFY_APIS | SETUP_APIS
@@ -92,6 +99,8 @@ def summarize_request(rows, request_name, generation, prompt_length, expected_to
     timer nesting. A mixed aggregate containing both nested and outer calls cannot
     be separated from this TSV, so the entire row is omitted and reported as a risk.
     Reset precedes the generation wall timer and is always accounted separately.
+    Wall output rates count generated tokens, including the first output for the request
+    rate and excluding it for the decode rate; input processing is a separate metric.
     """
     if type(prompt_length) is not int or prompt_length < 1:
         raise ValueError("prompt_length must be a positive integer")
@@ -225,6 +234,14 @@ def summarize_request(rows, request_name, generation, prompt_length, expected_to
         "wall_first_token_seconds": wall["first_token_seconds"],
         "wall_total_seconds": wall["total_seconds"],
         "wall_decode_seconds": wall["total_seconds"] - wall["first_token_seconds"],
+        # First output is produced by prefill; request throughput counts every output.
+        "wall_output_tokens_per_second": len(tokens) / wall["total_seconds"]
+        if tokens and wall["total_seconds"]
+        else None,
+        "wall_decode_tokens_per_second": (len(tokens) - 1)
+        / (wall["total_seconds"] - wall["first_token_seconds"])
+        if len(tokens) > 1 and wall["total_seconds"] > wall["first_token_seconds"]
+        else None,
         "accounted_generation_sdk_seconds": accounted,
         "unattributed_generation_seconds": residual,
         "unattributed_scope": "unmeasured CPU work and SDK boundaries; not device stall time",
@@ -257,6 +274,8 @@ def summarize_runs(samples):
         "wall_first_token_seconds",
         "wall_total_seconds",
         "wall_decode_seconds",
+        "wall_output_tokens_per_second",
+        "wall_decode_tokens_per_second",
         "accounted_generation_sdk_seconds",
         "unattributed_generation_seconds",
     )

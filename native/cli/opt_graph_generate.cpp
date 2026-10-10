@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,10 @@ struct CpuSnapshot {
   rusage main_thread{};
 };
 
+struct CpuPhaseBoundaries {
+  std::optional<CpuSnapshot> prefill, decode;
+};
+
 CpuSnapshot read_cpu_snapshot() {
   CpuSnapshot snapshot;
   if (getrusage(RUSAGE_SELF, &snapshot.process) ||
@@ -68,6 +73,13 @@ CpuUsage cpu_usage_between(const CpuSnapshot &before, const CpuSnapshot &after) 
           elapsed_cpu_seconds(before.process.ru_stime, after.process.ru_stime),
           elapsed_cpu_seconds(before.main_thread.ru_utime, after.main_thread.ru_utime),
           elapsed_cpu_seconds(before.main_thread.ru_stime, after.main_thread.ru_stime)};
+}
+
+void write_cpu_usage(std::ostream &out, CpuUsage usage) {
+  out << std::setprecision(17) << "{\"process_user_seconds\":" << usage.process_user_seconds
+      << ",\"process_system_seconds\":" << usage.process_system_seconds
+      << ",\"main_thread_user_seconds\":" << usage.main_thread_user_seconds
+      << ",\"main_thread_system_seconds\":" << usage.main_thread_system_seconds << '}';
 }
 
 struct BenchmarkRun {
@@ -201,7 +213,9 @@ void progress(const fs::path &directory, const std::string &phase, const char *s
 void save_generation(const fs::path &path, const inference::Generation &result,
                      std::size_t launches, np101::TensorTransfers before,
                      np101::TensorTransfers after, unsigned prefill_block, ExecutionCounts counts,
-                     CpuUsage cpu_usage) {
+                     const CpuSnapshot &cpu_before, const CpuSnapshot &cpu_after,
+                     const CpuPhaseBoundaries &boundaries) {
+  const auto cpu_usage = cpu_usage_between(cpu_before, cpu_after);
   std::ofstream out(path);
   out << '{';
   inference::write_generation(out, result);
@@ -214,7 +228,17 @@ void save_generation(const fs::path &path, const inference::Generation &result,
       << std::setprecision(17) << ",\"process_user_cpu_seconds\":" << cpu_usage.process_user_seconds
       << ",\"process_system_cpu_seconds\":" << cpu_usage.process_system_seconds
       << ",\"main_thread_user_cpu_seconds\":" << cpu_usage.main_thread_user_seconds
-      << ",\"main_thread_system_cpu_seconds\":" << cpu_usage.main_thread_system_seconds << "}\n";
+      << ",\"main_thread_system_cpu_seconds\":" << cpu_usage.main_thread_system_seconds
+      << ",\"cpu_phases\":{\"reset\":";
+  write_cpu_usage(out, cpu_usage_between(cpu_before, boundaries.prefill.value_or(cpu_after)));
+  out << ",\"prefill\":";
+  write_cpu_usage(out, boundaries.prefill ? cpu_usage_between(*boundaries.prefill,
+                                                              boundaries.decode.value_or(cpu_after))
+                                          : CpuUsage{});
+  out << ",\"decode\":";
+  write_cpu_usage(out, boundaries.decode ? cpu_usage_between(*boundaries.decode, cpu_after)
+                                         : CpuUsage{});
+  out << "}}\n";
   if (!out) {
     throw std::runtime_error("cannot save experimental generation");
   }
@@ -229,6 +253,10 @@ int main(int argc, char **argv) {
   const fs::path root(argv[3]);
   auto directory = root;
   try {
+    const auto *preload_setting = std::getenv("SPECFERRY_VERIFY_WEIGHT_PRELOAD");
+    if (preload_setting && std::string(preload_setting) != "1") {
+      throw std::invalid_argument("weight preload diagnostic setting must be 1 or unset");
+    }
     const auto options = inference::read_run_options(argv[2], true);
     const auto benchmark = options.benchmark, lifecycle_check = options.lifecycle;
     const auto warmups = options.warmups, repeats = options.repeats;
@@ -238,6 +266,9 @@ int main(int argc, char **argv) {
     }
     const auto block = options.block, maximum = options.maximum;
     const auto &readback = options.readback;
+    const auto readback_method = options.readback_transport == "mapped"
+                                     ? np101::TensorReadback::MappedHost
+                                     : np101::TensorReadback::SdkCopy;
     const auto &variant_name = options.variant;
     const auto variant = parse_variant(variant_name);
     const auto decoder_group_size = options.decoder_group_size;
@@ -281,12 +312,19 @@ int main(int argc, char **argv) {
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
+      if (preload_setting) {
+        progress(directory, "weight-preload");
+        np101::SdkScope preload_scope("phase", "weight-preload");
+        std::ofstream report(directory / "weight-preload.tsv");
+        model.verify_weight_preload(report);
+      }
       {
         std::ofstream initialized(directory / "initialization.json");
         initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
                     << ",\"weight_payload_bytes\":" << weight_bytes << ",\"variant\":\""
                     << variant_name << "\",\"decoder_group_size\":" << decoder_group_size
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
+                    << ",\"readback_transport\":\"" << options.readback_transport << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
                     << ",\"decode_steps\":" << model.decode_steps()
                     << ",\"prefill_steps\":" << model.prefill_steps()
@@ -319,19 +357,26 @@ int main(int argc, char **argv) {
           const auto launches = model.launches();
           const auto counts_before = execution_counts(model);
           const auto cpu_before = read_cpu_snapshot();
-          const auto result = model.generate(requests[index], maximum);
+          CpuPhaseBoundaries boundaries;
+          const auto result = model.generate(requests[index], maximum, [&](auto phase) {
+            if (phase == inference::GenerationPhase::Prefill) {
+              boundaries.prefill = read_cpu_snapshot();
+            } else if (phase == inference::GenerationPhase::Decode) {
+              boundaries.decode = read_cpu_snapshot();
+            }
+          });
           const auto cpu_after = read_cpu_snapshot();
           const auto completed = model.launches();
           const auto request_counts = execution_counts(model, counts_before);
           save_generation(directory / (name + ".json"), result, completed - launches, before,
-                          np101::tensor_transfers(), block, request_counts,
-                          cpu_usage_between(cpu_before, cpu_after));
+                          np101::tensor_transfers(), block, request_counts, cpu_before, cpu_after,
+                          boundaries);
           // Diagnostics run after generation, outside its transfer/time contract.
           {
             np101::SdkScope diagnostic_scope("phase", "diagnostic");
             const auto diagnostic_before = np101::tensor_transfers();
             if (readback == "logits") {
-              const auto logits = model.read_output("logits");
+              const auto logits = model.read_output("logits", readback_method);
               save_diagnostic(directory / (name + ".logits.bin"), logits,
                               "cannot save final logits diagnostic");
             }
@@ -343,7 +388,7 @@ int main(int argc, char **argv) {
             if (readback == "kv") {
               for (unsigned layer = cache_first - 1; layer < cache_last; ++layer) {
                 for (bool values : {false, true}) {
-                  auto bytes = model.read_cache(layer, values);
+                  auto bytes = model.read_cache(layer, values, readback_method);
                   const auto head_dimension = config.decoder.kv_spec().head_dim;
                   const auto row_bytes = std::size_t(head_dimension) * 2;
                   const auto head_bytes = row_bytes * config.decoder.capacity;
@@ -438,6 +483,7 @@ int main(int argc, char **argv) {
           << ",\"cache_suffix_checked_bytes\":" << cache_suffix_checked_bytes
           << ",\"cache_suffix_matches\":" << (cache_suffix_matches ? "true" : "false")
           << ",\"cache_readback\":\"" << readback << "\""
+          << ",\"readback_transport\":\"" << options.readback_transport << "\""
           << ",\"cache_first_layer\":" << cache_first << ",\"cache_last_layer\":" << cache_last
           << ",\"diagnostic_reads\":" << diagnostic_transfers.reads
           << ",\"diagnostic_read_bytes\":" << diagnostic_transfers.read_bytes

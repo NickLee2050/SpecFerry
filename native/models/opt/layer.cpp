@@ -2,6 +2,7 @@
 #include "vsi_nn_pub.h"
 
 #include <cmath>
+#include <stdexcept>
 
 namespace specferry::models::opt {
 using namespace np101;
@@ -13,14 +14,21 @@ constexpr auto f16 = DataType::Float16;
 Tensor linear(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
               bool split_output_channels = false) {
   return g.linear(input, weights, weights.find(name + ".weight"), weights.find(name + ".bias"),
-                  split_output_channels);
+                  split_output_channels ? 2u : 1u);
 }
 
 Tensor norm(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
             float epsilon) {
-  const TensorSpec spec{f16, {input.spec.shape[0]}};
-  auto scale = g.weight(weights, weights.find(name + ".weight"), spec);
-  auto bias = g.weight(weights, weights.find(name + ".bias"), spec);
+  const auto width = input.spec.shape[0];
+  const auto affine = [&](const std::string &suffix) {
+    const auto &record = weights.find(name + suffix);
+    if (record.spec.type != f16 || record.spec.shape != Shape{width}) {
+      throw std::invalid_argument("unexpected OPT layer norm weight: " + record.name);
+    }
+    return g.weight_chunk(weights, record, {DataType::Float32, {width, 1}}, 0);
+  };
+  auto scale = affine(".weight");
+  auto bias = affine(".bias");
   return g.layer_norm(input, scale, bias, epsilon);
 }
 } // namespace
