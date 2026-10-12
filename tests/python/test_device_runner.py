@@ -94,7 +94,7 @@ class DeviceRecoveryTests(unittest.TestCase):
                 device.require_recovered_device(root)
             self.assertTrue(marker.exists())
 
-    def test_reboot_clears_old_marker_even_if_a_pid_is_reused(self):
+    def test_reboot_preserves_gate_until_pinned_controls_pass(self):
         fields = Path("/proc/self/stat").read_text().rpartition(")")[2].split()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -104,8 +104,9 @@ class DeviceRecoveryTests(unittest.TestCase):
                 namespace="old namespace",
                 boot_id="previous boot",
             )
-            device.require_recovered_device(root)
-            self.assertFalse(marker.exists())
+            with self.assertRaisesRegex(RuntimeError, "recovery is unverified"):
+                device.require_recovered_device(root)
+            self.assertTrue(marker.exists())
 
     def test_legacy_marker_without_boot_identity_still_blocks(self):
         with tempfile.TemporaryDirectory() as directory:

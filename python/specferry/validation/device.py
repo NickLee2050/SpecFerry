@@ -103,9 +103,10 @@ def require_recovered_device(root: Path) -> None:
             f"confirming device recovery: {marker}"
         ) from error
     if record.get("boot_id") and record["boot_id"] != host_boot_id():
-        # A reboot ends the previous driver's lifetime, even if PIDs are reused.
-        marker.unlink()
-        return
+        raise RuntimeError(
+            "NP101 boot changed, but recovery is unverified; confirm a cold restart and "
+            "pass both pinned recovery controls before another device run"
+        )
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):
         raise RuntimeError(
             f"NP101 recovery must be checked from its original host PID namespace: {marker}"
@@ -128,7 +129,7 @@ def require_recovered_device(root: Path) -> None:
 
 
 @contextmanager
-def device_lock(root: Path):
+def device_lock(root: Path, *, recovery_control=False):
     """Serialize this repository's diagnostics; never block another user's process."""
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".np101-diagnostic.lock").open("a") as lock:
@@ -136,7 +137,9 @@ def device_lock(root: Path):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another SpecFerry device diagnostic is running") from error
-        require_recovered_device(root)
+        # Pinned controls still hold the lock while run_controls validates recovery.
+        if not recovery_control:
+            require_recovered_device(root)
         yield
 
 
@@ -153,9 +156,12 @@ def run_device(
     verify_trace=None,
     require_compiled_operations=False,
     abort_check=None,
+    recovery_control=False,
 ):
     """Call under device_lock. A clean exit is not proof of exclusive NPU execution."""
-    require_recovered_device(RECOVERY_ROOT)
+    # Only run_controls authorizes pinned controls while retaining the closed recovery gate.
+    if not recovery_control:
+        require_recovered_device(RECOVERY_ROOT)
     if require_compiled_operations and verify_trace is None:
         raise ValueError("compiled operation guard requires the pinned Verify trace")
     if timeout <= 0:

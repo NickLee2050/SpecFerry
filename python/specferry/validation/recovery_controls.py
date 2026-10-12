@@ -155,22 +155,33 @@ def run_controls(output, options, include_llm):
             print(name, "deadline", options.timeout or deadline, "command:", binary, *arguments)
         return 0
     output.mkdir(parents=True, exist_ok=False)
-    preflight = snapshot(output / "preflight", options.sudo_read_only)
-    if not healthy(preflight):
-        raise RuntimeError(
-            "Recovery control preflight failed; inspect saved kernel log and ownership"
-        )
     marker = RECOVERY_ROOT / "np101-recovery-required.json"
-    if marker.exists():
-        previous = json.loads(marker.read_text())
-        if not options.cold_restarted or previous.get("boot_id") == host_boot_id():
-            raise RuntimeError(
-                "Confirm host and NP101 cold restart in a new boot before Recovery control"
-            )
-        shutil.copy2(marker, output / "previous-recovery-marker.json")
     reports = []
     # Retain the lock through delayed checks, so no repository test overlaps this gate.
-    with device_lock(RECOVERY_ROOT):
+    with device_lock(RECOVERY_ROOT, recovery_control=True):
+        preflight = snapshot(output / "preflight", options.sudo_read_only)
+        if not healthy(preflight):
+            raise RuntimeError(
+                "Recovery control preflight failed; inspect saved kernel log and ownership"
+            )
+        if marker.exists():
+            previous = json.loads(marker.read_text())
+            if not options.cold_restarted or previous.get("boot_id") == host_boot_id():
+                raise RuntimeError(
+                    "Confirm host and NP101 cold restart in a new boot before Recovery control"
+                )
+            shutil.copy2(marker, output / "previous-recovery-marker.json")
+        if include_llm or marker.exists():
+            write_json(
+                marker,
+                dict(
+                    reason="Pinned recovery controls are incomplete",
+                    boot_id=host_boot_id(),
+                    pid_namespace=os.readlink("/proc/self/ns/pid"),
+                    members=[],
+                    evidence=str(output),
+                ),
+            )
         for name, binary, arguments, deadline in selected:
             directory = output / name
             evidence = run_device(
@@ -182,6 +193,7 @@ def run_controls(output, options, include_llm):
                 abort_check=lambda: bool(
                     snapshot(directory / "monitor", options.sudo_read_only)["faults"]
                 ),
+                recovery_control=True,
             )
             try:
                 immediate = snapshot(directory / "immediate", options.sudo_read_only)
@@ -211,4 +223,6 @@ def run_controls(output, options, include_llm):
             print(f"{name}: {'PASS' if passed else 'FAIL'}", flush=True)
             if not passed:
                 return 1
+        if include_llm:
+            marker.unlink()
     return 0

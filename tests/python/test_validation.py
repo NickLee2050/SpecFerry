@@ -27,6 +27,102 @@ from specferry.validation.arrays import compare_arrays
 
 
 class RecoveryControlTests(unittest.TestCase):
+    def test_only_complete_recovery_clears_an_archived_fault(self):
+        for outcome in ("complete", "conv-only", "interrupted"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                marker = root / "np101-recovery-required.json"
+                original = {"boot_id": "previous-boot", "reason": "previous device fault"}
+                marker.write_text(json.dumps(original))
+                options = SimpleNamespace(
+                    case="recovery",
+                    prepare_only=False,
+                    sudo_read_only=False,
+                    cold_restarted=True,
+                    timeout=None,
+                )
+                selected = [("repository-conv", Path("conv"), [], 60)]
+                if outcome != "conv-only":
+                    selected.append(("old-component", Path("llm"), [], 180))
+
+                def run_control(binary, arguments, output, sdk, deadline, **kwargs):
+                    self.assertTrue(marker.exists())
+                    self.assertTrue(kwargs["recovery_control"])
+                    with self.assertRaisesRegex(RuntimeError, "recovery"):
+                        device_runner.require_recovered_device(root)
+                    with self.assertRaisesRegex(RuntimeError, "another SpecFerry"):
+                        with device_runner.device_lock(root, recovery_control=True):
+                            self.fail("Recovery controls must retain the device lock")
+                    if outcome == "interrupted" and binary.name == "llm":
+                        raise RuntimeError("interrupted before model execution")
+                    output.mkdir(parents=True)
+                    return dict(
+                        returncode=0,
+                        timeout=False,
+                        process_group_exited=True,
+                        remaining_processes=[],
+                        device_recovery_required=False,
+                    )
+
+                with (
+                    patch.object(recovery_controls, "RECOVERY_ROOT", root),
+                    patch.object(recovery_controls, "host_boot_id", return_value="new-boot"),
+                    patch.object(recovery_controls, "controls", return_value=selected),
+                    patch.object(
+                        recovery_controls, "snapshot", return_value=dict(faults=[], owners="")
+                    ),
+                    patch.object(recovery_controls, "run_device", side_effect=run_control),
+                    patch.object(recovery_controls, "numerical_check", return_value=True),
+                    patch.object(recovery_controls.time, "sleep"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if outcome == "interrupted":
+                        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                            recovery_controls.run_controls(root / "output", options, True)
+                    else:
+                        self.assertEqual(
+                            recovery_controls.run_controls(
+                                root / "output", options, outcome == "complete"
+                            ),
+                            0,
+                        )
+                self.assertEqual(marker.exists(), outcome != "complete")
+                self.assertEqual(
+                    json.loads((root / "output/previous-recovery-marker.json").read_text()),
+                    original,
+                )
+
+    def test_recovery_rejects_unconfirmed_or_same_boot_restart(self):
+        for cold_restarted, previous_boot in ((False, "previous-boot"), (True, "new-boot")):
+            with (
+                self.subTest(cold_restarted=cold_restarted, previous_boot=previous_boot),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                marker = root / "np101-recovery-required.json"
+                original = {"boot_id": previous_boot, "reason": "previous device fault"}
+                marker.write_text(json.dumps(original))
+                options = SimpleNamespace(
+                    case="recovery",
+                    prepare_only=False,
+                    sudo_read_only=False,
+                    cold_restarted=cold_restarted,
+                    timeout=None,
+                )
+                with (
+                    patch.object(recovery_controls, "RECOVERY_ROOT", root),
+                    patch.object(recovery_controls, "host_boot_id", return_value="new-boot"),
+                    patch.object(recovery_controls, "controls", return_value=[]),
+                    patch.object(
+                        recovery_controls, "snapshot", return_value=dict(faults=[], owners="")
+                    ),
+                    patch.object(recovery_controls, "run_device") as runner,
+                    self.assertRaisesRegex(RuntimeError, "Confirm host and NP101 cold restart"),
+                ):
+                    recovery_controls.run_controls(root / "output", options, True)
+                runner.assert_not_called()
+                self.assertEqual(json.loads(marker.read_text()), original)
+
     def test_running_child_is_stopped_when_health_monitor_reports_fault(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -98,9 +194,6 @@ class RecoveryControlTests(unittest.TestCase):
                     ],
                 ),
                 patch.object(recovery_controls, "snapshot", side_effect=[healthy, healthy, faulty]),
-                patch.object(
-                    recovery_controls, "device_lock", return_value=contextlib.nullcontext()
-                ),
                 patch.object(recovery_controls, "run_device", side_effect=device_run) as runner,
                 patch.object(recovery_controls, "numerical_check", return_value=True),
                 patch.object(recovery_controls.time, "sleep"),
