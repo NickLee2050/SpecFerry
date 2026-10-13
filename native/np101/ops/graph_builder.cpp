@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -316,9 +317,6 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
   if (!output_parts || !matrix.spec.shape[1] || matrix.spec.shape[1] % output_parts) {
     throw std::invalid_argument("linear output parts must evenly divide the positive output width");
   }
-  // The installed SDK crashes while verifying even an isolated biased FCL.
-  // Use documented MatMul/Add; FP16 projection rounds before the bias addition.
-  // Keep this boundary visible in the independent model-level comparisons.
   const auto projected = [&] {
     if (output_parts == 1) {
       return project(input, store, matrix);
@@ -335,6 +333,66 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
     return projected;
   }();
   return binary(VSI_NN_OP_ADD, projected, weight(store, bias, bias.spec));
+}
+
+std::vector<Tensor> GraphBuilder::compiled(const CompiledGraphSpec &spec,
+                                           const std::vector<Tensor> &inputs) {
+  if (spec.path.empty() || spec.path.find('\0') != std::string::npos ||
+      !std::filesystem::is_regular_file(spec.path) || !std::filesystem::file_size(spec.path)) {
+    throw std::invalid_argument("compiled graph requires a nonempty regular model file");
+  }
+  if (inputs.empty() || inputs.size() != spec.inputs.size() || spec.outputs.empty() ||
+      inputs.size() > std::numeric_limits<std::uint32_t>::max() ||
+      spec.outputs.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("compiled graph port counts disagree");
+  }
+  if (!spec.graph_version[0] || (compiled_version_[0] && compiled_version_ != spec.graph_version)) {
+    throw std::invalid_argument("compiled graph requires one explicit compatible graph version");
+  }
+  for (std::size_t index = 0; index < inputs.size(); ++index) {
+    const auto &expected = spec.inputs[index];
+    expected.bytes();
+    if (inputs[index].spec.type != expected.type || inputs[index].spec.shape != expected.shape ||
+        !vsi_nn_GetTensor(graph.get(), inputs[index].id)) {
+      throw std::invalid_argument("compiled graph input contract mismatch");
+    }
+  }
+  for (const auto &output : spec.outputs) {
+    output.bytes();
+  }
+
+  if (!compiled_version_[0]) {
+    check(vsi_nn_SetGraphVersion(graph.get(), spec.graph_version[0], spec.graph_version[1],
+                                 spec.graph_version[2]),
+          "set compiled graph version");
+    compiled_version_ = spec.graph_version;
+  }
+
+  // Charge known embedded constants before the SDK imports the model. A second
+  // node is charged separately because sharing its internal backing is unproven.
+  graph.reserve_compiled_constants(spec.constant_bytes);
+  compiled_paths_.push_back(std::filesystem::absolute(spec.path).string());
+  std::vector<Tensor> outputs;
+  outputs.reserve(spec.outputs.size());
+  for (const auto &output : spec.outputs) {
+    outputs.push_back(tensor(output));
+  }
+  auto *operation = sdk_call("vsi_nn_AddNode", [&] {
+    return vsi_nn_AddNode(graph.get(), VSI_NN_OP_NBG, inputs.size(), outputs.size(), nullptr);
+  });
+  if (!operation || !operation->input.tensors || operation->input.num != inputs.size() ||
+      !operation->output.tensors || operation->output.num != outputs.size()) {
+    throw std::runtime_error("compiled graph node construction failed");
+  }
+  for (std::size_t index = 0; index < inputs.size(); ++index) {
+    operation->input.tensors[index] = inputs[index].id;
+  }
+  for (std::size_t index = 0; index < outputs.size(); ++index) {
+    operation->output.tensors[index] = outputs[index].id;
+  }
+  operation->nn_param.nbg.type = VSI_NN_NBG_FILE;
+  operation->nn_param.nbg.url = compiled_paths_.back().c_str();
+  return outputs;
 }
 
 Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {

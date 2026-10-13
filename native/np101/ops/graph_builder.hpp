@@ -6,6 +6,7 @@
 #include "np101/weights.hpp"
 #include "vsi_nn_pub.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -25,10 +26,21 @@ struct Tensor {
   TensorSpec spec;
 };
 
+struct CompiledGraphSpec {
+  std::string path;
+  // Caller-validated compiled ports, in SDK order (contiguous dimension first).
+  std::vector<TensorSpec> inputs, outputs;
+  // Known embedded tensor payload, excluding unknown SDK copies and workspaces.
+  std::size_t constant_bytes = 0;
+  std::array<unsigned, 3> graph_version{};
+};
+
 // Adds nodes to one graph. Parameter arrays outlive the graph that borrows them.
 // This is a construction helper, not an execution engine or model registry.
 class GraphBuilder {
   std::deque<Shape> parameters_;
+  std::deque<std::string> compiled_paths_;
+  std::array<unsigned, 3> compiled_version_{};
   WeightBank *weights_;
   std::vector<vsi_nn_tensor_id_t> mutable_weight_inputs_;
   std::vector<vsi_nn_tensor_id_t> input_ids_, output_ids_;
@@ -64,9 +76,12 @@ public:
   Tensor argmax(Tensor input, unsigned axis);
   Tensor integer(std::int32_t value);
   Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
-  // FP16 MatMul followed by bias addition, with an FP16 intermediate boundary.
+  // FP16 projection followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
                 const WeightRecord &bias, unsigned output_parts = 1);
+  // Creates fixed NBG ports; mixing NBG with ordinary nodes needs workload validation.
+  // The builder owns the path until graph destruction; the graph owns payload charges.
+  std::vector<Tensor> compiled(const CompiledGraphSpec &spec, const std::vector<Tensor> &inputs);
   Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);
   // FP32 square/reduce/rsqrt: mean=true is RMS; false is L2 normalization.
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);

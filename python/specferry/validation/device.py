@@ -105,7 +105,7 @@ def require_recovered_device(root: Path) -> None:
     if record.get("boot_id") and record["boot_id"] != host_boot_id():
         raise RuntimeError(
             "NP101 boot changed, but recovery is unverified; confirm a cold restart and "
-            "pass both pinned recovery controls before another device run"
+            "follow the current incident ledger before another device run"
         )
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):
         raise RuntimeError(
@@ -137,7 +137,7 @@ def device_lock(root: Path, *, recovery_control=False):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another SpecFerry device diagnostic is running") from error
-        # Pinned controls still hold the lock while run_controls validates recovery.
+        # Explicit diagnostics retain the lock and leave the recovery gate closed.
         if not recovery_control:
             require_recovered_device(root)
         yield
@@ -157,9 +157,10 @@ def run_device(
     require_compiled_operations=False,
     abort_check=None,
     recovery_control=False,
+    profiler_output=None,
 ):
     """Call under device_lock. A clean exit is not proof of exclusive NPU execution."""
-    # Only run_controls authorizes pinned controls while retaining the closed recovery gate.
+    # Explicit diagnostics may use the exception while retaining the closed recovery gate.
     if not recovery_control:
         require_recovered_device(RECOVERY_ROOT)
     if require_compiled_operations and verify_trace is None:
@@ -168,7 +169,12 @@ def run_device(
         raise ValueError("timeout must be positive")
     if sdk_timing and sdk_summary:
         raise ValueError("SDK call tracing and summary timing are mutually exclusive")
+    if profiler_output is not None and (
+        recovery_control or sdk_timing or sdk_summary or trace_driver
+    ):
+        raise ValueError("Profiler capture requires a separate diagnostic without other timing")
     binary, output = binary.resolve(strict=True), output.resolve()
+    binary_sha256 = sha256(binary)
     output.mkdir(parents=True, exist_ok=True)
     header = Path("/usr/inc/CL/cl_viv_vx_ext.h")
     if header.is_file():
@@ -187,6 +193,15 @@ def run_device(
     env.pop("SPECFERRY_WEIGHT_READBACK_REPORT", None)
     env.pop("SPECFERRY_VERIFY_TRACE", None)
     env.pop("SPECFERRY_VERIFY_REQUIRE_OPERATIONS", None)
+    env.pop("VP_OUTPUT", None)
+    env["VP_ENABLE_PRINT"] = "0"
+    if profiler_output is not None:
+        profiler_output = Path(profiler_output).resolve()
+        if profiler_output.exists():
+            raise ValueError("Profiler output must not overwrite existing evidence")
+        profiler_output.parent.mkdir(parents=True, exist_ok=True)
+        env.update(VIV_VX_PROFILE="1", VP_OUTPUT=str(profiler_output))
+        env["SPECFERRY_VERIFY_EXECUTION_TRACE"] = "0"
     if require_compiled_operations:
         env["SPECFERRY_VERIFY_REQUIRE_OPERATIONS"] = "1"
     verify_trace_record = (
@@ -209,7 +224,7 @@ def run_device(
     evidence = {
         "command": command,
         "boot_id": host_boot_id(),
-        "binary_sha256": sha256(binary),
+        "binary_sha256": binary_sha256,
         "sdk_library_directory": str(sdk_lib.resolve()),
         "sdk_library_sha256": {
             name: sha256(sdk_lib / name)
@@ -228,6 +243,11 @@ def run_device(
         "sdk_summary": sdk_summary,
         "verify_trace": verify_trace_record,
         "require_compiled_operations": require_compiled_operations,
+        "profiler": {
+            "requested": profiler_output is not None,
+            "output": str(profiler_output) if profiler_output is not None else None,
+            "console_print_requested": False,
+        },
         "hardware_execution_proven": False,
     }
     # Preserve the exact executable/SDK identity even if the test crashes.

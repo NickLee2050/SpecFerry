@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run frozen recovery controls or one bounded NP101 operator/cache check."""
+"""Run an explicit vendor diagnostic or one bounded NP101 operator/cache check."""
 
 import argparse
 import sys
@@ -17,8 +17,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     cases = parser.add_subparsers(dest="case", required=True)
     for name in (
-        "recovery",
-        "conv",
         "vendor-conv",
         "lookup",
         "projection",
@@ -32,7 +30,7 @@ def parse_args():
     ):
         case = cases.add_parser(name)
         add_run_arguments(case)
-        if name in ("conv", "vendor-conv", "recovery"):
+        if name == "vendor-conv":
             case.add_argument(
                 "--cold-restarted", action="store_true", help="confirm host and NP101 cold restart"
             )
@@ -45,7 +43,7 @@ def parse_args():
             case.add_argument("--operator", choices=("gather", "embedding"), required=True)
         elif name == "projection":
             case.add_argument(
-                "--operator", choices=("matmul-add", "fcl", "mapped-readback"), required=True
+                "--operator", choices=("matmul-add", "mapped-readback"), required=True
             )
         elif name == "fp16-preservation":
             case.add_argument("--operator", choices=("add", "select"), required=True)
@@ -56,11 +54,9 @@ def parse_args():
         elif name == "cache-append":
             case.add_argument("--rank", type=int, choices=(2, 3), required=True)
     args = parser.parse_args()
-    if args.case in ("conv", "vendor-conv", "recovery") and (
-        args.sdk_timing or args.trace_driver or args.trace_verify
-    ):
+    if args.case == "vendor-conv" and (args.sdk_timing or args.trace_driver or args.trace_verify):
         parser.error(
-            "Recovery control uses frozen uninstrumented controls; tracing is not supported"
+            "Vendor diagnostic uses a frozen uninstrumented binary; tracing is not supported"
         )
     if args.case == "sampling" and not (
         8 <= args.classes <= 50272 and args.classes % 8 == 0 and 1 <= args.samples <= 8192
@@ -72,10 +68,10 @@ def parse_args():
 def main():
     args = parse_args()
     output = args.output.resolve()
-    if args.case in ("conv", "vendor-conv", "recovery"):
-        from specferry.validation.recovery_controls import run_controls
+    if args.case == "vendor-conv":
+        from specferry.validation.recovery_controls import run_vendor_control
 
-        return run_controls(output, args, include_llm=args.case == "recovery")
+        return run_vendor_control(output, args)
     device = output / "device"
     targets = {
         "lookup": "lookup_check",

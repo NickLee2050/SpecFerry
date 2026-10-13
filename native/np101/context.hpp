@@ -4,6 +4,7 @@
 #include "vsi_nn_pub.h"
 
 #include <map>
+#include <vector>
 
 namespace specferry::np101 {
 void check(vsi_status status, const char *operation);
@@ -45,12 +46,16 @@ public:
   void close();
 
   MemoryBudget::Lease reserve(bool constant, std::size_t bytes);
+  // Known constants embedded in a compiled node have no application tensor ID.
+  // Charge each node once; SDK copies and workspaces remain unknown.
+  void reserve_compiled_constants(std::size_t bytes);
   void record_storage(vsi_nn_tensor_id_t id, MemoryBudget::Lease lease);
   void alias_storage(vsi_nn_tensor_id_t id, const Graph &owner, vsi_nn_tensor_id_t source);
 
 private:
   Context &context_;
   std::map<vsi_nn_tensor_id_t, MemoryBudget::Lease> allocations_;
+  std::vector<MemoryBudget::Lease> compiled_constants_;
   vsi_nn_graph_t *handle_ = nullptr;
 };
 } // namespace specferry::np101

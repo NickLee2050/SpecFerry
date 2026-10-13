@@ -1,11 +1,12 @@
-#include "models/opt/layer.hpp"
 #include "models/opt/partitioned_graph_model.hpp"
 #include "np101/diagnostics.hpp"
+#include "np101/memory_budget.hpp"
 #include "np101/ops/cache_update.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "np101/ops/vocabulary.hpp"
 #include "np101/weight_bank.hpp"
+#include "vsi_nn_pub.h"
 
 #include <algorithm>
 #include <cstring>
@@ -37,6 +38,7 @@ struct PartitionedGraphModel::Impl {
     Tensor controls{}, embedded{};
     std::vector<std::unique_ptr<GraphBuilder>> decoder_graphs;
     std::vector<std::string> decoder_roles;
+    std::unique_ptr<GraphBuilder> cache_commit;
     std::unique_ptr<GraphBuilder> head;
     Tensor projected{}, selected{};
     std::vector<Tensor> logits;
@@ -44,6 +46,10 @@ struct PartitionedGraphModel::Impl {
     std::string prefix() const { return block == 1 ? "" : "prefill" + std::to_string(block) + "."; }
 
     void close() {
+      if (cache_commit) {
+        cache_commit->graph.close();
+        cache_commit.reset();
+      }
       if (head) {
         head->graph.close();
         head.reset();
@@ -63,9 +69,14 @@ struct PartitionedGraphModel::Impl {
   Variant variant;
   PrefillHeadPolicy prefill_head_policy;
   unsigned prefill_block;
+  const std::vector<CompiledFfn> compiled_ffn;
+  const std::vector<CompiledDecoder> compiled_decoders;
+  const std::vector<CompiledFfn> compiled_prefill_ffn;
+  Tensor compiled_indices{}, compiled_mask{};
   WeightBank bank;
   Graph cache;
   std::vector<Tensor> cache_tensors;
+  std::unique_ptr<GraphBuilder> cache_reset;
   std::unique_ptr<ExecutionSet> decode, prefill;
   ExecutionSet *latest = nullptr;
   unsigned position = 0;
@@ -73,15 +84,19 @@ struct PartitionedGraphModel::Impl {
   std::size_t completed_decode_steps = 0;
   std::size_t completed_prefill_steps = 0;
   std::size_t completed_head_runs = 0;
+  std::size_t constant_weight_bytes = 0;
   bool prediction_valid = false;
   bool failed = false;
   bool closed = false;
 
   Impl(Context &context, const WeightStore &weights, const ModelConfig &spec,
        const PhaseObserver &phase, Variant selected_variant, PrefillHeadPolicy prefill_head,
-       unsigned block)
+       unsigned block, std::vector<CompiledFfn> compiled, std::vector<CompiledDecoder> decoders,
+       std::vector<CompiledFfn> prefill_artifacts)
       : config(spec), variant(selected_variant), prefill_head_policy(prefill_head),
-        prefill_block(block), bank(context), cache(context, 2 * spec.decoder.layers, 0) {
+        prefill_block(block), compiled_ffn(std::move(compiled)),
+        compiled_decoders(std::move(decoders)), compiled_prefill_ffn(std::move(prefill_artifacts)),
+        bank(context), cache(context, 2 * spec.decoder.layers + 2, 0) {
     try {
       build(context, weights, phase);
     } catch (...) {
@@ -128,8 +143,8 @@ struct PartitionedGraphModel::Impl {
     return {keys, values};
   }
 
-  Tensor build_decoder(GraphBuilder &builder, const WeightStore &weights, unsigned layer,
-                       Tensor hidden, Tensor shared_controls, unsigned block) {
+  Tensor build_attention(GraphBuilder &builder, const WeightStore &weights, unsigned layer,
+                         Tensor hidden, Tensor shared_controls, unsigned block) {
     const auto &decoder = config.decoder;
     const auto dimension = decoder.kv_spec().head_dim;
     auto slot_index = builder.slice(shared_controls, {2 * block}, {1});
@@ -148,9 +163,15 @@ struct PartitionedGraphModel::Impl {
       attended =
           builder.permute(builder.reshape(attended, {dimension, block, decoder.heads}), {0, 2, 1});
     }
-    attended = builder.reshape(attended, {decoder.hidden, block});
-    auto tail = build_decoder_tail(builder, weights, decoder, layer, hidden, attended,
-                                   variant == Variant::MergedKvFc1Split2);
+    return builder.reshape(attended, {decoder.hidden, block});
+  }
+
+  Tensor build_decoder(GraphBuilder &builder, const WeightStore &weights, unsigned layer,
+                       Tensor hidden, Tensor shared_controls, unsigned block) {
+    const auto &decoder = config.decoder;
+    const auto attended = build_attention(builder, weights, layer, hidden, shared_controls, block);
+    const auto tail = build_decoder_tail(builder, weights, decoder, layer, hidden, attended,
+                                         variant == Variant::MergedKvFc1Split2);
     return tail.at("output");
   }
 
@@ -165,7 +186,16 @@ struct PartitionedGraphModel::Impl {
       }
     }
     const auto cache_count = 2 * decoder.layers;
-    const TensorSpec cache_spec{f16, {decoder.hidden, decoder.capacity}};
+    const bool compiled_decoder = variant == Variant::CompiledDecoder;
+    const TensorSpec cache_spec =
+        compiled_decoder ? TensorSpec{DataType::Float32,
+                                      {decoder.kv_spec().head_dim, decoder.capacity, decoder.heads}}
+                         : TensorSpec{f16, {decoder.hidden, decoder.capacity}};
+    if (compiled_decoder) {
+      const auto ports = compiled_decoder_inputs(decoder);
+      compiled_indices = {add_tensor(cache, ports[3]), ports[3]};
+      compiled_mask = {add_tensor(cache, ports[4]), ports[4]};
+    }
     const std::vector<std::uint8_t> zeros(cache_spec.bytes());
     for (unsigned index = 0; index < cache_count; ++index) {
       cache_tensors.push_back({add_tensor(cache, cache_spec, false, zeros), cache_spec});
@@ -177,7 +207,31 @@ struct PartitionedGraphModel::Impl {
       prefill = std::make_unique<ExecutionSet>(prefill_block);
       build_execution_set(*prefill, context, weights, phase);
     }
+    if (!compiled_prefill_ffn.empty()) {
+      build_cache_reset(context, phase);
+    }
     latest = decode.get();
+  }
+
+  void build_cache_reset(Context &context, const PhaseObserver &phase) {
+    const auto count = static_cast<unsigned>(cache_tensors.size());
+    cache_reset = std::make_unique<GraphBuilder>(context, count + 1, count);
+    auto &builder = *cache_reset;
+    const auto &spec = cache_tensors.front().spec;
+    // Initialize one runtime input once, keeping the reset copies out of constant folding.
+    // Reuse the validated KV commit operation; all destinations retain fixed backing.
+    const Tensor zeros{
+        add_tensor(builder.graph, spec, false, std::vector<std::uint8_t>(spec.bytes())), spec};
+    std::vector<Tensor> outputs;
+    for (const auto &storage : cache_tensors) {
+      const auto destination = builder.bind({cache, storage.id}, storage.spec);
+      builder.node(VSI_NN_OP_DATACONVERT, {zeros}, destination);
+      outputs.push_back(destination);
+    }
+    if (phase) {
+      phase("setup.kv-reset");
+    }
+    builder.compile({zeros}, outputs);
   }
 
   void build_execution_set(ExecutionSet &execution, Context &context, const WeightStore &weights,
@@ -213,25 +267,111 @@ struct PartitionedGraphModel::Impl {
     }
     entry.compile({controls}, {embedded});
 
+    std::vector<Tensor> commit_inputs, commit_outputs;
+    if (variant == Variant::CompiledDecoder) {
+      execution.cache_commit =
+          std::make_unique<GraphBuilder>(context, 4 * decoder.layers, 2 * decoder.layers);
+    }
     GraphBuilder *producer = execution.embedding.get();
     Tensor previous = embedded;
     for (unsigned layer = 0; layer < decoder.layers; ++layer) {
-      auto owner = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
+      auto owner =
+          std::make_unique<GraphBuilder>(context, variant == Variant::CompiledDecoder ? 16 : 512,
+                                         variant == Variant::CompiledDecoder ? 1 : 256, &bank);
       auto &builder = *owner;
       const auto group_input = builder.share(*producer, previous);
-      auto shared_controls = builder.share(entry, controls);
-      auto hidden = build_decoder(builder, weights, layer, group_input, shared_controls, block);
-      if (phase) {
-        phase("setup." + execution.prefix() + "layer." + std::to_string(layer));
+
+      const auto stage = "layer." + std::to_string(layer);
+      const auto compile = [&](GraphBuilder &graph, const std::string &role,
+                               const std::vector<Tensor> &inputs,
+                               const std::vector<Tensor> &outputs) {
+        if (phase) {
+          phase("setup." + execution.prefix() + role);
+        }
+        graph.compile(inputs, outputs);
+      };
+      const auto keep = [&](std::unique_ptr<GraphBuilder> graph, const std::string &role) {
+        execution.decoder_graphs.push_back(std::move(graph));
+        execution.decoder_roles.push_back(execution.timing_prefix + ".decoder." + role);
+      };
+      if (variant == Variant::CompiledDecoder) {
+        const auto &compiled = compiled_decoders.at(layer).graph;
+        std::vector<Tensor> inputs{group_input};
+        for (unsigned index : {0u, 1u}) {
+          const auto storage = cache_tensors.at(2 * layer + index);
+          inputs.push_back(builder.bind({cache, storage.id}, storage.spec));
+        }
+        inputs.push_back(builder.bind({cache, compiled_indices.id}, compiled_indices.spec));
+        inputs.push_back(builder.bind({cache, compiled_mask.id}, compiled_mask.spec));
+        const auto outputs = builder.compiled(compiled, inputs);
+        compile(builder, stage, inputs, outputs);
+        // Separate copy graph avoids unvalidated NBG input/output aliasing or mixed-node graphs.
+        // It runs after all decoders, before any next-token consumer can read the new state.
+        auto &commit = *execution.cache_commit;
+        for (unsigned index : {1u, 2u}) {
+          auto source = commit.share(builder, outputs[index]);
+          auto destination = commit.share(builder, inputs[index]);
+          commit.node(VSI_NN_OP_DATACONVERT, {source}, destination);
+          commit_inputs.push_back(source);
+          commit_outputs.push_back(destination);
+        }
+        producer = owner.get();
+        previous = outputs[0];
+        constant_weight_bytes += compiled.constant_bytes;
+        keep(std::move(owner), std::to_string(layer) + ".compiled");
+        continue;
       }
-      builder.compile({group_input, shared_controls}, {hidden});
+      const auto shared_controls = builder.share(entry, controls);
+      if (variant == Variant::MergedKvCompiledFfn) {
+        const auto &compiled = (block == 1 ? compiled_ffn : compiled_prefill_ffn).at(layer).graph;
+        const auto version = compiled.graph_version;
+        check(vsi_nn_SetGraphVersion(builder.graph.get(), version[0], version[1], version[2]),
+              "set compiled OPT attention graph version");
+        const auto attended =
+            build_attention(builder, weights, layer, group_input, shared_controls, block);
+        const auto normalized =
+            build_attention_tail(builder, weights, decoder, layer, group_input, attended)
+                .normalized;
+        compile(builder, stage + ".attention", {group_input, shared_controls}, {normalized});
+        auto *attention_graph = owner.get();
+        keep(std::move(owner), std::to_string(layer) + ".attention");
+
+        // v105 rejected NBG mixed with ordinary decoder nodes. Separate graphs
+        // retain fixed device buffers; no FFN weights enter the shared bank.
+        auto ffn = std::make_unique<GraphBuilder>(context, 16, 8);
+        const auto ffn_input = ffn->share(*attention_graph, normalized);
+        const auto mlp = ffn->compiled(compiled, {ffn_input}).at(0);
+        compile(*ffn, stage + ".ffn", {ffn_input}, {mlp});
+        auto *ffn_graph = ffn.get();
+        keep(std::move(ffn), std::to_string(layer) + ".ffn");
+
+        auto finish = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
+        check(vsi_nn_SetGraphVersion(finish->graph.get(), version[0], version[1], version[2]),
+              "set compiled OPT residual graph version");
+        const auto residual = finish->share(*attention_graph, normalized);
+        const auto ffn_output = finish->share(*ffn_graph, mlp);
+        const auto output =
+            build_ffn_finish(*finish, weights, decoder, layer, residual, ffn_output).output;
+        compile(*finish, stage + ".residual", {residual, ffn_output}, {output});
+        producer = finish.get();
+        previous = output;
+        keep(std::move(finish), std::to_string(layer) + ".residual");
+        constant_weight_bytes += compiled.constant_bytes;
+        continue;
+      }
+      auto hidden = build_decoder(builder, weights, layer, group_input, shared_controls, block);
+      compile(builder, stage, {group_input, shared_controls}, {hidden});
       producer = owner.get();
       previous = hidden;
-      execution.decoder_graphs.push_back(std::move(owner));
-      execution.decoder_roles.push_back(execution.timing_prefix + ".decoder." +
-                                        std::to_string(layer));
+      keep(std::move(owner), std::to_string(layer));
     }
 
+    if (execution.cache_commit) {
+      if (phase) {
+        phase("setup.kv-commit");
+      }
+      execution.cache_commit->compile(commit_inputs, commit_outputs);
+    }
     execution.head = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
     auto &output = *execution.head;
     auto shared_hidden = output.share(*producer, previous);
@@ -292,9 +432,27 @@ struct PartitionedGraphModel::Impl {
       const SdkScope timing_role("role", execution.timing_prefix + ".controls");
       upload_tensor(execution.embedding->graph, execution.controls.id, integers(controls));
     }
+    if (variant == Variant::CompiledDecoder) {
+      const SdkScope timing_role("role", execution.timing_prefix + ".compiled-controls");
+      std::vector<std::int32_t> indices;
+      indices.reserve(2 * config.decoder.heads);
+      for (unsigned head = 0; head < config.decoder.heads; ++head) {
+        indices.push_back(std::int32_t(head));
+        indices.push_back(std::int32_t(position));
+      }
+      std::vector<float> mask(config.decoder.capacity, -1e9f);
+      std::fill_n(mask.begin(), position + 1, 0.0f);
+      std::vector<std::uint8_t> mask_bytes(mask.size() * sizeof(float));
+      std::memcpy(mask_bytes.data(), mask.data(), mask_bytes.size());
+      upload_tensor(cache, compiled_indices.id, integers(indices));
+      upload_tensor(cache, compiled_mask.id, mask_bytes);
+    }
     run(*execution.embedding, execution.timing_prefix + ".embedding");
     for (std::size_t index = 0; index < execution.decoder_graphs.size(); ++index) {
       run(*execution.decoder_graphs[index], execution.decoder_roles[index]);
+    }
+    if (execution.cache_commit) {
+      run(*execution.cache_commit, execution.timing_prefix + ".kv-commit");
     }
     if (run_head) {
       run(*execution.head, execution.timing_prefix + ".head");
@@ -335,8 +493,13 @@ struct PartitionedGraphModel::Impl {
     failed = true;
     prediction_valid = false;
     if (position) {
-      for (const auto &tensor : cache_tensors) {
-        upload_tensor(cache, tensor.id, std::vector<std::uint8_t>(tensor.spec.bytes()));
+      if (cache_reset) {
+        // Synchronous completion precedes control upload and every next-request consumer.
+        run(*cache_reset, "kv-reset");
+      } else {
+        for (const auto &tensor : cache_tensors) {
+          upload_tensor(cache, tensor.id, std::vector<std::uint8_t>(tensor.spec.bytes()));
+        }
       }
     }
     position = 0;
@@ -368,6 +531,10 @@ struct PartitionedGraphModel::Impl {
     failed = true;
     prediction_valid = false;
     latest = nullptr;
+    if (cache_reset) {
+      cache_reset->graph.close();
+      cache_reset.reset();
+    }
     if (prefill) {
       prefill->close();
       prefill.reset();
@@ -385,9 +552,13 @@ struct PartitionedGraphModel::Impl {
 PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore &weights,
                                              const ModelConfig &config, PhaseObserver phase,
                                              Variant variant, PrefillHeadPolicy prefill_head,
-                                             unsigned prefill_block) {
+                                             unsigned prefill_block,
+                                             std::vector<CompiledFfn> compiled_ffn,
+                                             std::vector<CompiledDecoder> compiled_decoders,
+                                             std::vector<CompiledFfn> compiled_prefill_ffn) {
   config.validate();
-  if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2) {
+  if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2 &&
+      variant != Variant::MergedKvCompiledFfn && variant != Variant::CompiledDecoder) {
     throw std::invalid_argument("unknown partitioned OPT variant");
   }
   if (prefill_head != PrefillHeadPolicy::EveryToken &&
@@ -397,6 +568,10 @@ PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore
   if (prefill_block != 1 && prefill_block != 4 && prefill_block != 8 && prefill_block != 16) {
     throw std::invalid_argument("partitioned OPT prefill block must be 1, 4, 8 or 16");
   }
+  if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2 &&
+      variant != Variant::MergedKvCompiledFfn && prefill_block != 1) {
+    throw std::invalid_argument("compiled decoder has no validated block-prefill weight sharing");
+  }
   if (variant == Variant::MergedKvFc1Split2 && config.decoder.intermediate % 2) {
     throw std::invalid_argument("split-fc1 OPT requires an even intermediate width");
   }
@@ -404,8 +579,51 @@ PartitionedGraphModel::PartitionedGraphModel(Context &context, const WeightStore
     throw std::invalid_argument("capacity must be divisible by the prefill block");
   }
   validate_model_weights(weights, config, config.decoder.layers);
-  impl_ =
-      std::make_unique<Impl>(context, weights, config, phase, variant, prefill_head, prefill_block);
+  if (variant == Variant::MergedKvCompiledFfn) {
+    if ((prefill_block != 1 && prefill_block != 16) ||
+        (prefill_block == 1 && !compiled_prefill_ffn.empty())) {
+      throw std::invalid_argument("compiled OPT prefill requires an explicit block16 artifact set");
+    }
+    std::size_t constants = 0;
+    const auto validate_set = [&](const std::vector<CompiledFfn> &artifacts, unsigned tokens) {
+      if (artifacts.size() != config.decoder.layers) {
+        throw std::invalid_argument("compiled OPT FFN requires one artifact per decoder layer");
+      }
+      for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
+        validate_compiled_ffn(artifacts[layer], weights, config.decoder, layer, tokens);
+        const auto bytes = artifacts[layer].graph.constant_bytes;
+        if (bytes > segment_payload_limit - constants) {
+          throw std::invalid_argument("compiled OPT FFN sets exceed the constant payload limit");
+        }
+        constants += bytes;
+      }
+    };
+    validate_set(compiled_ffn, 1);
+    if (prefill_block != 1) {
+      validate_set(compiled_prefill_ffn, prefill_block);
+    }
+  } else if (!compiled_ffn.empty() || !compiled_prefill_ffn.empty()) {
+    throw std::invalid_argument("compiled OPT FFN artifacts require the compiled variant");
+  }
+  if (variant == Variant::CompiledDecoder) {
+    if (compiled_decoders.size() != config.decoder.layers) {
+      throw std::invalid_argument("compiled OPT decoder requires one artifact per layer");
+    }
+    std::size_t constants = 0;
+    for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
+      validate_compiled_decoder(compiled_decoders[layer], weights, config.decoder, layer);
+      const auto bytes = compiled_decoders[layer].graph.constant_bytes;
+      if (bytes > segment_payload_limit - constants) {
+        throw std::invalid_argument("compiled OPT decoders exceed the constant payload limit");
+      }
+      constants += bytes;
+    }
+  } else if (!compiled_decoders.empty()) {
+    throw std::invalid_argument("compiled decoder artifacts require the compiled decoder variant");
+  }
+  impl_ = std::make_unique<Impl>(context, weights, config, phase, variant, prefill_head,
+                                 prefill_block, std::move(compiled_ffn),
+                                 std::move(compiled_decoders), std::move(compiled_prefill_ffn));
 }
 
 PartitionedGraphModel::~PartitionedGraphModel() = default;
@@ -446,6 +664,12 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool
   }
   const auto tensor = impl_->cache_tensors.at(layer * 2 + values);
   const auto packed = read_tensor(impl_->cache, tensor.id, method);
+  if (impl_->variant == Variant::CompiledDecoder) {
+    if (packed.size() != cache_spec().bytes()) {
+      throw std::runtime_error("compiled OPT cache readback has an unexpected size");
+    }
+    return packed;
+  }
   const auto row_bytes = std::size_t(decoder.kv_spec().head_dim) * dtype_bytes(f16);
   const auto slot_bytes = row_bytes * decoder.heads;
   if (packed.size() != slot_bytes * decoder.capacity) {
@@ -462,6 +686,13 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool
     }
   }
   return result;
+}
+
+TensorSpec PartitionedGraphModel::cache_spec() const {
+  const auto &impl = require_impl();
+  const auto &decoder = impl.config.decoder;
+  return {impl.variant == Variant::CompiledDecoder ? DataType::Float32 : f16,
+          {decoder.kv_spec().head_dim, decoder.capacity, decoder.heads}};
 }
 
 std::vector<std::uint8_t> PartitionedGraphModel::read_output(const std::string &name,
@@ -502,11 +733,12 @@ std::size_t PartitionedGraphModel::head_runs() const {
 }
 
 std::size_t PartitionedGraphModel::cache_reset_uploads_per_request() const {
-  return require_impl().cache_tensors.size();
+  const auto &impl = require_impl();
+  return impl.cache_reset ? 0 : impl.cache_tensors.size();
 }
 
 std::size_t PartitionedGraphModel::weight_bytes() const {
-  return impl_ ? impl_->bank.payload_bytes() : 0;
+  return impl_ ? impl_->bank.payload_bytes() + impl_->constant_weight_bytes : 0;
 }
 
 void PartitionedGraphModel::close() {

@@ -1,7 +1,6 @@
-"""Recovery controls use frozen successful workloads, without SDK instrumentation."""
+"""Kernel health checks and an explicit vendor diagnostic; never clear the recovery gate."""
 
 import json
-import math
 import os
 import re
 import shutil
@@ -30,41 +29,16 @@ FAULT = re.compile(
 )
 
 
-def controls(include_llm, output, *, vendor=False):
+def vendor_control():
     """Reject changed/missing controls before opening the device; never silently rebuild."""
     pinned = json.loads((ROOT / "tests/fixtures/np101-recovery-controls.json").read_text())
-    prefix = "vendor" if vendor else "convolution"
-    binary = ROOT / pinned[prefix + "_binary"]
-    paths = {binary: pinned[prefix + "_sha256"]}
-    if not vendor:
-        paths[ROOT / pinned["convolution_source"]] = pinned["convolution_source_sha256"]
-    if include_llm:
-        paths[ROOT / pinned["component_binary"]] = pinned["component_sha256"]
-        paths[ROOT / pinned["deployment"] / "deployment-manifest.json"] = pinned[
-            "deployment_manifest_sha256"
-        ]
-        paths.update(
-            (ROOT / pinned["fixture"] / name, digest)
-            for name, digest in pinned["fixture_sha256"].items()
-        )
-        for name in ("weights.bin", "weights.index", "deployment-manifest.json"):
-            (ROOT / pinned["deployment"] / name).resolve(strict=True)
+    binary = ROOT / pinned["vendor_binary"]
+    paths = {binary: pinned["vendor_sha256"]}
     paths.update((SDK / name, digest) for name, digest in pinned["sdk_sha256"].items())
     for path, digest in paths.items():
         if sha256(path) != digest:
             raise ValueError(f"Recovery control requires the frozen successful file: {path}")
-    result = [("vendor-conv" if vendor else "repository-conv", binary, [], 60)]
-    if include_llm:
-        device = output / "old-component/device"
-        result.append(
-            (
-                "old-component",
-                ROOT / pinned["component_binary"],
-                [ROOT / pinned["deployment"], ROOT / pinned["fixture"], device, "2", "0", "1"],
-                180,
-            )
-        )
-    return result
+    return binary
 
 
 def snapshot(output, sudo_read_only):
@@ -97,37 +71,11 @@ def healthy(record):
     return not record["faults"] and not record["owners"]
 
 
-def numerical_check(name, device):
-    if name == "repository-conv":
-        log = (device / "sdk.log").read_text()
-        passes = re.findall(r"^PASS iteration=(\d+) max_abs_error=(\S+)$", log, re.M)
-        try:
-            return (
-                [index for index, _ in passes] == ["0", "1"]
-                and all(
-                    math.isfinite(float(error)) and 0 <= float(error) <= 0.1 for _, error in passes
-                )
-                and log.rstrip().endswith("Completed; graph/context released")
-            )
-        except ValueError:
-            return False
-    if name == "vendor-conv":
-        match = re.search(
-            r"total=64 mismatches=0 max_abs_err=([\d.eE+-]+)", (device / "sdk.log").read_text()
-        )
-        return bool(match and float(match[1]) <= 0.1)
-    measured = json.loads((device / "measured.0.json").read_text())
-    execution = json.loads((device / "execution.json").read_text())
-    return (
-        measured["tokens"] == [78, 631]
-        and measured["consumed"] == 6
-        and measured["stop_reason"] == "max_new_tokens"
-        and execution["phase"] == "complete"
-        and execution["released"]
-        and execution["const_live_bytes"] == execution["nonconst_live_bytes"] == 0
-        and execution["const_peak_bytes"] <= 2**30
-        and execution["nonconst_peak_bytes"] <= 2**30
+def numerical_check(device):
+    match = re.search(
+        r"total=64 mismatches=0 max_abs_err=([\d.eE+-]+)", (device / "sdk.log").read_text()
     )
+    return bool(match and float(match[1]) <= 0.1)
 
 
 def recovery_record(output, name, evidence, postflight):
@@ -148,15 +96,13 @@ def recovery_record(output, name, evidence, postflight):
     write_json(marker, record)
 
 
-def run_controls(output, options, include_llm):
-    selected = controls(include_llm, output, vendor=options.case == "vendor-conv")
+def run_vendor_control(output, options):
+    binary = vendor_control()
     if options.prepare_only:
-        for name, binary, arguments, deadline in selected:
-            print(name, "deadline", options.timeout or deadline, "command:", binary, *arguments)
+        print("vendor-conv", "deadline", options.timeout or 60, "command:", binary)
         return 0
     output.mkdir(parents=True, exist_ok=False)
     marker = RECOVERY_ROOT / "np101-recovery-required.json"
-    reports = []
     # Retain the lock through delayed checks, so no repository test overlaps this gate.
     with device_lock(RECOVERY_ROOT, recovery_control=True):
         preflight = snapshot(output / "preflight", options.sudo_read_only)
@@ -171,58 +117,51 @@ def run_controls(output, options, include_llm):
                     "Confirm host and NP101 cold restart in a new boot before Recovery control"
                 )
             shutil.copy2(marker, output / "previous-recovery-marker.json")
-        if include_llm or marker.exists():
+        if marker.exists():
             write_json(
                 marker,
                 dict(
-                    reason="Pinned recovery controls are incomplete",
+                    reason="Vendor diagnostic does not establish device recovery",
                     boot_id=host_boot_id(),
                     pid_namespace=os.readlink("/proc/self/ns/pid"),
                     members=[],
                     evidence=str(output),
                 ),
             )
-        for name, binary, arguments, deadline in selected:
-            directory = output / name
-            evidence = run_device(
-                binary,
-                arguments,
-                directory / "device",
-                SDK,
-                options.timeout or deadline,
-                abort_check=lambda: bool(
-                    snapshot(directory / "monitor", options.sudo_read_only)["faults"]
-                ),
-                recovery_control=True,
-            )
-            try:
-                immediate = snapshot(directory / "immediate", options.sudo_read_only)
-                print(f"{name}: waiting 45s for delayed kernel faults", flush=True)
-                time.sleep(45)
-                postflight = snapshot(directory / "postflight", options.sudo_read_only)
-            except (OSError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
-                recovery_record(directory, name, evidence, {"health_check_incomplete": True})
-                raise
-            execution_pass = clean_execution(evidence)
-            gate_pass = execution_pass and healthy(immediate) and healthy(postflight)
-            report = {"control": name, "execution": evidence, "health_pass": gate_pass}
-            try:
-                report["numerical_pass"] = execution_pass and numerical_check(
-                    name, directory / "device"
-                )
-            except (OSError, ValueError, KeyError):
-                report["numerical_pass"] = False
-            reports.append(report)
-            passed = gate_pass and report["numerical_pass"]
-            if not passed:
-                recovery_record(directory, name, evidence, postflight)
-            write_json(
-                output / "result.json",
-                {"status": "passed" if passed else "failed", "controls": reports},
-            )
-            print(f"{name}: {'PASS' if passed else 'FAIL'}", flush=True)
-            if not passed:
-                return 1
-        if include_llm:
-            marker.unlink()
-    return 0
+        name = "vendor-conv"
+        directory = output / name
+        evidence = run_device(
+            binary,
+            [],
+            directory / "device",
+            SDK,
+            options.timeout or 60,
+            abort_check=lambda: bool(
+                snapshot(directory / "monitor", options.sudo_read_only)["faults"]
+            ),
+            recovery_control=True,
+        )
+        try:
+            immediate = snapshot(directory / "immediate", options.sudo_read_only)
+            print(f"{name}: waiting 45s for delayed kernel faults", flush=True)
+            time.sleep(45)
+            postflight = snapshot(directory / "postflight", options.sudo_read_only)
+        except (OSError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
+            recovery_record(directory, name, evidence, {"health_check_incomplete": True})
+            raise
+        execution_pass = clean_execution(evidence)
+        gate_pass = execution_pass and healthy(immediate) and healthy(postflight)
+        report = {"control": name, "execution": evidence, "health_pass": gate_pass}
+        try:
+            report["numerical_pass"] = execution_pass and numerical_check(directory / "device")
+        except (OSError, ValueError, KeyError):
+            report["numerical_pass"] = False
+        passed = gate_pass and report["numerical_pass"]
+        if not passed:
+            recovery_record(directory, name, evidence, postflight)
+        write_json(
+            output / "result.json",
+            {"status": "passed" if passed else "failed", "controls": [report]},
+        )
+        print(f"{name}: {'PASS' if passed else 'FAIL'}", flush=True)
+    return 0 if passed else 1

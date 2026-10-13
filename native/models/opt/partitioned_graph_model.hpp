@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inference/generation.hpp"
-#include "models/opt/config.hpp"
+#include "models/opt/layer.hpp"
 #include "np101/context.hpp"
 #include "np101/tensor.hpp"
 
@@ -13,14 +13,19 @@
 #include <vector>
 
 namespace specferry::models::opt {
-// Fixed embedding/head graphs and one decoder layer per graph. Optional
-// Block prefill uses a second graph set with the same weights and KV backing.
+// Fixed embedding/head graphs with device buffers between decoder stages. Compiled
+// FFNs use three graphs per layer; full decoder NBGs use one plus a shared KV copy graph.
+// Block prefill shares ordinary weights and KV. Compiled FFNs require separately
+// budgeted fixed-shape artifacts for the prefill and decode execution sets.
+// The compiled block-prefill candidate clears KV with a separate fixed copy graph.
 class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
-  // All variants use merged KV and retain shared mutable vocabulary blocks.
-  enum class Variant { MergedKv, MergedKvFc1Split2 };
+  // All variants retain shared mutable vocabulary blocks. Compiled decoders use FP32
+  // head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
+  // C++ candidates; their artifact loading is not yet exposed by the product CLI.
+  enum class Variant { MergedKv, MergedKvFc1Split2, MergedKvCompiledFfn, CompiledDecoder };
 
   // Generation may skip unused prompt predictions; public step() always runs the head.
   // EveryToken runs the head for each consumed block's final column.
@@ -30,7 +35,9 @@ public:
                         const ModelConfig &config, PhaseObserver phase = {},
                         Variant variant = Variant::MergedKv,
                         PrefillHeadPolicy prefill_head = PrefillHeadPolicy::EveryToken,
-                        unsigned prefill_block = 1);
+                        unsigned prefill_block = 1, std::vector<CompiledFfn> compiled_ffn = {},
+                        std::vector<CompiledDecoder> compiled_decoders = {},
+                        std::vector<CompiledFfn> compiled_prefill_ffn = {});
   ~PartitionedGraphModel();
   PartitionedGraphModel(const PartitionedGraphModel &) = delete;
   PartitionedGraphModel &operator=(const PartitionedGraphModel &) = delete;
@@ -41,6 +48,8 @@ public:
   std::vector<std::uint8_t>
   read_cache(unsigned layer, bool values,
              np101::TensorReadback method = np101::TensorReadback::SdkCopy);
+  // Diagnostic layout is [head, slot, dimension]; compiled decoders retain FP32 KV.
+  np101::TensorSpec cache_spec() const;
   // Head outputs describe only the final consumed token, including after a full prefill block.
   std::vector<std::uint8_t>
   read_output(const std::string &name,

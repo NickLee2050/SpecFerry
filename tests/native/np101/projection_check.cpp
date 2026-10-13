@@ -226,7 +226,7 @@ void check_ffn_collection(const fs::path &output, const FfnFixture &fixture,
   report("complete", true);
 }
 
-Tensor build_projection(GraphBuilder &graph, Tensor input, bool fused) {
+Tensor build_projection(GraphBuilder &graph, Tensor input) {
   std::vector<float> identity(width * width, 0);
   for (unsigned index = 0; index < width; ++index) {
     identity[index * width + index] = 1;
@@ -234,12 +234,6 @@ Tensor build_projection(GraphBuilder &graph, Tensor input, bool fused) {
   auto weight = graph.floats(identity, {width, width}, f16);
   auto bias = graph.floats(std::vector<float>(width, 0.25f), {width}, f16);
   auto output = graph.tensor(input.spec);
-  if (fused) {
-    auto *operation = graph.node(VSI_NN_OP_FCL, {input, weight, bias}, output);
-    operation->nn_param.fcl.weights = width;
-    operation->nn_param.fcl.axis = 0;
-    return output;
-  }
 
   auto *operation = graph.node(VSI_NN_OP_MATRIXMUL, {input, weight}, output);
   operation->nn_param.matrixmul.transpose[0] = FALSE;
@@ -247,14 +241,13 @@ Tensor build_projection(GraphBuilder &graph, Tensor input, bool fused) {
   return graph.binary(VSI_NN_OP_ADD, output, graph.reshape(bias, {width, 1}));
 }
 
-void compile_projection(GraphBuilder &graph, Tensor input, Tensor output, bool fused) {
+void compile_projection(GraphBuilder &graph, Tensor input, Tensor output) {
   const std::vector<vsi_nn_op_t> expected =
-      fused ? std::vector<vsi_nn_op_t>{VSI_NN_OP_FCL}
-            : std::vector<vsi_nn_op_t>{VSI_NN_OP_MATRIXMUL, VSI_NN_OP_RESHAPE, VSI_NN_OP_ADD};
+      std::vector<vsi_nn_op_t>{VSI_NN_OP_MATRIXMUL, VSI_NN_OP_RESHAPE, VSI_NN_OP_ADD};
   if (graph.graph.get()->cur_nid != expected.size()) {
     throw std::runtime_error("projection node count differs from the requested mode");
   }
-  std::cout << "Graph: " << (fused ? "FCL(axis=0, weights=8)" : "MATRIXMUL -> RESHAPE(bias) -> ADD")
+  std::cout << "Graph: " << "MATRIXMUL -> RESHAPE(bias) -> ADD"
             << "; FP16 input [8,1], identity weight [8,8], bias [8]=0.25\n";
   for (unsigned index = 0; index < expected.size(); ++index) {
     auto *operation = vsi_nn_GetNode(graph.graph.get(), index);
@@ -283,13 +276,13 @@ void compile_projection(GraphBuilder &graph, Tensor input, Tensor output, bool f
         "VerifyGraph");
 }
 
-void check_projection(Context &context, bool fused) {
+void check_projection(Context &context) {
   GraphBuilder graph(context, 6, 3);
   auto input = graph.tensor({f16, {width, 1}});
-  auto output = build_projection(graph, input, fused);
-  // Both modes start with valid FP16 data before setup/verify, as in the vendor demo.
+  auto output = build_projection(graph, input);
+  // Initialize valid FP16 inputs before setup/verify.
   upload_tensor(graph.graph, input.id, encode_floats(std::vector<float>(width, 1)));
-  compile_projection(graph, input, output, fused);
+  compile_projection(graph, input, output);
 
   for (const float value : {1.0f, -0.5f}) {
     upload_tensor(graph.graph, input.id, encode_floats(std::vector<float>(width, value)));
@@ -345,9 +338,8 @@ int main(int argc, char **argv) {
   const bool collection =
       mode == "ffn-full" || mode == "ffn-linear" || mode == "ffn-linear-fc1-split2" || batched;
   if ((collection && argc != (batched ? 6 : 5)) ||
-      (!collection &&
-       (argc != 3 || (mode != "fcl" && mode != "matmul-add" && mode != "mapped-readback")))) {
-    std::cerr << "usage: np101_projection_check OUTPUT fcl|matmul-add|mapped-readback\n"
+      (!collection && (argc != 3 || (mode != "matmul-add" && mode != "mapped-readback")))) {
+    std::cerr << "usage: np101_projection_check OUTPUT matmul-add|mapped-readback\n"
                  "   or: np101_projection_check OUTPUT "
                  "ffn-full|ffn-linear|ffn-linear-fc1-split2 DEPLOYMENT FIXTURE\n"
                  "   or: np101_projection_check OUTPUT ffn-linear-batched DEPLOYMENT FIXTURE "
@@ -377,7 +369,7 @@ int main(int argc, char **argv) {
     if (mode == "mapped-readback") {
       check_mapped_readback(context);
     } else {
-      check_projection(context, mode == "fcl");
+      check_projection(context);
     }
     context.close();
   });

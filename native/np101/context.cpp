@@ -64,10 +64,15 @@ void Graph::close() {
     throw std::runtime_error("vsi_nn_ReleaseGraph did not clear handle");
   }
   allocations_.clear();
+  compiled_constants_.clear();
 }
 
 MemoryBudget::Lease Graph::reserve(bool constant, std::size_t bytes) {
   return context_.memory().reserve(constant, bytes);
+}
+
+void Graph::reserve_compiled_constants(std::size_t bytes) {
+  compiled_constants_.push_back(reserve(true, bytes));
 }
 
 void Graph::record_storage(vsi_nn_tensor_id_t id, MemoryBudget::Lease lease) {

@@ -13,14 +13,17 @@
    NP hang、EDMA timeout、BUG/Oops/page fault/general protection fault/invalid opcode/
    soft lockup。`Waiting for HDMA Transfer...` 单独出现不算超时。串行、限时、运行中监控；
    任一故障停止板卡工作并保留标记，不能靠正确输出、owner清空或`recovery done`放行。
-2. 恢复需用户确认**主机与NP101冷启动**，新boot清洁后归档原标记。热重启不作为恢复。
-   串行跑固定仓库卷积，再跑冻结旧OPT component C16/prompt5/两输出 `[78,631]`；
-   两者都须数值、执行、预算、释放和内核通过，且各在退出后检查至少45秒，禁止SDK插桩。
-   历史hang曾在释放28–35秒后出现。只有两级通过才允许已检查范围内的后续工作。
-3. `check_np101.py conv` 使用归档自写卷积，`recovery` 再运行冻结旧OPT；`vendor-conv`
-   只是可选诊断。默认进程期限60/180秒，不代表性能目标。命令/身份清单见
-   [测试手册](../tests/README.md#device-discipline-and-recovery)；缺失/哈希改变直接拒绝，
-   不重编译替换固定控制。自写与原厂都有失败历史，两级成功不证明硬件无故障。
+2. **10-13按用户要求删除自写卷积，禁止重建或作为恢复检查重新启用**。
+   源码、binary、缓存副本、构建残留、专用测试和`check_np101.py conv/recovery`
+   入口已删除；保留事故日志、binary/SDK身份和分析，历史源码路径/行号仅用于定位。
+   历史成功和旧记录中的“两级控制”安排不能撤销本条；本页历史流程不作为当前命令。
+3. 恢复控制需用户约定，不自动替换为原厂卷积或冻结旧OPT；两者也有冷启动失败记录。
+   必须确认主机与NP101冷启动、清洁新boot、固定binary/NBG/SDK身份，并完成数值、
+   执行、预算、释放及至少45秒延迟检查，全部通过才可归档清除旧标记。
+   `vendor-conv`仅为明确授权的诊断，其成功不清除门禁。新的编译模型规范入口仅对
+   当前未闭锁设备执行，不能越过既有恢复标记；已验固定全图的成功窗口见下表。
+   v105私有Verify审计仅在匹配SDK hash后显式开启，不用于未知v106布局。
+   普通对照同样串行、固定请求、逐项延迟检查，通过只覆盖该负载，不证明其他候选健康。
 4. 相同binary/SDK控制在确认冷启动后再次失败时，停止相同条件重试，先分析已有证据；
    不重复消耗冷启动。故障复现需明确授权；有意复现selection-hang前先提醒冷启动。
 5. 每次需冷启动的事件单独记：boot、binary/SDK身份、输入/结构、期望/实际结果，
@@ -38,11 +41,238 @@
 | 10-09 11:33–11:34 / `f214ee36-6fd8-42cd-922a-d5095f9980bd` | EVIS事故后确认冷启动；同身份两级控制及各45秒通过，11:33:27.158501/11:34:33.882395清洁。原标记在 `decode-working-set-20261009/recovery/previous-recovery-marker.json` |
 | 10-10 12:44:51.561149 +08:00成功窗口 / 同上boot | 8图纯GEMM/FFN消融及后置基线共12进程数值/释放/延迟门禁通过。`gemm-ffn-ablation-20261010/summary.json`；C128、精度及压力测试证据统一见实现总结 |
 | 10-12 08:57–08:58 / `7d7a10f6-a1b8-4e20-84df-2b8805bdefbd` | 用户确认冷启动；固定仓库卷积两轮及冻结旧OPT `[78,631]`、正常释放/预算和各45秒延迟门禁通过，最后检查08:58:33.619404清洁。旧标记已归档于`gemm-layout-recovery-20261012/previous-recovery-marker.json`。仅恢复有界实验资格，不证明历史故障修复 |
+| 10-13 11:33–11:37 / `c71e332e-0dd5-4553-ab31-fd0a56aca44d` | 用户确认冷启动并授权直接全图OPT；v106、固定binary/NBG、C64/M1、17输入/16输出，1暖机+1正式请求的选词/logits/末层KV、预算/释放和45秒延迟检查通过。原标记及本次未完成标记归档于`compiled-opt-driver-recheck-20261013/fullgraph-opt/`，实时标记已清除；未运行卷积、旧OPT或block16清零候选 |
+| 10-13 11:57–12:24 / 同上boot | v106新全图TTGT端口查询及9个模型进程通过：全图普通/TTGT/普通、逐decoder、编译FFN、block16普通/TTGT/普通、手写。15次正式请求240输出token，数值/预算/释放及各45秒延迟检查通过；block16的首/末层KV reset粗验通过。无新事故或实时恢复标记。`compiled-opt-layout-v106-20261013/summary.json` |
+| 10-13 14:52–15:06 / `2e8953e2-a612-45e9-8a97-17f94fbe0cc0` | 用户重装v105并授权补测，新boot预检清洁且无恢复标记；全图及block16混合普通/TTGT/普通两组、TTGT端口查询通过。12次正式请求192输出token，选词/logits、全图末层KV、block16 reset粗验、预算/释放及各45秒门禁通过；匹配v105 Verify-only构图审计完整。`compiled-opt-layout-v105-20261013/summary.json`；无新设备事故 |
 
-**最后已存检查：2026-10-12T10:35:36.070813+08:00**：同一新boot的官方YOLO/ResNet
-NBG示例正常释放、各45秒延迟门禁通过，无目标故障/owner/恢复标记。证据
-`official-knowledge-consolidation-20261012/np101-official-evaluation-20261012/summary.json`；
-此前GEMM/TTGT结果见实现总结。这不证明历史根因修复，下一轮仍执行门禁。
+**最后已存检查：2026-10-13T15:06:01.066871+08:00，v105补测全部通过**：上表
+各进程exit 0，结束即时及超过45秒日志无NP hang、EDMA timeout或BUG/Oops，
+无残留owner/恢复标记。复用此前编译/等价检查通过的产物，没有运行已删除卷积或
+原厂demo；const/nonconst应用payload各低于1GiB且释放归零。v105外层构图审计
+149图/3579 operation/750 extension，完整无缺项；不能外推NBG内部或v106槽位。
+本轮通过不证明历史故障修复或长期稳定性。身份、逐阶段结果及原始内核日志见
+`compiled-opt-layout-v105-20261013/`；性能与实现边界见总结。
+
+此前2026-10-13T11:24:50.370255+08:00：v106原厂卷积SIGFPE并在退出后延迟NP hang，
+该boot没有运行OPT，用户随后停止会话并冷启动。独立事故见下文。
+
+此前2026-10-13T11:09:05.666015+08:00，门禁失败：用户确认双冷启动的
+新boot `80bde6ed-09c2-4fc4-9bd6-bdef9aa446dd`，仅运行冻结旧OPT，11:08:15及
+释放后的11:08:46两次NP hang；无owner/残留进程，标记保留。没有运行卷积、设备KV
+清零候选或性能对照。新增独立事故见下文。
+
+此前2026-10-13T10:37:58.341550+08:00：再次冷启动的新boot
+`0b6cbe69-f080-4f8d-83d7-5536d06701f2`中，冻结仓库卷积在10:37:07和
+释放后的10:37:38两次NP hang。owner为空、恢复标记保留；旧OPT及修改后的模型
+未运行。新增独立事故见下文，不能用此前成功窗口放行。
+
+此前2026-10-13T09:35:15.199740+08:00：10-12成功窗口的boot完成M16真实8层
+prefill FFN普通/TTGT/普通三个NBG集合进程，数值、释放及各45秒门禁通过，无目标
+故障、owner或恢复要求。首次夹具软链接在Context创建前被主机路径检查拒绝，
+改本地硬链接后通过；不是冷启动事故。证据`compiled-prefill-ffn-layout-20261013/summary.json`。
+
+此前2026-10-13T09:12:54.286901+08:00：同一boot完成全图NBG的两次
+端口查询、首次生成选词失败和INT32修正版的1暖机+1正式请求；各进程退出后的45秒
+门禁均无目标故障、owner或恢复要求。首次输出50118→32767已定位为生成C的ArgMax
+中间INT16，修正后选词、logits、末层KV、预算/释放通过；这不是冷启动事故。
+离线工具的版本拒绝及缺shader头文件失败均发生在无galcore环境，不能算板卡故障。
+证据`compiled-opt-fullgraph-20261013/{summary,selection-diagnosis}.json`，未新增冷启动事故。
+
+此前2026-10-12T18:22:13.091073+08:00：同一boot完成单份decoder
+循环KV、编译FFN匹配基线及24层完整decoder关闭/开启/关闭三个进程；数值、外层
+operation、释放及各45秒延迟检查无目标故障、owner或恢复要求。首版reshape KV
+绑定在首NBG Verify正常返回−1，未Run、延迟门禁清洁；改普通rank3 FP32 backing后
+通过，原因边界及避免重试的构造见实现总结。该拒绝不是冷启动事故。
+证据`compiled-decoder-integration-20261012/summary.json`；此前单层端口/末槽证据在
+`decoder-nbg-validation-20261012/summary.json`。未新增冷启动事故。
+此前profiler及24层SDK汇总六进程的清洁证据保留于`profiler-decode-survey-20261012/summary.json`。
+此前编译FFN/常量绑定/三图接入已通过；混图Verify正常返回−1和M8192普通布局数值
+失败等边界见实现总结。本次成功不证明历史设备故障修复，下一轮仍执行门禁。
+
+## 10-13 v106原厂卷积整数除法异常及延迟hang（独立事故）
+
+事件`vendor-convolution-v106-divide-error-20261013-112403`，boot
+`12f5b844-90fe-4bdb-950d-f5cd525c7a4b`。用户更换v106、确认冷启动并明确授权原厂
+demo；原binary SHA256仍为`d51a13abb7f82594bbe3bc889ff9bf958690d6e028c9185ad751bb9b79174a9a`。
+驱动srcversion为`8D46803809F15FA0FD98A92`，四个SDK库已换版，`libNNArchPerf.so`
+哈希与v105相同；完整身份在`driver-switch-revalidation-20261013/identity.json`。
+
+| UTC+8时间 | 已确认事件 |
+|---|---|
+| 11:22:35.445349 / 11:24:03.377615 | 全boot初检清洁、无owner；正式预检后PID4443打开galcore |
+| **11:24:03.553583** | 主机`trap divide error`，IP `0x7fd762633749`，位于`libNNArchPerf.so` |
+| 11:24:03.733607 / 11:24:04.071548 | 进程SIGFPE（exit−8），墙钟0.472s；release后即时日志无NP hang、owner为空，无数值结果 |
+| **11:24:33.157658 / .169757** | **NP hang / recovery done**，release后29.424s，证明即时检查不足以放行 |
+| 11:24:50.370255 | 45秒延迟检查确认hang，owner为空；恢复标记保留 |
+
+**精确指令及边界**：内核记录的可执行映射起点为`0x7fd762613000`，ELF该LOAD段
+虚拟偏移为`0x1000`，故指令地址为`0x21749`，对应
+`NNTransposeCycleCount_V9+0x1f9: idiv %ecx`。这是主机整数除法异常，不是模型
+浮点数值误差。无寄存器/core证据，不能在除数为零和商溢出之间定论；本轮未采API栈，
+历史v106记录将同函数定位于Verify内部，但不能伪称本轮重新取得了调用栈。
+后续hang与异常退出/未完成SDK释放的因果关系仍未证实，不能据此断言硬件损坏。
+
+**后续及规避**：原厂检查失败，旧OPT未启动。用户随后授权直接尝试优化OPT，但又在
+启动前主动暂停并安排冷启动，因此本boot没有运行OPT；下一boot按用户约定直接测试
+已验全图NBG，不原样重跑卷积。保留新SDK身份，不加载仅适配v105的私有插桩。
+原始记录、内核事件、反汇编及独立台账在
+`driver-switch-revalidation-20261013/vendor-convolution/`，其中`automatic-incident.json`
+保留原记录，`incident.json`补充定位；不与后续OPT运行混为同一事件。
+
+## 10-13 删除卷积后冻结旧OPT初始化hang（独立事故）
+
+事件`frozen-opt-cold-restart-hang-20261013-110815`，boot
+`80bde6ed-09c2-4fc4-9bd6-bdef9aa446dd`。用户明确确认主机与NP101双冷启动，
+同意以冻结旧OPT代替本轮恢复对照；没有执行已删除的自写卷积或原厂卷积。
+24层旧component模型，C16、5输入、期望2输出`[78,631]`，0暖机/1请求、无插桩。
+binary SHA256 `536830eefedb969b525ce338cd4f996451b40ceb5a5e8af0f744463e923a9809`；
+binary、五个SDK库、固定夹具身份与10-12成功控制相同，命令仅输出目录不同。
+
+| UTC+8时间 | 已确认事件 |
+|---|---|
+| 11:07:41.675859 / 11:07:47.495481 | 全boot预检清洁、无owner；PID6379随后打开galcore |
+| 11:07:47.511587–.735468 | 17条HDMA等待提示；stdout停在初始化/尝试打开设备，没有请求或初始化完成记录 |
+| **11:08:15.291471 / .295573** | **NP hang / recovery done**，打开设备后27.795990秒；早于监控终止 |
+| 11:08:19.957775 / 11:08:20.043490 | 监控发现故障，随后SIGTERM及release；exit−15，墙钟38.298s，180秒期限未耗尽 |
+| **11:08:46.011492 / .015602** | **第二次NP hang / recovery done**，release后25.968002秒 |
+| 11:09:05.666015 | 至少45秒延迟检查含两次hang，owner为空、无残留进程；未见EDMA timeout或BUG/Oops |
+
+**API边界**：未完成模型初始化，没有`measured.0.json`或完成释放的`execution.json`。
+无逐API插桩，不能从设备open日志或stdout缓冲判定未返回的是CreateContext、张量
+构造/上传、Setup还是Verify；未取得精确未返回API。进程栈读取时子进程已被故障
+监控终止，没有有效栈证据。读取缺失完成文件导致的主机`FileNotFoundError`发生在
+45秒检查之后，是次生报告错误，不能解释先前hang；原自动记录与修正记录均保留。
+
+**已证实与假设**：本轮没有卷积参与，卷积专属建图不是此次现象的必要条件；旧OPT
+与已删除卷积仍可能共享应用/SDK初始化行为，尚不能排除所有应用因素或断言硬件损坏。
+两次hang间隔30.720021s，与此前卷积事故30.720010/30.720075s接近，提示共同
+看门狗/完成等待/恢复机制，未证明触发根因。驱动srcversion仍为
+`F53A3E6EFBB7D0FD7D4617C`、内核5.15.0-67、版本6.4.9.9.452545；DRM minor恢复为0，
+故此前minor2不是故障必要条件。设备KV清零改动及TTGT均未执行，无新性能结果。
+
+**规避**：保留恢复标记、停止上板；不原样再跑同控制，优先比较共同初始化/驱动事件
+证据，需要新依据或明确诊断授权再改方案，不重新引入已删除卷积。原性能对照保持
+待验。证据`opt-cold-restart-validation-20261013/old-opt-reference/`包含原标记、
+执行身份、完整内核日志、事件窗口及独立`incident.json`；上级`summary.json`记录未执行项。
+
+## 10-13 再次冷启动后冻结卷积重复失败（独立事故）
+
+事件`pinned-convolution-cold-retry-hang-20261013-103707`，boot
+`0b6cbe69-f080-4f8d-83d7-5536d06701f2`。用户再次确认冷启动并要求重试；新boot
+全内核预检清洁、无owner，原标记归档于
+`compiled-prefill-reset-validation-20261013/recovery/previous-recovery-marker.json`。
+仍为冻结FP16三节点/六tensor卷积、两轮确定性数值检查；binary/源代码/五份SDK身份
+与下述10:18失败及10-12成功控制相同。禁止插桩的恢复控制没有改动或重建。
+
+| UTC+8时间 | 已确认事件 |
+|---|---|
+| 10:36:44.097083 / .238095 | 正式预检清洁；PID4512打开galcore |
+| 10:36:44.302951–.354132 | 六条HDMA等待提示；stdout到三节点图摘要，无首轮PASS |
+| **10:37:07.858087 / .878316** | **NP hang / recovery done**，距打开设备23.620秒，早于监控终止 |
+| 10:37:11.671064 / .746073 | 监控发现故障，随后SIGTERM/release；exit−15、墙钟27.587秒，60秒期限未耗尽 |
+| **10:37:38.578162 / .594245** | **第二次NP hang / recovery done**，release后26.832秒 |
+| 10:37:58.341550 | 至少45秒延迟检查含两次hang，无owner/残留进程；未见EDMA timeout、BUG/Oops |
+
+期望两轮正确输出及正常释放，实际没有首轮PASS；旧OPT、设备KV清零候选和性能
+对照均未启动。API边界与下述10:18事故相同：已完成建图/首次输入上传，随后Setup、
+Verify、首轮上传/RunGraph/读回无逐调用返回证据，不能指定具体未返回API。
+
+两次冷启动均在约22–24秒后首次hang、释放后再报hang，是可复用的故障特征，
+但尚未证明看门狗/完成信号机制或硬件损坏。已加载galcore srcversion为
+`F53A3E6EFBB7D0FD7D4617C`，启动日志版本仍为`6.4.9.9.452545`；本boot DRM minor
+为2，此前成功及失败boot均为0，枚举差异本身不能解释全部失败。
+
+停止全部上板并保留标记；后续先比较启动/SDK证据，若授权进一步诊断，应独立定位
+SDK调用边界，不把插桩诊断替代冻结控制，也不继续原样消耗冷启动。没有新性能结果，
+不把未执行的模型修改当原因。后续用户明确停用该卷积，当前禁止执行规则见页首。
+详细身份、时间线、完整日志及原自动记录在
+`compiled-prefill-reset-validation-20261013/recovery/repository-conv/incident.json`及同目录。
+
+## 10-13 冷启动后冻结仓库卷积失败及释放后NP hang（独立事故）
+
+事件`pinned-convolution-recovery-hang-20261013-101856`，boot
+`8ed28f4d-9417-4d44-ad44-8abe3e9871c1`。用户明确确认主机与NP101均冷启动；
+原模型故障标记归档于`compiled-prefill-reset-20261013/recovery/previous-recovery-marker.json`。
+首级固定仓库卷积为FP16 CONV2D→RELU→MAXPOOL，3节点/6tensor，确定性输入、两轮
+数值检查；未重编译或替换。binary SHA256
+`e77822ba009fe29bd0c1279a98ea3125a619a6b1cb5d318a5ec8bfcaec55862f`，五个固定SDK库
+与10-12成功控制逐项相同。修改后的OPT只在CPU上构建，没有上板。
+
+| UTC+8时间 | 已确认事件 |
+|---|---|
+| 10:18:33.849483 / .959000 | 全boot预检无目标故障、无owner；PID4965随后打开galcore |
+| 10:18:33.983139–.995264 | 六条HDMA等待提示；stdout只有打开设备及三节点图摘要，没有首轮PASS |
+| **10:18:56.030991 / .035181** | **NP hang / recovery done**，在监控终止之前，距打开设备22.072秒 |
+| 10:19:01.408934 / .487082 | 监控发现故障，随后SIGTERM及release galcore；exit−15、墙钟27.601s，60秒期限未耗尽，无残留进程 |
+| **10:19:26.751001 / .751389** | **第二次NP hang / recovery done**，在release后25.264秒 |
+| 10:19:48.088053 | 退出后超过45秒检查含两次hang，owner为空；没有EDMA timeout、BUG/Oops证据 |
+
+**API定位边界**：事故时源码`retired-convolution-control-20261008/conv_relu_pool_test.cpp`
+（10-13按用户要求已删除，以下为删除前核对结果）
+183–184行已输出图摘要，证明建图及首次输入`vsi_nn_CopyDataToTensor`返回；之后依次
+为`vsi_nn_SetupGraph`（185–187）、`vsi_nn_VerifyGraph`（188–190）、首轮输入上传
+（197）、`vsi_nn_RunGraph`（198–200）、`vsi_nn_ConvertTensorToFloat32Data`（201–203）。
+控制按约定关闭插桩，没有这些调用的返回标记或首轮PASS，无法指定哪一API未返回。
+HDMA日志不是API返回标记，不能认定卡在Verify或将等待提示叫作EDMA超时。
+
+**已证实与假设**：首个hang早于SIGTERM和进程期限，新模型、TTGT及设备清零图均未
+执行；不能归因本轮模型修改。同身份历史通过不排除间歇性应用/SDK交互，设备/驱动/
+固件初始化或事件同步异常仍是假设，不能推断永久硬件损坏，也不否定用户冷启动确认。
+旧boot模型故障和此次小卷积故障是否同根因未知。
+
+**后续规避**：停止所有上板，保留标记；相同冻结控制在冷启动后失败，先分析现有
+身份/启动/驱动证据，不以相同条件重复尝试或重编译替换控制。若以后恢复试验，仍须
+两设备冷启动及固定两级门禁。旧OPT未启动，性能无新样本；设备清零改动仅构建通过。
+证据`compiled-prefill-reset-20261013/recovery/repository-conv/`包含完整内核前后置日志、
+`incident.json`、原自动记录、SDK输出/身份；该实验根目录保留构建和未执行状态。
+
+后续用户明确授权同boot再试一次冻结卷积；执行环境自动审批以重复hang及原样重试
+风险为由拒绝启动。设备进程未启动，没有新增测试或故障，不算新的冷启动事故；
+恢复标记未改。拒绝记录在`pinned-convolution-retry-20261013/blocked.json`。
+
+## 10-13 block16混合OPT后置普通布局运行期NP hang（独立事故）
+
+事件`compiled-prefill-baseline-hang-20261013-095326`，boot
+`7d7a10f6-a1b8-4e20-84df-2b8805bdefbd`。用户要求测完整模型TTGT收益，串行普通→
+TTGT→普通；前两进程各1暖机+3正式请求及45秒门禁通过。第三进程仍是普通布局，
+binary/源代码/SDK/24份普通prefill NBG及24份M1 NBG/请求与首进程身份完全一致，
+不是在执行TTGT产物。C64、17输入→16输出、block16及末词head，固定绑定和常驻复用。
+binary SHA256 `9f0e0b525ac7d8fbce28ff03a126524ebc9e1973d52ac67f1c8ee9ed1fb5fb2a`。
+
+| UTC+8时间 | 已确认事件 |
+|---|---|
+| 09:52:23.301330 / 26.369289 | 全boot预检清洁、无owner/恢复要求；随后PID105686打开galcore |
+| 09:52:39.635767 | 第148次Verify成功返回；3531个外层operation完整、750个extension，无缺项。初始化13.270s，const/nonconst峰值856,859,964/345,837,364 B，各低于1GiB |
+| 09:53:03.169136 / .173136 | 首次正式请求及最终mapped logits文件写入时间；此前暖机也完成。文件时间不是SDK精确调用时间 |
+| 09:53:03.174219 | 第二次正式请求`measured.0.1`开始；后续没有该请求的完整结果 |
+| 09:53:03.177267–.186400 | 49条`Waiting for HDMA Transfer...`，随后到hang前无新HDMA日志；这些等待提示本身不是超时 |
+| **09:53:26.629275 / .637455** | **NP hang / recovery done**，发生在第二请求开始23.455秒后，早于监控终止 |
+| 09:53:34.262343 / 35.505275 | 监控确认故障并终止进程；内核release galcore。exit−15、墙钟71.096s、1800秒总期限未耗尽，无残留进程 |
+| 09:54:24.167831 | 退出后超过45秒检查仍含该hang，owner为空；所存窗口没有EDMA timeout、BUG/Oops或第二次hang |
+
+**API定位边界**：最后已知完成的是首请求的13块mapped logits读回，随后进入
+`PartitionedGraphModel::generate`。性能测量关闭了逐API/逐层执行追踪，因此无法确定
+未返回的是reset/控制上传`vsi_nn_CopyDataToTensor`、某图`vsi_nn_RunGraph`或标量选词
+`vsi_nn_ConvertTensorToData`，也不能指定某一decoder层。对应代码为
+`native/models/opt/partitioned_graph_model.cpp`的`reset/consume/run/predict`及缓存runner
+的`model.generate`循环；未在故障状态额外探测设备。
+
+**事实与假设**：不是Verify未返回、已知1024槽缺项或应用payload超限；同身份曾完成
+全部请求，故障进程也先完成暖机及一次正式请求。49条等待的数量吻合48份KV reset
+上传加一次block控制上传，提示reset→首个prefill块区间，但日志不是API返回标记，
+不能据此证明reset已完成或确定内部算子。跨进程SDK/驱动/固件状态、较大常驻权重及
+reset/块执行交接均为未证实假设；前序TTGT进程虽正常释放并过延迟门禁，仍不能
+证明或排除跨进程影响。SIGTERM和总期限不能解释先发生的hang。
+
+**后续规避**：保留恢复标记，停止全部上板；确认主机与NP101冷启动后按固定两级
+控制及延迟门禁恢复。不原样重跑此A/B/A套件、不以减少次数宣称修复；已完成同身份
+与编译表离线对照。若另行安排诊断，先针对reset/首个prefill块保留API或阶段证据，
+与性能测量分开。前两成功进程的有限性能仍保留，第三进程部分数据全部排除，
+漂移对照和稳定性验收未完成；显式候选不切默认。
+
+证据`compiled-prefill-opt-20261013/ordinary-after/`：`incident.json`（详细记录）、
+`automatic-incident.json`（原自动记录）、`kernel-event-window.log`、完整内核前后置日志、
+SDK验图表/执行身份及部分请求文件；源码/产物身份在上级`*-artifacts.json`和`artifacts/`。
 
 ## 10-11 八图纯GEMM基线执行停滞及释放后NP hang（独立事故）
 

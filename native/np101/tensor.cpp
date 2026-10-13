@@ -52,14 +52,15 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
                                              const std::vector<std::uint32_t> &region_start,
                                              const std::vector<std::uint32_t> &region_end) {
   const auto rank = tensor->attr.dim_num;
-  if (!tensor->t || tensor->attr.vtl || tensor->attr.is_created_from_handle || rank > 2 ||
+  if (!tensor->t || tensor->attr.vtl || tensor->attr.is_created_from_handle || rank > 3 ||
       tensor->attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE) {
-    throw std::invalid_argument("mapped readback requires an ordinary unquantized rank-1/2 tensor");
+    throw std::invalid_argument(
+        "mapped readback requires an ordinary unquantized rank-1/2/3 tensor");
   }
   if (region_start.size() != rank || region_end.size() != rank) {
     throw std::invalid_argument("mapped tensor region rank differs");
   }
-  std::array<vx_size, 2> start{}, end{0, 1}, length{1, 1};
+  std::array<vx_size, 3> start{}, end{0, 1, 1}, length{1, 1, 1};
   for (unsigned axis = 0; axis < rank; ++axis) {
     if (region_start[axis] >= region_end[axis] || region_end[axis] > tensor->attr.size[axis]) {
       throw std::out_of_range("mapped tensor region exceeds storage");
@@ -69,8 +70,8 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
     length[axis] = end[axis] - start[axis];
   }
   const auto row_bytes = length[0] * element_bytes;
-  const auto bytes = row_bytes * length[1];
-  std::array<vx_size, 2> stride{};
+  const auto bytes = row_bytes * length[1] * length[2];
+  std::array<vx_size, 3> stride{};
   std::vector<std::uint8_t> result(bytes);
   void *pointer = nullptr;
   vx_map_id map_id = 0;
@@ -100,19 +101,25 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
     }
   } mapping{tensor->t, map_id};
 
-  if (!pointer || stride[0] != element_bytes ||
-      (rank == 2 &&
-       (stride[1] < row_bytes || stride[1] > (std::numeric_limits<std::size_t>::max() - row_bytes) /
-                                                 std::max<vx_size>(1, length[1] - 1)))) {
+  auto span = row_bytes;
+  bool valid = pointer && stride[0] == element_bytes;
+  for (unsigned axis = 1; valid && axis < rank; ++axis) {
+    valid = stride[axis] >= span &&
+            (length[axis] == 1 ||
+             stride[axis] <= (std::numeric_limits<std::size_t>::max() - span) / (length[axis] - 1));
+    if (valid) {
+      span += (length[axis] - 1) * stride[axis];
+    }
+  }
+  if (!valid) {
     throw std::runtime_error("mapped tensor pointer or strides violate the readback contract");
   }
-  // Copy while mapped; the pointer expires at unmap. Honor padded rows without per-element IO.
-  if (rank == 1 || stride[1] == row_bytes) {
-    std::memcpy(result.data(), pointer, bytes);
-  } else {
+  // The pointer expires at unmap. Copy rows while honoring padding in every mapped axis.
+  for (vx_size plane = 0; plane < length[2]; ++plane) {
     for (vx_size row = 0; row < length[1]; ++row) {
-      std::memcpy(result.data() + row * row_bytes,
-                  static_cast<const std::uint8_t *>(pointer) + row * stride[1], row_bytes);
+      std::memcpy(result.data() + (plane * length[1] + row) * row_bytes,
+                  static_cast<const std::uint8_t *>(pointer) + plane * stride[2] + row * stride[1],
+                  row_bytes);
     }
   }
   mapping.close();
@@ -208,10 +215,13 @@ std::vector<std::uint8_t> read_tensor_region(Graph &graph, vsi_nn_tensor_id_t id
   auto *tensor = get_tensor(graph, id);
   const auto bytes = tensor_bytes(tensor);
   const auto rank = tensor->attr.dim_num;
-  if (rank > 2) {
-    throw std::invalid_argument("mapped tensor regions require rank-1/2");
+  if (rank > 3) {
+    throw std::invalid_argument("mapped tensor regions require rank-1/2/3");
   }
-  const auto elements = std::size_t(tensor->attr.size[0]) * (rank == 2 ? tensor->attr.size[1] : 1);
+  std::size_t elements = 1;
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    elements *= tensor->attr.size[axis];
+  }
   auto result = read_mapped_tensor(tensor, bytes / elements, start, end);
   ++transfers.reads;
   transfers.read_bytes += result.size();

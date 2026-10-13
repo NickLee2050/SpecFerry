@@ -195,6 +195,29 @@ class DeviceRecoveryTests(unittest.TestCase):
         terminate.assert_any_call(123456, signal.SIGKILL)
         self.assertEqual(marker["boot_id"], device.host_boot_id())
 
+    def test_profiler_is_explicit_and_cannot_instrument_recovery_controls(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, VIV_VX_PROFILE="1", VP_OUTPUT="inherited.vpd"),
+        ):
+            output = Path(directory) / "capture.vpd"
+            result, process, _, _ = self.run_fixture([0], [])
+            self.assertEqual(process.spawn_environment["VIV_VX_PROFILE"], "0")
+            self.assertNotIn("VP_OUTPUT", process.spawn_environment)
+            self.assertFalse(result["profiler"]["requested"])
+            result, process, _, _ = self.run_fixture([0], [], profiler_output=output)
+            self.assertEqual(process.spawn_environment["VIV_VX_PROFILE"], "1")
+            self.assertEqual(process.spawn_environment["VP_OUTPUT"], str(output))
+            self.assertEqual(process.spawn_environment["SPECFERRY_VERIFY_EXECUTION_TRACE"], "0")
+            self.assertEqual(result["profiler"]["output"], str(output))
+            for option in ("recovery_control", "sdk_timing", "sdk_summary", "trace_driver"):
+                with self.subTest(option=option), self.assertRaisesRegex(ValueError, "separate"):
+                    self.run_fixture([0], [], profiler_output=output, **{option: True})
+            output.write_bytes(b"original evidence")
+            with self.assertRaisesRegex(ValueError, "overwrite"):
+                self.run_fixture([0], [], profiler_output=output)
+            self.assertEqual(output.read_bytes(), b"original evidence")
+
     def test_timeout_requires_recovery_even_if_signal_handler_exits_successfully(self):
         result, _, terminate, marker = self.run_fixture(
             [subprocess.TimeoutExpired("fixture", 1), 0], []

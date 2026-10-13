@@ -1,38 +1,35 @@
 # NP101 推理实现与优化结论
 
-整理日期：2026-10-12；设备与性能证据截至 2026-10-12。目标是在旧 component 正确性的
-基础上降低 OPT-350m 单请求 decode 延迟。完整模型在已测范围内通过，prefill 明显加速，
-持续 decode 仍约 **0.71–0.72 输出 token/s**，主要性能目标尚未完成。
+更新：2026-10-13。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
+降低单请求decode延迟。未完成项见[TODO](../TODO.md)，每次上板先读
+[事故台账](np101-recovery-incidents.md)，接口见[测试手册](../tests/README.md)，
+SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
 
-本页集中维护实现、验收、性能和技术结论；[TODO](../TODO.md) 只维护未完成工作。
-[SDK 问题表](np101-sdk-driver-validation-report.md) 维护失败契约，
-[冷启动事件台账](np101-recovery-incidents.md) 维护运行门禁、独立事故及规避，
-[测试手册](../tests/README.md) 维护命令与诊断接口。
+原始证据相对 `.cache/runs/`，不随Git分发；压缩前全文、代码与hash在
+`commit-cleanup-20261013/before/`、`before-manifest.json`。早期归档见
+`documentation-consolidation-20261010/`；退役脚本保存在压缩证据归档中。
 
-## 实现与验收范围
+## 当前实现与验收范围
 
-- 活跃 DLM 为真实 `facebook/opt-350m`，24 层，checkpoint 默认 greedy。Qwen3.5
-  既有实现、checkpoint 和回归证据保留；DLM/TLM 联合推理尚未验证。
-- 已测计算链在 NP101 图内完成 embedding、decoder、KV 更新、最终归一化、LM head
-  与 greedy；主机负责分词、初始化、调度及 token 读回/文字展示。Replay→Submit→HAL
-  COMMIT→完成等待支持编译设备命令路径，不代表逐指令核利用率证明。
-- Python 入口默认仍为 component 回归后端；graph 默认 `merged-kv`，固定每图一层 decoder。
-  两路 fc1、block16、last-token head 和 mapped 诊断均按明确选项使用。
-- 固定图、固定绑定与常驻权重/KV；prefill/decode 两套图共享 backing。每层 K/V
-  分别用 `[1024,C]` 存储，供 16 头 attention；普通请求 reset 后复用，不重新编译。
-  block4/16 处理同一请求的已知连续输入，尾部和 decode 使用 block1，不等待凑块。
-- 分块 KV 写使用已校准的 `vxReshapeTensor` 写别名：普通 RESHAPE 可能复制，缺少
-  共享写回保证，这是有语义依据的 API 例外。已校准真实头维、混合写入、覆盖、末块
-  和 causal 不变性；不交换运行期句柄。分次追加 prompt 的增量输入接口尚未实现。
-- 模型重建先释放全部旧图及最后一个旧 Context，再创建新 Context；并存 Context
-  共享进程 shader 槽表。普通请求继续复用模型，不能用第二 Context 隔离槽位预算。
-- const/nonconst 应用 tensor payload 分别限 1 GiB，共享 backing 只计一次并计临时
-  峰值；SDK 隐藏副本、workspace 和物理位置未知。预算合规不等于数据完整性保证。
-
-当前维护入口集中在完整生成、logits/KV、生命周期及性能集合。旧前缀诊断、局部权重/
-双层合图、预加载抽样、四路fc1及单层权重复用实验已退役，源码快照见
-`.cache/runs/code-consolidation-20261010/before/`。精简后已完成主机编译、离线回归及下表
-最后两项板卡验收；此前各项保留原版本证据，不宣称已对当前binary全量重验。
+- 图内完成embedding、24层decoder、KV更新、最终归一化、LM head和greedy；主机
+  负责分词、初始化、调度及token读回。Qwen3.5实现/checkpoint/回归证据保留。
+- Python默认仍为component回归后端；手写graph默认`merged-kv`、每图一层decoder。
+  两路fc1、block4/16及last-token head按显式配置使用。每请求复用图，无运行期Verify。
+- 手写prefill/decode共享一份权重/KV；KV为FP16 `[1024,C]`。分块写采用已校准的
+  `vxReshapeTensor`别名并保留写后读依赖；普通RESHAPE可能复制，不能替代共享写保证。
+- 编译FFN候选每层attention→NBG FFN→残差/LN三图。M1及block16已验；M16包与
+  M1包分别常驻，预算含额外FFN权重。固定48-copy图清零KV，首/末层粗验及重复请求
+  通过；v105外层审计149图、3579 operation、750 extension。
+- 完整decoder候选每层一份NBG，M1/C64、普通rank3 FP32 KV，加独立copy图提交；
+  共27图。未接block16，不作NBG输入/输出原地别名。
+- 全图NBG包含embedding、所有decoder、project_out、LM head及greedy；独立48-copy
+  KV提交图，共2图。仅M1/C64已验，主机逐token调度；48个FFN投影TTGT无明显收益。
+- NBG固定端口/图版本/权重来源；builder持有路径，图计入嵌入常量预算。const/nonconst
+  各≤1GiB，共享backing只计一次；SDK副本、workspace和物理地址未知。
+- 重建前释放所有旧图和最后一个Context；v105 Context共享进程1024 shader槽表，
+  并存Context不隔离预算，平行Verify未验。AddNode仅逐项设置字段，不覆盖nn_param。
+- 归一化及FP32 KV保留敏感精度契约。普通生成只读token，logits/KV按需粗读；
+  普通非量化rank1/2/3 tensor可显式MappedHost读回，无SDK-copy回退。
 
 | 验收对象 | 已完成范围 | 边界 |
 |---|---|---|
@@ -45,50 +42,51 @@
 | 有界常驻复用 | 同 boot、17输入/16输出，1暖机+10正式请求，160输出一致、无运行期编译、释放归零 | 约五分钟证据，不构成跨启动或长期验收 |
 | 精简后 / C64 | 17输入/16输出，1暖机+1正式请求均与原CPU oracle一致；39项检查、编译完整性、预算/释放及延迟门禁通过 | 复用已验配置，无新增全层KV矩阵 |
 | 精简后 / C128 | 96/97/96输入，各32输出，96个输出均与CPU一致；最终50,272维logits全量比较、A/B/A重复logits逐字节一致、末槽/越界拒绝/释放及延迟门禁通过 | 58项检查；仅这些输入与粗验范围，无全层KV或长期稳定性结论 |
+| 编译FFN / C64 | 24层三图设备连接，block1、17输入/16输出，1暖机+1正式请求；选词/最终logits、v105的74图编译完整性、预算/释放及延迟门禁通过 | 单层两步KV另有粗验；block16见下文v106验收，未重验全层KV或长期稳定性；未切默认CLI |
+| 完整decoder NBG / C64 | 第0层端口/接续/末槽及单份循环KV通过；24层block1、17输入/16输出，三进程各1暖机+1正式请求；选词、最终logits、末层KV/未写槽、27图外层operation、释放及各45秒门禁通过 | 普通FP32三维KV；未重验全层KV、block16、C128或长期稳定性；正式CLI未接入 |
+| 单个全图NBG / C64 | M1、17输入/16输出，1暖机+1正式请求；全部选词、最终logits、末层KV/未写槽、2图外层operation、预算/释放及45秒门禁通过 | 含GatherND及INT32选词修正；KV回写独立，不是整段生成循环编进NBG；未验block16、C128或长期稳定性 |
 
-**已接受的精度例外**：C64 的16-token prompt，第15个新词在同一30-token历史下，
-CPU FP16 增量选164（` going`），设备 block1/block4 均选45（` not`）。两者 logit
-差在 CPU/设备分别为 +0.000976563/-0.000976563；CPU FP32 也选45。完整向量最大
-误差0.03125，通过 `atol=0.08, rtol=0.02`。沿设备实际历史下一词均为686，最大误差
-0.0234375。仅此近并列差异获准接受，原失败证据及严格检查保留，不豁免未来任意分歧。
+近并列精度例外仅有一例：C64、16-token prompt、第15个新词、同一30-token历史，
+FP16参考token164（` going`）与设备45（` not`），top2间隔
+约0.00098，整向量最大误差0.03125，容差`atol=0.08, rtol=0.02`通过；CPU FP32也选45，
+沿设备历史下一词与CPU一致。此授权不豁免其他选词分歧。证据
+`token-logit-precision-20261001/`、`acceptance-decision-20261001.json`。
 
-## 做过的修改与决策
+C128的96/97输入、32输出及末槽已验，设备与CPU整段续写一致；答案有重复和事实错误，
+说明计算一致性不等于回答质量。两轮96输入共64输出/113.310s，97输入32输出/57.921s，
+未剔除暖机，不作持续吞吐基线。证据 `post-cleanup-context-20261010/`。
 
-| 工作 | 观察与收益 | 决策 |
-|---|---|---|
-| 实际节点规模 / 图边界 | 单层612 SDK节点 Verify约141–169秒；两层993节点到758秒仍未完成；两层四张分图累计11.026秒且数值通过。缩小预留量无明显收益 | 采用可控固定小图；非线性已观察，O(n³)仍只是经验假设 |
-| 合并逐头 KV | AddNode 从旧component的1572增到逐头KV的4741，约96%增量来自KV/控制；合并后1861。每层KV节点126→6，extension1143→423 | 保留合并KV，降低真实展开和共享槽位压力 |
-| 固定图与共享存储 | 消除新路径运行期Verify，减少控制IO；两套图共享一份权重/KV | 保留；应用共享不证明物理零复制 |
-| block4 prefill | 15-token输入图prefill约23.09→9.72秒，减少58% | 保留；首词改善为主 |
-| 仅末prompt块运行head | 对应C16实验prefill/总图时间减少6.10%/4.68% | 保留显式last-token策略，decode仍每步运行head |
-| 两路fc1 | 沿输出通道拆两次MatMul后Concat，保留完整归约与FP16边界；FFN集合快9.27%，完整模型decode图时间少5.16%–6.22% | 保留显式候选；预装fc2后曾绕过AddTensor失败，根因未定 |
-| 更大已知输入块 | FFN M1→M4每输入成本低约72%；M4/M8/M16约0.258/0.146/0.088秒每输入每24层轮。模型64-token prefill由block4约22.7秒降到block16的8.233秒 | 接入block16；算子回放及输入处理率不作输出吞吐 |
-| 固定LayerNorm参数 | 初始化将96份FP16 gamma/beta扩为共享FP32 `[1024,1]`；动态归一化精度不变；52图编译节点4227→3843，只有tensorcopy计数少384 | 保留图简化；Verify约13.2–13.5→10.7秒，decode无提速 |
-| 更大/更小图、存储变体 | 两decoder合图、attention/FFN再拆图、图内const初筛均未获益 | 不采用；不据此判断所有图边界 |
-| 四路fc1 | 整模型额外收益仅约1%–2%，两套图槽位估算894→990/1024 | 模型及集合入口均退役，保留证据 |
-| 权重预转置 / 缩小工作集 | 预转置慢1.60%；FFN矩阵工作集384→16 MiB，集合慢约4%–5% | 不接入模型；不能排除带宽/隐藏搬运瓶颈 |
-| 1×1卷积 / VX MatMul候选 | 卷积Verify进入FCL优化器崩溃；VX集合未建立采用收益，匹配EVIS对照hang，无可比时间 | 关闭探索、退役专用入口，保留SDK自动选择；不能声称后端性能等价 |
-| 诊断读回 | 大量SDK-copy曾触发EDMA；减少读回、显式Map/Unmap后所列粗验通过 | 常规生成只读token，诊断按需要粗读；未证明永久规避EDMA |
+## 保留的优化与关闭的路线
 
-AddNode、编译节点、extension及shader槽位是不同计数。不同日期/boot/负载的收益
-不能相乘或相加；增加节点的两路fc1能提速，减少节点的LN预处理没有decode收益。
-LN预处理使共享权重净增0.1875 MiB至662,589,440 B，nonconst峰值反降约1.297 MiB
-至766,517,812 B，const为13,884 B；关闭后均归零，保留了初始化收益。
+| 修改 | 证据与决策 |
+|---|---|
+| 合并逐头KV | 逐头实现4741 AddNode→合并1861；每层KV节点126→6，extension1143→423。保留，减轻真实展开与共享槽表压力 |
+| 固定图和共享存储 | 权重/KV复用、消除运行期Verify；应用共享不证明物理零复制 |
+| block4/16与last-token head | 15-token图prefill约23.09→9.72s；64输入block4→16约22.7→8.233s。收益主要在首词，未知未来decode token不能直接合批 |
+| 两路fc1 | 沿输出通道拆两次MatMul再Concat，保留完整归约/FP16边界；整模decode约快5%–6%。预装fc2曾绕过AddTensor失败，根因未定 |
+| 固定LayerNorm affine | 96份gamma/beta初始化扩为共享FP32，4227→3843编译节点；Verify约13.2→10.7s，decode无收益。权重662,589,440 B |
+| 编译FFN→完整decoder→全图 | 局部FFN集合约快11.7倍，但串行整模受其余阶段限制；最新生成性能见下表 |
+| KV读回/清零 | 粗验和Map/Unmap减少大SDK-copy暴露面；48次清零上传改固定copy图，重复请求通过，不证明EDMA永久修复 |
+| 更大/更小图、const MatMul、四路fc1、权重预转置、小工作集 | 未获采用收益或预算/槽位接近上限，专用分支/入口退役，原始证据保留 |
+| 原始FCL、1×1卷积、强制VX投影 | 失败/无有效匹配收益；诊断分支退役。NBG可用不证明手写FCL故障修复 |
+| 两路fc2、INT8 | fc2拆分整模decode少5.28%–5.54%，与block16组合暂缓；INT8经FP16输出明显更慢，无纯I8→I32已验通路，整数探索已停止 |
+
+单层612 SDK节点Verify约141–169s；两层993节点到758s未完成；两层四张小图累计
+11.026s且正确。缩小预留量无明显收益。非线性已观察，O(n³)仅经验假设；AddNode、
+编译operation、extension与shader槽位是不同计数，不能混用。证据见
+`graph-reservation-analysis-20260928/`、`verify-boundary-analysis-20260928/`、
+`merged-kv-optimization-20260929/`、`int8-and-ffn-partition-20261010/`。
 
 ## 性能口径与代表性结果
 
-- **驻留请求输出吞吐**：`Σ实际输出数 / Σgeneration.total_seconds`，含prefill/首词、
-  decode、必要IO及调度；排除初始化、启动前Setup/Verify、reset、CPU参考、落盘、释放。
-  旧实现运行期重复Verify仍计入实际请求墙钟，不能为美化输出吞吐而扣除。
-- **首词后decode速率**：`Σ(输出数−1) / Σ(total_seconds−first_token_seconds)`；
-  单输出请求无此指标。暖机剔除，不合并不同长度/配置；TTFT单列。
-- **图时间**：外层RunGraph及独立ProcessGraph，包含完成等待，剔除独立Verify、
-  显式IO等，不重复相加内层区间；不是纯NPU算术时间。输入处理与算子回放另列。
-- 使用代表性重复集合、前→候选→后和内存汇总；新增追踪做关闭→开启→关闭对照。
-  已重算历史39组/103次正式请求；旧版长输入的单次数值记录不作为持续硬件吞吐基线。
-
-下表输出速率均按正式请求的输出数/时间累计计算。前三行为历史匹配对照；后两行
-说明当前水平，不能据跨boot的差值归因某项优化。除常驻复用10次外，每组3次正式请求。
+- 请求输出吞吐：`Σ实际输出数 / Σgeneration.total_seconds`，包含prefill/首词、decode、
+  必要IO与调度；排除初始化、独立Setup/Verify、reset、CPU参考、落盘和释放。
+  旧实现运行期重复Verify计入墙钟，不能扣除。
+- 首词后decode速率：`Σ(输出数−1) / Σ(total_seconds−first_token_seconds)`；
+  单输出无此指标。暖机剔除，不合并不同长度/配置，首词单列。
+- 图/算子时间包含执行、内部搬运和完成等待；排除准备、显式IO、日志，不重加嵌套区间。
+  输入处理率、算子回放、有效GFLOP/s均不是生成输出吞吐。
+- 重复真实负载集合，前→候选→后；新追踪按关闭→开启→关闭量化扰动。
 
 | 配置 | 输入→每次输出 | 请求输出 token/s | 首词后decode token/s | TTFT中位秒 |
 |---|---:|---:|---:|---:|
@@ -98,245 +96,178 @@ LN预处理使共享权重净增0.1875 MiB至662,589,440 B，nonconst峰值反�
 | 两路fc1 / block16 / C64，常驻复用10次 | 17→16 | 0.660356 | 0.720658 | 3.413 |
 | 同配置加LN预处理 / C64 | 32→32 | 0.672882 | 0.714363 | 4.159 |
 
-- 合并KV相对旧component的请求/decode输出速率高16.93%/19.71%，含旧运行期Verify/IO
-  减少的收益。block4相对block1的请求高33.68%，decode变化很小，主要缩短首词。
-- 两路fc1匹配对照的decode图时间1590.990→1508.881→1608.923 ms/token；按实际输出
-  墙钟重算，decode速率相对两侧基线高5.40%/6.70%。
-- block16的64输入/1输出：图prefill约22.7→8.233秒，实际请求输出约0.044→0.1215
-  token/s；7.773是**输入处理率**。63-token输入有15个单token尾部，粗验未观察到收益。
-- LN预处理前→候选→后，17输入/16输出，图decode中位1388.886→1392.695→1385.400
-  ms/token，候选慢0.27%/0.53%，没有推理提速。Verify总计13.455/10.722/13.166秒。
-- 10-09的32输入/32输出三次均与CPU参考逐token一致，共96输出/142.669892秒；首词后
-  93输出/130.186002秒。请求中位47.565700秒。英文续写有重复，CPU参考同样重复；
-  准确文字及IDs在 `layernorm-affine-preparation-20261009/generated-text.json`。
+历史39组/103次正式请求已按上述口径重算。手写block16的64输入/1输出实际约
+0.1215token/s，7.773是输入处理率。证据 `output-throughput-review-20261009/`、
+`layernorm-affine-preparation-20261009/`。
 
-10-10精简后短请求正式16输出/24.434267秒，输出/decode速率0.654818/0.716318，
-首词3.493851秒；初始化20.982537秒另计。C128为有界验收请求，未剔除暖机，
-保留原有SDK内存汇总/编译守门，不作为新的持续性能基线：
+以下均C64、17输入/16输出；v105前四行早先各1暖机+1正式，后四行最新匹配测试，
+普通全图取前后两进程、block16普通取前后各3正式，TTGT为夹在其中的1/3正式。
 
-| C128输入→每次输出 | 次数 | 累计输出/生成秒 | 请求输出 token/s | 首词后decode token/s | 首词均值秒 |
-|---|---:|---:|---:|---:|---:|
-| 96→32 | 2 | 64 / 113.310060 | 0.564822 | 0.702754 | 12.542853 |
-| 97→32 | 1 | 32 / 57.920707 | 0.552479 | 0.703752 | 13.871129 |
-
-C128初始化20.918025秒另计；52图/3843编译节点，权重仍为662,589,440 B，
-const/nonconst峰值26,172/808,396,852 B。最终logits最大误差0.025634766/0.0234375，
-均通过既有容差。英文阅读题中，钥匙明在厨房桌上，模型却答“包里”并重复天气问答；
-闭馆日答对“周日”，后续续写虚构地址。CPU与设备的完整32-token续写完全一致，
-这两例说明计算一致性通过不等于回答质量通过；不是新增设备精度例外。完整原文、
-未修饰续写、IDs及统计在 `post-cleanup-context-20261010/`。
-
-## FFN 拆分与精度对照
-
-10-10临时实验复用真实24层OPT、C64/block1、17输入→16输出，各1暖机+1正式请求，
-顺序为FP16前基线→fc2拆分→INT8→后基线。准备/Verify另计，运行期无编译；最终
-logits在计时外映射读回。block1首词/请求吞吐不能直接与block16成绩比较。
-
-| 配置 | 24层FFN集合秒/轮 | 整模decode秒/token | 请求输出token/s | 首词后decode token/s |
-|---|---:|---:|---:|---:|
-| FP16前/后基线，fc1两路 | 0.833293 / 0.838159 | 1.403291 / 1.399385 | 0.370544 / 0.371218 | 0.712611 / 0.714600 |
-| FP16，fc1/fc2各两路 | 0.771849 | 1.325552 | 0.393179 | 0.754403 |
-| W8A8线性层，fc1两路 | 1.532214 | 2.435580 | 0.210961 | 0.410580 |
-
-- **两路fc2仍是候选**：沿输出通道拆分，每路保留完整归约，拼接后加bias，不复制
-  权重。FFN时间减少7.37%–7.91%，整模decode延迟减少5.28%–5.54%；16个输出及
-  最终50,272维logits与基线逐字节一致。单套图extension447→471，权重仍
-  662,589,440 B；block16组合与长期复用未验，正式代码未接入。
-- **INT8路线已关闭**：线性层用DFP W8A8，权重/激活步长1/256、1/8，MatMul输出
-  FP16，其余敏感状态及共享head保留原精度。170个GEMM选中`evis.gemm_I8I8toF16`，
-  权重payload降至359,550,976 B，但FFN慢约83%、整模decode慢约74%。整模仅验
-  logits有限与重复一致性，输出16个换行，无整模INT8精度/质量验收；dtype、布局及
-  转换同时变化，不能把减速归因于输出FP16或据此否定整数峰值能力。
-- **输出改INT32无已证实通路**：同库内嵌shader的I8→F16/I8变体包含FP32归约；
-  MATRIXMUL的28项类型表不含I8×I8→I32，公开参数无累加类型开关。源码/分派名称
-  不足以确定物理乘法器或解释减速，用户已停止此路线。
-
-FFN使用24份不同真实权重，4轮暖机后3×8轮计时；该集合不是输出吞吐。8次板卡
-进程均释放/预算归零，各至少45秒延迟门禁通过。精确参数、前后漂移及独立参考见
-`int8-and-ffn-partition-20261010/`；整数类型审计见`int8-output-type-audit-20261010/`。
-
-## FP16 计算压力与部件消融
-
-以下均按MAC=2 FLOPs，分子只计GEMM/卷积，分母为固定绑定的重复图集合，含附加
-算子、内部搬运和完成等待；准备/Verify、显式IO、日志及释放在计时外。有效GFLOP/s
-不是输出吞吐、净kernel时间或物理利用率。完整证据分别在
-`fp16-compute-scaling-20261010/`、`gemm-ffn-ablation-20261010/`。
-
-| 集合 | 每轮图数 | 每轮秒（批次中位） | 有效GFLOP/s |
+| 实现 | v105 decode ms/token | v106 decode ms/token | 实际输出 token/s，v105 / v106 |
 |---|---:|---:|---:|
-| FFN M=1 前/后 | 24 | 0.906432 / 0.904791 | 0.444218 / 0.445024 |
-| FFN M=16 | 24 | 1.410359 | 4.567950 |
-| FFN M=64 | 24 | 6.101793 | 4.223316 |
-| FFN M=256 | 24 | 24.852782 | 4.147593 |
-| 3×3卷积集合 | 8 | 1.197557 | 8.069493 |
+| 两路fc1手写 / M1，历史 | 1407.787 | 1597.820 | 0.369 / 0.324 |
+| 编译FFN三图 / M1，历史 | 666.124 | 1195.969 | 0.816 / 0.443 |
+| 逐decoder NBG / M1，历史 | 621.903 | 839.248 | 0.875 / 0.640 |
+| 普通全图 / M1，最新 | 542.949 | 602.512 | 0.921 / 0.834 |
+| 全图FFN TTGT / M1，最新 | 542.225 | 603.427 | 0.922 / 0.839 |
+| 混合编译 / block16，最新 | 650.103 | 1188.585 | 1.407 / 0.780 |
+| 混合编译＋prefill TTGT / block16，最新 | 651.436 | 1167.116 | 1.425 / 0.802 |
 
-FFN使用24份OPT真实权重、fc1/fc2各一路；每轮GEMM算术量为
-`24×4×M×1024×4096`。卷积按demo契约，以8份不同随机输入/权重执行
-64×64、128入/出通道、3×3 CONV→RELU→2×2 MAXPOOL，每轮卷积算术量为
-`8×2×64×64×128²×3²`。测三个批次，大M缩减重复轮数；末图完整输出粗验通过，
-M1前后漂移−0.181%，最大nonconst峰值571.232 MiB；6进程释放及延迟门禁通过。
+最新v105普通/TTGT全图首词9.228/9.219s、生成17.373/17.352s；block16普通/TTGT
+首词1.618/1.460s、生成11.369/11.231s。全图TTGT输出率仅增0.12%、decode少0.13%，
+无明显收益；block16首词少9.76%、输出率增1.23%，M1decode未改且反增0.21%。
+v105普通前后decode漂移全图−0.037%、block16+0.008%；v106分别−0.90%/−2.19%。
 
-随后以8份不同真实权重逐步增加FFN部件；纯GEMM每图只有一个
-`evis.gemm_transb_F16F16toF16`。M1、M16、M64、1024方阵、M16第二投影分别为
-0.413、4.467、4.237、4.156、4.624 GFLOP/s。固定M16的消融如下：
+v106的9个模型进程/15正式/240输出、重装v105后的6进程/12正式/192输出均通过
+选词/logits、所列KV/清零、预算/释放及各45秒延迟门禁。没有新hang或EDMA。
+初始化v105全图0.743–0.775s、block16约12.5s；v106约10–12s/86–92s，独立记录。
+回退速度恢复，支持与软件栈变化有关；驱动/SDK同时变化且boot不同，不能单独归因驱动。
 
-| 累计结构 | 平均ms/图 | 较上一步增加ms | 有效GFLOP/s |
-|---|---:|---:|---:|
-| GEMM1 | 30.046773 | — | 4.466960 |
-| +bias1 | 30.048160 | 0.001387 | 4.466754 |
-| +ReLU | 30.233394 | 0.185234 | 4.439387 |
-| +GEMM2 | 58.553615 | 28.320221 | 4.584439 |
-| +bias2，核心FFN完整 | 58.933232 | 0.379616 | 4.554908 |
-| +残差 | 58.617851 | −0.315380 | 4.579415 |
-| +LayerNorm | 60.876714 | 2.258863 | 4.409493 |
+证据：`ffn-compiled-integration-20261012/summary.json`、
+`compiled-decoder-integration-20261012/summary.json`、`compiled-opt-fullgraph-20261013/`、
+`compiled-opt-layout-v106-20261013/summary.json`、`compiled-opt-layout-v105-20261013/summary.json`。
+首次v106单样本585.566ms/0.857token/s另存 `compiled-opt-driver-recheck-20261013/`，
+不覆盖或与后续匹配平均混算。编译模型规范入口见测试手册，正式导出仍待完善。
 
-**低有效算力已在纯GEMM出现**；最大非GEMM增量为LayerNorm约2.26ms/3.85%。
-增量包含整图优化/状态差异，负增量不认定为加速。12进程末图完整输出粗验最大误差
-≤0.00390625，前后M16漂移−0.00458%；释放/预算/延迟门禁通过。不能分离GEMM
-内部计算、搬运与等待；后续应核实编译路径及厂商预期，而非继续盲目扩大M。
+## GEMM、布局与设备有效算力
 
-### 矩阵尺寸与完整TTGT
+MAC=2 FLOPs，只计GEMM/卷积算术量，分母为真实重复图集合。手写权重为运行时tensor，
+NBG将其嵌入并允许打包，比较不只是编译器变量。每集合8份不同矩阵、2暖机、3重复批次，
+2048方阵为2图各4组；表中延迟为集合均摊，每格 **ms / GFLOP/s**。
+TTGT为 `C=A·B → Cᵀ=Bᵀ·Aᵀ → C`，显式输入/权重/输出转置均计时，主机布局准备除外。
 
-10-12确认冷启动并通过固定控制后，完成全部8种尺寸配对。
-`C=A·B → Cᵀ=Bᵀ·Aᵀ → C`显式转置两个输入及输出，三次转置全部计时。
-原始路径存储Bᵀ，TTGT存储数学B，主机布局准备在计时外；数学输入相同。
-除2048方阵用确定性随机FP16外均取OPT权重，每集合8份不同矩阵。
-
-一图8组独立GEMM，2048方阵两图各4组以控制单次调用长度；每布局独立进程，
-2轮暖机后3批、每批至少2轮。表中为集合中位时间÷8，非孤立调用延迟；分子为
-8×2MNK，计时范围同上，未将合图的成功解释为历史hang根因已修复。
-
-| M / K / N | 原始均摊ms | 原始GFLOP/s | 完整TTGT均摊ms | TTGT GFLOP/s |
+| M / K / N | 手写 GEMM ms / GFLOP/s | 手写完整 TTGT ms / GFLOP/s | NBG 固定权重 GEMM ms / GFLOP/s | NBG 固定权重 TTGT ms / GFLOP/s |
 |---|---:|---:|---:|---:|
-| 1 / 1024 / 4096 | 20.488 | 0.409 | 282.677 | 0.030 |
-| 16 / 1024 / 4096 | 29.689 | 4.521 | 285.551 | 0.470 |
-| 16 / 4096 / 1024 | 28.679 | 4.680 | 272.540 | 0.492 |
-| 64 / 1024 / 4096 | 126.035 | 4.260 | 348.383 | 1.541 |
-| 256 / 1024 / 4096 | 510.485 | 4.207 | 618.060 | 3.475 |
-| 1024 / 1024 / 1024 | 514.145 | 4.177 | 494.418 | 4.343 |
-| 1024 / 1024 / 4096 | 2045.272 | 4.200 | 1796.324 | 4.782 |
-| 2048 / 2048 / 2048 | 4101.422 | 4.189 | 3235.913 | 5.309 |
+| 1 / 1024 / 4096 | 20.488 / 0.409 | 282.677 / 0.030 | 2.771 / 3.027 | 2.784 / 3.013 |
+| 16 / 1024 / 4096 | 29.689 / 4.521 | 285.551 / 0.470 | 8.741 / 15.355 | 1.911 / 70.233 |
+| 16 / 4096 / 1024 | 28.679 / 4.680 | 272.540 / 0.492 | 2.052 / 65.416 | 1.967 / 68.242 |
+| 64 / 1024 / 4096 | 126.035 / 4.260 | 348.383 / 1.541 | 33.258 / 16.143 | 4.913 / 109.276 |
+| 256 / 1024 / 4096 | 510.485 / 4.207 | 618.060 / 3.475 | 161.880 / 13.266 | 58.293 / 36.839 |
+| 1024 / 1024 / 1024 | 514.145 / 4.177 | 494.418 / 4.343 | 156.208 / 13.748 | 135.888 / 15.803 |
+| 1024 / 1024 / 4096 | 2045.272 / 4.200 | 1796.324 / 4.782 | 780.590 / 11.004 | 363.978 / 23.600 |
+| 2048 / 2048 / 2048 | 4101.422 / 4.189 | 3235.913 / 5.309 | 1633.039 / 10.520 | 605.707 / 28.363 |
 
-完整TTGT对小M明显更慢；三种最大形状分别减少约3.8%、12.2%、21.1%的时间，
-仍无量级改善。M16另测预转置输入、仅交换乘法得到21.058ms/6.374GFLOP/s，
-其输入准备和CPU最终转置不计时，不能作为完整TTGT或模型收益。
+固定FP16权重的扩展集合：前两行8乘积，后三行2图各1乘积，非仅尺寸变量；最大
+源payload界384MiB，显式IO峰值160MiB，SDK隐藏workspace未知。
 
-25进程检查全部编译GEMM节点及最后一组完整输出，最大误差0.00390625，前后
-输出逐字节一致、最大漂移0.559%；nonconst峰值384 MiB、const峰值0，释放归零，
-各45秒延迟门禁通过。证据`gemm-layout-collection-20261012/summary.json`；10-11
-失败轮无有效性能结论，调用定位及关机page fault独立保留于事故台账。
+| M / K / N | NBG普通布局 | NBG完整TTGT |
+|---|---:|---:|
+| 64 / 1024 / 8192 | 66.537 / 16.137 | 9.813 / 109.418 |
+| 64 / 8192 / 1024 | 10.879 / 98.698 | 12.762 / 84.136 |
+| 4096 / 1024 / 4096 | 3144.465 / 10.927 | 1494.615 / 22.989 |
+| 4096 / 4096 / 4096 | 997.590 / 137.771 | 2857.784 / 48.093 |
+| 8192 / 1024 / 4096 | 数值失败，不计有效算力 | 2960.221 / 23.214 |
 
-## 官方资料、离线模型与性能对照
+最高实测137.771GFLOP/s；N增大后仍约109，M增大不单调。TTGT不是通用最优。
+M8192普通前4096行正确、后半错误（最大1.9194336），同形TTGT通过；正常释放/延迟
+日志清洁，此数值失败不记为有效性能或冷启动事故。双运行时输入M16 NBG数值失败，
+最大误差4.612/3.361，输入前后逐位一致，不能外推为所有动态MatMul不支持。
 
-2026-10-12联合阅读本机 `~/NP101_Official`、`~/NP101_API` 已展开的6份PDF
-（39页）及56份Markdown，补查示例源码、驱动归档及SDK符号。系统/容器镜像内部
-依赖文档未穷举。以下路径相对这两个目录；原始资料不复制进Git。
+8图GEMM→bias→ReLU→fc2→bias→残差→LN消融表明低有效算力已在纯GEMM出现；
+LN最大增量约2.26ms/3.85%。真实8层M1 FFN：手写前后34.426/34.972、常量MatMul35.142、
+NBG约2.964ms/FFN，不能据FCL融合名判定物理引擎。M16 FFN普通/TTGT约10.912/4.067ms，
+局部2.683倍收益不能直接外推串行整模。有效算力不是物理利用率。
+证据 `gemm-ffn-ablation-20261010/`、`gemm-layout-collection-20261012/`、
+`compiled-gemm-layout-20261012/`、`compiled-opt-exploration-20261012/`、
+`compiled-prefill-ffn-layout-20261013/`。
 
-| 资料 | 已确认用途 / 边界 |
-|---|---|
-| Official `docs/np101-pe-22_board_manual_rev0.6.pdf` 第3–4、9–11页；`np101_chip_overview_rev0.6.pdf` 第4页 | 厂商规格：12个NN处理单元、48个CPU单元、4GB SeDRAM、2TB/s；INT8 20TOPS、FP16/BF16 10TFLOPS、FP32 512GFLOPS、FP64 256GFLOPS、典型10W。不是本机实测峰值/功耗；软件栈图区分CPU/RVV与NPU后端，虚线模块仍在开发 |
-| Official `docs/np101_ep_model_deployment.pdf`；`np101_soc_model_deployment.pdf` | 相同模型转换流程，EP构建主机程序，SoC交叉编译RISC-V程序；支持FP16配置，不必先开展INT8量化 |
-| Official `demo/ModelZoo/README.md`；`tools/compile/ModelTest/readme.md` | 网络二进制与运行库需匹配；NBG、metadata、生成源码应成套更新，再构建应用 |
-| Official 串口/网口/SD说明、SoC CPU多核示例 | 系统维护、串口日志及CPU应用部署参考。UART3、115200/8N1、UTF-8；串口工具和libgomp不证明NPU profiling或单图多核能力 |
-| API `ref_op_api_guide.md`、`op_demo_conv_relu_pool/README.md` | 与仓库demo对应文件逐字节相同，无需重复导入；算子可调用性不等于全部参数/物理引擎已验证 |
-| API `ljmnp_drivers_1.0.5-ubuntu20.04_x86_64/updatelist.txt` | 声明修复Transformer导出NB、显存写入正确性及ARM拷贝bus error；未证明对应本项目事故。README残留1.0.1例子，不能据文件夹名确定当前内核版本 |
+## 官方转换与NBG契约
 
-### 编译产物与执行证据
+联合阅读 `~/NP101_Official`、`~/NP101_API` 的6份PDF（39页）及56份Markdown，
+英文改名映射、阅读清单/hash与原始评估在 `official-knowledge-consolidation-20261012/`。
+不把第三方镜像、源码、许可证或逐页记录复制进Git。
 
 ```text
-ONNX → 导入 / 精度配置 / 离线编译
-     → network_binary.nb + nbg_meta.json + vnn_* / main 等源码
-     → C/C++构建 infer.out 或 libinfer.so
-     → SDK加载独立.nb → Setup → Verify → 重复RunGraph → 释放
+ONNX → 导入/精度配置/离线编译
+     → network_binary.nb + metadata + 生成C/C++
+     → 主机ELF/动态库加载NBG → Setup → Verify → 重复RunGraph → 释放
 ```
 
-`.nb`是NBG网络二进制，不是可直接启动的ELF；动态库也不替代它。
-`convert_model.py`包装已有生成源码并尝试构建，真正模型编译由转换工具的Pegasus完成。
-离线编译仍有运行期准备，但不能由这些调用推出内部重新完整编译或准备成本相同。
+`.nb`不是ELF。Setup/Verify/Run链直接来自YOLO官方源码，不是仅由反汇编猜测：
+`tools/compile/ModelTest/apps/yolov5s_uint8_nbg_unify/`中`vnn_yolov5suint8.cpp:231–233,352`、
+`main.cpp:91,143,235–255`。这些调用不证明运行时重做全部离线编译。
 
-上述调用链**直接来自官方源码**：以Official
-`tools/compile/ModelTest/apps/yolov5s_uint8_nbg_unify/`为例，
-`vnn_yolov5suint8.cpp:231–233`创建NBG文件节点，`:352`调用`vsi_nn_SetupGraph`；
-`main.cpp:91`调用`vsi_nn_VerifyGraph`，`:143`同步调用`vsi_nn_RunGraph`，
-`:235–255`为创建/预处理/Verify/执行/后处理/释放主流程。反汇编只补充确认实际ELF
-的RunGraph调用，不是Setup/Verify结论的唯一依据，也未由此推断硬件引擎。
+- 工具Pegasus 6.6.1，目标`VIP9000LD_PLUS_PID0X1000001D`，ONNX opset11/IR7。
+  非特权bubblewrap隔离编译、不暴露galcore。tensor meta无图像预处理；FP16配置映射
+  `--dtype float`，输出强制FP32关闭，实际精度/端口必须查产物。
+- NBG/metadata/生成源码须成套且匹配SDK；常量Gemm可能变fullconnect，算子名不保证
+  物理引擎或绕过历史FCL失败。完整动态shape、自动KV和跨NBG共享权重语义未确认。
+- OPT单层导出初始FP16 KV的次正规值被文本转换及算术清零；改普通rank3 FP32 KV。
+  reshape输入绑定与混图NBG曾Verify正常返回−1，独立NBG/普通KV通过，无设备事故；
+  没有依据时不重试失败构造。独立copy提交，不换运行期tensor句柄。
+- 全图原Gather要求runtime1.1.39，本机头文件/模拟器1.1.37；等价GatherND导出1.1.35。
+  原ONNX1450节点/52输入/50输出，logits/48状态逐位等价。
+- 生成C的ArgMax中间INT16使50118饱和到32767，外部INT32不足以修复。源IR指定int32
+  仍被忽略；仅把该virtual tensor改INT32再用同目标重建，版本保护不改。
+  手工重建需`VIVANTE_SDK_DIR`找到shader头、`VSIMULATOR_CONFIG`为完整.config路径。
+- 全图TTGT只换24层FFN的48个投影；完整ONNX50输出逐位等价。导入IR fullconnect
+  147→99、matmul48→96，不能当物理核分配。102板端端口匹配，NBG636,229,888 B。
+  两布局const/nonconst峰值662,593,528/25,528,908 B，释放归零。
+- 同时常驻两套整模权重超过1GiB；全图M1加24层M16 FFN约1065MiB也超限。
+  不假定NBG能共享权重、不借改is_const绕过；完整prefill方案见TODO。
 
-### 转换工具的已知契约
+板卡手册声称12 NN单元/48 CPU单元、4GB SeDRAM、2TB/s、INT8 20TOPS、FP16/BF16
+10TFLOPS、FP32 512GFLOPS、典型10W；均为厂商规格，不是本机实测。匹配文件
+`np101_chip_overview_rev0.6.pdf`、`np101-pe-22_board_manual_rev0.6.pdf`。
+官方YOLOv5s UINT8为69.525ms、236.368GOP/s（64正式），ResNet34目录模型为
+7.405ms、989.599GOP/s（192正式）；按实际ONNX Conv/Gemm计MAC=2 ops，其余工作
+只入分母。前者图片检测无独立准确率oracle，后者随机输入仅验logits稳定；无分类精度结论。
 
-本机Official `tools/model_conversion/quantize_toolkit`的OCI包内工具为6.6.1，
-导出目标`VIP9000LD_PLUS_PID0X1000001D`，调用Pegasus的
-`export ovxlib --dtype float --pack-nbg-unify`。脚本把`fp16`映射成`float`并跳过
-整数量化；此命名不保证每个节点/累加均为FP16，目标与当前SDK兼容性仍需验证。
+## 归因、并行与profiler
 
-- 导入脚本生成`*_postprocess_file.yml`，导出脚本读取`*_postprocessmeta.yml`；
-  需在工作副本核对。脚本执行后仍有echo，不能仅用退出码判断成功，须检查产物/日志。
-- ONNX常量权重二维MatMul/Gemm可能融合为`fullconnect`；也有通用matmul规则。
-  必须看导入JSON/编译报告，不能用ONNX算子名保证避开历史FCL优化器风险。
-- 已见样例为固定图像shape；OPT需要张量meta、无图像预处理。动态shape、ONNX
-  opset上限、自动KV管理/原地别名及NBG之间权重共享尚未确认。可见规则无显式
-  LayerNormalization，必要时按原语导出并保持敏感精度，不以规则表代替执行验收。
-- 单NBG外层一个节点不表示内部一个算子，也不证明绕过共享shader槽位限制。
-  两份现有完整权重为1,325,178,880 B，超过单段1GiB；独立prefill/decode NBG
-  不能沿用手写图共享一份权重的结论，优先单套M1并复用其处理prompt。
+应用权重在首次Run前已有固定消费绑定；424分块与10矩阵首/中/尾960B抽样通过，
+执行期应用无AddTensor/Setup/Verify。抽样不证明全部权重、物理驻留或内部零搬运。
+层间hidden和KV没有应用逐层下载/上传，逻辑tensorcopy节点数不是物理通信量。
 
-### 官方模型的有界实测
+早期strace图区间得到ioctl约92%–94%，有追踪扰动。内存汇总关闭/开启/关闭后，
+提交后Wait占外层图99.536%、Submit0.255%；Wait包括未完成计算、内部搬运和驱动，
+不能作为IO占比。手写decode应用CPU约0.412%，编译FFN约1.72%、逐decoder约0.723%，
+未测后台线程，CPU不能与墙钟相加；显式控制/token IO约0.421–0.551ms/token。
 
-10-12同boot、当前 `/usr/lib/ljmicro`、单实例、默认affinity；以下为所附ONNX的
-Conv/Gemm算术量（MAC=2 ops）除以NBG图时间，按实际文件逐节点计数并独立复核，
-不按模型名称套标准FLOPs。除这两类算子外的工作只计入分母。
+| 已验版本的同步SDK阶段 | ms/输出token | decode占比 |
+|---|---:|---:|
+| 编译FFN版：QKV/KV/attention/out_proj/首残差/LN | 438.283 | 66.345% |
+| 编译FFN版：NBG FFN执行 | 85.029 | 12.871% |
+| 编译FFN版：末残差/LN | 30.368 | 4.597% |
+| 编译FFN版：LM head | 103.018 | 15.594% |
+| 逐decoder版：24层NBG | 510.445 | 82.081% |
+| 逐decoder版：LM head | 103.103 | 16.579% |
+| 逐decoder版：外部KV提交copy | 5.014 | 0.806% |
 
-| 提供的模型 / 精度 | 正式次数 | 均摊ms/次 | 源模型GOP/次 | 等效GOP/s |
-|---|---:|---:|---:|---:|
-| YOLOv5s / UINT8 NBG | 64 | 69.5253 | 16.4336 | 236.368 |
-| ResNet34目录中的模型 / UINT8 NBG | 192 | 7.40454 | 7.32752 | 989.599 |
+编译FFN的SDK汇总扰动−0.061%，逐decoder+0.058%（关闭/开启/关闭）；数据只涵盖
+对应旧模型，不把比例搬到最新全图。FFN局部11.7倍受Amdahl限制；当时完全去掉
+85ms也最多约1.148倍。外部KV提交不是该版本大头；全图内部仍缺可靠分项。
+证据 `decode-wait-attribution-20261009/`、`weight-preload-and-vx-review-20261009/`、
+`profiler-decode-survey-20261012/`、`compiled-decoder-integration-20261012/`。
 
-各先暖机2次；YOLO累加官方逐RunGraph计时，打印在调用间；ResNet为原生循环3×64
-次集合。准备、显式IO、后处理和释放不计入。YOLO真实图片得到bus/person检测，
-无独立准确率oracle；ResNet用固定随机输入，1000 logits有限、非恒定、前后逐字节
-一致，不是分类准确率验收。两进程正常退出/释放，各45秒延迟内核门禁通过。
-ONNX与NBG为随附配套且IO匹配，但无编译器源文件哈希映射；不能称为真实指令计数。
-**这些是量化网络GOP/s，不是FP16 GFLOP/s**，不能据此许诺OPT提速或推定CPU回退。
+Async由官方样例源码及SDK反汇编确认：同Context一个worker/任务队列，再进入普通
+同步ProcessGraph；不意味着设备多核重叠。官方多图多句柄用`gcoHAL_SetMnpuAffinity`
+分配独立帧，`--cores`不是单图自动切分，可能复制权重/增加槽位；本项目未采用。
+静态EVIS/NN/FCL名称、库名、核编号都不足以证明物理执行或利用率。
 
-### 执行引擎、并行与profiler线索
+匹配转换镜像的VivanteIDE5.6.0文档说明vProfiler采集、VPD Analyzer解析；板端环境：
 
-- API指南将EVIS/CL归为SH shader，与CPU回退分开；其中105/50/7/2是算子分类
-  数量，不是核数。VX入口也可能再选EVIS GEMM，软件后端名称不能证明物理利用率。
-- API 1.0.5包中的ovxlib/OpenVX/GAL与当前用户态库逐字节相同；这不鉴定运行中
-  内核版本，也不证明离线/在线采用相同融合、布局、精度或执行引擎。
-- 官方 `convert_model.py` 和ResNet的 `fps_test.py` 用多句柄/多图、线程及
-  `gcoHAL_SetMnpuAffinity`分配独立帧。`--cores`不是单图自动切分开关，`--chunk`
-  是领取任务批次；不能直接加速有自回归依赖的单请求。多实例可能复制权重并增加槽位；
-  SDK语义和并发尚未校准，本项目未启用。安装脚本的12个EnableCore编号不证明核利用率。
-- 板卡手册第10页§3.3宣称算子性能分析能力，SDK含`gc_hal_profiler.h`和部分
-  `gcoPROFILER_*`导出符号；未找到独立采集程序、获取/安装/解码说明。驱动包的
-  `/usr/bin`为空。FPS脚本测重放吞吐，串口软件采日志，都不是硬件计数器profiler。
-  需要厂商提供匹配版本的采集器、解析器、最小命令及NN/SH/内存计数器语义；不直接
-  试调用未验证HAL接口，也不由`libArchModelSw`等库名判定仿真执行。
+| 设置 | 意义 |
+|---|---|
+| `VIV_VX_PROFILE=1/0` | 开启/关闭OpenVX采集；OpenGL的VIV_PROFILE不等价 |
+| `VP_OUTPUT=/绝对路径/request.vpd` | 普通用户可写目录、每轮独立输出 |
+| `VP_ENABLE_PRINT=0` | 请求关闭打印，不等于停止采集 |
 
-资料清单/hash、英文改名映射、源码依据及实测原始记录已归档到
-`official-knowledge-consolidation-20261012/`；主文保留结论，不导入第三方源码/
-许可证、镜像或逐页日记。官方OPT编译尚未开始，步骤与通过条件见[TODO](../TODO.md)。
+`run_device`默认关闭，显式profiler_output开启；不与恢复控制、SDK/ioctl计时同用。
+8个真实FFN集合（2暖机+3×16正式）关闭/开启/关闭为2.9563/10.1490/2.9747ms，
++242.24%扰动，输出逐位一致；SDK未遵守关闭打印，并改名`capture_<pid>_1.vpd`。
+71,970B文件含VP2000头、50记录×164字段，chip/product 0x9000/0x1000001d；HI总/idle
+与stdout匹配，但没有NN(0x310000)/TP(0x320000)分组。单位、覆盖、时钟域及Analyzer
+兼容性未确认，不能推断CPU执行、NN闲置、核利用率或PCIe瓶颈。
 
-## 瓶颈归因与认识
+使用同绑定/重复数关闭→开启→关闭，排除准备/暖机，报告扰动和漂移，生产延迟取关闭
+结果。IDE `Tools → VPD Analyzer → Load VPD File`先核对System Info；NP101文件解析
+尚未验。NN busy/MAC、DDR/SRAM、每核idle和TP是候选字段，需确认单位/回绕/覆盖，
+不能直接相加或把DDR等同PCIe。没有新依据不扩大高扰动采集或改驱动/电源。
+原文、反汇编在 `compiled-opt-exploration-20261012/profiler/`，实测在
+`profiler-decode-survey-20261012/{profiler-summary,capture-inspection}.json`。
 
-| 问题 | 已有证据 | 仍不能推出的结论 |
-|---|---|---|
-| CPU是否占大头 | 7步decode应用CPU中位40.046ms，约墙钟0.412%；整进程CPU含初始化/编译/释放 | 未测驱动后台线程，CPU时间不能与墙钟相加 |
-| 时间消耗在哪里 | 新增内层计时关闭/开启/关闭为1390.025/1389.392/1402.172ms/token；21步decode中，提交后Wait占外层图99.536%，Submit0.255%，显式token IO仅相当于0.019%–0.038% | Wait涵盖未完成计算、内部搬运、驱动和调度，不等于通信占比；三次对照不证明零计时开销 |
-| 旧ioctl结论 | 历史strace按图区间配对得到92%–94%，有逐调用追踪扰动；新测量用内存汇总 | 新HAL/API占比不是重新测得的原始ioctl占比；嵌套区间不能相加 |
-| 权重是否提前加载 | 首次Run前424个分块都有共享消费绑定；10个矩阵分块首/中/尾共960B与checkpoint一致，执行期应用无AddTensor/Setup/Verify | 抽样不证明全部权重、物理驻留、片上缓存或SDK内部零复制 |
-| 内部数据流 | 层间hidden、权重和KV共享；应用无逐层hidden下载/上传。预处理前M1的690个tensorcopy包含转换/reshape等；C64的48次KV transpose逻辑输出共6MiB | 节点名称和逻辑字节数不是实测传输次数/流量，不应直接删除写后读的依赖节点 |
-| 为什么batch有效 | M4工作量四倍而FFN轮时间只多约12%–14%；更大M继续降单位成本 | 还未分开向量利用、权重复用及提交摊销；不能直接批量计算未知的未来decode token |
-| 并行与流水 | 每token的26图有依赖，Q/K/V和两路fc1独立分支已在图内；同Context Async为单worker | 换Async不自动建立设备重叠；没有文档完整的NN核数控制接口或物理利用率证据 |
-| 第23层附近故障 | 分别出现过编译operation缺项、AddTensor加载失败、末层诊断EDMA | 层号不能代替准确失败API；1024槽解释不涵盖所有EDMA/内存损坏 |
-
-已扫描15个去重SDK ELF的主机可执行节；当前模型GEMM注册为EVIS路径，静态分派
-不能证明物理核占用。家庭端保持单请求标准自回归，初版不在DLM内部再增加猜token；
-跨端请求合批后置到家庭中心。重点仍为**单步内部计算、数据搬运和同步的硬件时间线**。
-
-## 外部方法调研的适用范围
-
-10-09已核对官方/作者资料；保留方法来源，不将外部加速比当作NP101收益。
+## 方法来源与证据入口
 
 | 来源 | 可借鉴方向与限制 |
 |---|---|
@@ -347,31 +278,11 @@ ONNX与NBG为随附配套且IO匹配，但无编译器源文件哈希映射；�
 | [llm.npu](https://arxiv.org/html/2407.05858v2)、[HeteroInfer](https://arxiv.org/html/2501.14794v2) | prompt分块、真实矩阵形状与异构同步；量化、CPU decode及移动统一内存前提与当前里程碑不同 |
 | [FlashAttention](https://arxiv.org/abs/2205.14135)、[Flash-Decoding](https://pytorch.org/blog/flash-decoding/)、[NeuPIMs](https://arxiv.org/html/2403.00579v2) | 长KV并行/减少访存及专用NPU+PIM重叠；当前C64、SDK接口和硬件条件不支持直接移植，不新增自定义kernel |
 
-## 设备状态与证据入口
+单家庭端优先单请求标准自回归；不在初版DLM内猜token，多端batch和DLM/TLM联合
+推理暂缓。对NP101方法的适用性以本项目证据为准，不搬用外部加速比。
 
-最后已存检查**2026-10-12T10:35:36.070813+08:00**，boot
-`7d7a10f6-a1b8-4e20-84df-2b8805bdefbd`，官方两个NBG示例及各45秒延迟门禁通过，
-无目标内核故障、owner或恢复标记。同boot此前已通过固定两级恢复控制及GEMM/TTGT集合。
-这只覆盖所测负载；10-11 RunGraph停滞与10:32关机page fault独立保留，根因未闭环。
-普通运行不再因boot改变自动删除恢复标记，必须两级恢复完整通过。
-
-以下相对 `.cache/runs/`，原始证据不随Git分发；归档仅供取证，不能覆盖当前代码或
-把当前实现冒充旧实验。首次清理前全文和SHA256在
-`documentation-consolidation-20261010/before/`、`before-manifest.json`。
-
-| 范围 | 证据目录／文件 |
-|---|---|
-| 图规模、编译表、合并KV | `graph-reservation-analysis-20260928/`、`attention-layout-analysis-20260928/`、`verify-boundary-analysis-20260928/`、`merged-kv-optimization-20260929/` |
-| block4、完整模型、精度例外 | `block-prefill-acceptance-20260930/`、`model-acceptance-20260930/`、`token-logit-precision-20261001/`、`acceptance-decision-20261001.json` |
-| 旧基线、吞吐重算 | `validated-opt-component-baseline-20261001/`、`output-throughput-review-20261009/summary.json` |
-| 两路fc1与映射验收 | `ffn-layout-comparison-20261008/`、`split-fc1-performance-20261008/`、`recovery-followup-20261008-1802/summary.json`、`split-fc1-context-20261009/` |
-| CPU/等待与预加载归因 | `recovery-followup-20261008-1802/decode-cpu/attribution-summary.json`、`decode-wait-attribution-20261009/`、`weight-preload-and-vx-review-20261009/` |
-| 工作集、输入宽度、块接入 | `decode-working-set-20261009/`、`ffn-input-width-20261009/`、`ffn-batch-scaling-20261009/`、`prefill-batch-scaling-20261009/summary.json` |
-| LN预处理与32/32文本 | `layernorm-affine-preparation-20261009/summary.json`、同目录源码前后快照、固定binary与逐次结果 |
-| 官方资料 / NBG实测 | `official-knowledge-consolidation-20261012/`：全文阅读清单、原始评估/门禁、MAC审计及清理前文档/hash |
-| 矩阵布局与TTGT | `gemm-layout-collection-20261012/summary.json`及各布局源码/identity/结果；失败轮见事故台账 |
-| 临时INT8 / 两路fc2 | `int8-and-ffn-partition-20261010/summary.json`、`source/`、`experiment-model.patch`、`run.py`及逐项门禁 |
-| FP16压力 / 纯GEMM与FFN消融 | `fp16-compute-scaling-20261010/summary.json`、`gemm-ffn-ablation-20261010/summary.json`及同目录临时源码、夹具与逐项门禁 |
-| 精简后短请求 / C128问答 | `post-cleanup-context-20261010/summary.json`、`generated-text.json`、`short-request/`、`context-questions/` |
-| 常驻复用、静态审计、SDK分析 | `resident-request-reuse-20261009/`、`decode-static-audit-20261009/`、`ffn-workload-analysis-20261004/`、`decode-offline-20261005/` |
-| 退役候选与历史源码 | `decoder-structure-screening-20261001/`、`fc1-shape-decode-20261009/`、`vx-gemm-estimate-20261009/`、`cleanup-20261001/before-source.tar.gz`、`diagnostic-cleanup-20261008/` |
+最新已存健康检查：2026-10-13 15:06:01 +08:00，boot
+`2e8953e2-a612-45e9-8a97-17f94fbe0cc0`，v105两组对照通过、无故障/owner/恢复标记。
+这是历史窗口；每次新运行仍遵守事故门禁。第23层附近的operation缺项、AddTensor
+失败和EDMA是不同API事件，不共用一个层号解释。关机page fault、卷积/旧OPT失败
+原因仍未闭环，逐次证据与规避保存在独立事故台账。
