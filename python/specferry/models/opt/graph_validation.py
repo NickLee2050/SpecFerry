@@ -178,7 +178,11 @@ def evaluate(
     if cache_readback in ("logits", "kv"):
         per_request = 2 * len(cache_layers)
         bytes_per_request = (
-            per_request * metadata["heads"] * metadata["capacity"] * metadata["width"] * 2
+            per_request
+            * metadata["heads"]
+            * metadata["capacity"]
+            * metadata["width"]
+            * (4 if variant in ("compiled-decoder", "compiled-fullgraph") else 2)
         )
         if read_logits:
             # The head exposes one tensor per vocabulary block, including a short last block.
@@ -188,7 +192,11 @@ def evaluate(
             vocabulary, block_rows = int(configuration[3]), int(configuration[6])
             if vocabulary != metadata["vocabulary"] or block_rows <= 0:
                 raise ValueError("logits layout disagrees with the CPU reference")
-            per_request = (vocabulary + block_rows - 1) // block_rows
+            per_request = (
+                1
+                if variant in ("compiled-ffn-finish", "compiled-fullgraph")
+                else (vocabulary + block_rows - 1) // block_rows
+            )
             bytes_per_request = vocabulary * 2
         expected_reads = len(metadata["requests"]) * per_request
         for field, expected in (
@@ -219,9 +227,19 @@ def evaluate(
     if type(reset_uploads_per_request) is not int or reset_uploads_per_request < 0:
         raise ValueError("reset upload count must be a nonnegative integer")
     if variant is not None:
-        if variant not in ("merged-kv", "merged-kv-fc1-split2"):
+        if variant not in (
+            "merged-kv",
+            "merged-kv-fc1-split2",
+            "compiled-ffn-finish",
+            "compiled-decoder",
+            "compiled-fullgraph",
+        ):
             raise ValueError("unknown partitioned-model variant")
-        expected_reset = 2 * metadata["layers"]
+        expected_reset = (
+            0
+            if variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
+            else 2 * metadata["layers"]
+        )
         checks["variant"] = (
             native_run.get("graph_layout") == "partitioned"
             and native_run.get("variant") == variant
@@ -309,7 +327,10 @@ def evaluate(
             result.get("tokens") == reference["tokens"]
             and result.get("consumed") == prefix
             and result.get("launches") == launches
-            and result.get("uploads") == launches + (reset_uploads_per_request if index else 0)
+            and result.get("uploads")
+            == launches
+            * (4 if variant == "compiled-fullgraph" else 3 if variant == "compiled-decoder" else 1)
+            + (reset_uploads_per_request if index else 0)
             and result.get("reads") == len(reference["tokens"])
         )
         if block_prefill:
@@ -368,7 +389,10 @@ def evaluate(
                 expected = np.fromfile(
                     fixture / f"expected.{index}.{layer}.{name}.bin", dtype="<f2"
                 )
-                actual = np.fromfile(device / f"{key}.bin", dtype="<f2")
+                actual = np.fromfile(
+                    device / f"{key}.bin",
+                    dtype="<f4" if variant in ("compiled-decoder", "compiled-fullgraph") else "<f2",
+                )
                 # Ignore unconsumed slots while checking every head in the valid prefix.
                 actual = actual.reshape(metadata["heads"], metadata["capacity"], metadata["width"])
                 if block_prefill:
@@ -378,7 +402,10 @@ def evaluate(
                 if repeat_of is not None:
                     previous = (
                         np.fromfile(
-                            device / f"measured.{repeat_of}.layer.{layer}.{name}.bin", dtype="<f2"
+                            device / f"measured.{repeat_of}.layer.{layer}.{name}.bin",
+                            dtype="<f4"
+                            if variant in ("compiled-decoder", "compiled-fullgraph")
+                            else "<f2",
                         )
                         .reshape(metadata["heads"], metadata["capacity"], metadata["width"])[
                             :, :prefix
@@ -437,7 +464,11 @@ def evaluate_benchmark(
         for name, expected in options.items():
             actual = observed.get(name)
             checks[f"{scope}.{name}"] = type(actual) is type(expected) and actual == expected
-    reset_uploads = 2 * metadata["layers"]
+    reset_uploads = (
+        0
+        if variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
+        else 2 * metadata["layers"]
+    )
     checks["reset_uploads"] = native.get("kv_reset_uploads_per_request") == reset_uploads
     expected_records, measured = [], []
     total_counts = dict(launches=0, prefill_steps=0, decode_steps=0, head_runs=0)
@@ -477,6 +508,13 @@ def evaluate_benchmark(
                     "consumed": reference["consumed"],
                     "prefill_block": block,
                     "uploads": counts["launches"]
+                    * (
+                        4
+                        if variant == "compiled-fullgraph"
+                        else 3
+                        if variant == "compiled-decoder"
+                        else 1
+                    )
                     + (reset_uploads if len(expected_records) > 1 else 0),
                     "reads": len(reference["tokens"]),
                     "read_bytes": 4 * len(reference["tokens"]),

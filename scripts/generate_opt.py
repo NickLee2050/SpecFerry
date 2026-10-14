@@ -9,8 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from specferry.models.opt.generation import lifecycle, prepare_request
-from specferry.models.opt.metrics import summarize
 from specferry.validation.device import device_lock, run_device, write_json
+from specferry.validation.generation_metrics import summarize
 from specferry.validation.performance import read_summary, summarize_request, summarize_runs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +55,12 @@ def main():
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--warmups", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--numerical-diagnostic",
+        action="store_true",
+        help="explicitly authorized released numerical-failure diagnosis",
+    )
+    parser.add_argument("--projection-backend", choices=("fcl", "nbg-qkv", "nbg-output", "nbg"))
     timing = parser.add_mutually_exclusive_group()
     timing.add_argument("--sdk-timing", action="store_true", help="trace individual SDK calls")
     timing.add_argument(
@@ -105,11 +111,79 @@ def main():
     )
     parser.add_argument("--block", type=int, choices=(1, 4, 8, 16), default=1)
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/opt-350m")
+    parser.add_argument(
+        "--compiled-ffn",
+        type=Path,
+        help="explicit source-bound M1 FFN finish package; graph backend only",
+    )
+    parser.add_argument(
+        "--compiled-model",
+        type=Path,
+        help="explicit source-bound fullgraph or decoder C64/C128 package",
+    )
+    parser.add_argument(
+        "--sudo-read-only",
+        action="store_true",
+        help="authorized journalctl checks for the compiled candidate",
+    )
     parser.add_argument("--checkpoint", type=Path, default=ROOT / ".cache/models/facebook/opt-350m")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare-cpu", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    compiled_package = None
+    if args.compiled_model is not None:
+        if (
+            args.compiled_ffn
+            or args.backend != "graph"
+            or args.block != 1
+            or args.capacity not in (64, 128)
+            or args.variant
+            or args.graph_layers
+            or args.lifecycle_check
+            or args.projection_backend
+            or args.sdk_timing
+            or args.sdk_summary
+        ):
+            parser.error(
+                "compiled model requires full C64/C128 M1 graph mode without another implementation override"
+            )
+        from specferry.models.opt.compiled_model import load_model_package
+
+        compiled_package = load_model_package(
+            args.compiled_model, args.model.resolve(), capacity=args.capacity
+        )
+        args.variant = (
+            "compiled-decoder" if compiled_package["kind"] == "decoders" else "compiled-fullgraph"
+        )
+        if args.variant == "compiled-fullgraph" and args.prefill_head not in (None, "every-token"):
+            parser.error("fullgraph contains its head and uses every-token policy")
+    if args.compiled_ffn is not None:
+        if (
+            args.backend != "graph"
+            or args.capacity not in (64, 128)
+            or args.block != 1
+            or args.graph_layers not in (None, 24)
+            or args.lifecycle_check
+            or args.variant is not None
+        ):
+            parser.error(
+                "compiled FFN requires full OPT/C64 or C128/M1 graph mode without variant or lifecycle override"
+            )
+        if args.sdk_timing or args.sdk_summary:
+            parser.error("compiled candidate entry currently uses untraced acceptance")
+        from specferry.models.opt.compiled import load_ffn_package
+
+        compiled_package = load_ffn_package(
+            args.compiled_ffn, args.model.resolve(), capacity=args.capacity
+        )
+        args.variant = "compiled-ffn-finish"
+        if args.projection_backend not in (None, "fcl") and "projections" not in compiled_package:
+            parser.error("NBG projection selection requires packaged projection artifacts")
+    elif not compiled_package and (
+        args.sudo_read_only or args.projection_backend or args.numerical_diagnostic
+    ):
+        parser.error("compiled candidate options require --compiled-ffn or --compiled-model")
     if args.backend != "graph" and any(
         option is not None
         for option in (
@@ -182,6 +256,18 @@ def main():
     if request_tokens is not None:
         request["request_tokens"] = request_tokens
         request["request_tokens_source"] = str(args.request_tokens_file.resolve())
+    elif compiled_package:
+        request_tokens = [request["tokens"]]
+    if compiled_package:
+        (
+            fixture
+            / ("compiled-model-package.txt" if args.compiled_model else "compiled-ffn-package.txt")
+        ).write_text(
+            json.dumps(
+                str((args.compiled_model or args.compiled_ffn).resolve()), ensure_ascii=False
+            )
+            + "\n"
+        )
     expected, metadata = None, None
     if args.backend == "graph":
         from specferry.models.opt.graph_validation import prepare
@@ -211,6 +297,8 @@ def main():
         "warmups": args.warmups,
         "repeats": args.repeats,
     }
+    if args.projection_backend:
+        settings["projection_backend"] = args.projection_backend
     if args.backend == "graph":
         settings.update(
             block=args.block,
@@ -235,20 +323,82 @@ def main():
     if args.prepare_only:
         print(f"Prepared {fixture}")
         return 0
-    with device_lock(ROOT / ".cache/runs"):
-        evidence = run_device(
-            binary,
-            arguments,
-            device,
-            Path("/usr/lib/ljmicro"),
-            args.timeout,
-            sdk_timing=args.sdk_timing,
-            sdk_summary=args.sdk_summary,
-            verify_trace=ROOT / "build/tests/libnp101_verify_trace.so"
-            if args.lifecycle_check
-            else None,
-            require_compiled_operations=args.lifecycle_check,
+    if compiled_package:
+        from specferry.models.opt.graph_validation import evaluate, evaluate_benchmark
+        from specferry.validation.compiled import run_case
+
+        device = output / "guarded/device"
+
+        def accept(case, observed):
+            if args.benchmark:
+                checks, _ = evaluate_benchmark(
+                    observed,
+                    metadata,
+                    args.block,
+                    warmups=args.warmups,
+                    repeats=args.repeats,
+                    variant=args.variant,
+                    decoder_group_size=1,
+                    prefill_head_policy=args.prefill_head,
+                )
+            else:
+                checks, _ = evaluate(
+                    fixture,
+                    observed,
+                    metadata,
+                    args.block,
+                    variant=args.variant,
+                    decoder_group_size=1,
+                    prefill_head_policy=args.prefill_head,
+                    cache_readback=args.cache_readback,
+                    cache_layer_range=args.cache_layer_range,
+                    readback_transport=args.readback_transport,
+                )
+            native = json.loads((observed / "run.json").read_text())
+            checks["head_backend"] = native.get("head_backend") == (
+                "fullgraph-nbg"
+                if args.variant == "compiled-fullgraph"
+                else "matmul"
+                if args.variant == "compiled-decoder"
+                else "nbg"
+                if "head" in compiled_package
+                else "fcl"
+            )
+            checks["release_budget"] = native.get("released") is True and all(
+                native.get(f"{segment}_live_bytes") == 0
+                and type(native.get(f"{segment}_peak_bytes")) is int
+                and 0 <= native[f"{segment}_peak_bytes"] <= 2**30
+                for segment in ("const", "nonconst")
+            )
+            return dict(passed=all(checks.values()), checks=checks)
+
+        guarded = run_case(
+            dict(binary=binary, arguments=[str(args.model.resolve()), str(fixture), "{output}"]),
+            compiled_package["sdk"],
+            output / "guarded",
+            sudo_read_only=args.sudo_read_only,
+            timeout=args.timeout,
+            evaluate_result=accept,
+            numerical_diagnostic=args.numerical_diagnostic,
         )
+        if not guarded["passed"]:
+            raise RuntimeError("compiled candidate acceptance failed; inspect guarded/result.json")
+        evidence = guarded["execution"]
+    else:
+        with device_lock(ROOT / ".cache/runs"):
+            evidence = run_device(
+                binary,
+                arguments,
+                device,
+                Path("/usr/lib/ljmicro"),
+                args.timeout,
+                sdk_timing=args.sdk_timing,
+                sdk_summary=args.sdk_summary,
+                verify_trace=ROOT / "build/tests/libnp101_verify_trace.so"
+                if args.lifecycle_check
+                else None,
+                require_compiled_operations=args.lifecycle_check,
+            )
     execution = (
         json.loads((device / "execution.json").read_text())
         if (device / "execution.json").is_file()
@@ -367,7 +517,7 @@ def main():
     print(
         "Input:",
         request["prompt"]
-        if request_tokens is None
+        if args.request_tokens_file is None
         else f"{len(request_tokens)} requests from {args.request_tokens_file}",
     )
     for text in texts:

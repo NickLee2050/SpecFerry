@@ -12,7 +12,12 @@
 #include <string>
 #include <vector>
 
+namespace specferry::np101 {
+class WeightBank;
+}
+
 namespace specferry::models::qwen3_5 {
+struct CompiledBlock;
 // Configured Qwen DeltaNet mixer, excluding decoder input norm, residual and MLP.
 // Context must outlive this object. All graph execution and state routing is C++.
 using np101::Context;
@@ -24,7 +29,8 @@ class DeltaNet {
 public:
   DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
   DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-           TensorBinding input, TensorBinding output);
+           TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr,
+           const CompiledBlock *compiled = nullptr);
   ~DeltaNet();
 
   DeltaNet(const DeltaNet &) = delete;
@@ -37,7 +43,8 @@ public:
   void step(const std::vector<std::uint8_t> &hidden_fp16);
   // Execute the construction-time input/output bindings without host activation IO.
   void step();
-  std::vector<std::uint8_t> read(const std::string &name);
+  std::vector<std::uint8_t> read(const std::string &name,
+                                 np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   std::size_t steps() const;
   void close();
 

@@ -4,7 +4,11 @@
 
 #include <cmath>
 #include <cstddef>
+#include <fstream>
+#include <iomanip>
+#include <set>
 #include <stdexcept>
+#include <utility>
 
 namespace specferry::models::opt {
 using namespace np101;
@@ -14,9 +18,9 @@ namespace {
 constexpr auto f16 = DataType::Float16;
 
 Tensor linear(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
-              bool split_output_channels = false) {
+              bool split_output_channels = false, LinearBackend backend = LinearBackend::MatMul) {
   return g.linear(input, weights, weights.find(name + ".weight"), weights.find(name + ".bias"),
-                  split_output_channels ? 2u : 1u);
+                  split_output_channels ? 2u : 1u, backend);
 }
 
 Tensor norm(GraphBuilder &g, const WeightStore &weights, Tensor input, const std::string &name,
@@ -35,6 +39,212 @@ Tensor norm(GraphBuilder &g, const WeightStore &weights, Tensor input, const std
 }
 } // namespace
 
+std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
+                                           const std::filesystem::path &deployment,
+                                           const ModelConfig &config, const WeightStore &weights,
+                                           CompiledHead &head,
+                                           std::vector<CompiledProjections> *projections) {
+  if (config.decoder.layers != 24 ||
+      (config.decoder.capacity != 64 && config.decoder.capacity != 128) ||
+      config.decoder.heads != 16 || config.embedding != 512 || config.vocabulary != 50272) {
+    throw std::invalid_argument(
+        "compiled FFN package requires the accepted OPT-350m C64/C128 model");
+  }
+  const auto root = std::filesystem::canonical(package);
+  std::ifstream file(root / "compiled-ffn.txt");
+  std::string magic, index_digest, deployment_digest, driver, digest, name, extra;
+  unsigned version = 0, count = 0;
+  file >> magic >> version >> index_digest >> deployment_digest >> driver >> count;
+  if (!file || magic != "specferry-opt-ffn-finish" || version < 1 || version > 3 || count != 5 ||
+      driver != "F53A3E6EFBB7D0FD7D4617C" ||
+      file_sha256(deployment / "weights.index") != index_digest ||
+      file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
+    throw std::invalid_argument("compiled FFN package deployment/header mismatch");
+  }
+  std::ifstream module("/sys/module/galcore/srcversion");
+  std::string loaded_driver;
+  module >> loaded_driver;
+  if (!module || loaded_driver != driver) {
+    throw std::invalid_argument("compiled FFN package requires its accepted loaded driver");
+  }
+  std::set<std::string> libraries{"libovxlib.so", "libOpenVX.so", "libGAL.so", "libArchModelSw.so",
+                                  "libNNArchPerf.so"};
+  for (unsigned index = 0; index < 5; ++index) {
+    file >> name >> digest;
+    if (!file || !libraries.erase(name) ||
+        file_sha256(std::filesystem::path("/usr/lib/ljmicro") / name) != digest) {
+      throw std::invalid_argument("compiled FFN package SDK identity differs");
+    }
+  }
+  file >> count;
+  if (!file || count != 24) {
+    throw std::invalid_argument("compiled FFN package requires 24 ordered layers");
+  }
+  std::vector<CompiledFfn> result;
+  std::size_t total = 0;
+  for (unsigned layer = 0; layer < count; ++layer) {
+    CompiledFfn artifact;
+    file >> artifact.layer >> std::quoted(name) >> digest >> artifact.graph.constant_bytes;
+    for (auto &part : artifact.graph.graph_version) {
+      file >> part;
+    }
+    for (auto &part : artifact.weight_sha256) {
+      file >> part;
+    }
+    for (auto &part : artifact.final_norm_sha256) {
+      file >> part;
+    }
+    if (!file || artifact.layer != layer || !artifact.includes_final_norm() ||
+        artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 34}) {
+      throw std::invalid_argument("compiled FFN package layer/version mismatch");
+    }
+    const auto binary = std::filesystem::canonical(root / name);
+    if (binary.parent_path() != root || !std::filesystem::file_size(binary) ||
+        std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
+        file_sha256(binary) != digest) {
+      throw std::invalid_argument("compiled FFN package NBG path/checksum mismatch");
+    }
+    artifact.graph.path = binary.string();
+    artifact.graph.inputs = artifact.graph.outputs = {{f16, {1024, 1}}};
+    validate_compiled_ffn(artifact, weights, config.decoder, layer);
+    if (artifact.graph.constant_bytes > segment_payload_limit - total) {
+      throw std::invalid_argument("compiled FFN package exceeds the constant payload limit");
+    }
+    total += artifact.graph.constant_bytes;
+    result.push_back(std::move(artifact));
+  }
+  unsigned head_count = version == 2 ? 1 : 0;
+  if (version == 3) {
+    file >> head_count;
+    if (!file || head_count > 1 || !projections) {
+      throw std::invalid_argument("compiled projection package requires an explicit receiver");
+    }
+  }
+  if (head_count) {
+    file >> std::quoted(name) >> digest >> head.graph.constant_bytes;
+    for (auto &part : head.graph.graph_version) {
+      file >> part;
+    }
+    for (auto &part : head.weight_sha256) {
+      file >> part;
+    }
+    const auto binary = std::filesystem::canonical(root / name);
+    if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
+        std::filesystem::file_size(binary) > head.graph.constant_bytes ||
+        file_sha256(binary) != digest ||
+        head.graph.constant_bytes > segment_payload_limit - total) {
+      throw std::invalid_argument("compiled head package path/checksum/budget mismatch");
+    }
+    head.graph.path = binary.string();
+    head.graph.inputs = {{f16, {1024, 1}}};
+    head.graph.outputs = {{f16, {50272, 1}}};
+    validate_compiled_head(head, weights, config);
+    total += head.graph.constant_bytes;
+  }
+  if (version == 3) {
+    file >> count;
+    if (!file || count != config.decoder.layers) {
+      throw std::invalid_argument("compiled projections require all ordered decoder layers");
+    }
+    for (unsigned layer = 0; layer < count; ++layer) {
+      CompiledProjections artifact;
+      file >> artifact.layer;
+      for (auto *graph : {&artifact.qkv, &artifact.output}) {
+        file >> std::quoted(name) >> digest >> graph->constant_bytes;
+        for (auto &part : graph->graph_version) {
+          file >> part;
+        }
+        const auto binary = std::filesystem::canonical(root / name);
+        if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
+            std::filesystem::file_size(binary) > graph->constant_bytes ||
+            file_sha256(binary) != digest ||
+            graph->constant_bytes > segment_payload_limit - total) {
+          throw std::invalid_argument("compiled projection path/checksum/budget mismatch");
+        }
+        graph->path = binary.string();
+        graph->inputs = {{f16, {config.decoder.hidden, 1}}};
+        graph->outputs.assign(graph == &artifact.qkv ? 3 : 1, graph->inputs.front());
+        total += graph->constant_bytes;
+      }
+      for (auto &port : artifact.qkv_order) {
+        file >> port;
+      }
+      for (auto &hash : artifact.weight_sha256) {
+        file >> hash;
+      }
+      if (!file) {
+        throw std::invalid_argument("incomplete compiled projection identities");
+      }
+      validate_compiled_projections(artifact, weights, config.decoder, layer);
+      projections->push_back(std::move(artifact));
+    }
+  }
+  if (file >> extra) {
+    throw std::invalid_argument("trailing compiled FFN package data");
+  }
+  return result;
+}
+
+void validate_compiled_projections(const CompiledProjections &projections,
+                                   const WeightStore &weights, const Config &config,
+                                   unsigned layer) {
+  const std::set<unsigned> order(projections.qkv_order.begin(), projections.qkv_order.end());
+  if (config.hidden != 1024 || config.heads != 16 || projections.layer != layer ||
+      order != std::set<unsigned>{0, 1, 2}) {
+    throw std::invalid_argument("compiled projection geometry/order differs");
+  }
+  for (const auto *graph : {&projections.qkv, &projections.output}) {
+    if (graph->graph_version != std::array<unsigned, 3>{1, 1, 34} || graph->inputs.size() != 1 ||
+        graph->outputs.size() != (graph == &projections.qkv ? 3u : 1u)) {
+      throw std::invalid_argument("compiled projection ports/version differ");
+    }
+    for (const auto &ports : {graph->inputs, graph->outputs}) {
+      for (const auto &port : ports) {
+        if (port.type != f16 || port.shape != Shape{1024, 1}) {
+          throw std::invalid_argument("compiled projection requires FP16 M1 ports");
+        }
+      }
+    }
+  }
+  std::size_t index = 0, qkv_bytes = 0, output_bytes = 0;
+  for (const std::string part : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+    for (const std::string suffix : {".weight", ".bias"}) {
+      const auto &record = weights.find(config.prefix(layer) + "self_attn." + part + suffix);
+      if (projections.weight_sha256.at(index++) != record.sha256) {
+        throw std::invalid_argument("compiled projection source weight differs");
+      }
+      (part == "out_proj" ? output_bytes : qkv_bytes) += record.bytes;
+    }
+  }
+  if (projections.qkv.constant_bytes < qkv_bytes ||
+      projections.output.constant_bytes < output_bytes) {
+    throw std::invalid_argument("compiled projection constants are not accounted");
+  }
+}
+
+void validate_compiled_head(const CompiledHead &head, const WeightStore &weights,
+                            const ModelConfig &config) {
+  if (config.decoder.hidden != 1024 || config.embedding != 512 || config.vocabulary != 50272 ||
+      head.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} ||
+      head.graph.inputs.size() != 1 || head.graph.outputs.size() != 1 ||
+      head.graph.inputs[0].type != f16 || head.graph.inputs[0].shape != Shape{1024, 1} ||
+      head.graph.outputs[0].type != f16 || head.graph.outputs[0].shape != Shape{50272, 1}) {
+    throw std::invalid_argument("compiled head differs from the accepted FP16 OPT contract");
+  }
+  std::size_t payload = 0;
+  unsigned index = 0;
+  for (const std::string name : {"decoder.project_out.weight", "decoder.embed_tokens.weight"}) {
+    const auto &record = weights.find(name);
+    if (head.weight_sha256[index++] != record.sha256) {
+      throw std::invalid_argument("compiled head source weights differ");
+    }
+    payload += record.bytes;
+  }
+  if (head.graph.constant_bytes < payload || head.graph.constant_bytes > segment_payload_limit) {
+    throw std::invalid_argument("compiled head constant payload is not accounted");
+  }
+}
+
 std::vector<TensorSpec> compiled_decoder_inputs(const Config &config) {
   const auto dimension = config.kv_spec().head_dim;
   return {{f16, {config.hidden, 1}},
@@ -48,25 +258,32 @@ void validate_compiled_decoder(const CompiledDecoder &compiled, const WeightStor
                                const Config &config, unsigned layer) {
   // Only this export geometry and precision policy have hardware evidence.
   if (config.hidden != 1024 || config.intermediate != 4096 || config.heads != 16 ||
-      config.capacity != 64 || config.epsilon != 1e-5f || compiled.layer != layer ||
-      compiled.weight_sha256.size() != 16 ||
-      compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 34}) {
+      (config.capacity != 64 && config.capacity != 128) || config.epsilon != 1e-5f ||
+      compiled.layer != layer || compiled.weight_sha256.size() != 16 ||
+      (compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} &&
+       compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 35})) {
     throw std::invalid_argument("compiled OPT decoder differs from the accepted export contract");
   }
   const auto inputs = compiled_decoder_inputs(config);
   const std::vector<TensorSpec> outputs{inputs[0], inputs[1], inputs[2]};
-  const auto matches = [](const auto &actual, const auto &expected) {
+  const auto matches = [](const auto &actual, const auto &expected, const auto &order) {
     if (actual.size() != expected.size()) {
       return false;
     }
+    const std::set<unsigned> seen(order.begin(), order.end());
+    if (seen.size() != actual.size()) {
+      return false;
+    }
     for (std::size_t i = 0; i < actual.size(); ++i) {
-      if (actual[i].type != expected[i].type || actual[i].shape != expected[i].shape) {
+      if (order[i] >= actual.size() || actual[order[i]].type != expected[i].type ||
+          actual[order[i]].shape != expected[i].shape) {
         return false;
       }
     }
     return true;
   };
-  if (!matches(compiled.graph.inputs, inputs) || !matches(compiled.graph.outputs, outputs)) {
+  if (!matches(compiled.graph.inputs, inputs, compiled.input_order) ||
+      !matches(compiled.graph.outputs, outputs, compiled.output_order)) {
     throw std::invalid_argument("compiled OPT decoder port contract mismatch");
   }
   std::size_t payload = 0;
@@ -110,6 +327,25 @@ void validate_compiled_ffn(const CompiledFfn &compiled, const WeightStore &weigh
     }
     payload += weight.spec.bytes();
   }
+  if (compiled.final_norm_sha256[0].empty() != compiled.final_norm_sha256[1].empty()) {
+    throw std::invalid_argument("compiled FFN normalization identities are incomplete");
+  }
+  if (compiled.includes_final_norm()) {
+    if (tokens != 1 || config.hidden != 1024 || config.intermediate != 4096 ||
+        config.epsilon != 1e-5f) {
+      throw std::invalid_argument("compiled FFN finish requires the fixed M1 OPT export contract");
+    }
+    for (unsigned index = 0; index < 2; ++index) {
+      const auto &weight =
+          weights.find(config.prefix(layer) + "final_layer_norm." + (index ? "bias" : "weight"));
+      if (weight.spec.type != f16 || weight.spec.shape != Shape{config.hidden} ||
+          weight.sha256 != compiled.final_norm_sha256[index]) {
+        throw std::invalid_argument("compiled FFN normalization source differs: " + weight.name);
+      }
+      // The mixed precision package widens the checkpoint affine to FP32.
+      payload += 2 * weight.spec.bytes();
+    }
+  }
   // Compiled packages can include padded or packed constants beyond the source weights.
   if (compiled.graph.constant_bytes < payload ||
       compiled.graph.constant_bytes > segment_payload_limit) {
@@ -118,21 +354,28 @@ void validate_compiled_ffn(const CompiledFfn &compiled, const WeightStore &weigh
 }
 
 Projections build_projections(GraphBuilder &g, const WeightStore &weights, const Config &config,
-                              unsigned layer, Tensor hidden) {
+                              unsigned layer, Tensor hidden, LinearBackend backend) {
   const auto prefix = config.prefix(layer);
-  auto query = linear(g, weights, hidden, prefix + "self_attn.q_proj");
+  auto query = linear(g, weights, hidden, prefix + "self_attn.q_proj", false, backend);
   query = g.binary(VSI_NN_OP_MULTIPLY, query,
                    g.scalar(1.0f / std::sqrt(float(config.kv_spec().head_dim)), f16));
-  auto key = linear(g, weights, hidden, prefix + "self_attn.k_proj");
-  auto value = linear(g, weights, hidden, prefix + "self_attn.v_proj");
+  auto key = linear(g, weights, hidden, prefix + "self_attn.k_proj", false, backend);
+  auto value = linear(g, weights, hidden, prefix + "self_attn.v_proj", false, backend);
   return {query, key, value};
 }
 
 AttentionTail build_attention_tail(GraphBuilder &g, const WeightStore &weights,
                                    const Config &config, unsigned layer, Tensor hidden,
-                                   Tensor attended) {
+                                   Tensor attended, LinearBackend backend) {
   const auto prefix = config.prefix(layer);
-  auto mixer = linear(g, weights, attended, prefix + "self_attn.out_proj");
+  auto mixer = linear(g, weights, attended, prefix + "self_attn.out_proj", false, backend);
+  return build_attention_finish(g, weights, config, layer, hidden, mixer);
+}
+
+AttentionTail build_attention_finish(GraphBuilder &g, const WeightStore &weights,
+                                     const Config &config, unsigned layer, Tensor hidden,
+                                     Tensor mixer) {
+  const auto prefix = config.prefix(layer);
   auto residual = g.binary(VSI_NN_OP_ADD, hidden, mixer);
   auto normalized = norm(g, weights, residual, prefix + "self_attn_layer_norm", config.epsilon);
   return {mixer, residual, normalized};

@@ -16,11 +16,22 @@ class Lookup : public GraphBuilder {
 public:
   Tensor index;
 
-  Lookup(Context &context, TensorBinding table, TensorSpec spec, TensorBinding result)
-      : GraphBuilder(context, 3, 1), index(tensor({DataType::Int32, {1}})) {
+  Lookup(Context &context, TensorBinding table, TensorSpec spec, TensorBinding result,
+         VocabularyLookup lookup)
+      : GraphBuilder(context, 3, 1),
+        index(tensor(
+            {DataType::Int32, lookup == VocabularyLookup::GatherNd ? Shape{1, 1} : Shape{1}})) {
     auto values = bind(table, spec);
     auto output = bind(result, {f16, {spec.shape[0], 1}});
-    node(VSI_NN_OP_GATHER, {values, index}, output)->nn_param.gather.axis = 1;
+    if (lookup == VocabularyLookup::GatherNd) {
+      // One coordinate selects a row in the SDK's reversed-dimension layout.
+      // The generated GatherND wrapper uses these same ports, with no parameters.
+      node(VSI_NN_OP_GATHER_ND, {values, index}, output);
+    } else if (lookup == VocabularyLookup::Gather) {
+      node(VSI_NN_OP_GATHER, {values, index}, output)->nn_param.gather.axis = 1;
+    } else {
+      throw std::invalid_argument("unknown vocabulary lookup operator");
+    }
     compile({values, index}, {output});
   }
 };
@@ -84,7 +95,8 @@ struct Vocabulary::Impl {
   std::vector<Tensor> blocks;
   std::vector<std::unique_ptr<Lookup>> lookups;
 
-  Impl(Context &context, const WeightStore &store, const WeightRecord &table, unsigned block_size)
+  Impl(Context &context, const WeightStore &store, const WeightRecord &table, unsigned block_size,
+       VocabularyLookup lookup)
       : rows(table.spec.shape[1]), width(table.spec.shape[0]), block_rows(block_size),
         storage(context, 1 + (rows - 1) / block_rows + 1, 0),
         output(
@@ -97,20 +109,20 @@ struct Vocabulary::Impl {
       auto id = add_tensor(storage, spec, false, bytes);
       blocks.push_back({id, spec});
       lookups.push_back(std::make_unique<Lookup>(context, TensorBinding{storage, id}, spec,
-                                                 TensorBinding{storage, output}));
+                                                 TensorBinding{storage, output}, lookup));
     }
   }
 };
 
 Vocabulary::Vocabulary(Context &context, const WeightStore &store, const WeightRecord &table,
-                       unsigned block_rows) {
+                       unsigned block_rows, VocabularyLookup lookup) {
   if (table.spec.type != f16 || table.spec.shape.size() != 2 || !block_rows || block_rows > 4096 ||
       table.spec.shape[1] > std::numeric_limits<std::int32_t>::max() ||
       std::uint64_t(table.spec.shape[0]) * block_rows * 2 > 8 * 1024 * 1024) {
     throw std::invalid_argument("vocabulary requires bounded FP16 row blocks");
   }
   table.spec.bytes();
-  impl_ = std::make_unique<Impl>(context, store, table, block_rows);
+  impl_ = std::make_unique<Impl>(context, store, table, block_rows, lookup);
 }
 
 Vocabulary::~Vocabulary() = default;

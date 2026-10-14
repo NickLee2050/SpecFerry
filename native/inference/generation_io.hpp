@@ -22,6 +22,7 @@ struct RunOptions {
   bool sampling = false, benchmark = false, lifecycle = false;
   std::string variant = "merged-kv", prefill_head = "every-token", readback = "none";
   std::string readback_transport = "sdk";
+  std::string projection_backend = "auto";
 };
 
 // Each CLI consumes its own keys, then rejects leftovers before initializing the SDK.
@@ -93,12 +94,23 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
     result.prefill_head = settings.text("prefill_head", "every-token");
     result.readback = settings.text("readback", "none");
     result.readback_transport = settings.text("readback_transport", "sdk");
+    result.projection_backend = settings.text("projection_backend", "auto");
     result.cache_first = settings.number("cache_first_layer", 0, 0, 32);
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
-    if (result.sampling ||
-        (result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2") ||
+    if ((result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||
+        (result.projection_backend != "auto" && result.projection_backend != "fcl" &&
+         result.projection_backend != "nbg-qkv" && result.projection_backend != "nbg-output" &&
+         result.projection_backend != "nbg") ||
+        result.sampling ||
+        (result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2" &&
+         result.variant != "compiled-ffn-finish" && result.variant != "compiled-decoder" &&
+         result.variant != "compiled-fullgraph") ||
+        ((result.variant == "compiled-ffn-finish" || result.variant == "compiled-decoder" ||
+          result.variant == "compiled-fullgraph") &&
+         (result.block != 1 || result.lifecycle)) ||
+        (result.variant == "compiled-fullgraph" && result.prefill_head != "every-token") ||
         (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
         (result.prefill_head != "every-token" && result.prefill_head != "last-token") ||
         (result.readback != "none" && result.readback != "logits" && result.readback != "kv") ||

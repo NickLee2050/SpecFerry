@@ -8,11 +8,13 @@
 #include "np101/weights.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -30,6 +32,8 @@ struct DecoderCase {
   std::size_t uploads = 1, control_bytes = 0;
   std::vector<std::vector<std::uint8_t>> inputs{};
   std::map<unsigned, std::vector<std::string>> fields{};
+  bool coarse = false;
+  std::vector<double> sequence_seconds{};
 };
 
 bool checkpoint(unsigned step, unsigned count) {
@@ -47,19 +51,22 @@ template <class Exception, class Action> void rejects(Action action) {
 }
 
 template <class Model>
-void sequence(Model &model, const DecoderCase &test, const std::string &name, unsigned count,
+void sequence(Model &model, DecoderCase &test, const std::string &name, unsigned count,
               bool final_only) {
   std::cout << name << ": " << count << " steps" << std::endl;
+  double seconds = 0;
   for (unsigned step = 0; step < count; ++step) {
     const auto before = np101::tensor_transfers();
+    const auto start = std::chrono::steady_clock::now();
     model.step(test.inputs[step]);
+    seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const auto after = np101::tensor_transfers();
     if (after.uploads - before.uploads != test.uploads ||
         after.upload_bytes - before.upload_bytes != test.inputs[step].size() + test.control_bytes ||
         after.reads != before.reads || model.length() != step + 1) {
       throw std::runtime_error("unexpected decoder position or host transfers");
     }
-    if (final_only ? step + 1 != count : !checkpoint(step, count)) {
+    if ((test.coarse || final_only) ? step + 1 != count : !checkpoint(step, count)) {
       continue;
     }
     for (const auto &[layer, fields] : test.fields) {
@@ -71,9 +78,10 @@ void sequence(Model &model, const DecoderCase &test, const std::string &name, un
       }
     }
   }
+  test.sequence_seconds.push_back(seconds);
 }
 
-template <class Factory> void trajectories(Factory create, const DecoderCase &test) {
+template <class Factory> void trajectories(Factory create, DecoderCase &test) {
   auto model = create();
   sequence(*model, test, "zero", test.count, false);
   rejects<std::invalid_argument>([&] { model->step({}); });
@@ -135,6 +143,14 @@ int main(int argc, char **argv) {
       }
     };
     np101::SdkTimings timings(output);
+    std::size_t const_peak = 0, nonconst_peak = 0;
+    const auto account = [&](np101::Context &context) {
+      if (context.memory().live(true) || context.memory().live(false)) {
+        throw std::runtime_error("decoder payload remains after release");
+      }
+      const_peak = std::max(const_peak, context.memory().peak(true));
+      nonconst_peak = std::max(nonconst_peak, context.memory().peak(false));
+    };
     if (profile == "opt") {
       const auto config = models::opt::read_config(fixture / "components.txt");
       test.capacity = config.capacity;
@@ -157,13 +173,39 @@ int main(int argc, char **argv) {
             return std::make_unique<models::opt::DecoderSlice>(context, weights, config, layers);
           },
           test);
+      account(context);
       context.close();
     } else if (profile == "qwen") {
       const auto config = models::qwen3_5::read_config(fixture / "components.txt");
+      std::map<unsigned, models::qwen3_5::CompiledBlock> compiled_mixers;
+      std::ifstream mixer_file(fixture / "compiled-mixer-package.txt");
+      if (mixer_file) {
+        std::string package, extra;
+        if (!(mixer_file >> std::quoted(package)) || mixer_file >> extra) {
+          throw std::invalid_argument("compiled mixer fixture requires one package path");
+        }
+        compiled_mixers = models::qwen3_5::load_compiled_mixers(package, weights, config);
+      }
+      auto backend = np101::ops::LinearBackend::MatMul;
+      std::ifstream backend_file(fixture / "feed-forward-backend.txt");
+      std::string name, extra;
+      if (backend_file) {
+        if (!(backend_file >> name) || backend_file >> extra ||
+            (name != "fcl" && name != "matmul")) {
+          throw std::invalid_argument("invalid Qwen feed-forward backend");
+        }
+        backend = name == "fcl" ? np101::ops::LinearBackend::FullyConnected
+                                : np101::ops::LinearBackend::MatMul;
+      }
+      test.coarse = fs::exists(fixture / "coarse-readback.txt");
+      const auto readback =
+          test.coarse ? np101::TensorReadback::MappedHost : np101::TensorReadback::SdkCopy;
       test.capacity = config.kv.capacity;
       for (auto index : layers) {
         auto &fields = test.fields[index];
-        fields = {"normalized", "mixer", "residual", "post_norm", "mlp", "output"};
+        fields = test.coarse ? std::vector<std::string>{"output"}
+                             : std::vector<std::string>{"normalized", "mixer", "residual",
+                                                        "post_norm",  "mlp",   "output"};
         if (config.mixer(index) == models::qwen3_5::MixerKind::Attention) {
           fields.insert(fields.end(), {"keys", "values"});
           test.uploads += 2;
@@ -173,21 +215,34 @@ int main(int argc, char **argv) {
         }
       }
       load_inputs(config.hidden_spec());
-      np101::Context context;
+      std::unique_ptr<np101::Context> context;
       trajectories(
           [&] {
-            return std::make_unique<models::qwen3_5::DecoderGroup>(context, weights, config,
-                                                                   layers);
+            if (context) {
+              account(*context);
+              context->close();
+              context.reset();
+            }
+            context = std::make_unique<np101::Context>();
+            return std::make_unique<models::qwen3_5::DecoderGroup>(
+                *context, weights, config, layers, backend, readback, compiled_mixers);
           },
           test);
-      context.close();
+      account(*context);
+      context->close();
     } else {
       throw std::invalid_argument("unknown model profile");
     }
     std::ofstream out(output / "execution.json");
     out << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"sequences\":4,"
            "\"steps\":"
-        << test.count + std::min(32U, test.count) + 2 * std::min(8U, test.count) << "}\n";
+        << test.count + std::min(32U, test.count) + 2 * std::min(8U, test.count)
+        << ",\"const_peak_bytes\":" << const_peak << ",\"nonconst_peak_bytes\":" << nonconst_peak
+        << ",\"const_live_bytes\":0,\"nonconst_live_bytes\":0,\"sequence_seconds\":[";
+    for (std::size_t index = 0; index < test.sequence_seconds.size(); ++index) {
+      out << (index ? "," : "") << test.sequence_seconds[index];
+    }
+    out << "]}\n";
     return out ? 0 : 1;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

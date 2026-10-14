@@ -54,7 +54,9 @@ def snapshot(output, sudo_read_only):
         raise RuntimeError(f"Cannot verify kernel health: {log.stderr.strip()}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".log").write_text(log.stdout)
-    owner = subprocess.run(prefix + ["fuser", "/dev/galcore"], capture_output=True, text=True)
+    # Sudo authorization covers journalctl only. Ownership checks remain unprivileged;
+    # an unreadable owner is an error, never a clean-device result.
+    owner = subprocess.run(["fuser", "/dev/galcore"], capture_output=True, text=True)
     if owner.returncode not in (0, 1) or (owner.returncode == 1 and owner.stderr.strip()):
         raise RuntimeError(f"Cannot verify device ownership: {owner.stderr.strip()}")
     record = {

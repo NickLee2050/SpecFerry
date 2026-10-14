@@ -99,7 +99,11 @@ ExecutionCounts execution_counts(const PartitionedModel &model, ExecutionCounts 
 PartitionedModel::Variant parse_variant(const std::string &name) {
   using Variant = PartitionedModel::Variant;
   const std::pair<const char *, Variant> variants[] = {
-      {"merged-kv", Variant::MergedKv}, {"merged-kv-fc1-split2", Variant::MergedKvFc1Split2}};
+      {"merged-kv", Variant::MergedKv},
+      {"merged-kv-fc1-split2", Variant::MergedKvFc1Split2},
+      {"compiled-ffn-finish", Variant::MergedKvCompiledFfn},
+      {"compiled-decoder", Variant::CompiledDecoder},
+      {"compiled-fullgraph", Variant::CompiledFullModel}};
   for (const auto &[label, variant] : variants) {
     if (name == label) {
       return variant;
@@ -288,6 +292,53 @@ int main(int argc, char **argv) {
     }
     np101::WeightStore weights(argv[1]);
     weights.verify();
+    std::vector<models::opt::CompiledFfn> compiled_ffn;
+    models::opt::CompiledHead compiled_head;
+    std::vector<models::opt::CompiledProjections> compiled_projections;
+    models::opt::CompiledModelPackage compiled_model;
+    models::opt::ProjectionPolicy projections;
+    if (variant == PartitionedModel::Variant::MergedKvCompiledFfn) {
+      std::ifstream manifest(fs::path(argv[2]) / "compiled-ffn-package.txt");
+      std::string package, extra;
+      if (!(manifest >> std::quoted(package)) || manifest >> extra) {
+        throw std::invalid_argument("compiled FFN variant requires one package path");
+      }
+      compiled_ffn = models::opt::load_compiled_ffn(package, argv[1], config, weights,
+                                                    compiled_head, &compiled_projections);
+      projections = {np101::ops::LinearBackend::FullyConnected,
+                     np101::ops::LinearBackend::FullyConnected};
+      const auto &backend = options.projection_backend;
+      if (compiled_projections.empty() && backend != "auto" && backend != "fcl") {
+        throw std::invalid_argument(
+            "NBG projection selection requires packaged projection artifacts");
+      }
+      projections.compiled_query = backend == "nbg" || backend == "nbg-qkv";
+      projections.compiled_output = backend == "nbg" || backend == "nbg-output";
+    }
+    if (variant == PartitionedModel::Variant::CompiledDecoder ||
+        variant == PartitionedModel::Variant::CompiledFullModel) {
+      std::ifstream manifest(fs::path(argv[2]) / "compiled-model-package.txt");
+      std::string package, extra;
+      if (!(manifest >> std::quoted(package)) || manifest >> extra) {
+        throw std::invalid_argument("compiled model variant requires one package path");
+      }
+      compiled_model = models::opt::load_compiled_model(package, argv[1], config, weights);
+      if ((variant == PartitionedModel::Variant::CompiledDecoder) !=
+          !compiled_model.decoders.empty()) {
+        throw std::invalid_argument("compiled model scope differs from selected variant");
+      }
+    }
+    const auto head_backend = variant == PartitionedModel::Variant::CompiledFullModel
+                                  ? "fullgraph-nbg"
+                              : !compiled_head.graph.path.empty() ? "nbg"
+                              : compiled_ffn.empty()              ? "matmul"
+                                                                  : "fcl";
+    const std::string projection_backend =
+        variant == PartitionedModel::Variant::MergedKvCompiledFfn
+            ? (options.projection_backend == "auto" ? "fcl" : options.projection_backend)
+        : variant == PartitionedModel::Variant::CompiledDecoder   ? "nbg-decoder"
+        : variant == PartitionedModel::Variant::CompiledFullModel ? "nbg-fullgraph"
+                                                                  : "matmul";
     fs::create_directories(directory);
     progress(directory, "initialize");
     np101::SdkTimings timings(directory);
@@ -303,7 +354,8 @@ int main(int argc, char **argv) {
       // Preserve the last compilation stage if initialization exceeds the device timeout.
       PartitionedModel model(
           context, weights, config, [&](const std::string &stage) { progress(directory, stage); },
-          variant, head_policy, block);
+          variant, head_policy, block, compiled_ffn, compiled_model.decoders, {}, projections,
+          compiled_head, compiled_projections, compiled_model.full);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
@@ -314,6 +366,8 @@ int main(int argc, char **argv) {
                     << variant_name << "\",\"decoder_group_size\":1"
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
+                    << ",\"head_backend\":\"" << head_backend << "\""
+                    << ",\"attention_projection_backend\":\"" << projection_backend << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
                     << ",\"decode_steps\":" << model.decode_steps()
                     << ",\"prefill_steps\":" << model.prefill_steps()
@@ -379,7 +433,8 @@ int main(int argc, char **argv) {
                 for (bool values : {false, true}) {
                   auto bytes = model.read_cache(layer, values, readback_method);
                   const auto head_dimension = config.decoder.kv_spec().head_dim;
-                  const auto row_bytes = std::size_t(head_dimension) * 2;
+                  const auto row_bytes =
+                      std::size_t(head_dimension) * np101::dtype_bytes(model.cache_spec().type);
                   const auto head_bytes = row_bytes * config.decoder.capacity;
                   if (bytes.size() != head_bytes * config.decoder.heads) {
                     throw std::runtime_error(
@@ -472,6 +527,8 @@ int main(int argc, char **argv) {
           << ",\"cache_suffix_matches\":" << (cache_suffix_matches ? "true" : "false")
           << ",\"cache_readback\":\"" << readback << "\""
           << ",\"readback_transport\":\"" << options.readback_transport << "\""
+          << ",\"head_backend\":\"" << head_backend << "\""
+          << ",\"attention_projection_backend\":\"" << projection_backend << "\""
           << ",\"cache_first_layer\":" << cache_first << ",\"cache_last_layer\":" << cache_last
           << ",\"diagnostic_reads\":" << diagnostic_transfers.reads
           << ",\"diagnostic_read_bytes\":" << diagnostic_transfers.read_bytes

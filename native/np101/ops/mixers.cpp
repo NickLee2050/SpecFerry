@@ -114,10 +114,10 @@ Tensor short_convolution(GraphBuilder &g, Tensor history, Tensor packed, Tensor 
 }
 
 Tensor swiglu(GraphBuilder &g, Tensor input, const WeightStore &weights, const WeightRecord &gate,
-              const WeightRecord &up, const WeightRecord &down) {
-  auto gated = g.project(input, weights, gate);
-  auto values = g.project(input, weights, up);
+              const WeightRecord &up, const WeightRecord &down, LinearBackend backend) {
+  auto gated = g.project(input, weights, gate, backend);
+  auto values = g.project(input, weights, up, backend);
   auto activated = g.unary(VSI_NN_OP_SWISH, gated, DataType::Float16);
-  return g.project(g.binary(VSI_NN_OP_MULTIPLY, activated, values), weights, down);
+  return g.project(g.binary(VSI_NN_OP_MULTIPLY, activated, values), weights, down, backend);
 }
 } // namespace specferry::np101::ops

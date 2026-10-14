@@ -55,7 +55,7 @@ add_library(np101_kv_cache native/np101/kv_cache.cpp)
 target_link_libraries(np101_kv_cache PUBLIC np101_context)
 target_compile_options(np101_kv_cache PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_delta_net native/models/qwen3_5/delta_net.cpp)
+add_library(np101_delta_net native/models/qwen3_5/delta_net.cpp native/models/qwen3_5/compiled.cpp)
 target_link_libraries(np101_delta_net PUBLIC np101_ops qwen_data)
 target_compile_options(np101_delta_net PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -63,7 +63,7 @@ add_library(np101_attention native/models/qwen3_5/attention.cpp)
 target_link_libraries(np101_attention PUBLIC np101_ops np101_kv_cache qwen_data)
 target_compile_options(np101_attention PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_decoder native/models/qwen3_5/decoder.cpp)
+add_library(np101_decoder native/models/qwen3_5/decoder.cpp native/models/qwen3_5/model.cpp)
 target_link_libraries(np101_decoder PUBLIC np101_delta_net np101_attention)
 target_compile_options(np101_decoder PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -76,9 +76,16 @@ target_compile_features(specferry_generation PUBLIC cxx_std_17)
 target_include_directories(specferry_generation PUBLIC native)
 target_link_libraries(specferry_generation PUBLIC specferry_diagnostics)
 target_compile_options(specferry_generation PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(np101_decoder PUBLIC specferry_generation)
+
+add_executable(specferry_qwen_generate native/cli/qwen_generate.cpp)
+target_link_libraries(specferry_qwen_generate PRIVATE np101_decoder)
+target_compile_options(specferry_qwen_generate PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(specferry_qwen_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 add_library(np101_opt_decoder native/models/opt/decoder.cpp native/models/opt/model.cpp
-  native/models/opt/layer.cpp native/models/opt/partitioned_graph_model.cpp)
+  native/models/opt/layer.cpp native/models/opt/compiled_model.cpp
+  native/models/opt/partitioned_graph_model.cpp)
 target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data specferry_generation)
 target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
 

@@ -25,6 +25,31 @@ bool valid_digest(const std::string &text) {
 }
 } // namespace
 
+std::string file_sha256(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  using Digest = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+  Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!file || !context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+    throw std::runtime_error("cannot hash file: " + path.string());
+  }
+  std::array<char, 64 * 1024> block;
+  while (file.read(block.data(), block.size()) || file.gcount()) {
+    if (EVP_DigestUpdate(context.get(), block.data(), file.gcount()) != 1) {
+      throw std::runtime_error("file SHA256 update failed");
+    }
+  }
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned size = 0;
+  if (!file.eof() || EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1) {
+    throw std::runtime_error("file SHA256 finalization failed");
+  }
+  std::ostringstream encoded;
+  for (unsigned index = 0; index < size; ++index) {
+    encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[index]);
+  }
+  return encoded.str();
+}
+
 WeightStore::WeightStore(const std::filesystem::path &directory) {
   auto root = std::filesystem::canonical(directory);
   data_path_ = std::filesystem::canonical(root / "weights.bin");

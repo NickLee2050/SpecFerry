@@ -65,6 +65,22 @@ def load_case(plan_path, name):
     request = resolve_path(case["request"])
     required = [request / "reference.json", request / "expected.0.logits.bin"]
     if "cache" in case:
+        cache = case["cache"]
+        if cache.get("dtype") not in {"F16", "F32"}:
+            raise ValueError("compiled KV reference dtype must be F16 or F32")
+        shape = cache.get("shape")
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 3
+            or any(type(value) is not int or value <= 0 for value in shape)
+        ):
+            raise ValueError("compiled KV reference requires a positive rank3 shape")
+        expected_bytes = math.prod(shape) * (2 if cache["dtype"] == "F16" else 4)
+        if any(
+            resolve_path(cache[part]).stat().st_size != expected_bytes
+            for part in ("keys", "values")
+        ):
+            raise ValueError("compiled KV reference size differs from its dtype and shape")
         required.extend(resolve_path(case["cache"][part]) for part in ("keys", "values"))
     if any(path not in {resolve_path(value) for value in files} for path in required):
         raise ValueError("independent numerical references require pinned file identities")
@@ -192,8 +208,23 @@ def audit_compilation(device):
     )
 
 
-def run_case(case, identity, output, *, sudo_read_only=False, timeout=600, audit_verify=False):
+def run_case(
+    case,
+    identity,
+    output,
+    *,
+    sudo_read_only=False,
+    timeout=600,
+    audit_verify=False,
+    evaluate_result=evaluate,
+    numerical_diagnostic=False,
+    cold_restarted=False,
+    sdk_timing=False,
+):
+    if numerical_diagnostic and cold_restarted:
+        raise ValueError("cold-restart and numerical diagnostics are separate recovery paths")
     sdk = resolve_path(identity["directory"])
+    binary = resolve_path(case["binary"]).resolve(strict=True)
     for name, digest in identity["sha256"].items():
         if sha256(sdk / name) != digest:
             raise ValueError(f"compiled validation requires the pinned SDK: {name}")
@@ -207,18 +238,49 @@ def run_case(case, identity, output, *, sudo_read_only=False, timeout=600, audit
     output.mkdir(parents=True, exist_ok=False)
     device = output / "device"
     arguments = [
-        str(device) if value == "{output}" else str(resolve_path(value)) if value != "-" else value
-        for value in case["arguments"]
+        str(device)
+        if value == "{output}"
+        else value
+        if index in case.get("literal_arguments", [])
+        else str(resolve_path(value))
+        if value != "-"
+        else value
+        for index, value in enumerate(case["arguments"])
     ]
     write_json(
         output / "plan.json",
         dict(case={k: str(v) if isinstance(v, Path) else v for k, v in case.items()}, sdk=identity),
     )
     marker = RECOVERY_ROOT / "np101-recovery-required.json"
-    with device_lock(RECOVERY_ROOT):
+    # Explicitly authorized diagnostics may follow a completed, released numerical
+    # failure. This exception never admits a kernel fault or an incomplete SDK run.
+    if numerical_diagnostic:
+        previous = read_json(marker)
+        execution = previous.get("execution", {})
+        native = read_json(resolve_path(previous["evidence"]) / "device/run.json")
+        if (
+            execution.get("returncode") != 1
+            or execution.get("timeout") is not False
+            or execution.get("device_recovery_required") is not False
+            or execution.get("process_group_exited") is not True
+            or execution.get("remaining_processes") != []
+            or native.get("status") != "numerical_mismatch"
+            or native.get("released") is not True
+            or any(native.get(f"{segment}_live_bytes") != 0 for segment in ("const", "nonconst"))
+            or not healthy(previous.get("kernel_gate", {"faults": ["unknown"], "owners": ""}))
+        ):
+            raise ValueError("numerical diagnostic requires a completed healthy numerical failure")
+        write_json(output / "previous-numerical-marker.json", previous)
+    with device_lock(RECOVERY_ROOT, recovery_control=numerical_diagnostic or cold_restarted):
         preflight = snapshot(output / "preflight", sudo_read_only)
         if not healthy(preflight):
             raise RuntimeError("compiled validation preflight failed; board not started")
+        if cold_restarted:
+            previous = read_json(marker)
+            if not previous.get("boot_id") or previous["boot_id"] == preflight["boot_id"]:
+                raise ValueError("cold-restart diagnostic requires a different confirmed boot")
+            # Preserve the old incident until this agreed workload passes every gate.
+            write_json(output / "previous-recovery-marker.json", previous)
         write_json(
             marker,
             dict(
@@ -233,12 +295,13 @@ def run_case(case, identity, output, *, sudo_read_only=False, timeout=600, audit
         report = dict(passed=False)
         try:
             evidence = run_device(
-                case["binary"],
+                binary,
                 arguments,
                 device,
                 sdk,
                 timeout,
                 recovery_control=True,
+                sdk_timing=sdk_timing,
                 verify_trace=ROOT / "build/tests/libnp101_verify_trace.so"
                 if audit_verify
                 else None,
@@ -252,12 +315,20 @@ def run_case(case, identity, output, *, sudo_read_only=False, timeout=600, audit
             postflight = snapshot(output / "postflight", sudo_read_only)
             report.update(immediate=immediate, postflight=postflight)
             if clean_execution(evidence):
-                report.update(evaluate(case, device))
+                report.update(evaluate_result(case, device))
                 if audit_verify:
                     report["compilation"] = audit_compilation(device)
                     report["passed"] &= report["compilation"]["passed"]
             report["passed"] = report["passed"] and healthy(immediate) and healthy(postflight)
-        except (OSError, ValueError, KeyError, RuntimeError, KeyboardInterrupt) as error:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            RuntimeError,
+            KeyboardInterrupt,
+        ) as error:
             report["error"] = str(error)
         write_json(output / "result.json", report)
         if report["passed"]:

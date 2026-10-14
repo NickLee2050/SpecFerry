@@ -23,5 +23,6 @@ Tensor delta_recurrence(GraphBuilder &builder, Tensor query, Tensor key, Tensor 
 Tensor short_convolution(GraphBuilder &builder, Tensor history, Tensor packed, Tensor kernel,
                          Tensor updated_history);
 Tensor swiglu(GraphBuilder &builder, Tensor input, const WeightStore &weights,
-              const WeightRecord &gate, const WeightRecord &up, const WeightRecord &down);
+              const WeightRecord &gate, const WeightRecord &up, const WeightRecord &down,
+              LinearBackend backend = LinearBackend::MatMul);
 } // namespace specferry::np101::ops

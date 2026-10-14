@@ -1,9 +1,11 @@
 #include "models/qwen3_5/attention.hpp"
 #include "models/qwen3_5/decoder.hpp"
 #include "models/qwen3_5/delta_net.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "np101/tensor_spec.hpp"
+#include "np101/weight_bank.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -23,8 +25,8 @@ public:
   Config config;
   std::map<std::string, Tensor> outputs;
 
-  DecoderGraph(Context &context, const Config &configuration)
-      : GraphBuilder(context, 64, 48), config(configuration) {}
+  DecoderGraph(Context &context, const Config &configuration, WeightBank *bank = nullptr)
+      : GraphBuilder(context, 64, 48, bank), config(configuration) {}
 
   Tensor norm(const WeightStore &weights, const std::string &name, Tensor input) {
     auto scale = weight(weights, weights.find(name), {f16, {config.hidden}});
@@ -54,11 +56,12 @@ struct DecoderLayer::Impl {
   bool failed = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
-       TensorBinding input)
+       TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
+       const CompiledBlock *compiled_feed_forward)
       : config(configuration), storage(context, 1, 0),
         mixed(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
-        normalization(context, config), feed_forward(context, config) {
+        normalization(context, config, bank), feed_forward(context, config, bank) {
     const auto prefix = config.layer_prefix(layer);
     const auto incoming = normalization.bind(input, config.hidden_spec());
     const auto normalized =
@@ -68,11 +71,14 @@ struct DecoderLayer::Impl {
 
     TensorBinding mixer_input{normalization.graph, normalized.id}, mixer_output{storage, mixed};
     if (config.mixer(layer) == MixerKind::Attention) {
-      attention =
-          std::make_unique<Attention>(context, weights, config, layer, mixer_input, mixer_output);
+      if (compiled) {
+        throw std::invalid_argument("DeltaNet compiled mixer cannot replace attention");
+      }
+      attention = std::make_unique<Attention>(context, weights, config, layer, mixer_input,
+                                              mixer_output, bank);
     } else {
-      delta =
-          std::make_unique<DeltaNet>(context, weights, config, layer, mixer_input, mixer_output);
+      delta = std::make_unique<DeltaNet>(context, weights, config, layer, mixer_input, mixer_output,
+                                         bank, compiled);
     }
 
     // The original input stays alive until the residual is consumed. No in-place
@@ -80,11 +86,23 @@ struct DecoderLayer::Impl {
     const auto residual = feed_forward.bind(input, config.hidden_spec());
     const auto mixer = feed_forward.bind(mixer_output, config.hidden_spec());
     auto &tail = feed_forward;
+    if (compiled_feed_forward) {
+      validate_compiled_feed_forward(*compiled_feed_forward, weights, config, layer);
+      const std::vector<Tensor> semantic{residual, mixer};
+      auto inputs = semantic;
+      for (unsigned index = 0; index < semantic.size(); ++index) {
+        inputs[compiled_feed_forward->input_order[index]] = semantic[index];
+      }
+      const auto outputs = tail.compiled(compiled_feed_forward->graph, inputs);
+      tail.outputs = {{"output", outputs.at(compiled_feed_forward->output_order.at(0))}};
+      tail.compile_outputs({residual, mixer});
+      return;
+    }
     const auto sum = tail.binary(VSI_NN_OP_ADD, residual, mixer);
     const auto norm = tail.norm(weights, prefix + "post_attention_layernorm.weight", sum);
     const auto mlp = swiglu(tail, norm, weights, weights.find(prefix + "mlp.gate_proj.weight"),
                             weights.find(prefix + "mlp.up_proj.weight"),
-                            weights.find(prefix + "mlp.down_proj.weight"));
+                            weights.find(prefix + "mlp.down_proj.weight"), backend);
     const auto output = tail.binary(VSI_NN_OP_ADD, sum, mlp);
     tail.outputs = {{"residual", sum}, {"post_norm", norm}, {"mlp", mlp}, {"output", output}};
     tail.compile_outputs({residual, mixer});
@@ -92,10 +110,13 @@ struct DecoderLayer::Impl {
 };
 
 DecoderLayer::DecoderLayer(Context &context, const WeightStore &weights, const Config &config,
-                           unsigned layer, TensorBinding input)
+                           unsigned layer, TensorBinding input, WeightBank *bank,
+                           LinearBackend backend, const CompiledBlock *compiled,
+                           const CompiledBlock *compiled_feed_forward)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, true);
-  impl_ = std::make_unique<Impl>(context, weights, config, layer, input);
+  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, bank, backend, compiled,
+                                 compiled_feed_forward);
 }
 
 DecoderLayer::~DecoderLayer() = default;
@@ -114,13 +135,17 @@ void DecoderLayer::step() {
     throw std::logic_error("decoder mixer position is inconsistent");
   }
   state.failed = true;
-  check(vsi_nn_RunGraph(state.normalization.graph.get()), "decoder input normalization");
+  check(
+      sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(state.normalization.graph.get()); }),
+      "decoder input normalization");
   if (state.delta) {
     state.delta->step();
   } else {
     state.attention->step();
   }
-  check(vsi_nn_RunGraph(state.feed_forward.graph.get()), "decoder residual and MLP");
+  check(
+      sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(state.feed_forward.graph.get()); }),
+      "decoder residual and MLP");
   ++state.completed;
   state.failed = false;
 }
@@ -148,21 +173,22 @@ TensorBinding DecoderLayer::output() {
   return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
 }
 
-std::vector<std::uint8_t> DecoderLayer::read(const std::string &name) {
+std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorReadback method) {
   if (!impl_ || impl_->failed || !impl_->completed) {
     throw std::logic_error("decoder layer has no completed output");
   }
   if (name == "normalized") {
-    return read_tensor(impl_->normalization.graph, impl_->normalization.outputs.at(name).id);
+    return read_tensor(impl_->normalization.graph, impl_->normalization.outputs.at(name).id,
+                       method);
   }
   if (name == "mixer") {
-    return read_tensor(impl_->storage, impl_->mixed);
+    return read_tensor(impl_->storage, impl_->mixed, method);
   }
   const auto &outputs = impl_->feed_forward.outputs;
   if (outputs.count(name)) {
-    return read_tensor(impl_->feed_forward.graph, outputs.at(name).id);
+    return read_tensor(impl_->feed_forward.graph, outputs.at(name).id, method);
   }
-  return impl_->delta ? impl_->delta->read(name) : impl_->attention->read(name);
+  return impl_->delta ? impl_->delta->read(name, method) : impl_->attention->read(name, method);
 }
 
 void DecoderLayer::close() {
@@ -185,20 +211,29 @@ struct DecoderGroup::Impl {
   Graph storage;
   vsi_nn_tensor_id_t input;
   std::vector<unsigned> selected;
+  std::unique_ptr<WeightBank> bank;
+  TensorReadback readback;
   std::vector<std::unique_ptr<DecoderLayer>> layers;
   std::size_t completed = 0;
   bool failed = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration,
-       const std::vector<unsigned> &indices)
+       const std::vector<unsigned> &indices, LinearBackend backend, TensorReadback method,
+       const std::map<unsigned, CompiledBlock> &compiled)
       : config(configuration), storage(context, 1, 0),
         input(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
-        selected(indices) {
+        selected(indices), readback(method) {
+    if (backend == LinearBackend::FullyConnected) {
+      bank = std::make_unique<WeightBank>(context);
+    }
     try {
       for (unsigned layer : selected) {
         auto binding = layers.empty() ? TensorBinding{storage, input} : layers.back()->output();
-        layers.push_back(std::make_unique<DecoderLayer>(context, weights, config, layer, binding));
+        const auto artifact = compiled.find(layer);
+        layers.push_back(std::make_unique<DecoderLayer>(
+            context, weights, config, layer, binding, bank.get(), backend,
+            artifact == compiled.end() ? nullptr : &artifact->second));
       }
     } catch (...) {
       while (!layers.empty()) {
@@ -217,7 +252,9 @@ struct DecoderGroup::Impl {
 };
 
 DecoderGroup::DecoderGroup(Context &context, const WeightStore &weights, const Config &config,
-                           const std::vector<unsigned> &layers) {
+                           const std::vector<unsigned> &layers, LinearBackend backend,
+                           TensorReadback readback,
+                           const std::map<unsigned, CompiledBlock> &compiled) {
   config.validate();
   if (layers.empty()) {
     throw std::invalid_argument("decoder slice is empty");
@@ -230,7 +267,16 @@ DecoderGroup::DecoderGroup(Context &context, const WeightStore &weights, const C
     }
     seen.push_back(layer);
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, layers);
+  for (const auto &[layer, artifact] : compiled) {
+    if (std::find(layers.begin(), layers.end(), layer) == layers.end()) {
+      throw std::invalid_argument("compiled Qwen mixer is outside the selected slice");
+    }
+    validate_compiled_mixer(artifact, weights, config, layer);
+  }
+  if (backend != LinearBackend::MatMul && backend != LinearBackend::FullyConnected) {
+    throw std::invalid_argument("unknown Qwen feed-forward backend");
+  }
+  impl_ = std::make_unique<Impl>(context, weights, config, layers, backend, readback, compiled);
 }
 
 DecoderGroup::~DecoderGroup() = default;
@@ -284,7 +330,7 @@ std::vector<std::uint8_t> DecoderGroup::read(unsigned layer, const std::string &
   if (found == impl_->selected.end()) {
     throw std::out_of_range("layer not in this decoder slice");
   }
-  return impl_->layers.at(found - impl_->selected.begin())->read(name);
+  return impl_->layers.at(found - impl_->selected.begin())->read(name, impl_->readback);
 }
 
 void DecoderGroup::close() {
@@ -292,6 +338,9 @@ void DecoderGroup::close() {
     while (!impl_->layers.empty()) {
       impl_->layers.back()->close();
       impl_->layers.pop_back();
+    }
+    if (impl_->bank) {
+      impl_->bank->close();
     }
     impl_->storage.close();
     impl_.reset();

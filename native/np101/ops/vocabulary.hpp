@@ -5,6 +5,8 @@
 #include <memory>
 
 namespace specferry::np101::ops {
+enum class VocabularyLookup { Gather, GatherNd };
+
 struct SamplingOptions {
   bool enabled = false;
   std::uint32_t seed = 0;
@@ -20,7 +22,7 @@ Tensor greedy_token(GraphBuilder &graph, const std::vector<Tensor> &logits, unsi
 class Vocabulary {
 public:
   Vocabulary(Context &context, const WeightStore &store, const WeightRecord &table,
-             unsigned block_rows = 4096);
+             unsigned block_rows = 4096, VocabularyLookup lookup = VocabularyLookup::Gather);
   ~Vocabulary();
   Vocabulary(const Vocabulary &) = delete;
   Vocabulary &operator=(const Vocabulary &) = delete;

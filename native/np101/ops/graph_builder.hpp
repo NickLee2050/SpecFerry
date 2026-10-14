@@ -1,6 +1,7 @@
 #pragma once
 
 #include "np101/context.hpp"
+#include "np101/ops/linear_backend.hpp"
 #include "np101/tensor.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weights.hpp"
@@ -52,6 +53,7 @@ public:
   GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights = nullptr);
   Tensor tensor(TensorSpec spec);
   Tensor constant(TensorSpec spec, const std::vector<std::uint8_t> &bytes);
+  Tensor constant_weight(const WeightStore &store, const WeightRecord &record);
   Tensor floats(const std::vector<float> &values, Shape shape, DataType type);
   Tensor scalar(float value, DataType type = DataType::Float32);
   Tensor weight(const WeightStore &store, const WeightRecord &record, TensorSpec expected);
@@ -72,13 +74,18 @@ public:
   Tensor reduce(Tensor input, bool mean, unsigned axis = 0);
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);
+  // Explicit candidate: static FP16 [K,N] weights, no fused bias or activation.
+  // Mirrors the generated FCL's policies; callers retain any FP16 bias boundary.
+  Tensor fully_connected(Tensor input, Tensor weights);
   Tensor gather(Tensor input, Tensor indices, unsigned axis);
   Tensor argmax(Tensor input, unsigned axis);
   Tensor integer(std::int32_t value);
-  Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record);
+  Tensor project(Tensor input, const WeightStore &store, const WeightRecord &record,
+                 LinearBackend backend = LinearBackend::MatMul);
   // FP16 projection followed by bias addition, with an FP16 intermediate boundary.
   Tensor linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                const WeightRecord &bias, unsigned output_parts = 1);
+                const WeightRecord &bias, unsigned output_parts = 1,
+                LinearBackend backend = LinearBackend::MatMul);
   // Creates fixed NBG ports; mixing NBG with ordinary nodes needs workload validation.
   // The builder owns the path until graph destruction; the graph owns payload charges.
   std::vector<Tensor> compiled(const CompiledGraphSpec &spec, const std::vector<Tensor> &inputs);

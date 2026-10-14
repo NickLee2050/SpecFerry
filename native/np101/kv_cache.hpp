@@ -2,6 +2,7 @@
 
 #include "np101/component_spec.hpp"
 #include "np101/context.hpp"
+#include "np101/tensor.hpp"
 #include "vsi_nn_pub.h"
 
 #include <cstddef>
@@ -24,8 +25,8 @@ public:
   void write(unsigned position);
   vsi_nn_tensor_id_t retain_keys(Graph &reader);
   vsi_nn_tensor_id_t retain_values(Graph &reader);
-  std::vector<std::uint8_t> read_keys();
-  std::vector<std::uint8_t> read_values();
+  std::vector<std::uint8_t> read_keys(TensorReadback method = TensorReadback::SdkCopy);
+  std::vector<std::uint8_t> read_values(TensorReadback method = TensorReadback::SdkCopy);
   unsigned capacity() const;
   KvSpec spec() const;
   std::size_t writes() const;

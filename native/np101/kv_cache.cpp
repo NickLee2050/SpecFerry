@@ -4,6 +4,7 @@
 #include "np101/tensor_spec.hpp"
 
 #include <array>
+#include <optional>
 #include <stdexcept>
 
 namespace specferry::np101 {
@@ -50,6 +51,7 @@ struct KvCache::Impl {
   std::vector<std::unique_ptr<TensorView>> key_views;
   std::vector<std::unique_ptr<TensorView>> value_views;
   Graph copy;
+  std::optional<unsigned> selected_position = 0;
   std::size_t completed_writes = 0;
   std::size_t revalidations = 0;
 
@@ -118,20 +120,26 @@ void KvCache::write(unsigned position) {
     throw std::out_of_range("KV write position exceeds capacity or cache is closed");
   }
   auto graph = impl_->copy.get()->g;
-  check(sdk_call("vxSetGraphParameterByIndex.key",
-                 [&] {
-                   return vxSetGraphParameterByIndex(
-                       graph, 0,
-                       reinterpret_cast<vx_reference>(impl_->key_views[position]->tensor));
-                 }),
-        "select key slot");
-  check(sdk_call("vxSetGraphParameterByIndex.value",
-                 [&] {
-                   return vxSetGraphParameterByIndex(
-                       graph, 1,
-                       reinterpret_cast<vx_reference>(impl_->value_views[position]->tensor));
-                 }),
-        "select value slot");
+  // Construction already binds slot zero. Rebinding identical destinations can
+  // invalidate the verified graph before the first token, without changing data.
+  if (impl_->selected_position != position) {
+    impl_->selected_position.reset();
+    check(sdk_call("vxSetGraphParameterByIndex.key",
+                   [&] {
+                     return vxSetGraphParameterByIndex(
+                         graph, 0,
+                         reinterpret_cast<vx_reference>(impl_->key_views[position]->tensor));
+                   }),
+          "select key slot");
+    check(sdk_call("vxSetGraphParameterByIndex.value",
+                   [&] {
+                     return vxSetGraphParameterByIndex(
+                         graph, 1,
+                         reinterpret_cast<vx_reference>(impl_->value_views[position]->tensor));
+                   }),
+          "select value slot");
+    impl_->selected_position = position;
+  }
   if (!vxIsGraphVerified(graph)) {
     ++impl_->revalidations;
     check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(graph); }),
@@ -155,18 +163,18 @@ vsi_nn_tensor_id_t KvCache::retain_values(Graph &reader) {
   return retain_tensor(impl_->storage, impl_->values, reader);
 }
 
-std::vector<std::uint8_t> KvCache::read_keys() {
+std::vector<std::uint8_t> KvCache::read_keys(TensorReadback method) {
   if (!impl_) {
     throw std::logic_error("closed KV cache");
   }
-  return read_tensor(impl_->storage, impl_->keys);
+  return read_tensor(impl_->storage, impl_->keys, method);
 }
 
-std::vector<std::uint8_t> KvCache::read_values() {
+std::vector<std::uint8_t> KvCache::read_values(TensorReadback method) {
   if (!impl_) {
     throw std::logic_error("closed KV cache");
   }
-  return read_tensor(impl_->storage, impl_->values);
+  return read_tensor(impl_->storage, impl_->values, method);
 }
 
 KvSpec KvCache::spec() const {

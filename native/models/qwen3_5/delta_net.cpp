@@ -1,4 +1,6 @@
+#include "models/qwen3_5/compiled.hpp"
 #include "models/qwen3_5/delta_net.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "vsi_nn_pub.h"
@@ -34,8 +36,9 @@ public:
 
   StepGraph(Context &context, const WeightStore &weights, const Config &configuration,
             unsigned layer, std::optional<TensorBinding> input_binding,
-            std::optional<TensorBinding> output_binding, StepGraph *previous = nullptr)
-      : GraphBuilder(context, 160, 128), config(configuration),
+            std::optional<TensorBinding> output_binding, StepGraph *previous = nullptr,
+            WeightBank *bank = nullptr)
+      : GraphBuilder(context, 160, 128, bank), config(configuration),
         prefix(config.layer_prefix(layer) + "linear_attn.") {
     const auto hidden = config.hidden_spec();
     if (input_binding && output_binding) {
@@ -135,19 +138,83 @@ private:
                {"gated", gated}};
   }
 };
+
+class CompiledStep {
+public:
+  GraphBuilder execution, commit;
+  Tensor input, recurrent, convolution;
+  std::map<std::string, Tensor> outputs;
+
+  CompiledStep(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
+               const CompiledBlock &artifact, TensorBinding incoming, TensorBinding destination)
+      : execution(context, 16, 1), commit(context, 6, 3) {
+    validate_compiled_mixer(artifact, weights, config, layer);
+    input = execution.bind(incoming, config.hidden_spec());
+    recurrent = execution.tensor(config.delta.recurrent());
+    convolution = execution.tensor(config.delta.convolution());
+    const std::vector<Tensor> inputs{input, recurrent, convolution};
+    std::vector<Tensor> sdk_inputs(3);
+    for (unsigned index = 0; index < 3; ++index) {
+      sdk_inputs[artifact.input_order[index]] = inputs[index];
+    }
+    const auto sdk_outputs = execution.compiled(artifact.graph, sdk_inputs);
+    std::vector<Tensor> logical;
+    for (const auto slot : artifact.output_order) {
+      logical.push_back(sdk_outputs[slot]);
+    }
+    execution.compile(inputs, logical);
+    outputs = {{"output", logical[0]}, {"recurrent", logical[1]}, {"convolution", logical[2]}};
+    // Fixed ordinary copy graph avoids NBG input/output aliases and alternating imports.
+    const std::vector<Tensor> destinations{commit.bind(destination, config.hidden_spec()),
+                                           commit.share(execution, recurrent),
+                                           commit.share(execution, convolution)};
+    std::vector<Tensor> sources;
+    for (unsigned index = 0; index < 3; ++index) {
+      const auto source = commit.share(execution, logical[index]);
+      commit.node(VSI_NN_OP_DATACONVERT, {source}, destinations[index]);
+      sources.push_back(source);
+    }
+    commit.compile(sources, destinations);
+  }
+
+  void run() {
+    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(execution.graph.get()); }),
+          "compiled DeltaNet RunGraph");
+    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(commit.graph.get()); }),
+          "compiled DeltaNet state commit");
+  }
+
+  void close() {
+    commit.graph.close();
+    execution.graph.close();
+  }
+};
 } // namespace
 
 struct DeltaNet::Impl {
+  Config config;
   std::unique_ptr<StepGraph> forward;
   std::unique_ptr<StepGraph> backward;
+  std::unique_ptr<CompiledStep> compiled;
   std::size_t completed_steps = 0;
   bool failed = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-       std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {}) {
-    forward = std::make_unique<StepGraph>(context, weights, config, layer, input, output);
-    backward =
-        std::make_unique<StepGraph>(context, weights, config, layer, input, output, forward.get());
+       std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {},
+       WeightBank *bank = nullptr, const CompiledBlock *artifact = nullptr)
+      : config(config) {
+    if (artifact) {
+      if (!input || !output) {
+        throw std::invalid_argument("compiled DeltaNet requires fixed external bindings");
+      }
+      compiled = std::make_unique<CompiledStep>(context, weights, config, layer, *artifact, *input,
+                                                *output);
+      return;
+    }
+    forward =
+        std::make_unique<StepGraph>(context, weights, config, layer, input, output, nullptr, bank);
+    backward = std::make_unique<StepGraph>(context, weights, config, layer, input, output,
+                                           forward.get(), bank);
   }
 };
 
@@ -162,12 +229,13 @@ DeltaNet::DeltaNet(Context &context, const WeightStore &weights, const Config &c
 }
 
 DeltaNet::DeltaNet(Context &context, const WeightStore &weights, const Config &config,
-                   unsigned layer, TensorBinding input, TensorBinding output) {
+                   unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank,
+                   const CompiledBlock *compiled) {
   validate_layer_weights(weights, config, layer, false);
   if (config.mixer(layer) != MixerKind::DeltaNet) {
     throw std::invalid_argument("layer is not DeltaNet");
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output);
+  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank, compiled);
   reset();
 }
 
@@ -177,14 +245,14 @@ TensorSpec DeltaNet::recurrent_spec() const {
   if (!impl_) {
     throw std::logic_error("closed DeltaNet");
   }
-  return impl_->forward->config.delta.recurrent();
+  return impl_->config.delta.recurrent();
 }
 
 TensorSpec DeltaNet::convolution_spec() const {
   if (!impl_) {
     throw std::logic_error("closed DeltaNet");
   }
-  return impl_->forward->config.delta.convolution();
+  return impl_->config.delta.convolution();
 }
 
 void DeltaNet::reset(const std::vector<std::uint8_t> &recurrent,
@@ -197,16 +265,22 @@ void DeltaNet::reset(const std::vector<std::uint8_t> &recurrent,
     throw std::invalid_argument("DeltaNet initial state size mismatch");
   }
   impl_->failed = true;
-  auto &step = *impl_->forward;
   const auto state =
       recurrent.empty() ? std::vector<std::uint8_t>(recurrent_spec().bytes()) : recurrent;
   const auto history =
       convolution.empty() ? std::vector<std::uint8_t>(convolution_spec().bytes()) : convolution;
-  for (auto tensor : {step.recurrent_input, step.recurrent_output}) {
-    upload_tensor(step.graph, tensor.id, state);
-  }
-  for (auto tensor : {step.convolution_input, step.convolution_output}) {
-    upload_tensor(step.graph, tensor.id, history);
+  if (impl_->compiled) {
+    auto &step = *impl_->compiled;
+    upload_tensor(step.execution.graph, step.recurrent.id, state);
+    upload_tensor(step.execution.graph, step.convolution.id, history);
+  } else {
+    auto &step = *impl_->forward;
+    for (auto tensor : {step.recurrent_input, step.recurrent_output}) {
+      upload_tensor(step.graph, tensor.id, state);
+    }
+    for (auto tensor : {step.convolution_input, step.convolution_output}) {
+      upload_tensor(step.graph, tensor.id, history);
+    }
   }
   impl_->completed_steps = 0;
   impl_->failed = false;
@@ -216,12 +290,17 @@ void DeltaNet::step(const std::vector<std::uint8_t> &hidden_fp16) {
   if (!impl_ || impl_->failed) {
     throw std::logic_error("DeltaNet must be initialized/reset before stepping");
   }
-  if (hidden_fp16.size() != impl_->forward->config.hidden_spec().bytes()) {
+  if (hidden_fp16.size() != impl_->config.hidden_spec().bytes()) {
     throw std::invalid_argument("DeltaNet expects one FP16 hidden vector");
   }
-  auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
   impl_->failed = true;
-  upload_tensor(step.graph, step.input.id, hidden_fp16);
+  if (impl_->compiled) {
+    auto &step = *impl_->compiled;
+    upload_tensor(step.execution.graph, step.input.id, hidden_fp16);
+  } else {
+    auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
+    upload_tensor(step.graph, step.input.id, hidden_fp16);
+  }
   impl_->failed = false;
   this->step();
 }
@@ -230,27 +309,39 @@ void DeltaNet::step() {
   if (!impl_ || impl_->failed) {
     throw std::logic_error("DeltaNet must be initialized/reset before stepping");
   }
-  auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
   impl_->failed = true;
-  check(vsi_nn_RunGraph(step.graph.get()), "DeltaNet RunGraph");
+  if (impl_->compiled) {
+    impl_->compiled->run();
+  } else {
+    auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
+    check(vsi_nn_RunGraph(step.graph.get()), "DeltaNet RunGraph");
+  }
   ++impl_->completed_steps;
   impl_->failed = false;
 }
 
-std::vector<std::uint8_t> DeltaNet::read(const std::string &name) {
+std::vector<std::uint8_t> DeltaNet::read(const std::string &name, TensorReadback method) {
   if (!impl_ || impl_->failed || impl_->completed_steps == 0) {
     throw std::logic_error("DeltaNet has no completed output");
   }
+  if (impl_->compiled) {
+    auto &step = *impl_->compiled;
+    return read_tensor(step.execution.graph, step.outputs.at(name).id, method);
+  }
   auto &last = impl_->completed_steps % 2 == 1 ? *impl_->forward : *impl_->backward;
-  return read_tensor(last.graph, last.outputs.at(name).id);
+  return read_tensor(last.graph, last.outputs.at(name).id, method);
 }
 
 std::size_t DeltaNet::steps() const { return impl_ ? impl_->completed_steps : 0; }
 
 void DeltaNet::close() {
   if (impl_) {
-    impl_->backward->graph.close();
-    impl_->forward->graph.close();
+    if (impl_->compiled) {
+      impl_->compiled->close();
+    } else {
+      impl_->backward->graph.close();
+      impl_->forward->graph.close();
+    }
     impl_.reset();
   }
 }

@@ -1,4 +1,5 @@
 #include "models/qwen3_5/attention.hpp"
+#include "np101/diagnostics.hpp"
 #include "np101/kv_cache.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
@@ -32,9 +33,12 @@ class AttentionGraph : public GraphBuilder {
 public:
   Config config;
   unsigned layer;
+  WeightBank *bank;
 
-  AttentionGraph(Context &context, const Config &configuration, unsigned index)
-      : GraphBuilder(context, 100, 80), config(configuration), layer(index) {}
+  AttentionGraph(Context &context, const Config &configuration, unsigned index,
+                 WeightBank *weights = nullptr)
+      : GraphBuilder(context, 100, 80, weights), config(configuration), layer(index),
+        bank(weights) {}
 
   Tensor weight(const WeightStore &weights, const std::string &name, Shape shape) {
     return GraphBuilder::weight(weights,
@@ -58,8 +62,8 @@ public:
   Tensor hidden, position, query, key, value, gate;
 
   ProjectionGraph(Context &context, const WeightStore &weights, const Config &configuration,
-                  unsigned layer, std::optional<TensorBinding> input)
-      : AttentionGraph(context, configuration, layer) {
+                  unsigned layer, std::optional<TensorBinding> input, WeightBank *bank = nullptr)
+      : AttentionGraph(context, configuration, layer, bank) {
     const auto d = config.kv.head_dim, qh = config.query_heads, kh = config.kv.heads;
     hidden = input ? bind(*input, config.hidden_spec()) : tensor(config.hidden_spec());
     position = tensor({i32, {1}});
@@ -116,7 +120,7 @@ public:
 
   ReaderGraph(Context &context, const WeightStore &weights, ProjectionGraph &producer,
               KvCache &cache, std::optional<TensorBinding> destination)
-      : AttentionGraph(context, producer.config, producer.layer) {
+      : AttentionGraph(context, producer.config, producer.layer, producer.bank) {
     auto query = share(producer, producer.query);
     auto gate = share(producer, producer.gate);
     Tensor keys{cache.retain_keys(graph), cache.spec().tensor()};
@@ -147,8 +151,9 @@ struct Attention::Impl {
   bool has_output = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-       std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {})
-      : producer(context, weights, config, layer, input),
+       std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {},
+       WeightBank *bank = nullptr)
+      : producer(context, weights, config, layer, input, bank),
         cache(context, producer.graph, producer.key.id, producer.value.id, config.kv),
         reader(context, weights, producer, cache, output) {}
 };
@@ -163,13 +168,13 @@ Attention::Attention(Context &context, const WeightStore &weights, const Config 
 }
 
 Attention::Attention(Context &context, const WeightStore &weights, const Config &config,
-                     unsigned layer, TensorBinding input, TensorBinding output)
+                     unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, false);
   if (config.mixer(layer) != MixerKind::Attention) {
     throw std::invalid_argument("layer is not Attention");
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output);
+  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank);
 }
 
 Attention::~Attention() = default;
@@ -203,11 +208,13 @@ void Attention::step() {
   impl_->has_output = false;
   auto &producer = impl_->producer;
   upload_tensor(producer.graph, producer.position.id, integer_bytes(impl_->length));
-  check(vsi_nn_RunGraph(producer.graph.get()), "attention projections");
+  check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(producer.graph.get()); }),
+        "attention projections");
   impl_->cache.write(impl_->length);
   upload_tensor(impl_->reader.graph, impl_->reader.valid_length.id,
                 integer_bytes(impl_->length + 1));
-  check(vsi_nn_RunGraph(impl_->reader.graph.get()), "attention cache reader");
+  check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(impl_->reader.graph.get()); }),
+        "attention cache reader");
   ++impl_->length;
   impl_->has_output = true;
   impl_->failed = false;
@@ -234,24 +241,25 @@ void Attention::truncate(unsigned length) {
 
 unsigned Attention::length() const { return impl_ ? impl_->length : 0; }
 
-std::vector<std::uint8_t> Attention::read(const std::string &name) {
+std::vector<std::uint8_t> Attention::read(const std::string &name, TensorReadback method) {
   if (!impl_ || impl_->failed || !impl_->has_output) {
     throw std::logic_error("attention has no completed output");
   }
   if (name == "keys") {
-    return impl_->cache.read_keys();
+    return impl_->cache.read_keys(method);
   }
   if (name == "values") {
-    return impl_->cache.read_values();
+    return impl_->cache.read_values(method);
   }
   if (name == "query" || name == "key" || name == "value") {
     auto &producer = impl_->producer;
     auto tensor = name == "query" ? producer.query : name == "key" ? producer.key : producer.value;
-    return read_tensor(producer.graph, tensor.id);
+    return read_tensor(producer.graph, tensor.id, method);
   }
   if (name == "output" || name == "probabilities") {
     auto &reader = impl_->reader;
-    return read_tensor(reader.graph, name == "output" ? reader.output.id : reader.probabilities.id);
+    return read_tensor(reader.graph, name == "output" ? reader.output.id : reader.probabilities.id,
+                       method);
   }
   throw std::invalid_argument("unknown attention output: " + name);
 }

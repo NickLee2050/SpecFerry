@@ -11,6 +11,10 @@
 #include <string>
 #include <vector>
 
+namespace specferry::np101 {
+class WeightBank;
+}
+
 namespace specferry::models::qwen3_5 {
 // Configured Qwen attention mixer, excluding decoder input norm/residual.
 // A single sequence owns one fixed-capacity KV allocation. Context outlives it.
@@ -24,7 +28,7 @@ class Attention {
 public:
   Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
   Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-            TensorBinding input, TensorBinding output);
+            TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr);
   ~Attention();
   Attention(const Attention &) = delete;
   Attention &operator=(const Attention &) = delete;
@@ -34,7 +38,8 @@ public:
   void reset();
   void truncate(unsigned length);
   unsigned length() const;
-  std::vector<std::uint8_t> read(const std::string &name);
+  std::vector<std::uint8_t> read(const std::string &name,
+                                 np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   void close();
 
 private:

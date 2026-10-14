@@ -1,48 +1,42 @@
 # Validation
 
-Run from the repository root in Conda `SpecFerry`, after [environment setup](../README.md).
-[Status](../docs/np101-status.md) owns accepted scope/precision/performance,
-[TODO](../TODO.md) unfinished work, and [incidents](../docs/np101-recovery-incidents.md) device gates.
-Historical evidence and retired programs are archived; they are not current test commands.
+Run from the repository root in Conda `SpecFerry`, after [setup](../README.md).
+[Status](../docs/np101-status.md) owns accepted configurations, precision and performance;
+[TODO](../TODO.md) owns unfinished work; [incidents](../docs/np101-recovery-incidents.md) owns
+recovery gates and individual cold-restart evidence. Historical programs are not current commands.
 
-## Test layers
+## Offline checks
 
-| Layer | Entry | Purpose |
-|---|---|---|
-| Offline Python | `python -m unittest discover -s tests -t .` | Checkpoint/export, generation policy, arrays/budgets, benchmark counts, KV/lifecycle and recovery guards; device calls are mocked |
-| Offline native | `ctest --test-dir build --output-on-failure` | Generation, timing, segmented memory, allocation readback and data contracts; never opens NP101 |
-| Model acceptance | `scripts/generate_opt.py` | Complete token/logit/KV correctness, lifecycle and resident performance; explicit CPU oracle |
-| Compiled acceptance | `scripts/check_np101_compiled.py` | Pinned NBG/reference plan, coarse output checks, release/budget and delayed health gate |
-| Targeted diagnostics | `check_np101.py`, `check_np101_memory.py`, `check_np101_model.py` | One selected operator/cache/memory/model question; no automatic sweep |
-
-Python tests are grouped by contract: `test_recovery`/`test_device_runner`, `test_graph_options`,
-`test_graph_benchmark`, `test_graph_cache`, `test_generation_cli`, `test_compiled_validation`,
-checkpoint/export/policy tests and common array/allocation checks. Fixtures are shared without
-sharing expected values with the code being checked. All 5 native CTest cases carry `unit;cpu` labels.
-
-```bash
+```sh
 python -m unittest discover -s tests -t .
 ctest --test-dir build -L cpu --output-on-failure
 python scripts/format_python.py --check
 python scripts/format_cpp.py --check
 ```
 
+Python covers checkpoint/export identities, generation policy/counts, arrays, budgets, KV/lifecycle
+and recovery guards with mocked device calls. All five native CTest cases have `unit;cpu` labels
+and never open NP101. Device diagnostics are explicit executables, never automatic CTest runs.
+
 ## Device discipline
 
-Read the ledger before every run; check boot, recovery marker, full-boot kernel and device owner.
-Serialize bounded processes, monitor faults and inspect at least 45 seconds after release.
-Correct outputs, empty ownership or `recovery done` do not override faults. Preserve markers.
-`--prepare-only` validates files/options without kernel or device access.
+Read the ledger before each run. Serialize bounded processes; check boot, recovery marker,
+full-boot kernel and device owner, monitor faults, and inspect at least 45 seconds after release.
+Correct output, empty ownership or `recovery done` do not override faults. Preserve markers.
+Recovery requires a confirmed host/NP101 cold restart and agreed controls with numerical,
+execution, budget, release and delayed-kernel acceptance; passing covers only that workload.
+Never restore the deleted repository convolution or silently substitute vendor/old OPT controls.
+`vendor-conv` remains an explicitly authorized diagnostic and cannot clear the recovery gate.
 
-The deleted repository convolution and its `conv`/`recovery` entries must never be restored.
-`vendor-conv` is an explicit diagnostic, cannot clear the marker, and requires agreement.
-Future fault recovery requires confirmed host/NP101 cold restart plus agreed controls and numerical,
-execution, budget, release and delayed-kernel checks. A passing workload proves only its scope.
-`--sudo-read-only` means authorized journalctl/fuser reads; it does not grant permission itself.
+`--prepare-only` never opens the device. Read-only `sudo journalctl` has standing authorization;
+`--sudo-read-only` enables it in the runner. Device-owner checks use unprivileged `fuser`.
+Other sudo actions require approval. Const/nonconst payloads each remain ≤1 GiB, including peaks;
+only authorized v106 synthetic capacity/integrity probes may use `--probe-limit` up to 4096 MiB.
+After allocation refusal, scan all written blocks; logical offsets are not physical addresses.
 
-## Complete generation and benchmarking
+## OPT generation
 
-```bash
+```sh
 python scripts/generate_opt.py --backend graph --block 4 --capacity 16 \
   --max-new-tokens 8 --compare-cpu --output .cache/runs/opt-tokens
 python scripts/generate_opt.py --backend graph --block 16 --capacity 64 \
@@ -51,93 +45,117 @@ python scripts/generate_opt.py --backend graph --block 16 --capacity 64 \
   --output .cache/runs/opt-benchmark
 ```
 
-Graph defaults: merged-kv, block1, every-token head, greedy, token-only readback. Blocks4/8/16
-consume known consecutive input from one request; tails/decode use block1, capacity must divide
-by block. Block8 model execution remains unvalidated. `last-token` skips unused prompt heads.
-Explicit component sampling uses `--sample --seed`; unsupported checkpoint settings fail.
-`--request-tokens-file` contains a JSON list of requests sharing one resident model.
+Defaults: merged KV, block1, every-token head, greedy, token-only readback. Blocks4/8/16 consume
+known consecutive input from one request; tails/decode use block1 and capacity must divide by block.
+Block8 model execution is unvalidated. `last-token` skips unused prompt heads while updating every
+input's decoders/KV. `--request-tokens-file` supplies a JSON list for one resident model.
+Sampling needs explicit `--sample --seed`; unsupported checkpoint settings fail.
 
-Benchmark validates warmups and excludes them; `benchmark.json` maps every measured file to its
-input/repeat, preserving actual EOS/capacity stops. Report actual output count/generation wall and
-post-first-token decode separately. Preparation/Setup/Verify/reset/extra diagnostics are excluded;
-required controls/token reads are included. CPU user/system time overlaps wall and cannot be added.
+Benchmark excludes validated warmups and maps measured files to input/repeat in `benchmark.json`.
+Report actual generated count / generation wall separately from post-first-token decode; do not mix
+input lengths. Preparation, reset and coarse diagnostics are excluded; required token IO is included.
+CPU user/system overlap wall and cannot be added. `--cache-readback logits|kv` is explicit;
+KV uses one-based inclusive `--cache-layer-range FIRST LAST`, with every layer still executing.
+`--readback-transport mapped` uses calibrated ordinary rank1/2/3 Map/Unmap without SDK fallback.
+Lifecycle mode releases the final old Context before rebuilding; it is separate from benchmarking.
 
-For diagnostics, `--cache-readback logits` reads final logits; `kv` requires one-based inclusive
-`--cache-layer-range FIRST LAST`. All layers still execute. `--readback-transport mapped` is an
-explicit ordinary nonquantized rank1/2/3 Map/Unmap path with stride-aware copies and no SDK fallback;
-use only calibrated scopes. `sdk` remains default; selected-token IO is unchanged.
-`--lifecycle-check` releases the old model and final Context before rebuilding, compares logits,
-close rejection and live memory; benchmark/lifecycle modes are separate acceptance runs.
+Native generation takes `DEPLOYMENT REQUEST OUTPUT`; the Python launcher writes unique `key value`
+settings in `run-options.txt`. Unknown, duplicate and incompatible options fail before SDK access.
 
-Native generation keeps three paths: `DEPLOYMENT REQUEST OUTPUT`. REQUEST contains unique
-`key value` settings in `run-options.txt`; unknown/duplicate/incompatible keys fail before SDK access.
-Common keys: max_new_tokens/warmups/repeats; graph also block/variant/prefill_head/readback/
-readback_transport/cache_first_layer/cache_last_layer/benchmark/lifecycle; component alone seed.
-Use the Python launcher to prepare these files instead of reconstructing options by hand.
+## Source-bound compiled exports
 
-## Compiled model acceptance
+The installed compiler runs in a device-free rootfs. Runtime packages contain NBGs and source/SDK/
+budget/port manifests; ONNX, generated C and compiler logs stay outside the runtime package.
 
-```bash
-python scripts/check_np101_compiled.py --plan /absolute/path/plan.json \
-  --case fullgraph --prepare-only --output .cache/runs/compiled-check
-python scripts/check_np101_compiled.py --plan /absolute/path/plan.json \
-  --case fullgraph --output .cache/runs/compiled-check
+| Exporter | Maintained output |
+|---|---|
+| `export_np101_opt_ffn.py` | All 24 M1 FFN/residual/final-norm graphs, FP16 boundaries and FP32 normalization; per-layer CPU and generated-C audits |
+| `export_np101_opt_projections.py` | All 24 independent QKV/out graphs plus one shared head; public and SDK port permutations |
+| `export_np101_opt_model.py` | `--scope decoders|fullgraph --capacity 64|128`, FP32 KV, typed ports, optional `--package-output` |
+| `export_np101_qwen_blocks.py` | One layer or `--all-layers`; `--part mixer|feed-forward`, optional reused first layer and runtime package |
+
+```sh
+PYTHONPATH=python python scripts/export_np101_opt_ffn.py \
+  --checkpoint .cache/models/facebook/opt-350m --deployment .cache/np101/opt-350m \
+  --rootfs /absolute/path/to/compiler/rootfs --output /absolute/path/to/ffn-package
+python scripts/generate_opt.py --backend graph --compiled-ffn /absolute/path/to/ffn-package \
+  --prefill-head last-token --prompt "The capital of France is" --max-new-tokens 16 \
+  --output .cache/runs/optimized-opt-request --prepare-only
 ```
 
-One selected case per process; this replaces date-specific run/summarize scripts. The plan has
-schema_version=1, pinned SDK directory/module srcversion/library hashes, named file_sets and cases.
-Each case states binary/arguments/request, file_sets, kind (fullgraph/partitioned), measured repeats,
-expected stop reason and separate const/nonconst payload bounds. Reference JSON/logits and optional
-KV files must be hashed; fixed historical binaries also have binary_sha256. Paths can be absolute
-or repository-relative, and `{output}` denotes the child output directory. No data path is defaulted.
+FFN `--import-artifacts` rechecks existing exports. `--head-artifacts` and `--projection-artifacts`
+package the optional head and per-layer projections. `--projection-backend fcl|nbg-qkv|nbg-output|nbg`
+selects projections explicitly; default within that package is FCL. Source hashes, generated FP32
+arithmetic, FP16 ports, graph versions and budget bounds are checked before Context creation.
+Direct FCL binds input/static weight without fused bias; bias stays a separate FP16 Add.
 
-Fullgraph uses the maintained `np101_compiled_model_check CONTRACT REQUEST OUTPUT` CMake target:
-accepted M1/C64, prompt17/output16, one warmup plus one measured request, final logits/last-layer
-FP32 KV and release only. CONTRACT is the existing SDK-order 52-input/50-output text contract.
-Its NBG and contract hashes belong in the plan. Ordinary and FFN-TTGT artifacts use the same target.
-Layered compiled regressions retain their previously validated frozen binary identities until the
-formal exporter/loader is completed; their source evidence is in the archive, not duplicated programs.
-The consolidated local plan is `.cache/runs/commit-cleanup-20261013/compiled-opt-plan.json`.
+`generate_opt.py --backend graph --compiled-model PACKAGE` loads fullgraph/decoder packages.
+The accepted fullgraph exporter repairs ArgMax to INT32 and runs the generated simulator before
+re-saving. Verify-only re-saving was import-rejected. Re-saved graphs use public IO as their new
+kernel order, which differs from the original NBG's node order. Metadata alone cannot prove dtype;
+check generated C. Generated node C loads `network.export.data`, not the imported `model.data`.
 
-The runner checks identities before device access, uses one lock through delayed checks, validates
-warmup and every measured output, and emits result.json with independent numerical checks and
-performance only on acceptance. Optional cache contract states dtype/shape/reference paths;
-`device_reset` checks the stored coarse reset result and zero reset uploads.
-`--audit-verify` uses only pinned v105 Verify snapshots with execution tracing off; it refuses unknown
-SDK identities and checks complete graph/operation scans. NBG internal operators are not enumerated.
+Compiled OPT accepts the documented C64/C128/M1 scopes, bounded resident benchmarks and mapped
+coarse diagnostics. Follow the current ledger before executing; no implicit recovery, lifecycle
+rebuild or tracing override. Fixed acceptance/performance evidence lives in the status document.
 
-## Diagnostic selection
+## Pinned compiled acceptance
 
-| Entry | Retained cases |
+```sh
+python scripts/check_np101_compiled.py --plan /absolute/path/plan.json \
+  --case fullgraph --prepare-only --output .cache/runs/compiled-check
+```
+
+Schema version1 plans pin SDK/module/binary, named file sets, request/reference, kind, repetitions,
+stop reason and separate payload bounds. Paths are absolute or repository-relative; `{output}` is
+the child directory. Numerical references are independent and hashed. KV contracts state F16/F32,
+shape and reference paths. `device_reset` checks coarse reset evidence and zero reset uploads.
+The runner holds the lock through monitoring/delayed checks and reports performance only on pass.
+`--audit-verify` requires pinned v105, disables execution tracing and checks complete outer
+operations; it does not enumerate NBG internals. Legacy fixed binaries/plans remain immutable
+under ignored caches. Formal generation replaces the retired projection-specific model runner.
+
+## Cached Qwen generation
+
+No new downloads are enabled. Export `--part feed-forward --all-layers --mixers-package PACKAGE`
+combines 24 FFNs with the source-bound 18-mixer package. The explicit C64/v105 conservative
+combination has passed bounded full-model acceptance:
+
+```sh
+python scripts/generate_qwen.py --compiled-mixers /absolute/path/to/qwen-package \
+  --embedding-lookup gather-nd --matmul-feed-forward-layer 9 \
+  --prompt "What is 2 + 2? Answer with only the number." --max-new-tokens 8 \
+  --output .cache/runs/qwen-preparation --prepare-only
+```
+
+Loading validates the full 42-NBG package, then uses the existing device MatMul FFN for zero-based
+layer9; 18 DeltaNet and 23 FFN NBGs remain. No CPU FFN or `is_const` budget bypass is used.
+GATHER_ND has INT32 `[1,1]` coordinates and shared FP16 weights; identical KV slots keep bindings.
+Hi (13 inputs/one output) and two resident arithmetic requests (26 inputs/four outputs each,
+displaying `4\n`) passed tokens, coarse hidden/recurrent/KV, unwritten slots, repeated state,
+budgets/release and separate 45-second gates. Evidence: `qwen-matmul-fallback-coldboot-20261014/`.
+Only SDK calls diagnostic mode was measured; C128, normal-mode performance and long-term stability
+remain unvalidated. Earlier hangs retain independent ledger records and unresolved causes.
+
+For an agreed recovery diagnostic, `--cold-restarted --sdk-timing --repeats 1 --max-new-tokens 1`
+retains the previous marker and requires a different clean boot plus full acceptance before clearing
+it. The user must confirm both devices restarted; flags alone do not authorize recovery controls.
+The existing `reference_dlm.py`, `export_np101_dlm.py --verify-only` and model regression paths stay.
+
+## Targeted diagnostics and evidence
+
+| Entry | Retained purpose |
 |---|---|
-| `check_np101.py` | lookup, MatMul+Add/mapped-readback projection, sampling, FP16 preservation; explicit vendor diagnostic |
-| `check_np101.py` | kv, cache-append rank2/3, cache-packed/64/block4: writes, sharing and causal dependencies |
-| `check_np101_memory.py` | capacity, integrity, accounting, growth, weights; capacity alone is not integrity |
-| `check_np101_model.py` | OPT/Qwen regression, teacher reference and selection/IO isolation |
+| `check_np101.py` | lookup, MatMul+Add, mapped readback, sampling, FP16 preservation; cache writes/sharing/dependencies; explicit vendor diagnostic |
+| `check_np101_memory.py` | capacity/integrity/accounting/growth/weight questions; capacity is not integrity |
+| `check_np101_model.py` | OPT/Qwen teacher/decoder regressions, selection and IO isolation |
 
-Raw FCL/forced-const/VX projection experiments are retired. Keep failures in the SDK report and
-ledger; successful NBG import does not validate them. Quantization research is closed.
-Const/nonconst each remain ≤1GiB. Only explicitly authorized v106 synthetic capacity/integrity probes
-may use --probe-limit up to4096MiB; after refusal scan all successfully written blocks. Logical bytes,
-RSS and SDK counters do not prove physical allocation, leakage or bandwidth.
+Completed FFN split/batch collections and projection replacement programs are retired; their
+sources, binary identities and measurements remain under ignored caches. Necessary regressions
+use the maintained model/compiled entries. Never run archived commands with current binaries.
 
-FFN collections retain `np101_projection_check OUTPUT MODE DEPLOYMENT FIXTURE`: ffn-full,
-ffn-linear, ffn-linear-fc1-split2, or ffn-linear-batched with 4/8/16 after FIXTURE. Reuse teacher
-attention-norm/MLP fixtures; 24 different weights, four warmup sweeps and 3×8 measured sweeps,
-final-layer coarse mapped output. Preparation/IO/release excluded; not model output throughput.
-
-Qwen3.5 keeps its cached checkpoint and existing `export_np101_dlm.py --verify-only`, reference_dlm
-and check_np101_model qwen paths. No new downloads or unsupported configurations are enabled.
-
-## Tracing and records
-
-`--sdk-summary`/`--sdk-timing` are mutually exclusive. Summary aggregates request/phase/role/API
-in memory and writes after release; nested counts cannot be added. `--trace-verify` is explicit pinned
-v105 diagnosis; SPECFERRY_VERIFY_EXECUTION_TRACE=0 keeps only Verify, summary enables fixed
-in-memory Process/Submit/Replay/Wait/HAL data (4096 graph calls). Interrupted collections are discarded.
-Profiler is explicit and separate; follow the off/on/off method and known perturbation in the status page.
-
-Standard output: result.json, device/execution-evidence.json (command/boot/binary/SDK/exit/resources),
-sdk.log, measured generation files, budgets/release and health snapshots. Raw original reports,
-NBG/ONNX/metadata, checkpoints and cold-restart evidence stay under ignored cache paths. Temporary
-sources/scripts are archived by hash before deletion; do not run historical commands with current binaries.
+`--sdk-summary` aggregates in memory; `--sdk-timing` records individual calls, mutually exclusive.
+Profiler is explicit and separate; use off/on/off and the status document's perturbation limits.
+Outputs retain result.json, command/boot/binary/SDK identity, SDK log, measured generations,
+budgets/release and full health snapshots. Raw checkpoints/NBGs and immutable incident evidence
+stay ignored; `commit-preparation-20261014/before-manifest.json` pins this cleanup's retired sources.

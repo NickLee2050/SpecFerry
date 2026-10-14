@@ -6,6 +6,7 @@
 原始证据相对 `.cache/runs/`，不随Git分发；按boot、内核时间和证据去重。
 2026-10-10压缩前全文及哈希在 `documentation-consolidation-20261010/before/`、
 `before-manifest.json`；所有独立事故、原始日志和固定控制保持可追溯。
+10-14整理前全文及源码身份另存`commit-preparation-20261014/before/`、`before-manifest.json`。
 
 ## 每次运行与恢复门禁
 
@@ -44,50 +45,166 @@
 | 10-13 11:33–11:37 / `c71e332e-0dd5-4553-ab31-fd0a56aca44d` | 用户确认冷启动并授权直接全图OPT；v106、固定binary/NBG、C64/M1、17输入/16输出，1暖机+1正式请求的选词/logits/末层KV、预算/释放和45秒延迟检查通过。原标记及本次未完成标记归档于`compiled-opt-driver-recheck-20261013/fullgraph-opt/`，实时标记已清除；未运行卷积、旧OPT或block16清零候选 |
 | 10-13 11:57–12:24 / 同上boot | v106新全图TTGT端口查询及9个模型进程通过：全图普通/TTGT/普通、逐decoder、编译FFN、block16普通/TTGT/普通、手写。15次正式请求240输出token，数值/预算/释放及各45秒延迟检查通过；block16的首/末层KV reset粗验通过。无新事故或实时恢复标记。`compiled-opt-layout-v106-20261013/summary.json` |
 | 10-13 14:52–15:06 / `2e8953e2-a612-45e9-8a97-17f94fbe0cc0` | 用户重装v105并授权补测，新boot预检清洁且无恢复标记；全图及block16混合普通/TTGT/普通两组、TTGT端口查询通过。12次正式请求192输出token，选词/logits、全图末层KV、block16 reset粗验、预算/释放及各45秒门禁通过；匹配v105 Verify-only构图审计完整。`compiled-opt-layout-v105-20261013/summary.json`；无新设备事故 |
+| 10-13 17:30–18:02 / `2e8953e2-a612-45e9-8a97-17f94fbe0cc0` | v105真实QKV/out_proj/head的12局部进程及2整模进程通过，末次检查18:02:56.797592清洁；新FCL仅绑定输入/静态权重、bias独立Add，未复现旧带bias构造。C64/M1、17输入/16输出的选词/logits/末层KV、预算/释放及各45秒检查通过。基线报告漏JSON括号，原始记录保留，派生报告离线完成数值/编译表验收后归档临时标记，没有重跑或要求冷启动。`opt-projection-replacement-20261013/`；不外推M16、v106或长期稳定性 |
+| 10-13 19:16–20:00 / 同上boot | v105 attention、两种残差/LN、FFN/LN融合及M16 FFN的12局部进程，各2暖机＋3×16集合通过；新融合及后置原实现2整模进程，各1暖机＋1正式17输入/16输出，选词/logits/末层KV及未写槽、预算/释放和各45秒检查通过。最后20:00:37.659739清洁，14进程无新设备故障或恢复标记；前置原实现沿用上一成功窗口，不重复计数。`opt-core-replacement-20261013/{collection-summary,model-summary}.json`。未运行卷积控制，未外推跨boot/其他形状 |
+| 10-14 08:34–09:52 / 同上boot | 清理后固定全图粗验、正式混合入口的FCL/NBG head各3次C64请求、C128固定97输入/32输出及97/3/97隔离共5进程，11正式请求240输出，通过选词、适用的logits/末层KV、预算/释放、各45秒门禁；C128末槽/越界step零IO拒绝、short未写385,024B按位零及重复long KV逐字节一致通过。最后09:52:45.845988清洁。完整24层FFN重建在无设备的编译环境，与已验NBG逐字节一致；无新设备事故或恢复标记。`opt-entry-integration-20261014/`；未运行卷积、原厂控制或超预算block16 |
+| 10-14 17:48–17:58 / `4a5c4f7f-37c9-460c-a973-e14ca18cd81a` | 用户确认冷启动，v105/五库与上次一致，完整预检清洁。固定Qwen C64、GATHER_ND、零基layer9设备MatMul FFN、18份DeltaNet＋23份FFN NBG：Hi 13输入/1输出及算术26输入/两次各4输出，hidden/recurrent/KV/未写槽、两请求状态逐字节一致、预算/释放及各45秒门禁全部通过。17:53:07.510015 / 17:58:45.393383检查清洁、无owner；前次标记归档。`qwen-matmul-fallback-coldboot-20261014/summary.json`，没有运行卷积、旧OPT或独立控制；仅覆盖上述配置和请求，不证明原故障根因或长期稳定 |
 
-**最后已存检查：2026-10-13T15:06:01.066871+08:00，v105补测全部通过**：上表
-各进程exit 0，结束即时及超过45秒日志无NP hang、EDMA timeout或BUG/Oops，
-无残留owner/恢复标记。复用此前编译/等价检查通过的产物，没有运行已删除卷积或
-原厂demo；const/nonconst应用payload各低于1GiB且释放归零。v105外层构图审计
-149图/3579 operation/750 extension，完整无缺项；不能外推NBG内部或v106槽位。
-本轮通过不证明历史故障修复或长期稳定性。身份、逐阶段结果及原始内核日志见
-`compiled-opt-layout-v105-20261013/`；性能与实现边界见总结。
+**最新运行状态：10-14 17:58:45.393383，约定的完整Qwen保守组合验收通过。**
+boot `4a5c4f7f-37c9-460c-a973-e14ca18cd81a`，v105；固定binary SHA256
+`1775f5221fb6a6df5dc45ea6205f652d9856f4aa203fa0db1b2d64c03c923bf8`。
+先以Hi短请求通过全部恢复门禁，归档前次标记，再完成同进程两次算术请求；
+全部24层、device head/greedy及粗状态均通过，const/nonconst峰值
+887,143,543 / 669,684,140B，释放归零，无新内核故障或实时恢复标记。
+两进程分别完成1,263 / 5,642次RunGraph，削弱固定约41次提交就耗尽资源的简单解释；
+单层替换和冷boot同时改变，不能认定该NBG、FCL或特定资源就是根因。
+此前各次独立事故保留，未恢复原故障条件筛选或证明其间歇性问题修复。
+本轮确认、binary/source及参考身份、原标记、逐API、完整日志和数值结果集中在
+`qwen-matmul-fallback-coldboot-20261014/`。后续每次上板仍须执行本页门禁。
 
-此前2026-10-13T11:24:50.370255+08:00：v106原厂卷积SIGFPE并在退出后延迟NP hang，
-该boot没有运行OPT，用户随后停止会话并冷启动。独立事故见下文。
+正常返回的C128导入/初始化拒绝及其修复归入[实现总结](np101-status.md)，不列为冷启动事故。
 
-此前2026-10-13T11:09:05.666015+08:00，门禁失败：用户确认双冷启动的
-新boot `80bde6ed-09c2-4fc4-9bd6-bdef9aa446dd`，仅运行冻结旧OPT，11:08:15及
-释放后的11:08:46两次NP hang；无owner/残留进程，标记保留。没有运行卷积、设备KV
-清零候选或性能对照。新增独立事故见下文。
+## 10-14 Qwen编译FFN执行hang（独立冷启动需求）
 
-此前2026-10-13T10:37:58.341550+08:00：再次冷启动的新boot
-`0b6cbe69-f080-4f8d-83d7-5536d06701f2`中，冻结仓库卷积在10:37:07和
-释放后的10:37:38两次NP hang。owner为空、恢复标记保留；旧OPT及修改后的模型
-未运行。新增独立事故见下文，不能用此前成功窗口放行。
+事件`qwen-feed-forward-run-hang-20261014-171828`，boot
+`afc33733-d36a-4ebd-bed9-cf7e77bf082b`，v105五库与此前一致。用户确认再次冷启动，
+按约定运行GATHER_ND和省同槽KV改绑候选；Hi模板13输入/最多1输出/单请求，
+固定CPU期望token9419。故障后用户要求优先保守绕行、先完整运行。程序SHA256
+`0fdaf5c23aa434468cb60a4b95d3bddc0fe4169b5b6c4e9ea412f24f31070414`；binary/source
+已冻结于前次`offline-candidate/`，当次启动逐项核对一致。原标记复制保留，未提前清门禁。
 
-此前2026-10-13T09:35:15.199740+08:00：10-12成功窗口的boot完成M16真实8层
-prefill FFN普通/TTGT/普通三个NBG集合进程，数值、释放及各45秒门禁通过，无目标
-故障、owner或恢复要求。首次夹具软链接在Context创建前被主机路径检查拒绝，
-改本地硬链接后通过；不是冷启动事故。证据`compiled-prefill-ffn-layout-20261013/summary.json`。
+| UTC+8时间 / 区间 | 已确认事件 |
+|---|---|
+| 17:14:33.722434 / 17:16:09.147480 | 冷启动初检及完整正式预检清洁，无owner |
+| 17:16:36.528249–.529523 | 初始化Verify103为layer9 FFN，1.243ms成功，graph=`0x55656b067810` |
+| 17:18:02.420483前 | 61个embedding及全部24层/head初始化完成，wall96.309446s；const/nonconst峰值909,168,378 / 647,598,496 B，各低于1GiB |
+| **17:18:02.854824–17:18:28.293902** | **外层第41次`vsi_nn_RunGraph`，25.4391s**；按固定调用序列及现场进度，对应首token、零基layer9的编译FFN，`decoder.cpp`的feed_forward运行调用 |
+| **17:18:28.286043** | **首次NP hang**，在上述RunGraph内、早于返回约7.86ms；首次故障前没有任何运行期KV Verify |
+| 17:18:29.218745 | 结束前最后未返回调用为token1、同层FFN；它发生在首次故障之后，不是独立复现或首次触发位置 |
+| 17:18:29.660461后 | 监控发现故障并终止；exit−15、140.460s，900s期限未耗尽，无残留进程 |
+| **17:18:59.006119** | **第二次NP hang**，距首次30.720076s，发生在释放后 |
+| 17:19:16.277272 | 至少45秒后置检查确认两次hang、无owner，无EDMA timeout或BUG/Oops |
 
-此前2026-10-13T09:12:54.286901+08:00：同一boot完成全图NBG的两次
-端口查询、首次生成选词失败和INT32修正版的1暖机+1正式请求；各进程退出后的45秒
-门禁均无目标故障、owner或恢复要求。首次输出50118→32767已定位为生成C的ArgMax
-中间INT16，修正后选词、logits、末层KV、预算/释放通过；这不是冷启动事故。
-离线工具的版本拒绝及缺shader头文件失败均发生在无galcore环境，不能算板卡故障。
-证据`compiled-opt-fullgraph-20261013/{summary,selection-diagnosis}.json`，未新增冷启动事故。
+**实现与解释边界**：完整初始化及167次Verify审计有1409 outer operation、306
+extension，无已知缺项；后两次KV重验发生在首故障以后。第41次RunGraph由
+embedding一次＋每层四次定位到layer9 FFN：前三次为norm、DeltaNet、state commit，
+第四次为FFN；现场进度曾为`setup.token.0.decoder.9`。旧前缀setup是日志标签缺陷，
+这里实际处于推理，后续已改正。只消费到prefill中间，没有生成结果或完整释放验收。
 
-此前2026-10-12T18:22:13.091073+08:00：同一boot完成单份decoder
-循环KV、编译FFN匹配基线及24层完整decoder关闭/开启/关闭三个进程；数值、外层
-operation、释放及各45秒延迟检查无目标故障、owner或恢复要求。首版reshape KV
-绑定在首NBG Verify正常返回−1，未Run、延迟门禁清洁；改普通rank3 FP32 backing后
-通过，原因边界及避免重试的构造见实现总结。该拒绝不是冷启动事故。
-证据`compiled-decoder-integration-20261012/summary.json`；此前单层端口/末槽证据在
-`decoder-nbg-validation-20261012/summary.json`。未新增冷启动事故。
-此前profiler及24层SDK汇总六进程的清洁证据保留于`profiler-decode-survey-20261012/summary.json`。
-此前编译FFN/常量绑定/三图接入已通过；混图Verify正常返回−1和M8192普通布局数值
-失败等边界见实现总结。本次成功不证明历史设备故障修复，下一轮仍执行门禁。
+故障图是离线编译的`ffn09.nb`，SHA256
+`4815bd07064e8cc770e905702da041bc7de18dc088d23e03f9bf995278a4bfa8`。原始生成C的
+node11/12/15均为FCL，分别1024→3584、1024→3584、3584→1024，图内还含残差、
+FP32 RMSNorm、Swish和Multiply。外层手写调用NBG，不是直接手写的FCL建图；
+未取得内部逐命令轨迹，不能指定某个FCL或认定FCL本身致错。与旧带bias FCL的
+Verify主机SIGSEGV不同，本次Verify完整、故障在执行期。它落在此前layer7–11粗窗口
+内，但仅本次精确到此调用；不能称多个干净启动均已复现固定layer9。
+
+**离线修复与下次规避**：固定CPU模型首token的真实layer9输入，对原ONNX的单块
+输出最大误差0.0001221，原容差通过。原NBG在无galcore模拟器的Setup正常返回−1，
+没有运行，故不能据此验证NBG数值或判定产物坏。保留拒绝记录，停止扩展该路线。
+新增显式`--matmul-feed-forward-layer 9`，仅该层复用已有设备MatMul/FP32 RMSNorm/
+FP16 SwiGLU实现；18份DeltaNet及23份FFN NBG保留，没有CPU替代或改变is_const。
+少计该NBG22,024,843B，新增普通共享权重22,022,144B，继续分段预算及临时峰值守门。
+这是离线构建候选，未上板，也不保证首次内部异常位于该图。下一次先跑同一短请求，
+通过完整数值/预算/释放/45秒后才恢复原算术及两请求；不做性能矩阵或同boot故障重试。
+
+证据`qwen-gather-nd-coldboot-20261014/`：启动确认、`short-greeting/guarded`的原始
+自动与补充incident、逐API/Verify记录、完整内核日志及初始化峰值；
+`offline-feed-forward/`保存真实CPU输入、ONNX误差、模拟器拒绝与fallback计划，
+`offline-matmul-fallback-request/`复用固定数值参考。
+
+## 10-14 冷启动Qwen首次embedding验图hang（独立冷启动需求）
+
+事件`qwen-embedding-verify-hang-20261014-163714`，boot
+`2f47003e-e77c-47ef-8344-6d1dc3768c6f`，v105及五库与前次一致。用户确认双冷启动，
+约定以缩短的完整Qwen为检查，并授权再次故障后仅做离线修复。原15:57事故标记在
+启动前复制保留；新门禁要求不同boot、完整清洁日志、全部验收及45秒检查后才归档。
+程序SHA256 `1f605db929f5a9b910199c2fcfe70f73e15d9924b247c3aaedc7efee3a79d57b`，
+对应binary/source已冻结。Hi聊天模板13输入、最多1输出、单请求/C64；CPU参考为
+token 9419。启用逐SDK调用及匹配v105编译表记录，未启用profiler或syscall tracing。
+
+| UTC+8时间 / 区间 | 已确认事件 |
+|---|---|
+| 16:33:37.949188 / 16:36:45.650374 | 冷启动初检及正式完整预检清洁，无owner |
+| 16:36:52.362939 | 主程序进入`setup.embedding`，创建首个普通FP16 `[1024,4096]`词表块及单节点GATHER图 |
+| **16:36:52.573784–16:37:14.270641** | **第一次`vsi_nn_VerifyGraph`，21.6969s**；内层`vxVerifyGraph`的graph=`0x55790e41afa0`、verify_id=1 |
+| 16:36:52.576982 | 首图`vxnneExecutionLayer_GenerateCommands`已返回，operation为`evis.gather_F16toF16`且完整；之后仍在Verify内等待 |
+| **16:37:14.258268** | **首次NP hang**，早于Verify返回约12.37ms，也早于监控终止 |
+| 16:37:14.372344 | 第二个词表GATHER图Verify进入，监控停止时尚未返回；不是首次故障位置 |
+| 16:37:17.986052 / 16:37:18.066312 | 监控读到故障，随后galcore释放；exit−15、32.234s，900s期限未耗尽，无残留成员 |
+| **16:37:44.978282** | **第二次NP hang**，距首次30.720014s、距释放26.911970s |
+| 16:38:04.460317 | 45秒后置检查确认两次hang、无owner，无EDMA timeout或BUG/Oops |
+
+**边界与根因**：本次由Qwen主程序自身的`Vocabulary→Lookup→compile`进入失败区间，
+没有运行独立板卡预检；CPU参考和journalctl/fuser检查不执行NPU图。所有RunGraph/
+ProcessGraph计数为零，decoder、KV、42份NBG和整模大权重尚未初始化，因此这些不是
+本次必要条件，也不能与前次layer7–11运行期事故合并为同一根因。仅一项extension，
+没有1024槽缺项。Verify的后段含内部capture/ProcessInternal分支，但未跟踪到该分支，
+不能声称已证实内部执行。`libovxlib`的`_init_tensor`对普通非const/nonvirtual tensor
+调用`vsi_nn_FillTensorWithValue(0)`，削弱索引未初始化假设；不能凭主机调用断言物理内存
+健康。已定位API区间，尚未找到SDK/驱动内部首个错误。
+前次完整初始化的首个同结构/同kernel Verify为8.416ms，本次21.696s；SDK及lookup
+源码相同，但boot、binary和逐API记录条件不同，不是单变量因果对照。16:53:12.161305
+只读终检仍只有上述两次hang、无owner，未再执行设备程序。
+
+**离线规避候选**：公开`GATHER_ND`以INT32 `[1,1]`索引替换轴1 GATHER，保留
+FP16 `[1024,rows]`共享词表及 `[1024,1]`输出。官方转换器生成相同端口与无额外
+算子参数；无galcore的隔离模拟器对4096/2560行各选首/中/末/回退4次，1024列逐位
+一致，覆盖正负零、非正规数及极值。Qwen通过显式`--embedding-lookup gather-nd`
+选择，默认及OPT保持原路径；这是软件语义通过，未证明硬件稳定。另省去KV当前槽
+的重复改绑（首token已绑定slot0），减少无必要重Verify；非首槽改绑仍存在，不能
+据此关闭前次运行期问题。两项只做离线构建，故障后未再上板。
+
+证据`qwen-coldboot-diagnostic-20261014/`：`initial-health.*`、双冷启动确认、
+`short-greeting/{request,guarded}`完整前后日志、SDK调用/编译表、原始自动及补充incident、
+`frozen/`身份快照和`offline-audit/`反汇编；模拟器证据在`offline-embedding-gather-nd/`。
+下一次以替代lookup的短Qwen检查先确认embedding阶段，再继续后续层；不原样重复
+该初始化，不并行Verify。
+
+## 10-14 Qwen预填充期NP hang及释放后复发（独立冷启动需求）
+
+事件`qwen-prefill-hang-20261014-155716`，同boot
+`2e8953e2-a612-45e9-8a97-17f94fbe0cc0`、v105及固定五库。用户明确要求修复下节
+初始化拒绝；新候选为18份DeltaNet＋24份FFN NBG，未增加预算或改变is_const。
+共享tied词表、C64、24层、26输入、最多8输出、同Context两请求；没有完成的生成
+结果或完整数值/释放/吞吐验收。binary SHA256
+`326a7338496d914c1f8e02500918fee4f60afdc9301a737cd6cc12c7d31c995a`，
+原binary及对应源码已冻结在事故目录`frozen/`；未重新运行故障来补日志。
+
+| UTC+8时间 / 区间 | 已确认事件 |
+|---|---|
+| 15:55:10.435920 | 全boot预检清洁、无owner；旧正常分配拒绝标记保留并归档副本 |
+| 15:55:31.186633–15:56:48.113215 | 第165次Verify为单个LM head、547 operation，76.926538s返回成功；前24层均完成初始化 |
+| 15:56:48.113285 | `request.0`开始；首个26-token prefill，尚无生成结果 |
+| 15:56:48.418832 | KV-copy Verify167正常返回，对应初始化Verify93、零基layer7 |
+| **15:57:16.884853** | **首次NP hang**，发生在上述返回后28.466021s，早于监控终止；此时没有未闭合的Verify调用 |
+| 15:57:16.947138 | KV-copy Verify168才开始，对应初始化Verify110、零基layer11；后续仍有成功返回，不能据此放行 |
+| 15:57:18.867086 / 15:57:20.164841 | 监控发现故障并终止子进程；内核release galcore。exit−15、128.375s，900s期限未耗尽，无残留进程 |
+| **15:57:47.604877** | **第二次NP hang**，距首次30.720024s、release后27.440036s |
+| 15:58:08.818995 | 45秒后置确认两次hang、无owner；未见EDMA timeout/BUG/Oops |
+
+**调用边界**：由构造顺序和graph地址匹配，运行期166–173是GQA的KV copy图重验，
+不是新的embedding或FFN图：对应layer3/7/11/15/19/23，再layer3/7。首报错窗口为
+首token的layer7 KV-copy Verify返回之后、layer11的KV-copy Verify开始之前，候选
+包括layer7 copy执行/reader/FFN、layer8–10和layer11 norm/projection/KV控制。
+没有逐执行API日志，不能指定哪一层或未返回调用；也不能把最后Verify173返回当作
+首次出错位置。外层173图/1421 operation/306 extension完整，无已知1024槽缺项，
+NBG内部与SDK隐藏资源仍不可见。首次hang未落入Verify调用区间，不排除早先编译
+结果、图/视图交接或设备状态问题在执行时暴露；这些均未证实。
+
+**修复结论与下一轮规避**：新FFN NBG使初始化完成，原CreateTensor拒绝在本次
+候选中绕过；不能把新运行期hang归为同一原因，也不声称完整Qwen修复。停止所有
+板卡工作，保持标记；双设备冷启动后需约定有界诊断，不原样重复长请求。先离线审计
+`KvCache::write`的动态改绑/重Verify和所有权，优先复用固定绑定与独立commit结构；
+可考虑保留FP16 KV的固定ScatterND/copy写入，但本轮未实施，也未证明是根因。
+后续仅calls诊断模式记录token/decoder进度并包装所有Qwen RunGraph；初始化完成
+即单独保存wall/peak，避免再次丢失。正常计时不增加这些逐步日志，不并行Verify。
+
+初始165次Verify累计78.357516s，head占98.17%；其他图理想无限并行最多省1.430978s，
+不能通过并行小图解决这个head。证据
+`opt-qwen-integration-20261014/qwen-compiled-feed-forward-acceptance/`：原/补充
+`incident.json`、完整内核及`kernel-event-window.log`、Verify图映射、SDK/binary身份、
+冻结源码/binary及`verify-preparation-performance.json`。
 
 ## 10-13 v106原厂卷积整数除法异常及延迟hang（独立事故）
 

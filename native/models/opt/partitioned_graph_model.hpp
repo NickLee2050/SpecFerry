@@ -13,8 +13,14 @@
 #include <vector>
 
 namespace specferry::models::opt {
+struct ProjectionPolicy {
+  np101::ops::LinearBackend attention = np101::ops::LinearBackend::MatMul;
+  np101::ops::LinearBackend head = np101::ops::LinearBackend::MatMul;
+  bool compiled_query = false, compiled_output = false;
+};
+
 // Fixed embedding/head graphs with device buffers between decoder stages. Compiled
-// FFNs use three graphs per layer; full decoder NBGs use one plus a shared KV copy graph.
+// FFNs use two or three graphs per layer; full decoder NBGs use one plus a shared KV copy graph.
 // Block prefill shares ordinary weights and KV. Compiled FFNs require separately
 // budgeted fixed-shape artifacts for the prefill and decode execution sets.
 // The compiled block-prefill candidate clears KV with a separate fixed copy graph.
@@ -24,8 +30,14 @@ public:
 
   // All variants retain shared mutable vocabulary blocks. Compiled decoders use FP32
   // head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
-  // C++ candidates; their artifact loading is not yet exposed by the product CLI.
-  enum class Variant { MergedKv, MergedKvFc1Split2, MergedKvCompiledFfn, CompiledDecoder };
+  // candidates; the source-bound FFN finish package is available through an explicit CLI option.
+  enum class Variant {
+    MergedKv,
+    MergedKvFc1Split2,
+    MergedKvCompiledFfn,
+    CompiledDecoder,
+    CompiledFullModel
+  };
 
   // Generation may skip unused prompt predictions; public step() always runs the head.
   // EveryToken runs the head for each consumed block's final column.
@@ -37,7 +49,10 @@ public:
                         PrefillHeadPolicy prefill_head = PrefillHeadPolicy::EveryToken,
                         unsigned prefill_block = 1, std::vector<CompiledFfn> compiled_ffn = {},
                         std::vector<CompiledDecoder> compiled_decoders = {},
-                        std::vector<CompiledFfn> compiled_prefill_ffn = {});
+                        std::vector<CompiledFfn> compiled_prefill_ffn = {},
+                        ProjectionPolicy projections = {}, CompiledHead compiled_head = {},
+                        std::vector<CompiledProjections> compiled_projections = {},
+                        CompiledFullModel compiled_full_model = {});
   ~PartitionedGraphModel();
   PartitionedGraphModel(const PartitionedGraphModel &) = delete;
   PartitionedGraphModel &operator=(const PartitionedGraphModel &) = delete;

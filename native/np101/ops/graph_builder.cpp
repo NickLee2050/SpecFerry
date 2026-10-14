@@ -1,10 +1,12 @@
 #include "np101/diagnostics.hpp"
+#include "np101/memory_budget.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/weight_bank.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -23,6 +25,24 @@ Tensor GraphBuilder::tensor(TensorSpec spec) { return {add_tensor(graph, spec), 
 
 Tensor GraphBuilder::constant(TensorSpec spec, const std::vector<std::uint8_t> &bytes) {
   return {add_tensor(graph, spec, true, bytes), std::move(spec)};
+}
+
+Tensor GraphBuilder::constant_weight(const WeightStore &store, const WeightRecord &record) {
+  if (record.bytes > segment_payload_limit) {
+    throw std::invalid_argument("constant weight exceeds the tensor payload limit");
+  }
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(record.bytes);
+  for (std::size_t first = 0; first < record.bytes; first += 8 * 1024 * 1024) {
+    const auto chunk =
+        store.read(record, first, std::min(std::size_t{8 * 1024 * 1024}, record.bytes - first));
+    bytes.insert(bytes.end(), chunk.begin(), chunk.end());
+  }
+  try {
+    return constant(record.spec, bytes);
+  } catch (const std::exception &error) {
+    throw std::runtime_error("constant weight load failed: " + record.name + ": " + error.what());
+  }
 }
 
 Tensor GraphBuilder::floats(const std::vector<float> &values, Shape shape, DataType type) {
@@ -240,13 +260,36 @@ Tensor GraphBuilder::matmul(Tensor left, Tensor right, Shape shape, bool transpo
   return output;
 }
 
-Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const WeightRecord &record) {
+Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights) {
+  const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
+  if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
+      weights.spec.shape.size() != 2 || input.spec.shape[0] != weights.spec.shape[0] ||
+      !weight_tensor || !weight_tensor->attr.is_const) {
+    throw std::invalid_argument("FCL candidate requires FP16 [K,M] and static [K,N] weights");
+  }
+  auto output = tensor({f16, {weights.spec.shape[1], input.spec.shape[1]}});
+  auto *operation = node(VSI_NN_OP_FCL, {input, weights}, output);
+  operation->nn_param.fcl.weights = weights.spec.shape[1];
+  operation->vx_param.overflow_policy = VX_CONVERT_POLICY_SATURATE;
+  operation->vx_param.rounding_policy = VX_ROUND_POLICY_TO_NEAREST_EVEN;
+  operation->vx_param.down_scale_size_rounding = VX_CONVOLUTIONAL_NETWORK_DS_SIZE_ROUNDING_FLOOR;
+  return output;
+}
+
+Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const WeightRecord &record,
+                             LinearBackend backend) {
   if (input.spec.shape.size() != 2 || !input.spec.shape[1] || record.spec.shape.size() != 2 ||
       record.spec.shape[0] != input.spec.shape[0] || input.spec.type != f16 ||
       record.spec.type != f16) {
     throw std::invalid_argument("projection requires FP16 [K,tokens] and [K,N]");
   }
   const auto columns = input.spec.shape[0], rows = record.spec.shape[1];
+  if (backend == LinearBackend::FullyConnected) {
+    return fully_connected(input, constant_weight(store, record));
+  }
+  if (backend != LinearBackend::MatMul) {
+    throw std::invalid_argument("unknown projection backend");
+  }
   // Preserve the validated at-most-two-block projection strategy and bounded IO.
   constexpr unsigned block_rows = 4096;
   if (rows > 2 * block_rows) {
@@ -307,7 +350,8 @@ Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned 
 }
 
 Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
-                            const WeightRecord &bias, unsigned output_parts) {
+                            const WeightRecord &bias, unsigned output_parts,
+                            LinearBackend backend) {
   if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
       matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
       matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
@@ -318,6 +362,15 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
     throw std::invalid_argument("linear output parts must evenly divide the positive output width");
   }
   const auto projected = [&] {
+    if (backend == LinearBackend::FullyConnected) {
+      if (output_parts != 1 || matrix.bytes > 8 * 1024 * 1024) {
+        throw std::invalid_argument("FCL linear candidate requires a bounded complete matrix");
+      }
+      return fully_connected(input, constant_weight(store, matrix));
+    }
+    if (backend != LinearBackend::MatMul) {
+      throw std::invalid_argument("unknown linear backend");
+    }
     if (output_parts == 1) {
       return project(input, store, matrix);
     }

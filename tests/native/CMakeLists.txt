@@ -45,7 +45,7 @@ specferry_native_test(np101_decoder_check np101/decoder_check.cpp np101_decoder 
 specferry_native_test(np101_opt_io_check np101/opt_io_check.cpp np101_opt_decoder)
 specferry_native_test(np101_sampling_check np101/sampling_check.cpp np101_ops)
 specferry_native_test(np101_lookup_check np101/lookup_check.cpp np101_ops)
-specferry_native_test(np101_projection_check np101/projection_check.cpp np101_ops opt_data)
+specferry_native_test(np101_projection_check np101/projection_check.cpp np101_ops)
 specferry_native_test(np101_fp16_preservation_check np101/fp16_preservation_check.cpp np101_ops)
 specferry_native_test(np101_generation_check np101/generation_check.cpp np101_opt_decoder)
 specferry_native_test(np101_compiled_model_check np101/compiled_model_check.cpp np101_opt_decoder)

@@ -8,9 +8,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from specferry.models.opt.metrics import summarize
 from specferry.validation.allocation import MIB, capacity_result, check_segment_budget
 from specferry.validation.arrays import compare_arrays
+from specferry.validation.generation_metrics import summarize
 
 
 class ValidationTests(unittest.TestCase):

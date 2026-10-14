@@ -66,6 +66,55 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
                 self.assertTrue(all(checks.values()), checks)
                 self.assertTrue(checks["head_runs"])
 
+    def test_compiled_finish_requires_device_reset_without_host_uploads(self):
+        self.native_run.update(variant="compiled-ffn-finish", kv_reset_uploads_per_request=0)
+        self.initialized["variant"] = "compiled-ffn-finish"
+        self.save_metadata()
+        for index, request in enumerate(self.metadata["requests"]):
+            path = self.device / f"measured.{index}.json"
+            observed = json.loads(path.read_text())
+            observed["uploads"] = request["consumed"]
+            path.write_text(json.dumps(observed))
+        checks = self.evaluate(**(self.options | {"variant": "compiled-ffn-finish"}))
+        self.assertTrue(all(checks.values()), checks)
+        self.native_run["kv_reset_uploads_per_request"] = 4
+        self.save_metadata()
+        self.assertFalse(
+            self.evaluate(**(self.options | {"variant": "compiled-ffn-finish"}))["variant"]
+        )
+
+    def test_compiled_state_controls_are_counted_before_acceptance(self):
+        for variant, uploads, policy, heads in (
+            ("compiled-decoder", 3, "last-token", 6),
+            ("compiled-fullgraph", 4, "every-token", 10),
+        ):
+            self.native_run.update(
+                variant=variant,
+                kv_reset_uploads_per_request=0,
+                prefill_head_policy=policy,
+                head_runs=heads,
+            )
+            self.initialized.update(variant=variant, prefill_head_policy=policy)
+            self.save_metadata()
+            for index, request in enumerate(self.metadata["requests"]):
+                path = self.device / f"measured.{index}.json"
+                observed = json.loads(path.read_text())
+                observed["uploads"] = request["consumed"] * uploads
+                path.write_text(json.dumps(observed))
+            checks = self.evaluate(
+                **(self.options | {"variant": variant, "prefill_head_policy": policy})
+            )
+            self.assertTrue(all(checks.values()), checks)
+            path = self.device / "measured.0.json"
+            observed = json.loads(path.read_text())
+            observed["uploads"] -= 1
+            path.write_text(json.dumps(observed))
+            self.assertFalse(
+                self.evaluate(
+                    **(self.options | {"variant": variant, "prefill_head_policy": policy})
+                )["request.0"]
+            )
+
     def test_ignored_options_fail_even_when_all_tokens_and_cache_match(self):
         for scope, document in (("run", self.native_run), ("initialization", self.initialized)):
             for field, ignored in (

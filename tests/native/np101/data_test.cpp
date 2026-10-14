@@ -79,6 +79,10 @@ void weight_integrity() {
   const std::string record = "block.projection.weight F16 2,2 0 8 "
                              "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n";
   write_text(directory.path / "weights.bin", payload);
+  require(file_sha256(directory.path / "weights.bin") ==
+              "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72",
+          "file integrity must preserve non-text bytes");
+  rejects([&] { file_sha256(directory.path / "missing.bin"); }, "missing artifact must fail");
   write_text(directory.path / "weights.index", "specferry-np101-weights 1\n" + record);
   WeightStore store(directory.path);
   store.verify();

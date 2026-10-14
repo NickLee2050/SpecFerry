@@ -9,6 +9,9 @@
 #include <vector>
 
 namespace specferry::np101 {
+// Bounded host-only integrity check; does not initialize the SDK.
+std::string file_sha256(const std::filesystem::path &path);
+
 struct WeightRecord {
   std::string name;
   TensorSpec spec;

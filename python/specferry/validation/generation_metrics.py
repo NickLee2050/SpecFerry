@@ -24,6 +24,12 @@ def summarize(runs):
             raise ValueError("inconsistent generation timings")
         intervals.extend(times)
     return {
+        "measured_requests": len(runs),
+        "generated_tokens": sum(len(run["tokens"]) for run in runs),
+        "output_tokens_per_second": sum(len(run["tokens"]) for run in runs)
+        / sum(run["total_seconds"] for run in runs)
+        if sum(run["total_seconds"] for run in runs)
+        else None,
         "ttft_seconds": mean(run["first_token_seconds"] for run in runs),
         "prefill_seconds": mean(run["prefill_seconds"] for run in runs),
         "decode_tokens_per_second": len(intervals) / sum(intervals) if intervals else None,
