@@ -141,13 +141,15 @@ private:
 
 class CompiledStep {
 public:
-  GraphBuilder execution, commit;
+  GraphBuilder execution;
+  std::unique_ptr<GraphBuilder> commit;
   Tensor input, recurrent, convolution;
   std::map<std::string, Tensor> outputs;
 
   CompiledStep(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-               const CompiledBlock &artifact, TensorBinding incoming, TensorBinding destination)
-      : execution(context, 16, 1), commit(context, 6, 3) {
+               const CompiledBlock &artifact, TensorBinding incoming, TensorBinding destination,
+               bool deferred_commit)
+      : execution(context, 16, 1) {
     validate_compiled_mixer(artifact, weights, config, layer);
     input = execution.bind(incoming, config.hidden_spec());
     recurrent = execution.tensor(config.delta.recurrent());
@@ -164,28 +166,36 @@ public:
     }
     execution.compile(inputs, logical);
     outputs = {{"output", logical[0]}, {"recurrent", logical[1]}, {"convolution", logical[2]}};
+    if (deferred_commit) {
+      return;
+    }
+    commit = std::make_unique<GraphBuilder>(context, 6, 3);
     // Fixed ordinary copy graph avoids NBG input/output aliases and alternating imports.
-    const std::vector<Tensor> destinations{commit.bind(destination, config.hidden_spec()),
-                                           commit.share(execution, recurrent),
-                                           commit.share(execution, convolution)};
+    const std::vector<Tensor> destinations{commit->bind(destination, config.hidden_spec()),
+                                           commit->share(execution, recurrent),
+                                           commit->share(execution, convolution)};
     std::vector<Tensor> sources;
     for (unsigned index = 0; index < 3; ++index) {
-      const auto source = commit.share(execution, logical[index]);
-      commit.node(VSI_NN_OP_DATACONVERT, {source}, destinations[index]);
+      const auto source = commit->share(execution, logical[index]);
+      commit->node(VSI_NN_OP_DATACONVERT, {source}, destinations[index]);
       sources.push_back(source);
     }
-    commit.compile(sources, destinations);
+    commit->compile(sources, destinations);
   }
 
   void run() {
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(execution.graph.get()); }),
           "compiled DeltaNet RunGraph");
-    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(commit.graph.get()); }),
-          "compiled DeltaNet state commit");
+    if (commit) {
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(commit->graph.get()); }),
+            "compiled DeltaNet state commit");
+    }
   }
 
   void close() {
-    commit.graph.close();
+    if (commit) {
+      commit->graph.close();
+    }
     execution.graph.close();
   }
 };
@@ -197,19 +207,23 @@ struct DeltaNet::Impl {
   std::unique_ptr<StepGraph> backward;
   std::unique_ptr<CompiledStep> compiled;
   std::size_t completed_steps = 0;
-  bool failed = false;
+  bool failed = false, pending_commit = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
        std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {},
-       WeightBank *bank = nullptr, const CompiledBlock *artifact = nullptr)
+       WeightBank *bank = nullptr, const CompiledBlock *artifact = nullptr,
+       bool deferred_commit = false)
       : config(config) {
     if (artifact) {
       if (!input || !output) {
         throw std::invalid_argument("compiled DeltaNet requires fixed external bindings");
       }
       compiled = std::make_unique<CompiledStep>(context, weights, config, layer, *artifact, *input,
-                                                *output);
+                                                *output, deferred_commit);
       return;
+    }
+    if (deferred_commit) {
+      throw std::invalid_argument("deferred state commit requires a compiled DeltaNet");
     }
     forward =
         std::make_unique<StepGraph>(context, weights, config, layer, input, output, nullptr, bank);
@@ -230,12 +244,13 @@ DeltaNet::DeltaNet(Context &context, const WeightStore &weights, const Config &c
 
 DeltaNet::DeltaNet(Context &context, const WeightStore &weights, const Config &config,
                    unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank,
-                   const CompiledBlock *compiled) {
+                   const CompiledBlock *compiled, bool deferred_commit) {
   validate_layer_weights(weights, config, layer, false);
   if (config.mixer(layer) != MixerKind::DeltaNet) {
     throw std::invalid_argument("layer is not DeltaNet");
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank, compiled);
+  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank, compiled,
+                                 deferred_commit);
   reset();
 }
 
@@ -257,8 +272,8 @@ TensorSpec DeltaNet::convolution_spec() const {
 
 void DeltaNet::reset(const std::vector<std::uint8_t> &recurrent,
                      const std::vector<std::uint8_t> &convolution) {
-  if (!impl_) {
-    throw std::logic_error("reset on closed DeltaNet");
+  if (!impl_ || impl_->pending_commit) {
+    throw std::logic_error("reset requires a live DeltaNet without a pending state commit");
   }
   if ((!recurrent.empty() && recurrent.size() != recurrent_spec().bytes()) ||
       (!convolution.empty() && convolution.size() != convolution_spec().bytes())) {
@@ -287,7 +302,7 @@ void DeltaNet::reset(const std::vector<std::uint8_t> &recurrent,
 }
 
 void DeltaNet::step(const std::vector<std::uint8_t> &hidden_fp16) {
-  if (!impl_ || impl_->failed) {
+  if (!impl_ || impl_->failed || impl_->pending_commit) {
     throw std::logic_error("DeltaNet must be initialized/reset before stepping");
   }
   if (hidden_fp16.size() != impl_->config.hidden_spec().bytes()) {
@@ -306,12 +321,13 @@ void DeltaNet::step(const std::vector<std::uint8_t> &hidden_fp16) {
 }
 
 void DeltaNet::step() {
-  if (!impl_ || impl_->failed) {
+  if (!impl_ || impl_->failed || impl_->pending_commit) {
     throw std::logic_error("DeltaNet must be initialized/reset before stepping");
   }
   impl_->failed = true;
   if (impl_->compiled) {
     impl_->compiled->run();
+    impl_->pending_commit = !impl_->compiled->commit;
   } else {
     auto &step = impl_->completed_steps % 2 == 0 ? *impl_->forward : *impl_->backward;
     check(vsi_nn_RunGraph(step.graph.get()), "DeltaNet RunGraph");
@@ -320,8 +336,36 @@ void DeltaNet::step() {
   impl_->failed = false;
 }
 
+TensorBinding DeltaNet::output() {
+  if (!impl_ || !impl_->compiled || impl_->compiled->commit || impl_->failed) {
+    throw std::logic_error("direct DeltaNet output requires compiled deferred state commit");
+  }
+  return {impl_->compiled->execution.graph, impl_->compiled->outputs.at("output").id};
+}
+
+std::vector<TensorCopyBinding> DeltaNet::state_copies() {
+  if (!impl_ || !impl_->compiled || impl_->compiled->commit || impl_->failed) {
+    throw std::logic_error("external state copies require compiled deferred state commit");
+  }
+  auto &step = *impl_->compiled;
+  return {{{step.execution.graph, step.outputs.at("recurrent").id},
+           {step.execution.graph, step.recurrent.id},
+           recurrent_spec()},
+          {{step.execution.graph, step.outputs.at("convolution").id},
+           {step.execution.graph, step.convolution.id},
+           convolution_spec()}};
+}
+
+void DeltaNet::confirm_state_commit() {
+  if (!impl_ || !impl_->compiled || impl_->compiled->commit || impl_->failed ||
+      !impl_->pending_commit) {
+    throw std::logic_error("DeltaNet has no pending external state commit");
+  }
+  impl_->pending_commit = false;
+}
+
 std::vector<std::uint8_t> DeltaNet::read(const std::string &name, TensorReadback method) {
-  if (!impl_ || impl_->failed || impl_->completed_steps == 0) {
+  if (!impl_ || impl_->failed || impl_->pending_commit || impl_->completed_steps == 0) {
     throw std::logic_error("DeltaNet has no completed output");
   }
   if (impl_->compiled) {

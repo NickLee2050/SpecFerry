@@ -15,6 +15,12 @@ struct TensorBinding {
   vsi_nn_tensor_id_t id;
 };
 
+// A fixed copy contract. Both owners must outlive the graph retaining these bindings.
+struct TensorCopyBinding {
+  TensorBinding source, destination;
+  TensorSpec spec;
+};
+
 // Successful explicit helper transfers on this thread, excluding SDK-internal IO
 // and AddTensor initialization. Diagnostics use deltas around a complete step.
 struct TensorTransfers {

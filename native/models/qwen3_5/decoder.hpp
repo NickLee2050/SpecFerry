@@ -30,7 +30,8 @@ public:
                TensorBinding input, np101::WeightBank *shared_weights = nullptr,
                np101::ops::LinearBackend feed_forward = np101::ops::LinearBackend::MatMul,
                const CompiledBlock *compiled_mixer = nullptr,
-               const CompiledBlock *compiled_feed_forward = nullptr);
+               const CompiledBlock *compiled_feed_forward = nullptr,
+               bool deferred_delta_commit = false);
   ~DecoderLayer();
   DecoderLayer(const DecoderLayer &) = delete;
   DecoderLayer &operator=(const DecoderLayer &) = delete;
@@ -39,6 +40,8 @@ public:
   void reset();
   std::size_t length() const;
   TensorBinding output();
+  std::vector<np101::TensorCopyBinding> state_copies();
+  void confirm_state_commit();
   std::vector<std::uint8_t> read(const std::string &name,
                                  np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   void close();

@@ -3,6 +3,7 @@
 #include "inference/generation.hpp"
 #include "models/qwen3_5/compiled.hpp"
 #include "np101/context.hpp"
+#include "np101/ops/linear_backend.hpp"
 #include "np101/ops/vocabulary.hpp"
 
 #include <cstdint>
@@ -23,7 +24,10 @@ public:
         const std::map<unsigned, CompiledBlock> &compiled,
         const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
         const std::function<void(const std::string &)> &phase = {},
-        np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather);
+        np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather,
+        const CompiledBlock *compiled_head = nullptr,
+        np101::ops::LinearBackend head_backend = np101::ops::LinearBackend::MatMul,
+        bool combined_state_commit = false);
   ~Model();
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;

@@ -63,6 +63,10 @@ Remove `--prepare-only` to execute after the ledger's health/recovery checks. Qw
 accepted conservative composition above; explicit operator overrides are diagnostic configurations,
 with only the scopes recorded in the status document accepted. OPT's component backend remains the
 default regression baseline; the recommended optimized path is selected explicitly by the command.
+The optional Qwen DeltaNet package with broadcast outer products and fused input RMSNorm is used
+with `--head-backend shared-fcl --state-commit combined`. Matched C64 generation and repeated-request
+reset passed; package identities, performance and export options are in the status document and
+[test guide](tests/README.md). The conservative default remains available.
 Checkpoint generation defaults are preserved; sampling is limited to the component backend's
 validated FP32-logit path and needs explicit `--sample --seed 42`.
 

@@ -166,6 +166,67 @@ The accepted fault baseline is published only after numerical/release/45-second 
 alone do not authorize recovery controls.
 The existing `reference_dlm.py`, `export_np101_dlm.py --verify-only` and model regression paths stay.
 
+Optional vocabulary-prefix replacement preserves the default package and whole-vocabulary greedy:
+
+```sh
+python scripts/export_np101_qwen_blocks.py --part vocabulary-head --vocabulary-rows 65536 \
+  --deployment .cache/np101/Qwen3.5-0.8B --rootfs /absolute/path/to/compiler-rootfs \
+  --output .cache/runs/qwen-head-export --package-output .cache/np101/qwen-head-prefix
+python scripts/generate_qwen.py --compiled-mixers /absolute/path/to/qwen-package \
+  --compiled-head .cache/np101/qwen-head-prefix \
+  --prompt "Write one friendly sentence inviting a neighbor to dinner tomorrow." \
+  --max-new-tokens 16 --output .cache/runs/qwen-head-generation --prepare-only
+```
+
+This M1 head replaces only the first 65,536/248,320 vocabulary rows with 16 FCLs in one NBG;
+the other 45 row blocks retain shared MatMul weights. Export uses the saved public NBG port order.
+Native/Python loaders bind source hashes, ports, precision, graph version, SDK and constant budget.
+Matched C64/v105 original/candidate/original requests passed CPU tokens, coarse state, release
+and delayed gates: 0.195256 to 0.206645 actual output token/s; 0.340841 to 0.374409 decode token/s.
+Extra const is 134,219,128 B, with measured const/nonconst peaks 1,021,362,671 / 669,684,140 B.
+Evidence: `qwen-head-prefix-20261015/summary.json`. Full vocabulary replacement, C128 and longer
+stability were not covered by that prefix experiment. The initial wrong-port numerical failure is
+excluded from performance.
+
+Full shared-weight FCL replacement is a separate explicit option:
+
+```sh
+python scripts/generate_qwen.py --compiled-mixers /absolute/path/to/qwen-package \
+  --head-backend shared-fcl \
+  --prompt "Write one friendly sentence inviting a neighbor to dinner tomorrow." \
+  --max-new-tokens 16 --output .cache/runs/qwen-shared-head-generation --prepare-only
+```
+
+It retains the existing 61 embedding weight blocks for all 248,320 vocabulary rows, without
+changing `is_const` or importing an embedded-weight head NBG. It cannot combine with `--compiled-head`;
+the default remains `matmul`. Matched C64/v105 original/candidate/original requests passed CPU
+tokens, coarse state/unwritten slots, budget/release, compilation and separate 45-second gates.
+Actual output rose from 0.195944 to 0.249173 token/s; post-first-token decode from 0.341641 to
+0.536712 token/s. Const/nonconst peaks stayed 887,143,543 / 669,684,140 B, including temporary
+backing; SDK-internal packing/copies remain unknown. Evidence: `qwen-shared-head-20261015/summary.json`.
+No new device faults occurred. This does not validate C128 or longer stability.
+
+`--sdk-timing` records existing SDK calls and per-layer progress. The shared-head attribution
+used matched calls off/on/off (reusing the accepted off-before request): the on case was
+1.57%/1.53% slower in generation/decode than the off mean, with complete call-order coverage.
+DeltaNet NBG execution was 32.40% of traced
+decode wall, or 37.60% with its commit graphs. These spans include completion waits and internal
+movement, not individual hardware kernels. Evidence: `qwen-shared-head-attribution-20261015/summary.json`.
+
+DeltaNet export accepts independent `--outer-product multiply` and `--fuse-input-norm`
+options with `--part mixer`; `--all-layers` exports all 18 mixers. The former replaces only the
+FP32 rank-one state update. The latter consumes the raw decoder input, preserving FP32 RMSNorm,
+the weight offset and the FP16 projection boundary. Its version-2 native manifest binds the
+additional norm weight; version-1 packages keep the external norm. Combine mixer packages with
+the accepted FFN package through `specferry.models.qwen3_5.compiled.combine_packages`.
+
+Generation also accepts `--state-commit combined` (default: `per-layer`). FFNs then retain their
+DeltaNet NBG activation directly, and one fixed graph copies all 18 recurrent/convolution pairs
+after the decoder stack. New/old states remain distinct; the next token, reset and state readback
+require a completed commit. Explicit close releases consumers before state owners. Keep the
+full shared FCL head option when comparing these candidates; accepted scope and performance
+are recorded in the implementation summary.
+
 ## Targeted diagnostics and evidence
 
 | Entry | Retained purpose |

@@ -43,6 +43,29 @@ FP32 nonconst两次通过、2840 MiB失败，不能认定该配置总是安全�
 v105及模型/普通检查保持各段1 GiB上限。仅获授权的v106合成完整性探针可用
 `integrity --mib 4096 --probe-limit`；不覆盖SDK隐藏空间或未申请的物理内存。
 
+## 多输出NBG的公开端口与内部端口
+
+10-15 Qwen部分head初版数值失败来自项目导出器的端口映射，不是已证实的SDK算术或
+设备故障。生成`vnn_network.c`同时包含原始kernel分支和`inference_with_nbg`分支：
+前者16输出反序，后者及公开graph输出正序。实际保存的`network_binary.nb`使用后者，
+导出器却采用前者；参考首词31759（块7、块内3087）被解释为35855（块8、块内3087），
+符合`15−7=8`的块反序，后续反馈随之分歧。
+
+head导出显式采用已有`compiled_ports(..., saved_public_graph=True)`，重新打包端口元数据；
+NBG SHA256 `f7b15450bc2c0a4f17425b0e1a1a92d8ec3ff2b99eb51cfbf1d22ccea4ed249b`
+及native binary均未改变。修复后16输出及粗状态通过CPU比较，前后原实现对照通过；
+未全局改变其他已验产物的解析模式。回归覆盖生成C的两种分支及语义排列校验。
+首轮执行/释放、预算、完整内核和45秒检查均正常，按显式数值修复例外保留原标记，
+修复全验通过后归档；没有设备故障或断电事件。例外仍拒绝内核故障、未完成执行、
+未释放、超预算或编译审计失败。证据`qwen-head-prefix-20261015/`中的
+`port-order-diagnosis.json`、原失败与修复结果；错误数值轮不记有效性能。
+
+同日完整共享FCL head另通过C64/v105整模对照：普通词表tensor在embedding/head间
+保留引用，应用承诺只读，不改变const标记；4,096行与2,560行尾块先经隔离模拟器检查。
+无bias/激活融合，SDK失败条件不能由此一概豁免；其他FCL调用仍要求const权重。
+本次将权重改为NBG输入的ONNX候选只生成MatMul，未将其当作FCL性能证据。
+固定源码、真实输入、预算与完整门禁见`qwen-shared-head-20261015/summary.json`。
+
 ## 编译表缺项与共享槽位
 
 逐头KV及const/mutable变体共1143个extension，前1024个operation非空、后119个缺失；

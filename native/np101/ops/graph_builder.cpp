@@ -260,11 +260,12 @@ Tensor GraphBuilder::matmul(Tensor left, Tensor right, Shape shape, bool transpo
   return output;
 }
 
-Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights) {
+Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights) {
   const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
   if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
       weights.spec.shape.size() != 2 || input.spec.shape[0] != weights.spec.shape[0] ||
-      !weight_tensor || !weight_tensor->attr.is_const) {
+      !weight_tensor || weight_tensor->attr.vtl ||
+      (!weight_tensor->attr.is_const && !immutable_shared_weights)) {
     throw std::invalid_argument("FCL candidate requires FP16 [K,M] and static [K,N] weights");
   }
   auto output = tensor({f16, {weights.spec.shape[1], input.spec.shape[1]}});

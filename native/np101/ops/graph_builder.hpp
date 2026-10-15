@@ -74,9 +74,9 @@ public:
   Tensor reduce(Tensor input, bool mean, unsigned axis = 0);
   Tensor matmul(Tensor left, Tensor right, Shape output, bool transpose_left = false,
                 bool transpose_right = false);
-  // Explicit candidate: static FP16 [K,N] weights, no fused bias or activation.
-  // Mirrors the generated FCL's policies; callers retain any FP16 bias boundary.
-  Tensor fully_connected(Tensor input, Tensor weights);
+  // Static FP16 [K,N] weights, no fused bias/activation. Shared ordinary weights
+  // require explicit opt-in and must remain unchanged for the graph's lifetime.
+  Tensor fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights = false);
   Tensor gather(Tensor input, Tensor indices, unsigned axis);
   Tensor argmax(Tensor input, unsigned axis);
   Tensor integer(std::int32_t value);

@@ -208,6 +208,47 @@ def audit_compilation(device):
     )
 
 
+def validate_numerical_failure(previous):
+    """Require a completed, released numeric failure before an explicit repair diagnostic."""
+    execution = previous.get("execution", {})
+    directory = resolve_path(previous["evidence"])
+    if execution.get("returncode") == 0:
+        # Qwen writes execution.json; its independent Python oracle, after
+        # process exit, may reject numbers despite a clean native completion.
+        native = read_json(directory / "device/execution.json")
+        result = read_json(directory / "result.json")
+        failed = [name for name, passed in result.get("checks", {}).items() if passed is False]
+        numerical_failure = (
+            native.get("status") == "executed"
+            and native.get("phase") == "complete"
+            and result.get("passed") is False
+            and not result.get("error")
+            and result.get("compilation", {}).get("passed") is True
+            and bool(failed)
+            and all(name.startswith("request.") for name in failed)
+        )
+    else:
+        native = read_json(directory / "device/run.json")
+        numerical_failure = (
+            execution.get("returncode") == 1 and native.get("status") == "numerical_mismatch"
+        )
+    if (
+        not numerical_failure
+        or execution.get("timeout") is not False
+        or execution.get("device_recovery_required") is not False
+        or execution.get("process_group_exited") is not True
+        or execution.get("remaining_processes") != []
+        or native.get("released") is not True
+        or any(native.get(f"{segment}_live_bytes") != 0 for segment in ("const", "nonconst"))
+        or any(
+            native.get(f"{segment}_peak_bytes", 2**30 + 1) > 2**30
+            for segment in ("const", "nonconst")
+        )
+        or not healthy(previous.get("kernel_gate", {"faults": ["unknown"], "owners": ""}))
+    ):
+        raise ValueError("numerical diagnostic requires a completed healthy numerical failure")
+
+
 def run_case(
     case,
     identity,
@@ -256,20 +297,7 @@ def run_case(
     # failure. This exception never admits a kernel fault or an incomplete SDK run.
     if numerical_diagnostic:
         previous = read_json(marker)
-        execution = previous.get("execution", {})
-        native = read_json(resolve_path(previous["evidence"]) / "device/run.json")
-        if (
-            execution.get("returncode") != 1
-            or execution.get("timeout") is not False
-            or execution.get("device_recovery_required") is not False
-            or execution.get("process_group_exited") is not True
-            or execution.get("remaining_processes") != []
-            or native.get("status") != "numerical_mismatch"
-            or native.get("released") is not True
-            or any(native.get(f"{segment}_live_bytes") != 0 for segment in ("const", "nonconst"))
-            or not healthy(previous.get("kernel_gate", {"faults": ["unknown"], "owners": ""}))
-        ):
-            raise ValueError("numerical diagnostic requires a completed healthy numerical failure")
+        validate_numerical_failure(previous)
         write_json(output / "previous-numerical-marker.json", previous)
     with device_lock(RECOVERY_ROOT, recovery_control=numerical_diagnostic or board_power_cycled):
         baseline = None

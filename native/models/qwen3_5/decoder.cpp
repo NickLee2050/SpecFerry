@@ -48,7 +48,7 @@ struct DecoderLayer::Impl {
   Config config;
   Graph storage;
   vsi_nn_tensor_id_t mixed;
-  DecoderGraph normalization;
+  std::unique_ptr<DecoderGraph> normalization;
   std::unique_ptr<DeltaNet> delta;
   std::unique_ptr<Attention> attention;
   DecoderGraph feed_forward;
@@ -57,19 +57,25 @@ struct DecoderLayer::Impl {
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
        TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
-       const CompiledBlock *compiled_feed_forward)
+       const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit)
       : config(configuration), storage(context, 1, 0),
         mixed(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
-        normalization(context, config, bank), feed_forward(context, config, bank) {
+        feed_forward(context, config, bank) {
     const auto prefix = config.layer_prefix(layer);
-    const auto incoming = normalization.bind(input, config.hidden_spec());
-    const auto normalized =
-        normalization.norm(weights, prefix + "input_layernorm.weight", incoming);
-    normalization.outputs = {{"normalized", normalized}};
-    normalization.compile_outputs({incoming});
-
-    TensorBinding mixer_input{normalization.graph, normalized.id}, mixer_output{storage, mixed};
+    TensorBinding mixer_output{storage, mixed};
+    if (!compiled || !compiled->includes_input_norm) {
+      normalization = std::make_unique<DecoderGraph>(context, config, bank);
+      const auto incoming = normalization->bind(input, config.hidden_spec());
+      const auto normalized =
+          normalization->norm(weights, prefix + "input_layernorm.weight", incoming);
+      normalization->outputs = {{"normalized", normalized}};
+      normalization->compile_outputs({incoming});
+    }
+    const auto mixer_input =
+        normalization
+            ? TensorBinding{normalization->graph, normalization->outputs.at("normalized").id}
+            : input;
     if (config.mixer(layer) == MixerKind::Attention) {
       if (compiled) {
         throw std::invalid_argument("DeltaNet compiled mixer cannot replace attention");
@@ -78,13 +84,14 @@ struct DecoderLayer::Impl {
                                               mixer_output, bank);
     } else {
       delta = std::make_unique<DeltaNet>(context, weights, config, layer, mixer_input, mixer_output,
-                                         bank, compiled);
+                                         bank, compiled, deferred_delta_commit);
     }
 
     // The original input stays alive until the residual is consumed. No in-place
     // activation writes or alternating public output buffers are involved.
     const auto residual = feed_forward.bind(input, config.hidden_spec());
-    const auto mixer = feed_forward.bind(mixer_output, config.hidden_spec());
+    const auto mixer = feed_forward.bind(
+        deferred_delta_commit && delta ? delta->output() : mixer_output, config.hidden_spec());
     auto &tail = feed_forward;
     if (compiled_feed_forward) {
       validate_compiled_feed_forward(*compiled_feed_forward, weights, config, layer);
@@ -112,11 +119,11 @@ struct DecoderLayer::Impl {
 DecoderLayer::DecoderLayer(Context &context, const WeightStore &weights, const Config &config,
                            unsigned layer, TensorBinding input, WeightBank *bank,
                            LinearBackend backend, const CompiledBlock *compiled,
-                           const CompiledBlock *compiled_feed_forward)
+                           const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, true);
   impl_ = std::make_unique<Impl>(context, weights, config, layer, input, bank, backend, compiled,
-                                 compiled_feed_forward);
+                                 compiled_feed_forward, deferred_delta_commit);
 }
 
 DecoderLayer::~DecoderLayer() = default;
@@ -135,9 +142,11 @@ void DecoderLayer::step() {
     throw std::logic_error("decoder mixer position is inconsistent");
   }
   state.failed = true;
-  check(
-      sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(state.normalization.graph.get()); }),
-      "decoder input normalization");
+  if (state.normalization) {
+    check(sdk_call("vsi_nn_RunGraph",
+                   [&] { return vsi_nn_RunGraph(state.normalization->graph.get()); }),
+          "decoder input normalization");
+  }
   if (state.delta) {
     state.delta->step();
   } else {
@@ -173,15 +182,37 @@ TensorBinding DecoderLayer::output() {
   return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
 }
 
+std::vector<TensorCopyBinding> DecoderLayer::state_copies() {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("state copies require a live decoder layer");
+  }
+  return impl_->delta ? impl_->delta->state_copies() : std::vector<TensorCopyBinding>{};
+}
+
+void DecoderLayer::confirm_state_commit() {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("state commit requires a live decoder layer");
+  }
+  if (impl_->delta) {
+    impl_->delta->confirm_state_commit();
+  }
+}
+
 std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorReadback method) {
   if (!impl_ || impl_->failed || !impl_->completed) {
     throw std::logic_error("decoder layer has no completed output");
   }
   if (name == "normalized") {
-    return read_tensor(impl_->normalization.graph, impl_->normalization.outputs.at(name).id,
+    if (!impl_->normalization) {
+      throw std::invalid_argument("compiled input normalization has no public diagnostic output");
+    }
+    return read_tensor(impl_->normalization->graph, impl_->normalization->outputs.at(name).id,
                        method);
   }
   if (name == "mixer") {
+    if (impl_->delta) {
+      return impl_->delta->read("output", method);
+    }
     return read_tensor(impl_->storage, impl_->mixed, method);
   }
   const auto &outputs = impl_->feed_forward.outputs;
@@ -200,7 +231,9 @@ void DecoderLayer::close() {
     if (impl_->delta) {
       impl_->delta->close();
     }
-    impl_->normalization.graph.close();
+    if (impl_->normalization) {
+      impl_->normalization->graph.close();
+    }
     impl_->storage.close();
     impl_.reset();
   }

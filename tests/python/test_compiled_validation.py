@@ -23,6 +23,98 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_compiled_delta_norm_rejects_narrowed_reduction(self):
+        from specferry.models.qwen3_5.compiled import audit_mixer
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "export_model").mkdir()
+            (root / "export_model/vnn_network.h").write_text(
+                "#define VNN_VERSION_MAJOR 1\n"
+                "#define VNN_VERSION_MINOR 1\n"
+                "#define VNN_VERSION_PATCH 35\n"
+            )
+            for dtype in ("FLOAT32", "FLOAT16"):
+                with self.subTest(dtype=dtype):
+                    (root / "export_model/vnn_network.c").write_text(
+                        "/* @present_recurrent:out0 */\n"
+                        "NEW_VIRTUAL_TENSOR(0, attr, VSI_NN_TYPE_FLOAT32);\n"
+                        "/* @ReduceMean_input_norm_variance_1:out0 */\n"
+                        f"NEW_VIRTUAL_TENSOR(1, attr, VSI_NN_TYPE_{dtype});\n"
+                        "/* @Cast_input_normalized_2:out0 */\n"
+                        "NEW_VIRTUAL_TENSOR(2, attr, VSI_NN_TYPE_FLOAT16);\n"
+                    )
+                    if dtype == "FLOAT32":
+                        self.assertEqual(audit_mixer(root), [1, 1, 35])
+                    else:
+                        with self.assertRaisesRegex(ValueError, "narrowed required FP32"):
+                            audit_mixer(root)
+
+    def test_completed_python_numerical_failure_still_rejects_health_and_budget_faults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "device").mkdir()
+            native = dict(
+                status="executed",
+                phase="complete",
+                released=True,
+                const_live_bytes=0,
+                nonconst_live_bytes=0,
+                const_peak_bytes=64,
+                nonconst_peak_bytes=64,
+            )
+            result = dict(
+                passed=False,
+                compilation=dict(passed=True),
+                checks={"request.0.tokens": False, "release_budget": True},
+            )
+            previous = dict(
+                evidence=str(root),
+                kernel_gate=dict(faults=[], owners=""),
+                execution=dict(
+                    returncode=0,
+                    timeout=False,
+                    device_recovery_required=False,
+                    process_group_exited=True,
+                    remaining_processes=[],
+                ),
+            )
+            for problem in (None, "kernel", "live_budget", "compilation", "non_numerical"):
+                with self.subTest(problem=problem):
+                    execution_record = native | {"const_live_bytes": int(problem == "live_budget")}
+                    comparison = dict(result)
+                    marker = dict(previous)
+                    if problem == "kernel":
+                        marker["kernel_gate"] = dict(faults=["EDMA timeout"], owners="")
+                    if problem == "compilation":
+                        comparison["compilation"] = dict(passed=False)
+                    if problem == "non_numerical":
+                        comparison["checks"] = {"request.0.tokens": False, "release_budget": False}
+                    (root / "device/execution.json").write_text(json.dumps(execution_record))
+                    (root / "result.json").write_text(json.dumps(comparison))
+                    if problem:
+                        with self.assertRaisesRegex(ValueError, "healthy numerical failure"):
+                            compiled.validate_numerical_failure(marker)
+                    else:
+                        compiled.validate_numerical_failure(marker)
+
+    def test_compiled_vocabulary_prefix_preserves_semantic_output_order(self):
+        from specferry.models.qwen3_5.compiled import validate_vocabulary_head_ports
+
+        artifact = dict(
+            vocabulary_rows=8192,
+            inputs=[dict(name="hidden", dtype="F16", shape=[1024, 1])],
+            input_order=[0],
+            outputs=[dict(name=f"logits_{i}", dtype="F16", shape=[4096, 1]) for i in (1, 0)],
+            output_order=[1, 0],
+        )
+        validate_vocabulary_head_ports(artifact)
+        with self.assertRaisesRegex(ValueError, "port order"):
+            validate_vocabulary_head_ports(artifact | dict(output_order=[0, 1]))
+        for rows in (0, 4097, 69632, True):
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "row bound"):
+                validate_vocabulary_head_ports(artifact | dict(vocabulary_rows=rows))
+
     def test_qwen_default_entry_writes_the_accepted_native_policies(self):
         import torch
 
@@ -38,6 +130,7 @@ class CompiledValidationTests(unittest.TestCase):
                 sys, "argv", [str(script), "--compiled-mixers", str(root), "--output", str(root)]
             ):
                 args = runpy.run_path(str(script))["parse_arguments"]()
+            self.assertEqual(args.head_backend, "matmul")
             cli_options = {
                 "embedding_lookup": args.embedding_lookup,
                 "matmul_feed_forward_layer": args.matmul_feed_forward_layer,
@@ -176,8 +269,13 @@ class CompiledValidationTests(unittest.TestCase):
             bindings = [
                 "node[0]->input.tensors[0] = norm_tensor[0];",
                 "graph->input.tensors[0] = norm_tensor[0];",
+                "if (!inference_with_nbg) {",
                 "node[0]->output.tensors[0] = norm_tensor[1];",
                 "node[0]->output.tensors[1] = norm_tensor[2];",
+                "} else {",
+                "node[0]->output.tensors[0] = norm_tensor[2];",
+                "node[0]->output.tensors[1] = norm_tensor[1];",
+                "}",
                 "graph->output.tensors[0] = norm_tensor[2];",
                 "graph->output.tensors[1] = norm_tensor[1];",
             ]

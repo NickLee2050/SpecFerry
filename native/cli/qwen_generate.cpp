@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -91,6 +92,21 @@ int main(int argc, char **argv) {
     }
     const auto token_readback = token_readback_name == "mapped" ? np101::TensorReadback::MappedHost
                                                                 : np101::TensorReadback::SdkCopy;
+    const auto head_backend_name = read_option(request, "head-backend.txt", "matmul");
+    if (head_backend_name != "matmul" && head_backend_name != "shared-fcl") {
+      throw std::invalid_argument("unsupported Qwen head projection");
+    }
+    const auto head_backend = head_backend_name == "shared-fcl"
+                                  ? np101::ops::LinearBackend::FullyConnected
+                                  : np101::ops::LinearBackend::MatMul;
+    const auto state_commit = read_option(request, "state-commit.txt", "per-layer");
+    if (state_commit != "per-layer" && state_commit != "combined") {
+      throw std::invalid_argument("unsupported Qwen state commit policy");
+    }
+    if (head_backend_name != "matmul" && fs::exists(request / "compiled-head-package.txt")) {
+      throw std::invalid_argument(
+          "shared FCL head cannot also import a compiled vocabulary prefix");
+    }
     unsigned matmul_layer = 9;
     if (fs::exists(request / "matmul-feed-forward-layer.txt")) {
       std::ifstream fallback(request / "matmul-feed-forward-layer.txt");
@@ -110,6 +126,15 @@ int main(int argc, char **argv) {
     auto feed_forward = models::qwen3_5::load_compiled_feed_forward(argv[2], weights, config);
     // Validate the complete package before selecting the existing device MatMul FFN.
     feed_forward.erase(matmul_layer);
+    std::optional<models::qwen3_5::CompiledBlock> compiled_head;
+    if (fs::exists(request / "compiled-head-package.txt")) {
+      std::ifstream file(request / "compiled-head-package.txt");
+      std::string path;
+      if (!(file >> std::quoted(path)) || file >> extra || path.empty()) {
+        throw std::invalid_argument("invalid compiled vocabulary head package path");
+      }
+      compiled_head = models::qwen3_5::load_compiled_head(path, weights, config);
+    }
     fs::create_directories(output);
     np101::SdkTimings timings(output);
     phase(output, "initialize");
@@ -120,12 +145,17 @@ int main(int argc, char **argv) {
         [&](const std::string &name) {
           phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
         },
-        lookup);
+        lookup, compiled_head ? &*compiled_head : nullptr, head_backend,
+        state_commit == "combined");
     const auto initialize =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     {
       // Keep completed preparation evidence even if a later request fails.
       const auto &memory = context.memory();
+      unsigned compiled_input_norm_layers = 0;
+      for (const auto &entry : artifacts) {
+        compiled_input_norm_layers += entry.second.includes_input_norm;
+      }
       std::ofstream initialized(output / "initialization.json");
       initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
                   << ",\"const_peak_bytes\":" << memory.peak(true)
@@ -133,6 +163,11 @@ int main(int argc, char **argv) {
                   << ",\"compiled_mixers\":" << artifacts.size() << ",\"embedding_lookup\":\""
                   << lookup_name << '"' << ",\"matmul_feed_forward_layer\":" << matmul_layer
                   << ",\"token_readback\":\"" << token_readback_name << '"'
+                  << ",\"head_backend\":\"" << head_backend_name << '"' << ",\"state_commit\":\""
+                  << state_commit << '"'
+                  << ",\"compiled_input_norm_layers\":" << compiled_input_norm_layers
+                  << ",\"compiled_vocabulary_rows\":"
+                  << (compiled_head ? compiled_head->vocabulary_rows : 0)
                   << ",\"compiled_feed_forward\":" << feed_forward.size() << "}\n";
       if (!initialized) {
         throw std::runtime_error("cannot save Qwen initialization evidence");

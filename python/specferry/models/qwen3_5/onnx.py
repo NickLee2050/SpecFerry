@@ -6,6 +6,27 @@ from onnx import TensorProto
 from specferry.export.onnx import OnnxGraph
 
 
+def vocabulary_head_model(weights, rows):
+    """Compile a bounded vocabulary prefix, preserving one FP16 output per row block."""
+    table = weights["model.embed_tokens.weight"]
+    if (
+        table.shape[1] != 1024
+        or table.shape[0] < rows
+        or table.dtype != np.float16
+        or not 4096 <= rows <= 65536
+        or rows % 4096
+    ):
+        raise ValueError("compiled head requires 4096-aligned FP16 vocabulary rows, at most 65536")
+    graph = OnnxGraph({})
+    hidden = graph.port("hidden", TensorProto.FLOAT16, [1, 1024])
+    for index, first in enumerate(range(0, rows, 4096)):
+        weight = graph.constant(f"weight_{index}", table[first : first + 4096])
+        name = f"logits_{index}"
+        graph.node("Gemm", [hidden, weight], name, transB=1, alpha=1.0, beta=0.0)
+        graph.port(name, TensorProto.FLOAT16, [1, 4096], output=True)
+    return graph
+
+
 class DeltaGraph(OnnxGraph):
     def cast(self, value, name, dtype):
         return self.node("Cast", [value], name, to=dtype)
@@ -43,7 +64,7 @@ class DeltaGraph(OnnxGraph):
         return self.node("Mul", [value, sigmoid], prefix + "_swish")
 
 
-def delta_model(weights, layer, config):
+def delta_model(weights, layer, config, *, outer_product="matmul", fuse_input_norm=False):
     if config["layer_types"][layer] != "linear_attention":
         raise ValueError("compiled mixer export requires a DeltaNet layer")
     hidden = config["hidden_size"]
@@ -53,6 +74,8 @@ def delta_model(weights, layer, config):
     )
     if config["linear_num_key_heads"] != heads:
         raise ValueError("DeltaNet export currently requires equal key/value head counts")
+    if outer_product not in ("matmul", "multiply"):
+        raise ValueError("unknown DeltaNet outer product implementation")
     channels, width, convolution = (
         heads * (2 * key_dim + value_dim),
         heads * value_dim,
@@ -61,6 +84,41 @@ def delta_model(weights, layer, config):
     graph = DeltaGraph(weights)
     prefix = f"model.layers.{layer}.linear_attn."
     incoming = graph.port("hidden", TensorProto.FLOAT16, [1, hidden])
+    if fuse_input_norm:
+        # Match GraphBuilder::rms_norm, including its FP32 weight offset and
+        # final FP16 boundary before any projection reads the normalized input.
+        wide = graph.cast(incoming, "input_norm_fp32", TensorProto.FLOAT)
+        squares = graph.node("Mul", [wide, wide], "input_norm_squares")
+        variance = graph.node("ReduceMean", [squares], "input_norm_variance", axes=[-1], keepdims=1)
+        regularized = graph.node(
+            "Add",
+            [
+                variance,
+                graph.constant("input_norm_epsilon", np.array(config["rms_norm_eps"], "f4")),
+            ],
+            "input_norm_regularized",
+        )
+        inverse = graph.node(
+            "Reciprocal",
+            [graph.node("Sqrt", [regularized], "input_norm_root")],
+            "input_norm_inverse",
+        )
+        normalized = graph.node("Mul", [wide, inverse], "input_norm_normalized")
+        scale = graph.cast(
+            graph.weight("input_norm_weight", f"model.layers.{layer}.input_layernorm.weight"),
+            "input_norm_scale_fp32",
+            TensorProto.FLOAT,
+        )
+        scale = graph.node(
+            "Add",
+            [scale, graph.constant("input_norm_one", np.array(1, "f4"))],
+            "input_norm_shifted_scale",
+        )
+        incoming = graph.cast(
+            graph.node("Mul", [normalized, scale], "input_norm_scaled"),
+            "input_normalized",
+            TensorProto.FLOAT16,
+        )
     state = graph.port("past_recurrent", TensorProto.FLOAT, [heads, key_dim, value_dim])
     history = graph.port("past_convolution", TensorProto.FLOAT16, [channels, convolution])
     packed, gate, a, b = [
@@ -130,7 +188,11 @@ def delta_model(weights, layer, config):
     error = graph.node("Sub", [value, prediction], "error_fp32")
     correction = graph.node("Mul", [error, beta], "correction_fp32")
     transposed_key = graph.node("Transpose", [key], "transposed_key", perm=[0, 2, 1])
-    update = graph.node("MatMul", [transposed_key, correction], "update_fp32")
+    update = graph.node(
+        "MatMul" if outer_product == "matmul" else "Mul",
+        [transposed_key, correction],
+        "update_fp32",
+    )
     updated_state = graph.node("Add", [decayed, update], "present_recurrent")
     core = graph.node("MatMul", [query, updated_state], "core_fp32")
     core = graph.reshape(core, "flat_core", [heads, value_dim])

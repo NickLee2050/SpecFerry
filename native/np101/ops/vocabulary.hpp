@@ -1,6 +1,7 @@
 #pragma once
 
 #include "np101/ops/graph_builder.hpp"
+#include "np101/ops/linear_backend.hpp"
 
 #include <memory>
 
@@ -47,7 +48,9 @@ private:
 class VocabularyHead : public GraphBuilder {
 public:
   VocabularyHead(Context &context, Vocabulary &table, TensorBinding input,
-                 SamplingOptions sampling = {});
+                 SamplingOptions sampling = {},
+                 const std::vector<TensorBinding> &prefix_logits = {},
+                 LinearBackend backend = LinearBackend::MatMul);
   std::int32_t select(TensorReadback readback = TensorReadback::SdkCopy);
   void reset();
   std::vector<std::uint8_t> read_logits(); // Diagnostic only.

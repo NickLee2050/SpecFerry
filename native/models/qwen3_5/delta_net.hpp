@@ -18,7 +18,8 @@ class WeightBank;
 
 namespace specferry::models::qwen3_5 {
 struct CompiledBlock;
-// Configured Qwen DeltaNet mixer, excluding decoder input norm, residual and MLP.
+// Configured Qwen DeltaNet mixer; compiled artifacts may include input RMSNorm.
+// Residual and MLP remain separate.
 // Context must outlive this object. All graph execution and state routing is C++.
 using np101::Context;
 using np101::TensorBinding;
@@ -30,7 +31,7 @@ public:
   DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
   DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
            TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr,
-           const CompiledBlock *compiled = nullptr);
+           const CompiledBlock *compiled = nullptr, bool deferred_commit = false);
   ~DeltaNet();
 
   DeltaNet(const DeltaNet &) = delete;
@@ -43,6 +44,11 @@ public:
   void step(const std::vector<std::uint8_t> &hidden_fp16);
   // Execute the construction-time input/output bindings without host activation IO.
   void step();
+  // Only compiled deferred mode exposes its activation directly. State remains
+  // pending until the caller completes the fixed copies and confirms success.
+  TensorBinding output();
+  std::vector<np101::TensorCopyBinding> state_copies();
+  void confirm_state_commit();
   std::vector<std::uint8_t> read(const std::string &name,
                                  np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   std::size_t steps() const;

@@ -9,12 +9,14 @@
 #include <vector>
 
 namespace specferry::models::qwen3_5 {
-enum class CompiledBlockKind { DeltaNet, FeedForward };
+enum class CompiledBlockKind { DeltaNet, FeedForward, VocabularyHead };
 
 struct CompiledBlock {
   CompiledBlockKind kind = CompiledBlockKind::DeltaNet;
   np101::ops::CompiledGraphSpec graph;
   unsigned layer = 0;
+  unsigned vocabulary_rows = 0;
+  bool includes_input_norm = false;
   std::vector<unsigned> input_order, output_order;
   std::map<std::string, std::string> weight_sha256;
 };
@@ -31,4 +33,8 @@ std::map<unsigned, CompiledBlock> load_compiled_feed_forward(const std::filesyst
 std::map<unsigned, CompiledBlock> load_compiled_mixers(const std::filesystem::path &package,
                                                        const np101::WeightStore &weights,
                                                        const Config &config);
+CompiledBlock load_compiled_head(const std::filesystem::path &package,
+                                 const np101::WeightStore &weights, const Config &config);
+void validate_compiled_head(const CompiledBlock &artifact, const np101::WeightStore &weights,
+                            const Config &config);
 } // namespace specferry::models::qwen3_5
