@@ -217,7 +217,7 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
   compile(inputs, outputs);
 }
 
-std::int32_t VocabularyHead::select() {
+std::int32_t VocabularyHead::select(TensorReadback readback) {
   const SdkScope timing_role("role", "lm-head-selection");
   if (sampling_.enabled) {
     if (draws_ == std::numeric_limits<std::uint32_t>::max()) {
@@ -232,7 +232,7 @@ std::int32_t VocabularyHead::select() {
   }
   check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
         "vocabulary projection and token selection");
-  auto bytes = read_tensor(graph, token_.id);
+  auto bytes = read_tensor(graph, token_.id, readback);
   std::int32_t result;
   std::memcpy(&result, bytes.data(), sizeof(result));
   if (result < 0 || unsigned(result) >= vocabulary_size_) {

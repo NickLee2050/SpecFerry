@@ -1,13 +1,14 @@
 """Compiled acceptance must reject changed artifacts, bad state and inflated throughput."""
 
 import json
+import runpy
 import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -22,18 +23,69 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_qwen_default_entry_writes_the_accepted_native_policies(self):
+        import torch
+
+        from specferry.models.qwen3_5 import generation
+
+        script = Path(__file__).resolve().parents[2] / "scripts/generate_qwen.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "deployment-manifest.json").write_text(
+                json.dumps({"text_config": {"bos_token_id": 1, "eos_token_id": 2}})
+            )
+            with patch.object(
+                sys, "argv", [str(script), "--compiled-mixers", str(root), "--output", str(root)]
+            ):
+                args = runpy.run_path(str(script))["parse_arguments"]()
+            cli_options = {
+                "embedding_lookup": args.embedding_lookup,
+                "matmul_feed_forward_layer": args.matmul_feed_forward_layer,
+                "token_readback": args.token_readback,
+            }
+            for name, options in (("api", {}), ("cli", cli_options)):
+                with (
+                    self.subTest(entry=name),
+                    patch.object(generation, "verify_export"),
+                    patch.object(generation.Components, "from_text_config", return_value=Mock()),
+                    patch.object(generation, "load_tokenizer", return_value=Mock()),
+                    patch.object(generation, "encode", return_value=("Hi", torch.tensor([[1, 2]]))),
+                ):
+                    request, _ = generation.prepare_request(
+                        root, root, root / name, "Hi", 64, 1, 1, **options
+                    )
+                for key, value, filename in (
+                    ("embedding_lookup", "gather-nd", "embedding-lookup.txt"),
+                    ("matmul_feed_forward_layer", 9, "matmul-feed-forward-layer.txt"),
+                    ("token_readback", "mapped", "token-readback.txt"),
+                ):
+                    self.assertEqual(request[key], value)
+                    self.assertEqual((root / name / filename).read_text().strip(), str(value))
+
     def test_qwen_matmul_fallback_rejects_invalid_layers_before_loading_files(self):
         from specferry.models.qwen3_5.generation import prepare_request
 
         with patch("specferry.models.qwen3_5.generation.verify_export") as verify:
-            for layer in (-1, 24, True, "9"):
+            for layer in (None, -1, 24, True, "9"):
                 with self.subTest(layer=layer), self.assertRaisesRegex(ValueError, "0..23"):
                     prepare_request(
                         None, None, None, "Hi", 64, 1, 1, matmul_feed_forward_layer=layer
                     )
             verify.assert_not_called()
 
-    def test_cold_restart_requires_new_clean_boot_and_retains_gate_on_delayed_fault(self):
+    def test_qwen_token_transport_rejects_unknown_policy_before_loading_files(self):
+        from specferry.models.qwen3_5.generation import prepare_request
+
+        with patch("specferry.models.qwen3_5.generation.verify_export") as verify:
+            for transport in ("", "automatic", True):
+                with (
+                    self.subTest(transport=transport),
+                    self.assertRaisesRegex(ValueError, "readback transport"),
+                ):
+                    prepare_request(None, None, None, "Hi", 64, 1, 1, token_readback=transport)
+            verify.assert_not_called()
+
+    def test_board_power_cycle_allows_same_boot_and_retains_gate_on_delayed_fault(self):
         original_read_text = Path.read_text
         driver = Path("/sys/module/galcore/srcversion")
 
@@ -80,11 +132,11 @@ class CompiledValidationTests(unittest.TestCase):
                             output,
                         )
                         options = dict(
-                            cold_restarted=True,
+                            board_power_cycled=True,
                             sdk_timing=True,
                             evaluate_result=lambda case, device: {"passed": True},
                         )
-                        if boot == "old" or preflight_faults:
+                        if preflight_faults:
                             with self.assertRaises((ValueError, RuntimeError)):
                                 compiled.run_case(*arguments, **options)
                             run.assert_not_called()
@@ -93,6 +145,9 @@ class CompiledValidationTests(unittest.TestCase):
                             report = compiled.run_case(*arguments, **options)
                             self.assertEqual(report["passed"], not delayed_faults)
                             self.assertEqual(marker.exists(), bool(delayed_faults))
+                            self.assertEqual(
+                                (root / "np101-recovery-epoch.json").exists(), not delayed_faults
+                            )
                             self.assertEqual(
                                 json.loads((output / "previous-recovery-marker.json").read_text()),
                                 previous,

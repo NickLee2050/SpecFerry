@@ -32,12 +32,12 @@ def parse_args():
         add_run_arguments(case)
         if name == "vendor-conv":
             case.add_argument(
-                "--cold-restarted", action="store_true", help="confirm host and NP101 cold restart"
+                "--board-power-cycled", action="store_true", help="confirm NP101 board power cycle"
             )
             case.add_argument(
                 "--sudo-read-only",
                 action="store_true",
-                help="authorize sudo journalctl/fuser reads",
+                help="read kernel logs with sudo journalctl",
             )
         elif name == "lookup":
             case.add_argument("--operator", choices=("gather", "embedding"), required=True)

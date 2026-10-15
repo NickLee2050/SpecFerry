@@ -18,12 +18,20 @@ Python covers checkpoint/export identities, generation policy/counts, arrays, bu
 and recovery guards with mocked device calls. All five native CTest cases have `unit;cpu` labels
 and never open NP101. Device diagnostics are explicit executables, never automatic CTest runs.
 
+## EP baseline maintenance
+
+EP exploration has concluded for the configurations pinned in the status document. Recommended
+commands are in the main README; keep the component/operator/compiled regressions needed to
+maintain these baselines. New acceptance runs require a concrete changed contract or observed
+failure; do not repeat historical matrices as a release checklist. Hardware validation from 10-15
+remains immutable; finalization changes entry defaults and records, with offline checks only.
+
 ## Device discipline
 
 Read the ledger before each run. Serialize bounded processes; check boot, recovery marker,
 full-boot kernel and device owner, monitor faults, and inspect at least 45 seconds after release.
 Correct output, empty ownership or `recovery done` do not override faults. Preserve markers.
-Recovery requires a confirmed host/NP101 cold restart and agreed controls with numerical,
+Recovery requires a user-confirmed NP101 board power cycle and agreed controls with numerical,
 execution, budget, release and delayed-kernel acceptance; passing covers only that workload.
 Never restore the deleted repository convolution or silently substitute vendor/old OPT controls.
 `vendor-conv` remains an explicitly authorized diagnostic and cannot clear the recovery gate.
@@ -119,11 +127,10 @@ under ignored caches. Formal generation replaces the retired projection-specific
 
 No new downloads are enabled. Export `--part feed-forward --all-layers --mixers-package PACKAGE`
 combines 24 FFNs with the source-bound 18-mixer package. The explicit C64/v105 conservative
-combination has passed bounded full-model acceptance:
+combination has passed bounded full-model acceptance and is now the generation entry default:
 
 ```sh
 python scripts/generate_qwen.py --compiled-mixers /absolute/path/to/qwen-package \
-  --embedding-lookup gather-nd --matmul-feed-forward-layer 9 \
   --prompt "What is 2 + 2? Answer with only the number." --max-new-tokens 8 \
   --output .cache/runs/qwen-preparation --prepare-only
 ```
@@ -134,12 +141,29 @@ GATHER_ND has INT32 `[1,1]` coordinates and shared FP16 weights; identical KV sl
 Hi (13 inputs/one output) and two resident arithmetic requests (26 inputs/four outputs each,
 displaying `4\n`) passed tokens, coarse hidden/recurrent/KV, unwritten slots, repeated state,
 budgets/release and separate 45-second gates. Evidence: `qwen-matmul-fallback-coldboot-20261014/`.
-Only SDK calls diagnostic mode was measured; C128, normal-mode performance and long-term stability
-remain unvalidated. Earlier hangs retain independent ledger records and unresolved causes.
+A diagnostic-disabled comparison later hit a 4-byte EDMA timeout. After the user-confirmed board
+power cycle on 10-15, the explicit `--token-readback mapped` alternative passed greeting, matched
+SDK calls off/on/off arithmetic (two requests each) and natural generation (23 inputs/16 outputs):
+5 processes/8 requests, coarse state/unwritten slots, repeat identity where applicable,
+budget/release and separate 45-second gates. No SDK-copy fallback is introduced;
+no new kernel faults occurred, and the previous marker was archived. Finalized Python/native defaults
+select GATHER_ND, layer9 MatMul FFN and mapped token readback; explicit overrides remain diagnostic.
+The complete generation entry requires a valid fallback layer; the request API rejects `None`.
+Fault avoidance over longer runs, the original EDMA cause and Qwen C128 remain unresolved.
 
-For an agreed recovery diagnostic, `--cold-restarted --sdk-timing --repeats 1 --max-new-tokens 1`
-retains the previous marker and requires a different clean boot plus full acceptance before clearing
-it. The user must confirm both devices restarted; flags alone do not authorize recovery controls.
+Evidence and accepted timings: `qwen-mapped-recovery-20261015/summary.json`. Off-case pooled decode
+is 2942.13 ms/token; actual arithmetic output is 0.07707 token/s, and natural generation is
+0.19347 output token/s (0.33876 post-first-token decode). Preparation/reset/coarse IO are excluded.
+SDK calls recording added 4.22% generation wall and 3.48% decode time in the matched bounded
+comparison; Verify auditing stayed enabled in every case. Full-boot logs retain multiline fault
+timestamps; trace duration alone does not establish internal movement or utilization.
+
+For an agreed recovery diagnostic, `--board-power-cycled --sdk-timing --repeats 1 --max-new-tokens 1`
+retains the previous marker until full acceptance. User confirmation of an NP101 board power cycle
+is required; host cold restart and a changed boot ID are not. Same-boot recovery acknowledges only
+previously recorded timestamped faults, retaining the complete log and rejecting new occurrences.
+The accepted fault baseline is published only after numerical/release/45-second checks pass; flags
+alone do not authorize recovery controls.
 The existing `reference_dlm.py`, `export_np101_dlm.py --verify-only` and model regression paths stay.
 
 ## Targeted diagnostics and evidence

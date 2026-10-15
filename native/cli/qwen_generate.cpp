@@ -9,7 +9,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -34,6 +33,19 @@ void save(const fs::path &path, const std::vector<std::uint8_t> &bytes) {
   if (!file) {
     throw std::runtime_error("cannot save Qwen coarse diagnostic");
   }
+}
+
+std::string read_option(const fs::path &request, const char *name, const char *fallback) {
+  const auto path = request / name;
+  if (!fs::exists(path)) {
+    return fallback;
+  }
+  std::ifstream input(path);
+  std::string value, extra;
+  if (!(input >> value) || input >> extra) {
+    throw std::invalid_argument("invalid Qwen option: " + path.string());
+  }
+  return value;
 }
 } // namespace
 
@@ -67,37 +79,37 @@ int main(int argc, char **argv) {
     if (!input.eof() || prompt.empty() || prompt.size() > policy.capacity) {
       throw std::invalid_argument("invalid Qwen rendered prompt");
     }
-    std::string lookup_name = "gather";
-    if (fs::exists(request / "embedding-lookup.txt")) {
-      std::ifstream lookup_file(request / "embedding-lookup.txt");
-      lookup_file >> lookup_name;
-      if (!lookup_file || lookup_file >> extra) {
-        throw std::invalid_argument("invalid Qwen embedding lookup policy");
-      }
-    }
+    const auto lookup_name = read_option(request, "embedding-lookup.txt", "gather-nd");
     if (lookup_name != "gather" && lookup_name != "gather-nd") {
       throw std::invalid_argument("unsupported Qwen embedding lookup operator");
     }
     const auto lookup = lookup_name == "gather-nd" ? np101::ops::VocabularyLookup::GatherNd
                                                    : np101::ops::VocabularyLookup::Gather;
-    std::optional<unsigned> matmul_layer;
+    const auto token_readback_name = read_option(request, "token-readback.txt", "mapped");
+    if (token_readback_name != "sdk" && token_readback_name != "mapped") {
+      throw std::invalid_argument("unsupported Qwen token readback transport");
+    }
+    const auto token_readback = token_readback_name == "mapped" ? np101::TensorReadback::MappedHost
+                                                                : np101::TensorReadback::SdkCopy;
+    unsigned matmul_layer = 9;
     if (fs::exists(request / "matmul-feed-forward-layer.txt")) {
       std::ifstream fallback(request / "matmul-feed-forward-layer.txt");
       unsigned layer = 0;
       fallback >> layer;
-      if (!fallback || fallback >> extra || layer >= config.layer_types.size()) {
+      if (!fallback || fallback >> extra) {
         throw std::invalid_argument("invalid Qwen MatMul feed-forward layer");
       }
       matmul_layer = layer;
+    }
+    if (matmul_layer >= config.layer_types.size()) {
+      throw std::invalid_argument("Qwen MatMul feed-forward layer exceeds model depth");
     }
     np101::WeightStore weights(argv[1]);
     weights.verify();
     const auto artifacts = models::qwen3_5::load_compiled_mixers(argv[2], weights, config);
     auto feed_forward = models::qwen3_5::load_compiled_feed_forward(argv[2], weights, config);
-    if (matmul_layer) {
-      // Validate the complete package before selecting the existing device MatMul FFN.
-      feed_forward.erase(*matmul_layer);
-    }
+    // Validate the complete package before selecting the existing device MatMul FFN.
+    feed_forward.erase(matmul_layer);
     fs::create_directories(output);
     np101::SdkTimings timings(output);
     phase(output, "initialize");
@@ -119,8 +131,8 @@ int main(int argc, char **argv) {
                   << ",\"const_peak_bytes\":" << memory.peak(true)
                   << ",\"nonconst_peak_bytes\":" << memory.peak(false)
                   << ",\"compiled_mixers\":" << artifacts.size() << ",\"embedding_lookup\":\""
-                  << lookup_name << '"' << ",\"matmul_feed_forward_layer\":"
-                  << (matmul_layer ? std::to_string(*matmul_layer) : "null")
+                  << lookup_name << '"' << ",\"matmul_feed_forward_layer\":" << matmul_layer
+                  << ",\"token_readback\":\"" << token_readback_name << '"'
                   << ",\"compiled_feed_forward\":" << feed_forward.size() << "}\n";
       if (!initialized) {
         throw std::runtime_error("cannot save Qwen initialization evidence");
@@ -128,7 +140,7 @@ int main(int argc, char **argv) {
     }
     for (unsigned repeat = 0; repeat < repeats; ++repeat) {
       phase(output, "request." + std::to_string(repeat));
-      const auto result = model.generate(prompt, maximum);
+      const auto result = model.generate(prompt, maximum, token_readback);
       std::ofstream file(output / ("measured." + std::to_string(repeat) + ".json"));
       file << '{';
       inference::write_generation(file, result);

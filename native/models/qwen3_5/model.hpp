@@ -28,7 +28,9 @@ public:
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;
 
-  inference::Generation generate(const std::vector<std::int32_t> &prompt, unsigned maximum);
+  inference::Generation
+  generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
+           np101::TensorReadback token_readback = np101::TensorReadback::SdkCopy);
   std::vector<std::uint8_t> read(unsigned layer, const std::string &field);
   void close();
 

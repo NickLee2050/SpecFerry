@@ -24,14 +24,15 @@ def prepare_request(
     capacity,
     maximum,
     repeats,
-    embedding_lookup="gather",
-    matmul_feed_forward_layer=None,
+    embedding_lookup="gather-nd",
+    matmul_feed_forward_layer=9,
+    token_readback="mapped",
 ):
+    if token_readback not in ("sdk", "mapped"):
+        raise ValueError("unsupported Qwen token readback transport")
     if embedding_lookup not in ("gather", "gather-nd"):
         raise ValueError("unsupported Qwen embedding lookup operator")
-    if matmul_feed_forward_layer is not None and (
-        type(matmul_feed_forward_layer) is not int or not 0 <= matmul_feed_forward_layer < 24
-    ):
+    if type(matmul_feed_forward_layer) is not int or not 0 <= matmul_feed_forward_layer < 24:
         raise ValueError("Qwen MatMul feed-forward layer must be a zero-based layer in 0..23")
     verify_export(deployment)
     manifest = json.loads((deployment / "deployment-manifest.json").read_text())
@@ -82,10 +83,8 @@ def prepare_request(
     tokens = ids[0].tolist()
     (directory / "tokens.txt").write_text(" ".join(map(str, tokens)) + "\n")
     (directory / "embedding-lookup.txt").write_text(embedding_lookup + "\n")
-    if matmul_feed_forward_layer is not None:
-        (directory / "matmul-feed-forward-layer.txt").write_text(
-            str(matmul_feed_forward_layer) + "\n"
-        )
+    (directory / "token-readback.txt").write_text(token_readback + "\n")
+    (directory / "matmul-feed-forward-layer.txt").write_text(str(matmul_feed_forward_layer) + "\n")
     (directory / "policy.txt").write_text(
         f"{config.vocab_size} {capacity} {generation.bos_token_id or 0} {generation.eos_token_id} {maximum} {repeats}\n"
     )
@@ -98,6 +97,7 @@ def prepare_request(
         repeats=repeats,
         embedding_lookup=embedding_lookup,
         matmul_feed_forward_layer=matmul_feed_forward_layer,
+        token_readback=token_readback,
         deployment_sha256=sha256(deployment / "deployment-manifest.json"),
         selection=dict(
             origin="generation_config"

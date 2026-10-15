@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -41,7 +42,48 @@ def vendor_control():
     return binary
 
 
-def snapshot(output, sudo_read_only):
+def kernel_faults(log):
+    """Retain the journal timestamp when a kernel message contains embedded newlines."""
+    prefix, faults = "", []
+    for line in log.splitlines():
+        header = re.match(r"^\d{4}-\d{2}-\d{2}T\S+\s+\S+\s+kernel:", line)
+        if header:
+            prefix = header[0]
+        if FAULT.search(line):
+            faults.append(line if header or not prefix else prefix + " " + line.strip())
+    return faults
+
+
+def apply_fault_baseline(record, baseline):
+    """Exclude only recorded, timestamped occurrences from this same host boot."""
+    known = Counter()
+    if baseline.get("boot_id") == record.get("boot_id"):
+        known.update(
+            fault for fault in baseline.get("faults", []) if re.match(r"^\d{4}-\d{2}-\d{2}T", fault)
+        )
+    current, historical = [], []
+    for fault in record["faults"]:
+        if known[fault]:
+            historical.append(fault)
+            known[fault] -= 1
+        else:
+            current.append(fault)
+    return dict(record, faults=current, historical_faults=historical)
+
+
+def power_cycle_baseline(previous, preflight):
+    """A confirmed board reset may acknowledge known old faults, never unseen ones."""
+    baseline = dict(boot_id=preflight["boot_id"], faults=[])
+    if previous.get("boot_id") == preflight["boot_id"]:
+        health = previous.get("final_health") or previous.get("kernel_gate") or {}
+        baseline["faults"] = health.get("faults", []) + health.get("historical_faults", [])
+    filtered = apply_fault_baseline(preflight, baseline)
+    if not healthy(filtered):
+        raise RuntimeError("Board power-cycle preflight has unrecorded faults or a device owner")
+    return baseline, filtered
+
+
+def snapshot(output, sudo_read_only, *, fault_baseline=None):
     prefix = ["sudo", "-n"] if sudo_read_only else []
     log = subprocess.run(
         prefix + ["journalctl", "-k", "-b", "-o", "short-iso-precise", "--no-pager"],
@@ -62,9 +104,13 @@ def snapshot(output, sudo_read_only):
     record = {
         "checked_at": datetime.now().astimezone().isoformat(),
         "boot_id": host_boot_id(),
-        "faults": [line for line in log.stdout.splitlines() if FAULT.search(line)],
+        "faults": kernel_faults(log.stdout),
         "owners": owner.stdout.strip(),
     }
+    if fault_baseline is None:
+        epoch = RECOVERY_ROOT / "np101-recovery-epoch.json"
+        fault_baseline = json.loads(epoch.read_text()) if epoch.exists() else {}
+    record = apply_fault_baseline(record, fault_baseline)
     write_json(output.with_suffix(".json"), record)
     return record
 
@@ -92,7 +138,7 @@ def recovery_record(output, name, evidence, postflight):
         kernel_gate=postflight,
         established_cause="Execution or health gate failed; root cause is not established",
         sdk_call="Uninstrumented frozen control; exact outstanding SDK call is unknown",
-        next_run_rule="Stop board work; analyze evidence, confirm both devices cold-restarted",
+        next_run_rule="Stop board work; analyze evidence, confirm board power cycle and agreed checks",
     )
     write_json(output / "incident.json", record)
     write_json(marker, record)
@@ -107,18 +153,23 @@ def run_vendor_control(output, options):
     marker = RECOVERY_ROOT / "np101-recovery-required.json"
     # Retain the lock through delayed checks, so no repository test overlaps this gate.
     with device_lock(RECOVERY_ROOT, recovery_control=True):
-        preflight = snapshot(output / "preflight", options.sudo_read_only)
+        baseline = None
+        preflight = snapshot(
+            output / "preflight",
+            options.sudo_read_only,
+            fault_baseline={} if options.board_power_cycled else None,
+        )
+        if marker.exists():
+            previous = json.loads(marker.read_text())
+            if not options.board_power_cycled:
+                raise RuntimeError("Confirm board power cycle before the agreed diagnostic")
+            baseline, preflight = power_cycle_baseline(previous, preflight)
+            write_json(output / "preflight.json", preflight)
+            shutil.copy2(marker, output / "previous-recovery-marker.json")
         if not healthy(preflight):
             raise RuntimeError(
                 "Recovery control preflight failed; inspect saved kernel log and ownership"
             )
-        if marker.exists():
-            previous = json.loads(marker.read_text())
-            if not options.cold_restarted or previous.get("boot_id") == host_boot_id():
-                raise RuntimeError(
-                    "Confirm host and NP101 cold restart in a new boot before Recovery control"
-                )
-            shutil.copy2(marker, output / "previous-recovery-marker.json")
         if marker.exists():
             write_json(
                 marker,
@@ -139,15 +190,21 @@ def run_vendor_control(output, options):
             SDK,
             options.timeout or 60,
             abort_check=lambda: bool(
-                snapshot(directory / "monitor", options.sudo_read_only)["faults"]
+                snapshot(directory / "monitor", options.sudo_read_only, fault_baseline=baseline)[
+                    "faults"
+                ]
             ),
             recovery_control=True,
         )
         try:
-            immediate = snapshot(directory / "immediate", options.sudo_read_only)
+            immediate = snapshot(
+                directory / "immediate", options.sudo_read_only, fault_baseline=baseline
+            )
             print(f"{name}: waiting 45s for delayed kernel faults", flush=True)
             time.sleep(45)
-            postflight = snapshot(directory / "postflight", options.sudo_read_only)
+            postflight = snapshot(
+                directory / "postflight", options.sudo_read_only, fault_baseline=baseline
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
             recovery_record(directory, name, evidence, {"health_check_incomplete": True})
             raise

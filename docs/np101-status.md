@@ -1,6 +1,6 @@
 # NP101 推理实现与优化结论
 
-更新：2026-10-14。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
+更新：2026-10-15。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
 降低单请求decode延迟。未完成项见[TODO](../TODO.md)，每次上板先读
 [事故台账](np101-recovery-incidents.md)，接口见[测试手册](../tests/README.md)，
 SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
@@ -8,6 +8,35 @@ SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
 原始证据相对 `.cache/runs/`，不随Git分发；压缩前全文、代码与hash在
 `commit-cleanup-20261013/before/`、`before-manifest.json`。早期归档见
 `documentation-consolidation-20261010/`；退役脚本保存在压缩证据归档中。
+
+## EP阶段封版
+
+本轮EP功能验收和性能路径探索收尾；后续优化按新需求/证据重开，不要求完成所有
+可选TODO才结项。推荐配置固定如下，历史实现保留作回归及诊断，不自动重试故障条件：
+
+| 模型 | 推荐运行配置 | 已验范围 / 当前性能口径 |
+|---|---|---|
+| OPT-350m | FCL attention投影、融合NBG FFN/末LN、NBG head，M1、prefill仅末词head | C64/C128；C64的3次17输入/16输出为1.96582输出token/s、3.63403首词后decode token/s |
+| Qwen3.5-0.8B缓存模型 | GATHER_ND、零基layer9设备MatMul FFN、18 DeltaNet＋23 FFN NBG、mapped选词读回 | C64；23输入/16输出自然句为0.19347输出token/s、0.33876首词后decode token/s |
+
+模型、输入长度与请求数不同，上表不作跨模型速度对照；准备/reset/粗读回不计入生成。
+对应包保持原始内容，不移动或重导出；各自manifest绑定NBG、源权重、端口及五库身份：
+
+| 本机已验包（相对`.cache/runs/`） | manifest.json SHA256 |
+|---|---|
+| `opt-entry-integration-20261014/ffn-head-package` | `ec99e136f8458c301ed4165a582ade84751c468b596fcd3ef5431d0d96cf64fd` |
+| `opt-qwen-integration-20261014/qwen-compiled-blocks-package` | `9ccdf15e4c8e783b5e875af8ae03960a918563326a9529c2a57e2cd0d2e7f0be` |
+
+两包均绑定v105 `srcversion=F53A3E6EFBB7D0FD7D4617C`。原始checkpoint/NBG及固定
+已验binary继续位于忽略缓存，源码仓库不分发这些产物；manifest/源权重不匹配应拒绝。
+本轮将Qwen Python/native入口省略参数时的默认值对齐上述已验组合；显式覆盖仅供诊断。
+OPT默认component回归路径不变，推荐混合路径由README命令显式选择。默认策略的收尾
+仅做离线请求契约/构建检查，硬件验收和性能沿用固定显式配置的既有记录，没有重新上板。
+
+当前证据覆盖有界生成、状态/隔离、预算/释放和延迟内核检查；长期稳定、Qwen C128、
+内部硬件利用率及间歇性hang/EDMA根因未解决。恢复遵守板卡断电确认及完整门禁，
+不再强制主机冷启动或boot ID改变。可选head/分块prefill、SoC对照和TLM协议见TODO。
+收尾前文档及身份留存`ep-baseline-finalization-20261015/before/`、`before-manifest.json`。
 
 ## 当前实现与验收范围
 
@@ -25,8 +54,9 @@ SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
   v105/C64、17输入/16输出的1暖机+1正式请求通过，不切默认CLI、不外推M16或v106。
 - 完整decoder候选每层一份NBG，普通rank3 FP32 KV，加独立copy图提交；
   正式C128入口新增固定KV清零图，97/3/97输入及96输出通过。未接block16或NBG原地别名。
-- 全图NBG包含embedding、所有decoder、project_out、LM head及greedy；独立48-copy
-  KV提交图，共2图。仅M1/C64已验，主机逐token调度；48个FFN投影TTGT无明显收益。
+- 全图NBG包含embedding、所有decoder、project_out、LM head及greedy，独立48-copy
+  KV提交；C64共2图，正式C128另加固定reset共3图。仅M1已验，主机逐token调度；
+  48个FFN投影TTGT无明显收益。
 - NBG固定端口/图版本/权重来源；builder持有路径，图计入嵌入常量预算。const/nonconst
   各≤1GiB，共享backing只计一次；SDK副本、workspace和物理地址未知。
 - 重建前释放所有旧图和最后一个Context；v105 Context共享进程1024 shader槽表，
@@ -133,9 +163,68 @@ GATHER_ND保持共享FP16词表和INT32 `[1,1]`索引，离线逐位语义及本
 均通过；同槽KV写避免重复改绑，非首槽仍有重验，不切默认或外推长期稳定/C128。
 此前165次初始化Verify累计78.358s，其中单个547-operation head为76.927s
 （98.17%）；即使消去其他Verify也仅省1.431s，仍不优先并行Verify。
-最新完整证据及固定binary/source身份在`qwen-matmul-fallback-coldboot-20261014/summary.json`；
+10-14完整证据及固定binary/source身份在`qwen-matmul-fallback-coldboot-20261014/summary.json`；
 历史失败证据分别在`opt-qwen-integration-20261014/`、`qwen-coldboot-diagnostic-20261014/`
 及`qwen-gather-nd-coldboot-20261014/`。
+
+10-14后续关闭诊断对照曾发生**4字节EDMA超时**，当时停测并保留标记；
+正确的部分输出不算该轮性能/健康验收。驱动反汇编确认SG分支可主动将日志dst字段
+设为全1、实际提交另一张地址表，不能仅凭该值断言非法地址或DMA映射失败；
+活动分支/回调状态未采到，超时根因仍未确定，独立时间线见台账。
+
+**10-15映射读回组合通过新一轮完整验收。** 显式`--token-readback mapped`仅替换
+选中INT32 token的读取，复用Map/Unmap，不回退SDK-copy；本轮硬件验收时默认仍为sdk，封版入口现已对齐mapped。
+其余GATHER_ND、零基layer9设备MatMul、41份NBG、权重/精度/预算均保持上述保守组合。
+Hi、三轮各两次算术、单次自然句共5进程/8请求/41输出ID，tokens/粗hidden/recurrent/KV、
+未写槽、适用的重复状态逐字节一致、预算/释放及各45秒门禁全部通过；无新设备故障，
+旧标记归档。仅证明该C64/v105有界负载；不能认定间歇性EDMA已修复或外推C128。
+用户更新恢复规则：板卡断电确认即可，不强制服务器冷启动或boot改变；完整日志保留，
+同boot仅豁免上次已记录的带时间戳故障，新故障仍停测。本次实际host boot发生改变，
+不把本次成功当作同host boot恢复的实验结论。
+
+| 10-15负载 / SDK逐调用记录 | 输入/每请求输出ID | 请求数 | 平均生成 wall s | 实际输出 token/s | 首词后decode ms/token |
+|---|---:|---:|---:|---:|---:|
+| 算术，关闭前置 | 26/4 | 2 | 51.977 | 0.07696 | 2953.32 |
+| 算术，开启 | 26/4 | 2 | 54.096 | 0.07394 | 3044.55 |
+| 算术，关闭后置 | 26/4 | 2 | 51.830 | 0.07718 | 2930.95 |
+| 自然邀请句，关闭 | 23/16 | 1 | 82.701 | 0.19347 | 2951.97 |
+
+同负载关闭轮合并4请求/16输出ID，平均wall51.904s，实际输出0.07707 token/s；
+12个首词后间隔平均2942.13ms，即0.33989 token/s。开启记录比关闭均值增加生成wall
+4.22%、decode3.48%；后置关闭比前置生成−0.28%、decode−0.76%。各组仅两请求，
+是有界扰动估计；Verify审计在三轮均开启，不代表完全无诊断的生产性能。
+初始化、reset、粗读及文本展示不计入生成wall；token数包含生成的特殊ID，不均摊输入。
+与10-14的跨boot差异不能全部归因mapped。Hi生成23.093s，初始化123.686s另计。
+
+新开启轮按固定API语法覆盖全部5,642次RunGraph、6个首词后间隔，无额外设备探针。
+下表是SDK外层调用墙钟，含执行/内部搬运/完成等待，不是硬件kernel利用率：
+
+| Qwen decode段 | ms/token | decode墙钟占比 |
+|---|---:|---:|
+| 共享分块MatMul LM head＋greedy | 1356.30 | 44.55% |
+| 18层编译DeltaNet | 621.93 | 20.43% |
+| 23层编译FFN | 296.13 | 9.73% |
+| 6层attention投影/RoPE | 183.51 | 6.03% |
+| 24层input RMSNorm | 171.34 | 5.63% |
+| 循环状态固定回写 | 109.05 | 3.58% |
+| KV重Verify | 56.56 | 1.86% |
+| 单层MatMul FFN回退 | 56.28 | 1.85% |
+| selected-token显式Map＋Unmap | 0.0061 | 0.0002% |
+
+优先检查head及DeltaNet；仅消除KV重验的理论上限约1.02倍。每槽固定copy图会增加
+378张常驻图/756个copy节点，资源和workspace未验，因此未施工。可复用OPT rank2
+indexed append，但需将GQA backing改为`[512,64]`，显式reshape/permute恢复reader
+`[256,64,2]`及写后依赖；旧rank3 append失败契约继续适用，不自动切换。
+自然句输出与固定CPU参考的16个ID一致：
+`Happy Saturday, and I'd love to host a nice dinner with you tomorrow!`
+输入为“Write one friendly sentence inviting a neighbor to dinner tomorrow.”；
+Saturday非输入指定，CPU也如此，不把回答质量当设备正确性。TTFT38.421s，
+prefill37.077s，15个decode间隔、0.33876 token/s；消费38个位置，max_new_tokens停止。
+
+本轮原始身份/确认、每请求输出/性能、完整日志和归因集中在
+`qwen-mapped-recovery-20261015/{summary,performance-comparison,decode-attribution}.json`。
+此前失败、复用归因和离线KV/OPT驻留预算证据保留`qwen-decode-night-20261014/`；
+未执行新的profiler、容量矩阵或同boot故障筛选。
 
 全图/逐decoder的C64/C128源绑定导出、包和显式CLI已实现。C128全图首版ArgMax
 修正版仅在模拟器Verify后重存，v105导入返回`VX_ERROR_NO_RESOURCES`；未Setup/Verify/Run。
@@ -352,6 +441,15 @@ TTGT M16额外7,680B。下界不含小常量/未知SDK workspace；不假设两�
 因此尚未接block16，需解决实际驻留/复用，不能直接放行超预算模型。
 证据统一为`opt-entry-integration-20261014/`的entry/rebuild/budget/host-cpu摘要、
 fullgraph/entry/head/context128/reuse验收及固定source/SDK身份；本轮5板卡进程无新设备故障。
+
+后续离线按当前M1＋一份NBG head及真实M16逐层manifest重新核算：全部M16 NBG仍超
+const约35.55MiB。前2/3/4层M16改用已有普通权重FFN，已知const余量分别约
+0.53/18.57/36.61MiB（TTGT近似相同）；2层仅满足数学下界，不是安全峰值。
+选择前4层的保守方案，保留全部M1 FCL及20层M16 NBG，单份head经固定输入桥接复用，
+不改is_const。已知nonconst下界约330.69MiB，不含新增激活/临时alias，SDK workspace未知。
+32MiB规划余量是工程选择，不是SDK空间保证；尚未修改运行时、创建Context或上板。
+后续需拆开当前FCL只允许M1的门禁、支持显式部分M16 FFN、落实单head所有权及分段
+峰值守门，再做最小验收。证据`qwen-decode-night-20261014/offline-opt-residency.json`。
 
 ## GEMM、布局与设备有效算力
 

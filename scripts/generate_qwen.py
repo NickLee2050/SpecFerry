@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit cached Qwen text candidate; prepare-only never opens the device."""
+"""Validate cached Qwen generation with the accepted conservative defaults."""
 
 import argparse
 import json
@@ -21,28 +21,33 @@ from specferry.validation.generation_metrics import summarize
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def main():
+def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", default="What is 2 + 2? Answer with only the number.")
     parser.add_argument("--checkpoint", type=Path, default=ROOT / ".cache/models/Qwen/Qwen3.5-0.8B")
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/np101/Qwen3.5-0.8B")
     parser.add_argument("--compiled-mixers", type=Path, required=True)
     parser.add_argument("--capacity", type=int, choices=(64, 128), default=64)
-    parser.add_argument("--embedding-lookup", choices=("gather", "gather-nd"), default="gather")
-    parser.add_argument("--matmul-feed-forward-layer", type=int, choices=range(24))
+    parser.add_argument("--embedding-lookup", choices=("gather", "gather-nd"), default="gather-nd")
+    parser.add_argument("--matmul-feed-forward-layer", type=int, choices=range(24), default=9)
+    parser.add_argument("--token-readback", choices=("sdk", "mapped"), default="mapped")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--sudo-read-only", action="store_true")
     parser.add_argument(
-        "--cold-restarted",
+        "--board-power-cycled",
         action="store_true",
-        help="confirm host/NP101 cold restart and the agreed Qwen recovery diagnostic",
+        help="confirm board power cycle and the agreed Qwen recovery diagnostic",
     )
     parser.add_argument("--sdk-timing", action="store_true", help="record diagnostic SDK calls")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
     package = json.loads((args.compiled_mixers / "manifest.json").read_text())
     if (
         package["kind"] != "qwen-delta"
@@ -81,6 +86,7 @@ def main():
         args.repeats,
         args.embedding_lookup,
         args.matmul_feed_forward_layer,
+        args.token_readback,
     )
     reference = prepare_reference(args.checkpoint, request, fixture)
     if args.prepare_only:
@@ -107,7 +113,11 @@ def main():
                     device / f"measured.{index}.{name}.bin", dtype=contract["dtype"]
                 )
                 if name in ("keys", "values"):
-                    actual = actual.reshape(1, 2, args.capacity, 256)[:, :, : reference["consumed"]]
+                    full = actual.reshape(1, 2, args.capacity, 256)
+                    checks[f"request.{index}.{name}.unwritten_bit_zero"] = not np.any(
+                        full[:, :, reference["consumed"] :].copy().view("u1")
+                    ).item()
+                    actual = full[:, :, : reference["consumed"]]
                 else:
                     actual = actual.reshape(expected.shape)
                 tolerance = TOLERANCES[
@@ -116,7 +126,7 @@ def main():
                 checks[f"request.{index}.{name}"] = compare_arrays(actual, expected, **tolerance)[
                     "passed"
                 ]
-                if index and name not in ("keys", "values"):
+                if index:
                     checks[f"request.{index}.{name}.reset"] = (
                         device / f"measured.{index}.{name}.bin"
                     ).read_bytes() == (device / f"measured.0.{name}.bin").read_bytes()
@@ -151,7 +161,7 @@ def main():
         timeout=args.timeout,
         audit_verify=True,
         evaluate_result=accept,
-        cold_restarted=args.cold_restarted,
+        board_power_cycled=args.board_power_cycled,
         sdk_timing=args.sdk_timing,
     )
     write_json(output / "result.json", result)

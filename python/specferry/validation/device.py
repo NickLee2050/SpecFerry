@@ -104,7 +104,7 @@ def require_recovered_device(root: Path) -> None:
         ) from error
     if record.get("boot_id") and record["boot_id"] != host_boot_id():
         raise RuntimeError(
-            "NP101 boot changed, but recovery is unverified; confirm a cold restart and "
+            "Host boot changed, but NP101 recovery is unverified; confirm board power cycle and "
             "follow the current incident ledger before another device run"
         )
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):

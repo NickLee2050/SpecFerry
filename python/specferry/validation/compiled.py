@@ -21,7 +21,7 @@ from specferry.validation.device import (
     run_device,
     write_json,
 )
-from specferry.validation.recovery_controls import healthy, snapshot
+from specferry.validation.recovery_controls import healthy, power_cycle_baseline, snapshot
 
 ROOT = RECOVERY_ROOT.parents[1]
 
@@ -218,11 +218,11 @@ def run_case(
     audit_verify=False,
     evaluate_result=evaluate,
     numerical_diagnostic=False,
-    cold_restarted=False,
+    board_power_cycled=False,
     sdk_timing=False,
 ):
-    if numerical_diagnostic and cold_restarted:
-        raise ValueError("cold-restart and numerical diagnostics are separate recovery paths")
+    if numerical_diagnostic and board_power_cycled:
+        raise ValueError("board power-cycle and numerical diagnostics are separate recovery paths")
     sdk = resolve_path(identity["directory"])
     binary = resolve_path(case["binary"]).resolve(strict=True)
     for name, digest in identity["sha256"].items():
@@ -271,16 +271,21 @@ def run_case(
         ):
             raise ValueError("numerical diagnostic requires a completed healthy numerical failure")
         write_json(output / "previous-numerical-marker.json", previous)
-    with device_lock(RECOVERY_ROOT, recovery_control=numerical_diagnostic or cold_restarted):
-        preflight = snapshot(output / "preflight", sudo_read_only)
-        if not healthy(preflight):
-            raise RuntimeError("compiled validation preflight failed; board not started")
-        if cold_restarted:
-            previous = read_json(marker)
-            if not previous.get("boot_id") or previous["boot_id"] == preflight["boot_id"]:
-                raise ValueError("cold-restart diagnostic requires a different confirmed boot")
+    with device_lock(RECOVERY_ROOT, recovery_control=numerical_diagnostic or board_power_cycled):
+        baseline = None
+        preflight = snapshot(
+            output / "preflight", sudo_read_only, fault_baseline={} if board_power_cycled else None
+        )
+        if board_power_cycled:
+            previous = read_json(marker) if marker.exists() else {}
+            baseline, preflight = power_cycle_baseline(previous, preflight)
+            baseline.update(confirmed_at=preflight.get("checked_at"), evidence=str(output))
+            write_json(output / "preflight.json", preflight)
+            write_json(output / "board-power-cycle.json", baseline)
             # Preserve the old incident until this agreed workload passes every gate.
             write_json(output / "previous-recovery-marker.json", previous)
+        if not healthy(preflight):
+            raise RuntimeError("compiled validation preflight failed; board not started")
         write_json(
             marker,
             dict(
@@ -306,13 +311,15 @@ def run_case(
                 if audit_verify
                 else None,
                 require_compiled_operations=audit_verify,
-                abort_check=lambda: bool(snapshot(output / "monitor", sudo_read_only)["faults"]),
+                abort_check=lambda: bool(
+                    snapshot(output / "monitor", sudo_read_only, fault_baseline=baseline)["faults"]
+                ),
             )
             report["execution"] = evidence
-            immediate = snapshot(output / "immediate", sudo_read_only)
+            immediate = snapshot(output / "immediate", sudo_read_only, fault_baseline=baseline)
             print("Process exited; waiting 45 seconds for delayed kernel checks", flush=True)
             time.sleep(45)
-            postflight = snapshot(output / "postflight", sudo_read_only)
+            postflight = snapshot(output / "postflight", sudo_read_only, fault_baseline=baseline)
             report.update(immediate=immediate, postflight=postflight)
             if clean_execution(evidence):
                 report.update(evaluate_result(case, device))
@@ -332,6 +339,9 @@ def run_case(
             report["error"] = str(error)
         write_json(output / "result.json", report)
         if report["passed"]:
+            if baseline is not None:
+                # Publish only after numerical, release and delayed checks all pass.
+                write_json(RECOVERY_ROOT / "np101-recovery-epoch.json", baseline)
             shutil.copy2(marker, output / "completed-run-marker.json")
             marker.unlink()
         else:

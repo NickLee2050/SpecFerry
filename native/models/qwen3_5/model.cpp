@@ -117,7 +117,7 @@ struct Model::Impl {
     failed = false;
   }
 
-  std::int32_t predict() {
+  std::int32_t predict(TensorReadback token_readback) {
     require_live();
     if (!prediction_ready) {
       throw std::logic_error("Qwen has no completed decoder output");
@@ -125,7 +125,7 @@ struct Model::Impl {
     failed = true;
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(normalization->graph.get()); }),
           "Qwen final normalization");
-    const auto token = head->select();
+    const auto token = head->select(token_readback);
     failed = false;
     return token;
   }
@@ -237,7 +237,11 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
 
 Model::~Model() = default;
 
-inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, unsigned maximum) {
+inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
+                                      TensorReadback token_readback) {
+  if (token_readback != TensorReadback::SdkCopy && token_readback != TensorReadback::MappedHost) {
+    throw std::invalid_argument("unsupported Qwen token readback transport");
+  }
   if (!impl_ || prompt.empty()) {
     throw std::invalid_argument(
         "Qwen generation requires a live model and a nonempty rendered prompt");
@@ -245,7 +249,7 @@ inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, u
   return inference::generate_tokens(impl_->policy,
                                     {[&] { impl_->reset(); },
                                      [&](std::int32_t token) { impl_->consume(token); },
-                                     [&] { return impl_->predict(); }},
+                                     [&] { return impl_->predict(token_readback); }},
                                     prompt, maximum);
 }
 

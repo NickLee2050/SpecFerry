@@ -48,7 +48,7 @@ class VocabularyHead : public GraphBuilder {
 public:
   VocabularyHead(Context &context, Vocabulary &table, TensorBinding input,
                  SamplingOptions sampling = {});
-  std::int32_t select();
+  std::int32_t select(TensorReadback readback = TensorReadback::SdkCopy);
   void reset();
   std::vector<std::uint8_t> read_logits(); // Diagnostic only.
 

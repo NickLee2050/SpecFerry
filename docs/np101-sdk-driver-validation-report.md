@@ -4,6 +4,11 @@
 每次运行的约束及冷启动事故见[事件台账](np101-recovery-incidents.md)，命令见
 [测试手册](../tests/README.md)。以下是历史结果，不是自动复现清单；模型成功不关闭底层问题。
 
+10-14静态复核：v105 EDMA的SG分支会主动将timeout打印用dst字段设为全1，实际
+提交SG表；因此`dst=0xffffffffffffffff`不能单独证明非法访问或DMA映射失败。
+内部完成等待存在4ms/30s分支（HZ250），与应用900s期限不同；实际触发分支/根因未定。
+本轮4字节EDMA的独立时间线和反汇编证据见台账，不据此放行故障设备。
+
 `v105/v106` 指匹配的驱动与SDK安装包1.0.5/1.0.6，不是模块打印字符串。
 库位于 `/usr/lib/ljmicro`；galcore srcversion分别为 `F53A3E6EFBB7D0FD7D4617C` /
 `8D46803809F15FA0FD98A92`。每份证据固定boot、命令、binary/SDK哈希和内核窗口。

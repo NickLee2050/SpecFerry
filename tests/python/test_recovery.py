@@ -18,6 +18,32 @@ from specferry.validation import recovery_controls
 
 
 class RecoveryControlTests(unittest.TestCase):
+    def test_same_boot_power_cycle_only_acknowledges_recorded_fault_occurrences(self):
+        old = "2026-10-14T18:25:45.057746+0800 host kernel: EDMA timeout"
+        new = "2026-10-15T08:55:00.000000+0800 host kernel: EDMA timeout"
+        previous = dict(boot_id="same", kernel_gate=dict(faults=[old], owners=""))
+        preflight = dict(boot_id="same", faults=[old], owners="")
+        baseline, filtered = recovery_controls.power_cycle_baseline(previous, preflight)
+        self.assertTrue(recovery_controls.healthy(filtered))
+        self.assertEqual(filtered["historical_faults"], [old])
+        for faults in ([old, new], [old, old], ["EDMA timeout"]):
+            with self.subTest(faults=faults), self.assertRaises(RuntimeError):
+                recovery_controls.power_cycle_baseline(previous, preflight | dict(faults=faults))
+        self.assertEqual(
+            recovery_controls.apply_fault_baseline(preflight | dict(boot_id="new"), baseline)[
+                "faults"
+            ],
+            [old],
+        )
+
+    def test_multiline_edma_fault_keeps_its_journal_timestamp(self):
+        prefix = "2026-10-14T18:25:45.057746+0800 host kernel:"
+        detail = "--------gckEDMA_StartTransfer---timeout---len:0x4----"
+        normal = "2026-10-14T18:25:44.000000+0800 host kernel: Waiting for HDMA Transfer..."
+        direct = "2026-10-14T18:25:49.000000+0800 host kernel: NP[0] hang"
+        log = f"{normal}\n{prefix} \n    {detail}\n{direct}\n"
+        self.assertEqual(recovery_controls.kernel_faults(log), [prefix + " " + detail, direct])
+
     def test_vendor_diagnostic_preserves_recovery_gate(self):
         for outcome in ("complete", "interrupted"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
@@ -28,7 +54,7 @@ class RecoveryControlTests(unittest.TestCase):
                 options = SimpleNamespace(
                     prepare_only=False,
                     sudo_read_only=False,
-                    cold_restarted=True,
+                    board_power_cycled=True,
                     timeout=None,
                 )
 
@@ -56,7 +82,9 @@ class RecoveryControlTests(unittest.TestCase):
                     patch.object(recovery_controls, "host_boot_id", return_value="new-boot"),
                     patch.object(recovery_controls, "vendor_control", return_value=Path("demo")),
                     patch.object(
-                        recovery_controls, "snapshot", return_value=dict(faults=[], owners="")
+                        recovery_controls,
+                        "snapshot",
+                        return_value=dict(boot_id="new-boot", faults=[], owners=""),
                     ),
                     patch.object(recovery_controls, "run_device", side_effect=run_control),
                     patch.object(recovery_controls, "numerical_check", return_value=True),
@@ -77,10 +105,10 @@ class RecoveryControlTests(unittest.TestCase):
                     original,
                 )
 
-    def test_recovery_rejects_unconfirmed_or_same_boot_restart(self):
-        for cold_restarted, previous_boot in ((False, "previous-boot"), (True, "new-boot")):
+    def test_recovery_rejects_unconfirmed_power_cycle(self):
+        for board_power_cycled, previous_boot in ((False, "previous-boot"), (False, "new-boot")):
             with (
-                self.subTest(cold_restarted=cold_restarted, previous_boot=previous_boot),
+                self.subTest(board_power_cycled=board_power_cycled, previous_boot=previous_boot),
                 tempfile.TemporaryDirectory() as temporary,
             ):
                 root = Path(temporary)
@@ -90,7 +118,7 @@ class RecoveryControlTests(unittest.TestCase):
                 options = SimpleNamespace(
                     prepare_only=False,
                     sudo_read_only=False,
-                    cold_restarted=cold_restarted,
+                    board_power_cycled=board_power_cycled,
                     timeout=None,
                 )
                 with (
@@ -101,7 +129,7 @@ class RecoveryControlTests(unittest.TestCase):
                         recovery_controls, "snapshot", return_value=dict(faults=[], owners="")
                     ),
                     patch.object(recovery_controls, "run_device") as runner,
-                    self.assertRaisesRegex(RuntimeError, "Confirm host and NP101 cold restart"),
+                    self.assertRaisesRegex(RuntimeError, "Confirm board power cycle"),
                 ):
                     recovery_controls.run_vendor_control(root / "output", options)
                 runner.assert_not_called()
@@ -149,7 +177,7 @@ class RecoveryControlTests(unittest.TestCase):
             options = SimpleNamespace(
                 prepare_only=False,
                 sudo_read_only=False,
-                cold_restarted=False,
+                board_power_cycled=False,
                 timeout=None,
             )
             evidence = dict(
