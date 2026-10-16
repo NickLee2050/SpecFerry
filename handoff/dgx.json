@@ -1,0 +1,46 @@
+{
+  "updated_on": "2026-10-16",
+  "owner": "DGX TLM session",
+  "host": "dgx01",
+  "session_title": "SpecFerry框架搭建",
+  "peer_host": "fpga02",
+  "peer_session_title": "SpecFerry问题排查与性能优化",
+  "branch": "dev/TLM-impl",
+  "protocol": "specferry.draft.v1",
+  "contract": "protocol/draft-v1.schema.json",
+  "target": "facebook/opt-6.7b",
+  "tokenizer_sha256": "a5f5a66a21bc9928956de6c276ce034f8bb81fc2bb141dcb690ad0266e528de5",
+  "draft_candidate": "facebook/opt-350m; confirm tokenizer fingerprint on NP101 host",
+  "framework": "vLLM 0.28.0",
+  "generation": "FP16 greedy, synchronous, one concurrent sequence, eager integration service",
+  "services": {
+    "ordinary_target": "http://127.0.0.1:8000; graph-enabled, different serving configuration",
+    "external_draft_target": "http://127.0.0.1:8011; loopback test fixture until real device URL is configured",
+    "matching_target_only": "http://127.0.0.1:8010; empty-draft proposer without HTTP"
+  },
+  "real_np101_attached": false,
+  "validation": {
+    "native_build": "passed; library and host CLI",
+    "host_unit_tests": "32 run; 31 passed; 1 torch-dependent numerical check skipped",
+    "container_reference_tests": "3 passed with the same Conda interpreter and declared container torch runtime; includes the skipped numerical check",
+    "loopback_link": "16 output tokens; 3 native draft rounds, 12 proposed and 12 accepted synthetic tokens",
+    "evidence": ".cache/runs/dgx-bridge-link-smoke-20261016/report.json",
+    "performance_claim": "none; oracle fixture and cold first-request compilation are not device speedup measurements"
+  },
+  "device_address": null,
+  "initial_network_plan": "Host SSH tunnels; direct device NIC remains undecided",
+  "np101_side_pending": [
+    "Publish the actual DLM functions, token/cache semantics, context limit and runtime commit",
+    "Implement the SpecFerry HTTP draft contract using the existing device inference runtime",
+    "Reconcile every authoritative prefix; rebuild prefix state if cache truncation is unavailable",
+    "Return only greedy candidate token IDs; do not emit speculative text to the user",
+    "Record board execution evidence and run the contract probe after device-side recovery gates permit it"
+  ],
+  "known_limits": [
+    "The local native/np101 SDK smoke code does not describe the remote DLM runtime",
+    "FP16 native verification previously passed 14/17 cases; near-tie differences are retained",
+    "FP32 previously passed 17/17 cases; this is test coverage, not a universal guarantee",
+    "No real device acceptance rate or network throughput has been established"
+  ],
+  "revision_rule": "Use git rev-parse HEAD and launch.json source hashes when consuming this handoff; dated service status must be rechecked live"
+}
