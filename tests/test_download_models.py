@@ -12,7 +12,7 @@ from scripts import download_models as downloader
 
 
 class DownloadModelsTests(unittest.TestCase):
-    def test_dry_run_selects_only_dlm_and_does_not_create_output(self):
+    def test_dry_run_selects_only_opt_tlm_and_does_not_create_output(self):
         with tempfile.TemporaryDirectory() as root:
             destination = Path(root) / "not-created"
             stream = io.StringIO()
@@ -21,7 +21,7 @@ class DownloadModelsTests(unittest.TestCase):
                                           "--parallel-models", "8"])
             plan = json.loads(stream.getvalue())
             self.assertEqual(result, 0)
-            self.assertEqual([model["repo_id"] for model in plan["models"]], ["Qwen/Qwen3.5-0.8B"])
+            self.assertEqual([model["repo_id"] for model in plan["models"]], ["facebook/opt-6.7b"])
             self.assertEqual(plan["parallel_models"], 1)
             self.assertFalse(destination.exists())
 
@@ -83,6 +83,23 @@ class DownloadModelsTests(unittest.TestCase):
                          "sha256": hashlib.sha256(b"good").hexdigest()}]
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 downloader.verify_files(destination, expected)
+
+    def test_opt_bin_weights_and_bpe_tokenizer_exclude_other_frameworks(self):
+        names = ["config.json", "vocab.json", "merges.txt", "pytorch_model.bin.index.json",
+                 "pytorch_model-00001-of-00002.bin", "pytorch_model-00002-of-00002.bin",
+                 "flax_model.msgpack.index.json", "flax_model-00001-of-00002.msgpack",
+                 "tf_model.h5.index.json", "tf_model-00001-of-00002.h5"]
+        info = SimpleNamespace(siblings=[SimpleNamespace(rfilename=name) for name in names])
+        selected = {item["path"] for item in downloader.expected_files(info)}
+        self.assertEqual(selected, set(names[:6]))
+
+    def test_missing_bin_shard_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root)
+            name = "pytorch_model.bin.index.json"
+            (destination / name).write_text('{"weight_map":{"w":"missing.bin"}}')
+            with self.assertRaisesRegex(ValueError, "unselected shard"):
+                downloader.verify_files(destination, [{"path": name, "size": None, "sha256": None}])
 
 
 if __name__ == "__main__":

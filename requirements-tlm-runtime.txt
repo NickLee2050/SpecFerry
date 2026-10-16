@@ -1,0 +1,9 @@
+# GPU verification runtime supplied by the pinned vLLM ARM64 container.
+# Run with the Python 3.12 SpecFerry Conda interpreter, using the image's package
+# path. This is separate from requirements-reference.txt (x86_64 CPU reference).
+# Image ID: sha256:89154ef00dd15368d2b293c167e5cc7dbb521fcfb2fbb77510e0d4df2b820e8f
+torch==2.13.0+cu130
+transformers==5.15.1
+numpy==2.2.6
+# Native external proposer integration is pinned to the engine's private ABI.
+vllm==0.28.0

@@ -1,4 +1,7 @@
 name: SpecFerry
+# Optional GPU verifier runtime is declared in requirements-tlm-runtime.txt.
+# Its packages come from the pinned ARM64 container; the same SpecFerry Python
+# 3.12 interpreter is mounted read-only. Do not mix it with the CPU profile below.
 channels:
   - defaults
 dependencies:

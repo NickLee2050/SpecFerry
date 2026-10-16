@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download the enabled Qwen3.5 checkpoints, with pinned revisions and resume support."""
+"""Download the enabled checkpoints, with pinned revisions and resume support."""
 
 from __future__ import annotations
 
@@ -24,9 +24,10 @@ class ModelSpec:
     revision: str = "main"
 
 
-# Only the first DLM is enabled. Uncomment individual TLMs when their phase starts.
+# Current TLM phase: OPT first, Qwen second (user instruction, 2026-10-15).
 MODELS = (
-    ModelSpec("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
+    ModelSpec("facebook/opt-6.7b"),
+    # ModelSpec("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
     # ModelSpec("Qwen/Qwen3.5-4B"),       # First two-machine experiment.
     # ModelSpec("Qwen/Qwen3.5-9B"),       # Medium dense experiment.
     # ModelSpec("Qwen/Qwen3.5-27B"),      # Large dense experiment.
@@ -34,9 +35,10 @@ MODELS = (
 )
 ALLOWED_REPOS = frozenset(
     f"Qwen/Qwen3.5-{size}" for size in ("0.8B", "4B", "9B", "27B", "35B-A3B")
-)
+) | {"facebook/opt-6.7b"}
 FILE_PATTERNS = (
     "*.safetensors", "*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja",
+    "pytorch_model*.bin",
     "LICENSE", "LICENSE.*", "README.md",
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / ".cache" / "models"
@@ -50,7 +52,7 @@ def validate_models(models: tuple[ModelSpec, ...]) -> None:
         if "llama" in model.repo_id.casefold():
             raise ValueError(f"Llama models are excluded by project policy: {model.repo_id}")
         if model.repo_id not in ALLOWED_REPOS:
-            raise ValueError(f"Model is outside the Qwen3.5 download allowlist: {model.repo_id}")
+            raise ValueError(f"Model is outside the project download allowlist: {model.repo_id}")
         if model.repo_id in seen:
             raise ValueError(f"Duplicate model: {model.repo_id}")
         if not model.revision:
@@ -88,16 +90,23 @@ def expected_files(info) -> list[dict]:
         name = item.rfilename
         if not any(fnmatch(name, pattern) for pattern in FILE_PATTERNS):
             continue
+        if name.startswith(("flax_model", "tf_model")):
+            continue
         if Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name:
             raise ValueError(f"Unsafe repository path: {name}")
         lfs = getattr(item, "lfs", None)
         digest = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
         files.append({"path": name, "size": getattr(item, "size", None), "sha256": digest})
     names = {item["path"] for item in files}
-    if "config.json" not in names or not any(name.endswith(".safetensors") for name in names):
-        raise ValueError("The repository does not contain config.json and safetensors weights.")
-    if "tokenizer.json" not in names:
-        raise ValueError("The repository does not contain tokenizer.json.")
+    if any(name.endswith(".safetensors") for name in names):
+        files = [item for item in files if not item["path"].startswith("pytorch_model")]
+        names = {item["path"] for item in files}
+    if "config.json" not in names or not any(
+        name.endswith((".safetensors", ".bin")) for name in names
+    ):
+        raise ValueError("The repository does not contain config.json and supported weights.")
+    if "tokenizer.json" not in names and not {"vocab.json", "merges.txt"}.issubset(names):
+        raise ValueError("The repository does not contain a supported tokenizer.")
     return sorted(files, key=lambda item: item["path"])
 
 
@@ -111,7 +120,7 @@ def verify_files(destination: Path, files: list[dict]) -> None:
             raise ValueError(f"Download size mismatch: {path}")
         if item["sha256"] and sha256_file(path) != item["sha256"]:
             raise ValueError(f"Download SHA256 mismatch: {path}")
-        if item["path"].endswith(".safetensors.index.json"):
+        if item["path"].endswith((".safetensors.index.json", ".bin.index.json")):
             index = json.loads(path.read_text(encoding="utf-8"))
             if not set(index["weight_map"].values()).issubset(names):
                 raise ValueError(f"Weight index refers to an unselected shard: {path}")
@@ -148,7 +157,7 @@ def download_one(model: ModelSpec, output: Path, file_workers: int, range_worker
         from range_download import download_ranges
         from huggingface_hub import hf_hub_url
         for item in files:
-            if item['path'].endswith('.safetensors') and item['sha256'] and item['size']:
+            if item['path'].endswith(('.safetensors', '.bin')) and item['sha256'] and item['size']:
                 download_ranges(hf_hub_url(model.repo_id, item['path'], revision=info.sha),
                                 destination / item['path'], item['size'], item['sha256'], range_workers)
                 selected.remove(item['path'])
