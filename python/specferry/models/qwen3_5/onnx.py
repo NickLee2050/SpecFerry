@@ -6,27 +6,6 @@ from onnx import TensorProto
 from specferry.export.onnx import OnnxGraph
 
 
-def vocabulary_head_model(weights, rows):
-    """Compile a bounded vocabulary prefix, preserving one FP16 output per row block."""
-    table = weights["model.embed_tokens.weight"]
-    if (
-        table.shape[1] != 1024
-        or table.shape[0] < rows
-        or table.dtype != np.float16
-        or not 4096 <= rows <= 65536
-        or rows % 4096
-    ):
-        raise ValueError("compiled head requires 4096-aligned FP16 vocabulary rows, at most 65536")
-    graph = OnnxGraph({})
-    hidden = graph.port("hidden", TensorProto.FLOAT16, [1, 1024])
-    for index, first in enumerate(range(0, rows, 4096)):
-        weight = graph.constant(f"weight_{index}", table[first : first + 4096])
-        name = f"logits_{index}"
-        graph.node("Gemm", [hidden, weight], name, transB=1, alpha=1.0, beta=0.0)
-        graph.port(name, TensorProto.FLOAT16, [1, 4096], output=True)
-    return graph
-
-
 class DeltaGraph(OnnxGraph):
     def cast(self, value, name, dtype):
         return self.node("Cast", [value], name, to=dtype)

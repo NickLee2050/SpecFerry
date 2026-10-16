@@ -40,12 +40,6 @@ def prepare(args, fixture):
         if args.trace is None:
             raise ValueError("--trace is required for decoder references")
         return prepare(args.model, args.trace, fixture, args.layers, args.steps, args.capacity)
-    if args.case == "qwen":
-        from specferry.models.qwen3_5.validation_decoder import prepare
-
-        if args.trace is None:
-            raise ValueError("--trace is required for Qwen decoder references")
-        return prepare(args.model, args.trace, fixture, args.steps, args.layers[0], args.layers)
     return {}
 
 
@@ -53,7 +47,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "case",
-        choices=("selection", "io", "teacher", "opt", "qwen"),
+        choices=("selection", "io", "teacher", "opt"),
     )
     add_run_arguments(parser)
     parser.add_argument("--model", type=Path)
@@ -73,10 +67,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cpu_threads <= 0:
         parser.error("--cpu-threads must be positive")
-    args.model = (
-        args.model
-        or ROOT / ".cache/np101" / ("Qwen3.5-0.8B" if args.case == "qwen" else "opt-350m")
-    ).resolve()
+    args.model = (args.model or ROOT / ".cache/np101/opt-350m").resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     fixture, device = (
@@ -120,13 +111,11 @@ def main(argv=None):
         if args.case == "teacher":
             binary = ROOT / "build/tests/np101_generation_check"
             arguments += [metadata["layers"], metadata["count"]]
-    elif args.case in ("opt", "qwen"):
-        if args.case == "opt":
-            from specferry.models.opt.validation import evaluate
-        else:
-            from specferry.models.qwen3_5.validation_decoder import evaluate
+    elif args.case == "opt":
+        from specferry.models.opt.validation import evaluate
+
         binary = ROOT / "build/tests/np101_decoder_check"
-        arguments = [args.case, *arguments, metadata["steps"]]
+        arguments += [metadata["steps"]]
     return run_check(
         binary,
         arguments,

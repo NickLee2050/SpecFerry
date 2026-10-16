@@ -23,7 +23,6 @@ struct Model::Impl {
   std::vector<std::unique_ptr<DecoderLayer>> layers;
   std::unique_ptr<GraphBuilder> state_commit;
   std::unique_ptr<GraphBuilder> normalization;
-  std::unique_ptr<GraphBuilder> compiled_head;
   std::unique_ptr<VocabularyHead> head;
   unsigned position = 0;
   bool failed = false, prediction_ready = false;
@@ -35,7 +34,7 @@ struct Model::Impl {
        const std::map<unsigned, CompiledBlock> &compiled,
        const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
        const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-       const CompiledBlock *head_artifact, LinearBackend head_backend, bool combined_state_commit)
+       LinearBackend head_backend, bool combined_state_commit)
       : config(spec), policy(selection), bank(context), progress(phase) {
     const auto *timing = std::getenv("SPECFERRY_SDK_TIMING");
     trace_steps = timing && std::string_view(timing) == "calls";
@@ -92,20 +91,9 @@ struct Model::Impl {
       if (phase) {
         phase("lm-head");
       }
-      std::vector<TensorBinding> prefix_logits;
-      if (head_artifact) {
-        compiled_head =
-            std::make_unique<GraphBuilder>(context, 2 + head_artifact->graph.outputs.size(), 1);
-        auto input = compiled_head->bind({normalization->graph, normalized.id}, normalized.spec);
-        auto outputs = compiled_head->compiled(head_artifact->graph, {input});
-        compiled_head->compile({input}, outputs);
-        for (auto index : head_artifact->output_order) {
-          prefix_logits.push_back({compiled_head->graph, outputs.at(index).id});
-        }
-      }
       head = std::make_unique<VocabularyHead>(context, *vocabulary,
                                               TensorBinding{normalization->graph, normalized.id},
-                                              SamplingOptions{}, prefix_logits, head_backend);
+                                              SamplingOptions{}, head_backend);
     } catch (...) {
       close();
       throw;
@@ -171,11 +159,7 @@ struct Model::Impl {
     failed = true;
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(normalization->graph.get()); }),
           "Qwen final normalization");
-    if (compiled_head) {
-      check(
-          sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(compiled_head->graph.get()); }),
-          "Qwen compiled vocabulary prefix");
-    }
+
     const auto token = head->select(token_readback);
     failed = false;
     return token;
@@ -202,10 +186,7 @@ struct Model::Impl {
       head->graph.close();
       head.reset();
     }
-    if (compiled_head) {
-      compiled_head->graph.close();
-      compiled_head.reset();
-    }
+
     if (normalization) {
       normalization->graph.close();
       normalization.reset();
@@ -231,8 +212,7 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
              const std::map<unsigned, CompiledBlock> &compiled,
              const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
              const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-             const CompiledBlock *head_artifact, LinearBackend head_backend,
-             bool combined_state_commit) {
+             LinearBackend head_backend, bool combined_state_commit) {
   config.validate();
   const auto &table = weights.find("model.embed_tokens.weight");
   if (config.hidden != 1024 || config.intermediate != 3584 || config.layer_types.size() != 24 ||
@@ -241,15 +221,10 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
       table.spec.type != DataType::Float16 || table.spec.shape != Shape{1024, 248320}) {
     throw std::invalid_argument("complete Qwen model requires the fixed text deployment contract");
   }
-  if ((head_backend != LinearBackend::MatMul && head_backend != LinearBackend::FullyConnected) ||
-      (head_artifact && head_backend != LinearBackend::MatMul)) {
+  if (head_backend != LinearBackend::MatMul && head_backend != LinearBackend::FullyConnected) {
     throw std::invalid_argument("Qwen head requires one explicit projection implementation");
   }
   std::size_t constants = 0, ordinary_weights = table.bytes;
-  if (head_artifact) {
-    validate_compiled_head(*head_artifact, weights, config);
-    constants += head_artifact->graph.constant_bytes;
-  }
   for (const auto &entry : compiled_feed_forward) {
     if (entry.first >= 24) {
       throw std::invalid_argument("compiled Qwen feed-forward layer exceeds model bounds");
@@ -299,7 +274,7 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   try {
     impl_ =
         std::make_unique<Impl>(context, weights, config, policy, compiled, compiled_feed_forward,
-                               phase, lookup, head_artifact, head_backend, combined_state_commit);
+                               phase, lookup, head_backend, combined_state_commit);
   } catch (const std::exception &error) {
     const auto &memory = context.memory();
     throw std::runtime_error(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an explicit vendor diagnostic or one bounded NP101 operator/cache check."""
+"""Run one bounded NP101 operator or cache contract check."""
 
 import argparse
 import sys
@@ -17,29 +17,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     cases = parser.add_subparsers(dest="case", required=True)
     for name in (
-        "vendor-conv",
         "lookup",
         "projection",
         "sampling",
         "kv",
-        "cache-packed",
-        "cache-packed64",
-        "cache-packed-block4",
         "cache-append",
         "fp16-preservation",
     ):
         case = cases.add_parser(name)
         add_run_arguments(case)
-        if name == "vendor-conv":
-            case.add_argument(
-                "--board-power-cycled", action="store_true", help="confirm NP101 board power cycle"
-            )
-            case.add_argument(
-                "--sudo-read-only",
-                action="store_true",
-                help="read kernel logs with sudo journalctl",
-            )
-        elif name == "lookup":
+        if name == "lookup":
             case.add_argument("--operator", choices=("gather", "embedding"), required=True)
         elif name == "projection":
             case.add_argument(
@@ -54,10 +41,6 @@ def parse_args():
         elif name == "cache-append":
             case.add_argument("--rank", type=int, choices=(2, 3), required=True)
     args = parser.parse_args()
-    if args.case == "vendor-conv" and (args.sdk_timing or args.trace_driver or args.trace_verify):
-        parser.error(
-            "Vendor diagnostic uses a frozen uninstrumented binary; tracing is not supported"
-        )
     if args.case == "sampling" and not (
         8 <= args.classes <= 50272 and args.classes % 8 == 0 and 1 <= args.samples <= 8192
     ):
@@ -68,19 +51,12 @@ def parse_args():
 def main():
     args = parse_args()
     output = args.output.resolve()
-    if args.case == "vendor-conv":
-        from specferry.validation.recovery_controls import run_vendor_control
-
-        return run_vendor_control(output, args)
     device = output / "device"
     targets = {
         "lookup": "lookup_check",
         "projection": "projection_check",
         "sampling": "sampling_check",
         "kv": "kv_cache_check",
-        "cache-packed": "graph_cache_check",
-        "cache-packed64": "graph_cache_check",
-        "cache-packed-block4": "graph_cache_check",
         "cache-append": "cache_append_check",
         "fp16-preservation": "fp16_preservation_check",
     }
@@ -91,8 +67,6 @@ def main():
         arguments += [args.operator]
     elif args.case == "cache-append":
         arguments += [args.rank]
-    elif args.case in ("cache-packed", "cache-packed64", "cache-packed-block4"):
-        arguments += [args.case.removeprefix("cache-")]
     elif args.case == "sampling":
         from specferry.validation.sampling import evaluate as evaluate_samples
 

@@ -12,10 +12,6 @@
 #include <string>
 #include <vector>
 
-namespace specferry::np101 {
-class WeightBank;
-}
-
 namespace specferry::models::qwen3_5 {
 struct CompiledBlock;
 // Configured Qwen DeltaNet mixer; compiled artifacts may include input RMSNorm.
@@ -28,10 +24,9 @@ using np101::WeightStore;
 
 class DeltaNet {
 public:
-  DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
   DeltaNet(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-           TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr,
-           const CompiledBlock *compiled = nullptr, bool deferred_commit = false);
+           TensorBinding input, TensorBinding output, const CompiledBlock &compiled,
+           bool deferred_commit = false);
   ~DeltaNet();
 
   DeltaNet(const DeltaNet &) = delete;
@@ -41,10 +36,9 @@ public:
   // step never downloads/reuploads recurrent state or convolution history.
   void reset(const std::vector<std::uint8_t> &recurrent = {},
              const std::vector<std::uint8_t> &convolution = {});
-  void step(const std::vector<std::uint8_t> &hidden_fp16);
   // Execute the construction-time input/output bindings without host activation IO.
   void step();
-  // Only compiled deferred mode exposes its activation directly. State remains
+  // Only deferred mode exposes its activation directly. State remains
   // pending until the caller completes the fixed copies and confirms success.
   TensorBinding output();
   std::vector<np101::TensorCopyBinding> state_copies();

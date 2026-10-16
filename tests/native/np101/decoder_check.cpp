@@ -1,6 +1,5 @@
 #include "binary_io.hpp"
 #include "models/opt/decoder.hpp"
-#include "models/qwen3_5/decoder.hpp"
 #include "np101/context.hpp"
 #include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
@@ -32,7 +31,6 @@ struct DecoderCase {
   std::size_t uploads = 1, control_bytes = 0;
   std::vector<std::vector<std::uint8_t>> inputs{};
   std::map<unsigned, std::vector<std::string>> fields{};
-  bool coarse = false;
   std::vector<double> sequence_seconds{};
 };
 
@@ -66,7 +64,7 @@ void sequence(Model &model, DecoderCase &test, const std::string &name, unsigned
         after.reads != before.reads || model.length() != step + 1) {
       throw std::runtime_error("unexpected decoder position or host transfers");
     }
-    if ((test.coarse || final_only) ? step + 1 != count : !checkpoint(step, count)) {
+    if (final_only ? step + 1 != count : !checkpoint(step, count)) {
       continue;
     }
     for (const auto &[layer, fields] : test.fields) {
@@ -108,14 +106,13 @@ template <class Factory> void trajectories(Factory create, DecoderCase &test) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 6) {
-    std::cerr << "usage: np101_decoder_check opt|qwen DEPLOYMENT FIXTURE OUTPUT STEPS\n";
+  if (argc != 5) {
+    std::cerr << "usage: np101_decoder_check DEPLOYMENT FIXTURE OUTPUT STEPS\n";
     return 2;
   }
   try {
-    const std::string profile(argv[1]);
-    const fs::path fixture(argv[3]), output(argv[4]);
-    const auto counts = np101::parse_shape(argv[5]);
+    const fs::path fixture(argv[2]), output(argv[3]);
+    const auto counts = np101::parse_shape(argv[4]);
     if (counts.size() != 1 || counts[0] < 2) {
       throw std::invalid_argument("invalid step count");
     }
@@ -130,7 +127,7 @@ int main(int argc, char **argv) {
     }
     fs::create_directories(output);
     DecoderCase test{output, counts[0], 0};
-    np101::WeightStore weights(argv[2]);
+    np101::WeightStore weights(argv[1]);
     weights.verify();
     // Input/config validation occurs before the factory opens the SDK context.
     const auto load_inputs = [&](const np101::TensorSpec &spec) {
@@ -151,88 +148,29 @@ int main(int argc, char **argv) {
       const_peak = std::max(const_peak, context.memory().peak(true));
       nonconst_peak = std::max(nonconst_peak, context.memory().peak(false));
     };
-    if (profile == "opt") {
-      const auto config = models::opt::read_config(fixture / "components.txt");
-      test.capacity = config.capacity;
-      test.uploads += layers.size();
-      test.control_bytes = 4 * layers.size();
-      for (auto index : layers) {
-        test.fields[index] = {"query",          "key",
-                              "value",          "probabilities",
-                              "mixer",          "attention_residual",
-                              "attention_norm", "fc1",
-                              "activation",     "mlp",
-                              "ffn_residual",   "output",
-                              "keys",           "values"};
-      }
-      load_inputs(config.hidden_spec());
-      models::opt::validate_weights(weights, config, layers);
-      np101::Context context;
-      trajectories(
-          [&] {
-            return std::make_unique<models::opt::DecoderSlice>(context, weights, config, layers);
-          },
-          test);
-      account(context);
-      context.close();
-    } else if (profile == "qwen") {
-      const auto config = models::qwen3_5::read_config(fixture / "components.txt");
-      std::map<unsigned, models::qwen3_5::CompiledBlock> compiled_mixers;
-      std::ifstream mixer_file(fixture / "compiled-mixer-package.txt");
-      if (mixer_file) {
-        std::string package, extra;
-        if (!(mixer_file >> std::quoted(package)) || mixer_file >> extra) {
-          throw std::invalid_argument("compiled mixer fixture requires one package path");
-        }
-        compiled_mixers = models::qwen3_5::load_compiled_mixers(package, weights, config);
-      }
-      auto backend = np101::ops::LinearBackend::MatMul;
-      std::ifstream backend_file(fixture / "feed-forward-backend.txt");
-      std::string name, extra;
-      if (backend_file) {
-        if (!(backend_file >> name) || backend_file >> extra ||
-            (name != "fcl" && name != "matmul")) {
-          throw std::invalid_argument("invalid Qwen feed-forward backend");
-        }
-        backend = name == "fcl" ? np101::ops::LinearBackend::FullyConnected
-                                : np101::ops::LinearBackend::MatMul;
-      }
-      test.coarse = fs::exists(fixture / "coarse-readback.txt");
-      const auto readback =
-          test.coarse ? np101::TensorReadback::MappedHost : np101::TensorReadback::SdkCopy;
-      test.capacity = config.kv.capacity;
-      for (auto index : layers) {
-        auto &fields = test.fields[index];
-        fields = test.coarse ? std::vector<std::string>{"output"}
-                             : std::vector<std::string>{"normalized", "mixer", "residual",
-                                                        "post_norm",  "mlp",   "output"};
-        if (config.mixer(index) == models::qwen3_5::MixerKind::Attention) {
-          fields.insert(fields.end(), {"keys", "values"});
-          test.uploads += 2;
-          test.control_bytes += 8;
-        } else {
-          fields.insert(fields.end(), {"recurrent", "convolution"});
-        }
-      }
-      load_inputs(config.hidden_spec());
-      std::unique_ptr<np101::Context> context;
-      trajectories(
-          [&] {
-            if (context) {
-              account(*context);
-              context->close();
-              context.reset();
-            }
-            context = std::make_unique<np101::Context>();
-            return std::make_unique<models::qwen3_5::DecoderGroup>(
-                *context, weights, config, layers, backend, readback, compiled_mixers);
-          },
-          test);
-      account(*context);
-      context->close();
-    } else {
-      throw std::invalid_argument("unknown model profile");
+    const auto config = models::opt::read_config(fixture / "components.txt");
+    test.capacity = config.capacity;
+    test.uploads += layers.size();
+    test.control_bytes = 4 * layers.size();
+    for (auto index : layers) {
+      test.fields[index] = {"query",          "key",
+                            "value",          "probabilities",
+                            "mixer",          "attention_residual",
+                            "attention_norm", "fc1",
+                            "activation",     "mlp",
+                            "ffn_residual",   "output",
+                            "keys",           "values"};
     }
+    load_inputs(config.hidden_spec());
+    models::opt::validate_weights(weights, config, layers);
+    np101::Context context;
+    trajectories(
+        [&] {
+          return std::make_unique<models::opt::DecoderSlice>(context, weights, config, layers);
+        },
+        test);
+    account(context);
+    context.close();
     std::ofstream out(output / "execution.json");
     out << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"sequences\":4,"
            "\"steps\":"

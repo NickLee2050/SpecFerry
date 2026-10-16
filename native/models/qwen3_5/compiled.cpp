@@ -14,10 +14,6 @@ namespace {
 void validate_block(const CompiledBlock &artifact, const WeightStore &weights, const Config &config,
                     unsigned layer, CompiledBlockKind kind) {
   const bool mixer = kind == CompiledBlockKind::DeltaNet;
-  if (kind == CompiledBlockKind::VocabularyHead) {
-    validate_compiled_head(artifact, weights, config);
-    return;
-  }
   if (config.hidden != 1024 || config.epsilon != 1e-6f || layer >= config.layer_types.size() ||
       artifact.kind != kind || artifact.layer != layer ||
       (artifact.includes_input_norm && !mixer) ||
@@ -83,12 +79,9 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
                                               const WeightStore &weights, const Config &config,
                                               CompiledBlockKind kind) {
   const bool mixer = kind == CompiledBlockKind::DeltaNet;
-  const bool head = kind == CompiledBlockKind::VocabularyHead;
-  const auto label = head ? "vocabulary-head" : mixer ? "delta" : "feed-forward";
+  const auto label = mixer ? "delta" : "feed-forward";
   const auto root = std::filesystem::canonical(package);
-  std::ifstream file(root / (head    ? "compiled-head.txt"
-                             : mixer ? "compiled-mixers.txt"
-                                     : "compiled-feed-forward.txt"));
+  std::ifstream file(root / (mixer ? "compiled-mixers.txt" : "compiled-feed-forward.txt"));
   std::string magic, driver, name, digest, extra;
   unsigned version = 0, count = 0;
   file >> magic >> version >> driver >> count;
@@ -110,7 +103,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
     }
   }
   file >> count;
-  if (!file || count == 0 || count > (head ? 1u : mixer ? 18u : 24u)) {
+  if (!file || count == 0 || count > (mixer ? 18u : 24u)) {
     throw std::invalid_argument("compiled Qwen block package count differs");
   }
   std::map<unsigned, CompiledBlock> result;
@@ -131,13 +124,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
     }
     total += artifact.graph.constant_bytes;
     artifact.graph.path = binary.string();
-    if (head) {
-      file >> artifact.vocabulary_rows;
-      if (!file || artifact.vocabulary_rows < 4096 || artifact.vocabulary_rows > 65536 ||
-          artifact.vocabulary_rows % 4096) {
-        throw std::invalid_argument("compiled vocabulary head prefix exceeds the bounded contract");
-      }
-    } else if (mixer && version == 2) {
+    if (mixer && version == 2) {
       unsigned normalized = 0;
       file >> normalized;
       if (!file || normalized > 1) {
@@ -148,9 +135,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
     for (bool output : {false, true}) {
       auto &order = output ? artifact.output_order : artifact.input_order;
       auto &ports = output ? artifact.graph.outputs : artifact.graph.inputs;
-      const auto port_count = head    ? (output ? artifact.vocabulary_rows / 4096 : 1u)
-                              : mixer ? 3u
-                                      : (output ? 1u : 2u);
+      const auto port_count = mixer ? 3u : (output ? 1u : 2u);
       order.resize(port_count);
       for (auto &index : order) {
         file >> index;
@@ -172,10 +157,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
         ports.push_back({type == "F16" ? DataType::Float16 : DataType::Float32, shape});
       }
     }
-    for (unsigned source = 0; source < (head    ? 1u
-                                        : mixer ? 9u + artifact.includes_input_norm
-                                                : 4u);
-         ++source) {
+    for (unsigned source = 0; source < (mixer ? 9u + artifact.includes_input_norm : 4u); ++source) {
       file >> std::quoted(name) >> digest;
       if (!file || !artifact.weight_sha256.emplace(name, digest).second) {
         throw std::invalid_argument("compiled Qwen block source declarations differ");
@@ -215,42 +197,4 @@ std::map<unsigned, CompiledBlock> load_compiled_feed_forward(const std::filesyst
   return load_blocks(package, weights, config, CompiledBlockKind::FeedForward);
 }
 
-CompiledBlock load_compiled_head(const std::filesystem::path &package, const WeightStore &weights,
-                                 const Config &config) {
-  return load_blocks(package, weights, config, CompiledBlockKind::VocabularyHead).at(0);
-}
-
-void validate_compiled_head(const CompiledBlock &artifact, const WeightStore &weights,
-                            const Config &config) {
-  const auto &table = weights.find("model.embed_tokens.weight");
-  const auto rows = artifact.vocabulary_rows;
-  if (artifact.kind != CompiledBlockKind::VocabularyHead || artifact.layer != 0 ||
-      config.hidden != 1024 || rows < 4096 || rows > 65536 || rows % 4096 ||
-      table.spec.type != DataType::Float16 || table.spec.shape != ops::Shape{1024, 248320} ||
-      artifact.weight_sha256 != std::map<std::string, std::string>{{table.name, table.sha256}} ||
-      artifact.graph.constant_bytes < std::size_t(rows) * 1024 * 2 ||
-      artifact.graph.constant_bytes > segment_payload_limit ||
-      (artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} &&
-       artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 35})) {
-    throw std::invalid_argument("compiled vocabulary head source/geometry/budget differs");
-  }
-  for (bool output : {false, true}) {
-    const auto &ports = output ? artifact.graph.outputs : artifact.graph.inputs;
-    const auto &order = output ? artifact.output_order : artifact.input_order;
-    const auto count = output ? rows / 4096 : 1u;
-    std::set<unsigned> expected;
-    for (unsigned index = 0; index < count; ++index) {
-      expected.insert(index);
-    }
-    if (ports.size() != count || order.size() != count ||
-        std::set<unsigned>(order.begin(), order.end()) != expected) {
-      throw std::invalid_argument("compiled vocabulary head port permutation differs");
-    }
-    for (const auto &port : ports) {
-      if (port.type != DataType::Float16 || port.shape != ops::Shape{output ? 4096u : 1024u, 1}) {
-        throw std::invalid_argument("compiled vocabulary head FP16 port contract differs");
-      }
-    }
-  }
-}
 } // namespace specferry::models::qwen3_5

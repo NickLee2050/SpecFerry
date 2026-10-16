@@ -23,11 +23,11 @@
 | 带 bias 的 FCL Verify | 输入 `[8,1]`、单位矩阵 `[8,8]`、bias 0.25；输出 1.25/-0.25 | 两版 `SIGSEGV`；相同计算 MatMul+Add 两轮精确通过。v105 空指针偏移 `0xb0` 读取，v106 栈含 `vxoGraphOptimization_getKernelType`；未证明 bias 单独致错或所有 FCL 均失败 | `projection --operator matmul-add` 对照，`projection --operator fcl` 复现；旧版验图对照、旧版驱动回归 的 `fcl-verification/` 与 `fcl-symbolication.txt` |
 | 单 SELECT Verify / 历史 selection GATHER | 完成验图，无驱动 hang；保留 FP16 位模式 | 同一 SELECT binary：v106 冷启动首测 Verify 28.982 s，NP hang/自动恢复后 16 值正确；v105 9.228 ms，无 hang。历史 GATHER 也曾 hang；无 GATHER 的单 SELECT 已复现，不能仅归因索引写入时机 | `fp16-preservation --operator select`，超时 30 s；旧版冷启动 的 `fp16-selection/`、新版冷启动。selection 为 `check_np101_model.py selection` |
 | 三维 TENSORSTACKCONCAT(axis=1) Setup | `[8,1,2]` 追加到预分配 `[8,8,2]`，容量不变 | v105 单节点在 Setup 报 `Cannot calculate the reshape tensor 16 to 32` 后 SIGSEGV；没有应用 RESHAPE。两版追加+attention 三维组合也崩溃，二维组合通过；v106 单节点待补。三维参数是否支持仍需厂商确认 | `cache-append --rank 2` 对照，`cache-append --rank 3` 复现，超时 30 s；报告复核 的 `cache-append-{2d,3d}/` |
-| 分块写入后的完整字节扫描 | 所有已成功写入张量的每个字节一致 | v106 上界 4096 MiB，保留/全扫 2840 MiB；F16/F32×const/nonconst 四种均在第 109 块三个范围损坏 24 B。v105 目标 1024、保留/全扫 1016 MiB，四种同位置损坏 24 B；不是超过 1 GiB 才出现 | `check_np101_memory.py integrity --mib 1024 --storage constant --dtype F16`；新版内存扫描、旧版内存扫描 的 `summary.json` / `readback-blocks.jsonl` |
+| 分块写入后的完整字节扫描 | 所有已成功写入张量的每个字节一致 | v106 上界 4096 MiB，保留/全扫 2840 MiB；F16/F32×const/nonconst 四种均在第 109 块三个范围损坏 24 B。v105 目标 1024、保留/全扫 1016 MiB，四种同位置损坏 24 B；不是超过 1 GiB 才出现 | 已退役的完整字节扫描实验；新版内存扫描、旧版内存扫描 的 `summary.json` / `readback-blocks.jsonl` |
 | RANDOM_MULTINOMIAL FP16 | 8 类输出索引 0–7，频率和 seed/counter 有效 | 两版七组×4096 样本全返回 8，含全零 logits；F32 或 F16→F32 后采样通过。进程正常退出不代表数值通过 | `sampling --dtype F16 --classes 8 --samples 4096`；对照 `F32` / `F16_TO_F32`；旧版验图对照、旧版驱动回归、报告复核 |
 | FP16 ADD 非正规数 | 与零相加保留输入位模式 | 两版同 binary 的 10 个正负非正规数全部变 `0x0000`，其余 6 值正确；SELECT 保留 16 值，但 v106 触发选择算子验图。输入字节及 CPU 对照正确，需确认置零规则/配置 | `fp16-preservation --operator add`，超时 30 s；旧版冷启动 的 `fp16-add/`、新版内存扫描 的 `fp16-add/` |
-| SDK 内存计数 | 明确计数与实际板上分配关系，释放后恢复 | 两版 8 MiB tensor 使 `gpu_memory.currentSize` 增加 `2×8,388,608+4,672` B；524,288→17,306,176→524,288，读回正确。不能据此证明双份物理分配、泄漏或越界 | `check_np101_memory.py accounting --mib 8 --storage mutable --dtype F16`；旧版驱动回归 的 `memory-accounting/`、内存计数 |
-| 固定/重绑 copy 图的主机 RSS | 固定与重绑成本可解释，数据正确且释放 | 两版 128 轮，fixed 增量 0，same/advance 约 16 MiB，读回/释放通过；统计为第 127 轮减第 0 轮。RSS 是主机占用，不能推断板上占用、通信成本或泄漏 | `check_np101_memory.py growth --mode fixed --iterations 128`；单独改 `same` / `advance`；旧版驱动回归、重绑内存 |
+| SDK 内存计数 | 明确计数与实际板上分配关系，释放后恢复 | 两版 8 MiB tensor 使 `gpu_memory.currentSize` 增加 `2×8,388,608+4,672` B；524,288→17,306,176→524,288，读回正确。不能据此证明双份物理分配、泄漏或越界 | 已退役的8 MiB计数实验；旧版驱动回归 的 `memory-accounting/`、内存计数 |
+| 固定/重绑 copy 图的主机 RSS | 固定与重绑成本可解释，数据正确且释放 | 两版 128 轮，fixed 增量 0，same/advance 约 16 MiB，读回/释放通过；统计为第 127 轮减第 0 轮。RSS 是主机占用，不能推断板上占用、通信成本或泄漏 | 已退役的fixed/same/advance重绑实验（128轮）；旧版驱动回归、重绑内存 |
 
 
 全窗口1×1 CONV的FFN候选也在首次Verify崩溃：固定OpenVX ELF `0x2db0c2`
@@ -39,9 +39,8 @@
 分块完整性使用8 MiB块，拒绝下一块后仍全扫所有已写块，遇错继续扫描后统一释放。
 第109块三个错误偏移为1,340,216/1,340,280/1,340,344，各8B；历史v106对应位置差
 65,536 B，累计逻辑偏移约873.278/873.216 MiB，**不是物理地址**。v106的1024 MiB
-FP32 nonconst两次通过、2840 MiB失败，不能认定该配置总是安全。先测64 MiB控制；
-v105及模型/普通检查保持各段1 GiB上限。仅获授权的v106合成完整性探针可用
-`integrity --mib 4096 --probe-limit`；不覆盖SDK隐藏空间或未申请的物理内存。
+FP32 nonconst两次通过、2840 MiB失败，不能认定该配置总是安全。历史复现先用64 MiB控制；
+v105及模型/普通检查保持各段1 GiB上限。历史v106合成完整性探针曾单独获准使用4096 MiB；该入口现已退役，不覆盖SDK隐藏空间或未申请的物理内存。
 
 ## 多输出NBG的公开端口与内部端口
 
@@ -51,7 +50,7 @@ v105及模型/普通检查保持各段1 GiB上限。仅获授权的v106合成完
 导出器却采用前者；参考首词31759（块7、块内3087）被解释为35855（块8、块内3087），
 符合`15−7=8`的块反序，后续反馈随之分歧。
 
-head导出显式采用已有`compiled_ports(..., saved_public_graph=True)`，重新打包端口元数据；
+历史head导出修复显式采用已有`compiled_ports(..., saved_public_graph=True)`，重新打包端口元数据；
 NBG SHA256 `f7b15450bc2c0a4f17425b0e1a1a92d8ec3ff2b99eb51cfbf1d22ccea4ed249b`
 及native binary均未改变。修复后16输出及粗状态通过CPU比较，前后原实现对照通过；
 未全局改变其他已验产物的解析模式。回归覆盖生成C的两种分支及语义排列校验。
@@ -109,3 +108,6 @@ NBG SHA256 `f7b15450bc2c0a4f17425b0e1a1a92d8ec3ff2b99eb51cfbf1d22ccea4ed249b`
 三维追加的v106单节点及v106冷启动原selection仍未补测，不自动安排危险复现。
 退役结构需从历史归档独立恢复；当前固定图不能冒充旧实现。EDMA、控制hang与关机
 page fault的精确SDK/内核时间线由事故台账独立维护，根因均未因恢复检查通过而关闭。
+
+本次退役实验源码及身份见`.cache/runs/repository-compaction-20261016/`；
+上述历史参数与较大分配只描述既有证据，不是当前可执行命令或重试授权。

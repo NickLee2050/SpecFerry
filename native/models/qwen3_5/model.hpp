@@ -25,7 +25,6 @@ public:
         const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
         const std::function<void(const std::string &)> &phase = {},
         np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather,
-        const CompiledBlock *compiled_head = nullptr,
         np101::ops::LinearBackend head_backend = np101::ops::LinearBackend::MatMul,
         bool combined_state_commit = false);
   ~Model();

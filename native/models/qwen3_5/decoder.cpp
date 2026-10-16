@@ -8,7 +8,6 @@
 #include "np101/weight_bank.hpp"
 #include "vsi_nn_pub.h"
 
-#include <algorithm>
 #include <map>
 #include <stdexcept>
 
@@ -83,8 +82,11 @@ struct DecoderLayer::Impl {
       attention = std::make_unique<Attention>(context, weights, config, layer, mixer_input,
                                               mixer_output, bank);
     } else {
+      if (!compiled) {
+        throw std::invalid_argument("Qwen DeltaNet requires its compiled mixer");
+      }
       delta = std::make_unique<DeltaNet>(context, weights, config, layer, mixer_input, mixer_output,
-                                         bank, compiled, deferred_delta_commit);
+                                         *compiled, deferred_delta_commit);
     }
 
     // The original input stays alive until the residual is consumed. No in-place
@@ -239,144 +241,4 @@ void DecoderLayer::close() {
   }
 }
 
-struct DecoderGroup::Impl {
-  Config config;
-  Graph storage;
-  vsi_nn_tensor_id_t input;
-  std::vector<unsigned> selected;
-  std::unique_ptr<WeightBank> bank;
-  TensorReadback readback;
-  std::vector<std::unique_ptr<DecoderLayer>> layers;
-  std::size_t completed = 0;
-  bool failed = false;
-
-  Impl(Context &context, const WeightStore &weights, const Config &configuration,
-       const std::vector<unsigned> &indices, LinearBackend backend, TensorReadback method,
-       const std::map<unsigned, CompiledBlock> &compiled)
-      : config(configuration), storage(context, 1, 0),
-        input(add_tensor(storage, config.hidden_spec(), false,
-                         std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
-        selected(indices), readback(method) {
-    if (backend == LinearBackend::FullyConnected) {
-      bank = std::make_unique<WeightBank>(context);
-    }
-    try {
-      for (unsigned layer : selected) {
-        auto binding = layers.empty() ? TensorBinding{storage, input} : layers.back()->output();
-        const auto artifact = compiled.find(layer);
-        layers.push_back(std::make_unique<DecoderLayer>(
-            context, weights, config, layer, binding, bank.get(), backend,
-            artifact == compiled.end() ? nullptr : &artifact->second));
-      }
-    } catch (...) {
-      while (!layers.empty()) {
-        layers.pop_back();
-      }
-      throw;
-    }
-  }
-
-  ~Impl() {
-    // Explicit reverse destruction also covers partial construction/exceptions.
-    while (!layers.empty()) {
-      layers.pop_back();
-    }
-  }
-};
-
-DecoderGroup::DecoderGroup(Context &context, const WeightStore &weights, const Config &config,
-                           const std::vector<unsigned> &layers, LinearBackend backend,
-                           TensorReadback readback,
-                           const std::map<unsigned, CompiledBlock> &compiled) {
-  config.validate();
-  if (layers.empty()) {
-    throw std::invalid_argument("decoder slice is empty");
-  }
-  std::vector<unsigned> seen;
-  for (auto layer : layers) {
-    validate_layer_weights(weights, config, layer, true);
-    if (std::find(seen.begin(), seen.end(), layer) != seen.end()) {
-      throw std::invalid_argument("decoder slice repeats a layer");
-    }
-    seen.push_back(layer);
-  }
-  for (const auto &[layer, artifact] : compiled) {
-    if (std::find(layers.begin(), layers.end(), layer) == layers.end()) {
-      throw std::invalid_argument("compiled Qwen mixer is outside the selected slice");
-    }
-    validate_compiled_mixer(artifact, weights, config, layer);
-  }
-  if (backend != LinearBackend::MatMul && backend != LinearBackend::FullyConnected) {
-    throw std::invalid_argument("unknown Qwen feed-forward backend");
-  }
-  impl_ = std::make_unique<Impl>(context, weights, config, layers, backend, readback, compiled);
-}
-
-DecoderGroup::~DecoderGroup() = default;
-
-void DecoderGroup::step(const std::vector<std::uint8_t> &hidden_fp16) {
-  if (!impl_ || impl_->failed) {
-    throw std::logic_error("closed or failed decoder group must be recreated");
-  }
-  if (hidden_fp16.size() != impl_->config.hidden_spec().bytes()) {
-    throw std::invalid_argument("decoder expects one FP16 hidden vector");
-  }
-  if (impl_->completed >= impl_->config.kv.capacity) {
-    throw std::out_of_range("decoder group capacity exhausted");
-  }
-  // Reject before any layer advances. A later SDK failure instead leaves the
-  // whole group invalid; changing just its public length cannot undo recurrence.
-  for (const auto &layer : impl_->layers) {
-    if (layer->length() != impl_->completed) {
-      impl_->failed = true;
-      throw std::logic_error("decoder layer positions disagree");
-    }
-  }
-  impl_->failed = true;
-  upload_tensor(impl_->storage, impl_->input, hidden_fp16);
-  for (const auto &layer : impl_->layers) {
-    layer->step();
-  }
-  ++impl_->completed;
-  impl_->failed = false;
-}
-
-void DecoderGroup::reset() {
-  if (!impl_ || impl_->failed) {
-    throw std::logic_error("closed or failed decoder group must be recreated");
-  }
-  impl_->failed = true;
-  for (const auto &layer : impl_->layers) {
-    layer->reset();
-  }
-  impl_->completed = 0;
-  impl_->failed = false;
-}
-
-std::size_t DecoderGroup::length() const { return impl_ ? impl_->completed : 0; }
-
-std::vector<std::uint8_t> DecoderGroup::read(unsigned layer, const std::string &name) {
-  if (!impl_ || impl_->failed || !impl_->completed) {
-    throw std::logic_error("decoder group has no valid output");
-  }
-  auto found = std::find(impl_->selected.begin(), impl_->selected.end(), layer);
-  if (found == impl_->selected.end()) {
-    throw std::out_of_range("layer not in this decoder slice");
-  }
-  return impl_->layers.at(found - impl_->selected.begin())->read(name, impl_->readback);
-}
-
-void DecoderGroup::close() {
-  if (impl_) {
-    while (!impl_->layers.empty()) {
-      impl_->layers.back()->close();
-      impl_->layers.pop_back();
-    }
-    if (impl_->bank) {
-      impl_->bank->close();
-    }
-    impl_->storage.close();
-    impl_.reset();
-  }
-}
 } // namespace specferry::models::qwen3_5

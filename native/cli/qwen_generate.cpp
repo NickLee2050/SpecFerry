@@ -9,7 +9,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -103,9 +102,9 @@ int main(int argc, char **argv) {
     if (state_commit != "per-layer" && state_commit != "combined") {
       throw std::invalid_argument("unsupported Qwen state commit policy");
     }
-    if (head_backend_name != "matmul" && fs::exists(request / "compiled-head-package.txt")) {
+    if (fs::exists(request / "compiled-head-package.txt")) {
       throw std::invalid_argument(
-          "shared FCL head cannot also import a compiled vocabulary prefix");
+          "compiled vocabulary-prefix requests are retired; use shared-fcl");
     }
     unsigned matmul_layer = 9;
     if (fs::exists(request / "matmul-feed-forward-layer.txt")) {
@@ -126,15 +125,6 @@ int main(int argc, char **argv) {
     auto feed_forward = models::qwen3_5::load_compiled_feed_forward(argv[2], weights, config);
     // Validate the complete package before selecting the existing device MatMul FFN.
     feed_forward.erase(matmul_layer);
-    std::optional<models::qwen3_5::CompiledBlock> compiled_head;
-    if (fs::exists(request / "compiled-head-package.txt")) {
-      std::ifstream file(request / "compiled-head-package.txt");
-      std::string path;
-      if (!(file >> std::quoted(path)) || file >> extra || path.empty()) {
-        throw std::invalid_argument("invalid compiled vocabulary head package path");
-      }
-      compiled_head = models::qwen3_5::load_compiled_head(path, weights, config);
-    }
     fs::create_directories(output);
     np101::SdkTimings timings(output);
     phase(output, "initialize");
@@ -145,8 +135,7 @@ int main(int argc, char **argv) {
         [&](const std::string &name) {
           phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
         },
-        lookup, compiled_head ? &*compiled_head : nullptr, head_backend,
-        state_commit == "combined");
+        lookup, head_backend, state_commit == "combined");
     const auto initialize =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     {
@@ -166,8 +155,6 @@ int main(int argc, char **argv) {
                   << ",\"head_backend\":\"" << head_backend_name << '"' << ",\"state_commit\":\""
                   << state_commit << '"'
                   << ",\"compiled_input_norm_layers\":" << compiled_input_norm_layers
-                  << ",\"compiled_vocabulary_rows\":"
-                  << (compiled_head ? compiled_head->vocabulary_rows : 0)
                   << ",\"compiled_feed_forward\":" << feed_forward.size() << "}\n";
       if (!initialized) {
         throw std::runtime_error("cannot save Qwen initialization evidence");

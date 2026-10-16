@@ -182,25 +182,16 @@ void Vocabulary::close() {
 }
 
 VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBinding source,
-                               SamplingOptions sampling,
-                               const std::vector<TensorBinding> &prefix_logits,
-                               LinearBackend backend)
+                               SamplingOptions sampling, LinearBackend backend)
     : GraphBuilder(context, table.blocks() * 16 + 8, table.blocks() * 12 + 4),
       vocabulary_size_(table.rows()), sampling_(sampling) {
-  if (!table.blocks() || prefix_logits.size() > table.blocks() ||
-      (backend != LinearBackend::MatMul && backend != LinearBackend::FullyConnected) ||
-      (backend == LinearBackend::FullyConnected && !prefix_logits.empty())) {
+  if (!table.blocks() ||
+      (backend != LinearBackend::MatMul && backend != LinearBackend::FullyConnected)) {
     throw std::invalid_argument("head requires a live vocabulary");
   }
   auto input = bind(source, {f16, {table.width(), 1}});
   std::vector<Tensor> inputs{input};
   for (unsigned index = 0; index < table.blocks(); ++index) {
-    if (index < prefix_logits.size()) {
-      auto logits = bind(prefix_logits[index], {f16, {table.block_spec(index).shape[1], 1}});
-      inputs.push_back(logits);
-      logits_.push_back(logits);
-      continue;
-    }
     auto weights = bind(table.block(index), table.block_spec(index));
     inputs.push_back(weights);
     // The table owns the same ordinary read-only weights used by embedding.
@@ -227,7 +218,7 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
     token_ = greedy_token(*this, logits_, table.block_rows());
   }
   // Compiled prefix logits are graph inputs, never input/output aliases.
-  std::vector<Tensor> outputs(logits_.begin() + prefix_logits.size(), logits_.end());
+  std::vector<Tensor> outputs(logits_.begin(), logits_.end());
   outputs.push_back(token_);
   compile(inputs, outputs);
 }

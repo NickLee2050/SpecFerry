@@ -98,23 +98,6 @@ class CompiledValidationTests(unittest.TestCase):
                     else:
                         compiled.validate_numerical_failure(marker)
 
-    def test_compiled_vocabulary_prefix_preserves_semantic_output_order(self):
-        from specferry.models.qwen3_5.compiled import validate_vocabulary_head_ports
-
-        artifact = dict(
-            vocabulary_rows=8192,
-            inputs=[dict(name="hidden", dtype="F16", shape=[1024, 1])],
-            input_order=[0],
-            outputs=[dict(name=f"logits_{i}", dtype="F16", shape=[4096, 1]) for i in (1, 0)],
-            output_order=[1, 0],
-        )
-        validate_vocabulary_head_ports(artifact)
-        with self.assertRaisesRegex(ValueError, "port order"):
-            validate_vocabulary_head_ports(artifact | dict(output_order=[0, 1]))
-        for rows in (0, 4097, 69632, True):
-            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "row bound"):
-                validate_vocabulary_head_ports(artifact | dict(vocabulary_rows=rows))
-
     def test_qwen_default_entry_writes_the_accepted_native_policies(self):
         import torch
 
