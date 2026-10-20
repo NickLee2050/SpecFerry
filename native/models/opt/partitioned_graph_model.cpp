@@ -760,9 +760,10 @@ struct PartitionedGraphModel::Impl {
     }
     const SdkScope timing_role("role", latest->timing_prefix + ".selection");
     auto &prediction = latest->prediction();
+    // Reuse the validated mapped INT32 readback path; never fall back to SDK-copy on failure.
     const auto bytes =
         read_tensor(prediction.selection ? prediction.selection->graph : prediction.head->graph,
-                    prediction.selected.id);
+                    prediction.selected.id, TensorReadback::MappedHost);
     if (bytes.size() != sizeof(std::int32_t)) {
       throw std::runtime_error("partitioned OPT prediction is not one INT32");
     }

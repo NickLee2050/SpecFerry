@@ -380,6 +380,7 @@ int main(int argc, char **argv) {
                     << variant_name << "\",\"decoder_group_size\":1"
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
+                    << ",\"token_readback_transport\":\"mapped\""
                     << ",\"head_backend\":\"" << head_backend << "\""
                     << ",\"attention_projection_backend\":\"" << projection_backend << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
@@ -554,6 +555,7 @@ int main(int argc, char **argv) {
           << ",\"cache_suffix_matches\":" << (cache_suffix_matches ? "true" : "false")
           << ",\"cache_readback\":\"" << readback << "\""
           << ",\"readback_transport\":\"" << options.readback_transport << "\""
+          << ",\"token_readback_transport\":\"mapped\""
           << ",\"head_backend\":\"" << head_backend << "\""
           << ",\"attention_projection_backend\":\"" << projection_backend << "\""
           << ",\"cache_first_layer\":" << cache_first << ",\"cache_last_layer\":" << cache_last
