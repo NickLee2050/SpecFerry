@@ -87,6 +87,12 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
                                            const ModelConfig &config,
                                            const np101::WeightStore &weights, CompiledHead &head,
                                            std::vector<CompiledProjections> *projections = nullptr);
+// Optional M16 package: first four layers use ordinary weights, remaining twenty use NBG.
+// Its manifest binds the already validated M1 package and deployment; no SDK calls are made.
+std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &package,
+                                               const std::filesystem::path &deployment,
+                                               const ModelConfig &config,
+                                               const np101::WeightStore &weights);
 void validate_compiled_projections(const CompiledProjections &projections,
                                    const np101::WeightStore &weights, const Config &config,
                                    unsigned layer);

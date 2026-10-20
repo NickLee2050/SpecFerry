@@ -160,13 +160,13 @@ def run_device(
     profiler_output=None,
 ):
     """Call under device_lock. A clean exit is not proof of exclusive NPU execution."""
+    if not 0 < timeout <= 300:
+        raise ValueError("NP101 device runs require a timeout in (0, 300] seconds")
     # Explicit diagnostics may use the exception while retaining the closed recovery gate.
     if not recovery_control:
         require_recovered_device(RECOVERY_ROOT)
     if require_compiled_operations and verify_trace is None:
         raise ValueError("compiled operation guard requires the pinned Verify trace")
-    if timeout <= 0:
-        raise ValueError("timeout must be positive")
     if sdk_timing and sdk_summary:
         raise ValueError("SDK call tracing and summary timing are mutually exclusive")
     if profiler_output is not None and (
@@ -238,6 +238,7 @@ def run_device(
             if (sdk_lib / name).is_file()
         },
         "timeout": False,
+        "timeout_seconds": timeout,
         "driver_traced": trace_driver,
         "sdk_timing": sdk_timing,
         "sdk_summary": sdk_summary,

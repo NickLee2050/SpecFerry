@@ -3,6 +3,7 @@
 import json
 import re
 import shutil
+from pathlib import Path
 
 from specferry.data.checkpoint import sha256
 from specferry.validation.device import write_json
@@ -71,8 +72,140 @@ def audit_ffn_export(directory):
     }
 
 
+def package_prefill_exports(artifacts, deployment, output, manifest):
+    """Import the established M16 FFNs; four ordinary layers leave const headroom."""
+    models = json.loads((artifacts / "compiled-layers.json").read_text())["models"]
+    if [item["layer"] for item in models] != list(range(24)):
+        raise ValueError("prefill exports require all ordered source layers")
+    records = {
+        item["name"]: item
+        for item in json.loads((deployment / "deployment-manifest.json").read_text())["tensors"]
+    }
+    layers, lines = (
+        [],
+        [
+            "specferry-opt-prefill 1 "
+            + sha256(output / "compiled-ffn.txt")
+            + " "
+            + " ".join(
+                manifest["deployment_sha256"][name]
+                for name in ("weights.index", "deployment-manifest.json")
+            )
+            + " 16 20"
+        ],
+    )
+    for item in models[4:]:
+        layer = item["layer"]
+        directory = artifacts / f"layer{layer}"
+        binary = Path(item["nbg"]).resolve(strict=True)
+        parts = ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias")
+        identities = {
+            f"decoder.layers.{layer}.{part}": records[f"decoder.layers.{layer}.{part}"]["sha256"]
+            for part in parts
+        }
+        if (
+            item["rows"] != 16
+            or item["graph_version"] != [1, 1, 34]
+            or item["source_parameter_order"] != list(parts)
+            or item["source_parameter_sha256"] != list(identities.values())
+            or sha256(directory / "ffn.onnx") != item["onnx_sha256"]
+            or binary.parent != (directory / "export_ffn_nbg_unify").resolve()
+            or sha256(binary) != item["nbg_sha256"]
+        ):
+            raise ValueError("prefill export geometry/source/NBG identity differs")
+        wrapper = (binary.parent / "vnn_network.c").read_text()
+        if re.findall(r"NEW_NORM_TENSOR\([^;]*VSI_NN_TYPE_(\w+)", wrapper) != [
+            "FLOAT16",
+            "FLOAT16",
+        ]:
+            raise ValueError("prefill NBG ports must remain FP16")
+        for direction in ("Inputs", "Outputs"):
+            ports = list(item["nbg_metadata"][direction].values())
+            if len(ports) != 1 or ports[0]["shape"] != [16, 1024] or ports[0]["dtype"] != "float16":
+                raise ValueError("prefill NBG requires fixed [16,1024] ports")
+        target = output / f"prefill{layer:02d}.nb"
+        shutil.copyfile(binary, target)
+        entry = dict(
+            layer=layer,
+            path=target.name,
+            nbg_sha256=sha256(target),
+            constant_bytes=item["constant_tensor_bytes"],
+            weight_sha256=identities,
+        )
+        layers.append(entry)
+        lines.append(
+            f"{layer} {json.dumps(target.name)} {entry['nbg_sha256']} {entry['constant_bytes']} 1 1 34 "
+            + " ".join(identities.values())
+        )
+    native = output / "compiled-prefill.txt"
+    native.write_text("\n".join(lines) + "\n")
+    return dict(
+        tokens=16,
+        ordinary_layers=[0, 1, 2, 3],
+        layers=layers,
+        supported_capacities=[64],
+        native_manifest_sha256=sha256(native),
+    )
+
+
+def validate_prefill_package(package, manifest, records):
+    prefill = manifest["prefill"]
+    if (
+        not manifest.get("head")
+        or prefill["tokens"] != 16
+        or prefill["ordinary_layers"] != [0, 1, 2, 3]
+        or prefill["supported_capacities"] not in ([64], [64, 256])
+        or [item["layer"] for item in prefill["layers"]] != list(range(4, 24))
+        or sha256(package / "compiled-prefill.txt") != prefill["native_manifest_sha256"]
+    ):
+        raise ValueError("prefill package requires one head and four ordinary M16 layers")
+    header = (package / "compiled-prefill.txt").read_text().splitlines()[0].split()
+    expected_header = [
+        "specferry-opt-prefill",
+        "1",
+        manifest["native_manifest_sha256"],
+        manifest["deployment_sha256"]["weights.index"],
+        manifest["deployment_sha256"]["deployment-manifest.json"],
+        "16",
+        "20",
+    ]
+    if header != expected_header:
+        raise ValueError("prefill native header must bind the M1 package and deployment")
+    total = 0
+    for item in prefill["layers"]:
+        path = (package / item["path"]).resolve(strict=True)
+        prefix = f"decoder.layers.{item['layer']}."
+        expected = {
+            prefix + part: records[prefix + part]["sha256"]
+            for part in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias")
+        }
+        bound = item["constant_bytes"]
+        if (
+            path.parent != package
+            or not path.stat().st_size
+            or sha256(path) != item["nbg_sha256"]
+            or item["weight_sha256"] != expected
+            or type(bound) is not int
+            or not max(path.stat().st_size, sum(records[name]["bytes"] for name in expected))
+            <= bound
+            <= 2**30
+        ):
+            raise ValueError("prefill NBG identity/source/constant budget differs")
+        total += bound
+    # The caller counts optional NBG projections (at least their source weight payload).
+    # Without them, reserve all four M1 FCL matrices. The shared head is counted once.
+    return total + (0 if manifest.get("projections") else 24 * 4 * 1024 * 1024 * 2)
+
+
 def package_ffn_exports(
-    artifacts, deployment, output, sdk, *, head_artifacts=None, projection_artifacts=None
+    artifacts,
+    deployment,
+    output,
+    sdk,
+    *,
+    head_artifacts=None,
+    projection_artifacts=None,
+    prefill_artifacts=None,
 ):
     """Copy only runtime NBGs; preserve compiler evidence separately at its source."""
     from .export import verify_export
@@ -263,6 +396,10 @@ def package_ffn_exports(
             lines.append(" ".join(values))
     (output / "compiled-ffn.txt").write_text("\n".join(lines) + "\n")
     manifest["native_manifest_sha256"] = sha256(output / "compiled-ffn.txt")
+    if prefill_artifacts is not None:
+        manifest["prefill"] = package_prefill_exports(
+            prefill_artifacts, deployment, output, manifest
+        )
     write_json(output / "manifest.json", manifest)
     return load_ffn_package(output, deployment)
 
@@ -276,12 +413,12 @@ def load_ffn_package(package, deployment, *, capacity=64):
         or manifest.get("kind") != "opt-ffn-finish"
         or manifest.get("shape")
         != {"capacity": 64, "tokens": 1, "hidden": 1024, "intermediate": 4096, "layers": 24}
-        or manifest.get("supported_capacities", [64]) not in ([64], [64, 128])
-        or capacity not in (64, 128)
+        or manifest.get("supported_capacities", [64]) not in ([64], [64, 128], [64, 128, 256])
+        or capacity not in (64, 128, 256)
         or capacity not in manifest.get("supported_capacities", [64])
         or manifest.get("graph_version") != [1, 1, 34]
     ):
-        raise ValueError("compiled FFN package requires its accepted C64/M1 or C128/M1 geometry")
+        raise ValueError("compiled FFN package requires its declared C64/C128/C256 geometry")
     if sha256(package / "compiled-ffn.txt") != manifest["native_manifest_sha256"]:
         raise ValueError("compiled FFN native manifest identity differs")
     if set(manifest["deployment_sha256"]) != {"weights.index", "deployment-manifest.json"}:
@@ -373,6 +510,8 @@ def load_ffn_package(package, deployment, *, capacity=64):
                 ):
                     raise ValueError("compiled projection identity/ports/constant bound differs")
                 total += bound
+    if "prefill" in manifest:
+        total += validate_prefill_package(package, manifest, records)
     if total > 2**30:
         raise ValueError("compiled FFN package exceeds the constant payload limit")
     return manifest

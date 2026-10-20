@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--sudo-read-only", action="store_true")
     parser.add_argument("--audit-verify", action="store_true", help="pinned v105 Verify-only audit")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=300)
     options = parser.parse_args()
     if options.timeout <= 0:
         parser.error("timeout must be positive")

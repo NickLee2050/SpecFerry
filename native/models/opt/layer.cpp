@@ -45,10 +45,10 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
                                            CompiledHead &head,
                                            std::vector<CompiledProjections> *projections) {
   if (config.decoder.layers != 24 ||
-      (config.decoder.capacity != 64 && config.decoder.capacity != 128) ||
+      (config.decoder.capacity != 64 && config.decoder.capacity != 128 &&
+       config.decoder.capacity != 256) ||
       config.decoder.heads != 16 || config.embedding != 512 || config.vocabulary != 50272) {
-    throw std::invalid_argument(
-        "compiled FFN package requires the accepted OPT-350m C64/C128 model");
+    throw std::invalid_argument("compiled FFN package requires OPT-350m C64/C128/C256 geometry");
   }
   const auto root = std::filesystem::canonical(package);
   std::ifstream file(root / "compiled-ffn.txt");
@@ -181,6 +181,56 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
   }
   if (file >> extra) {
     throw std::invalid_argument("trailing compiled FFN package data");
+  }
+  return result;
+}
+
+std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &package,
+                                               const std::filesystem::path &deployment,
+                                               const ModelConfig &config,
+                                               const WeightStore &weights) {
+  const auto root = std::filesystem::canonical(package);
+  std::ifstream file(root / "compiled-prefill.txt");
+  std::string magic, m1_digest, index_digest, deployment_digest, name, digest, extra;
+  unsigned version = 0, tokens = 0, count = 0;
+  file >> magic >> version >> m1_digest >> index_digest >> deployment_digest >> tokens >> count;
+  if (!file || magic != "specferry-opt-prefill" || version != 1 || tokens != 16 || count != 20 ||
+      config.decoder.layers != 24 ||
+      (config.decoder.capacity != 64 && config.decoder.capacity != 256) ||
+      file_sha256(root / "compiled-ffn.txt") != m1_digest ||
+      file_sha256(deployment / "weights.index") != index_digest ||
+      file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
+    throw std::invalid_argument("M16 FFN package source/M1/geometry differs");
+  }
+  std::vector<CompiledFfn> result(24);
+  for (unsigned layer = 0; layer < result.size(); ++layer) {
+    result[layer].layer = layer;
+  }
+  std::size_t total = 0;
+  for (unsigned layer = 4; layer < result.size(); ++layer) {
+    auto &artifact = result[layer];
+    file >> artifact.layer >> std::quoted(name) >> digest >> artifact.graph.constant_bytes;
+    for (auto &part : artifact.graph.graph_version) {
+      file >> part;
+    }
+    for (auto &hash : artifact.weight_sha256) {
+      file >> hash;
+    }
+    const auto binary = std::filesystem::canonical(root / name);
+    if (!file || artifact.layer != layer || binary.parent_path() != root ||
+        !std::filesystem::file_size(binary) || file_sha256(binary) != digest ||
+        artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} ||
+        std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
+        artifact.graph.constant_bytes > segment_payload_limit - total) {
+      throw std::invalid_argument("M16 FFN package path/hash/layer/budget differs");
+    }
+    artifact.graph.path = binary.string();
+    artifact.graph.inputs = artifact.graph.outputs = {{f16, {1024, 16}}};
+    validate_compiled_ffn(artifact, weights, config.decoder, layer, 16);
+    total += artifact.graph.constant_bytes;
+  }
+  if (file >> extra) {
+    throw std::invalid_argument("trailing M16 FFN package data");
   }
   return result;
 }

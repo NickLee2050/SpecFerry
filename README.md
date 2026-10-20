@@ -10,7 +10,7 @@ Use the pinned v105 SDK/driver identities in each package manifest and follow th
 
 | Model | Recommended configuration | Accepted scope |
 |---|---|---|
-| OPT-350m | FCL attention projections, fused NBG FFN/final norm and NBG head; M1, last-token prefill head | C64/C128, bounded generation and request isolation |
+| OPT-350m | NBG QKV/out projections, fused M1 FFN/final norm and one NBG head; optional budgeted M16 prefill | Current NBG M1/M16: C64; earlier C128 configurations remain documented separately |
 | Cached Qwen3.5-0.8B | GATHER_ND, zero-based layer9 device MatMul FFN, 18 DeltaNet + 23 FFN NBGs, mapped token readback | C64 greeting, repeated arithmetic and 16-token natural generation |
 
 The [status document](docs/np101-status.md) pins package identities, measurements and acceptance
@@ -45,13 +45,14 @@ python scripts/export_opt.py
 python scripts/export_opt.py --verify-only
 ```
 
-Use an OPT FFN package containing the compiled head and a complete 42-NBG Qwen package. Local
+Use an OPT FFN package containing all QKV/out projections and the compiled head, and a complete
+42-NBG Qwen package. Local
 accepted package locations and manifest hashes are in the status document. These commands prepare
 requests and CPU references without opening the device; use a new output directory each time.
 
 ```bash
 python scripts/generate_opt.py --backend graph --compiled-ffn /absolute/path/to/opt-hybrid-package \
-  --projection-backend fcl --prefill-head last-token --capacity 64 \
+  --projection-backend nbg --prefill-head last-token --capacity 64 \
   --prompt 'The capital of France is' --max-new-tokens 16 --sudo-read-only \
   --output .cache/runs/opt-baseline --prepare-only
 python scripts/generate_qwen.py --compiled-mixers /absolute/path/to/qwen-package \
@@ -69,6 +70,13 @@ reset passed; package identities, performance and export options are in the stat
 [test guide](tests/README.md). The conservative default remains available.
 Checkpoint generation defaults are preserved; sampling is limited to the component backend's
 validated FP32-logit path and needs explicit `--sample --seed 42`.
+
+An OPT package with the accepted partial M16 exports also supports `--block 16 --capacity 64`.
+It keeps four ordinary FFNs and twenty NBG FFNs for prefill, shares FP16 KV and one head with M1,
+and retains FP32 normalization. Packages containing QKV/out exports default to NBG projections;
+the earlier head-only package retains its legacy FCL path. Direct FCL experiments are stopped.
+Each device child is limited to 300 seconds, including preparation; release and the required
+45-second delayed kernel check are separate.
 
 A user-confirmed NP101 board power cycle is sufficient to begin agreed recovery checks; host cold
 restart or a changed host boot ID is not required. Preserve fault markers until all acceptance and

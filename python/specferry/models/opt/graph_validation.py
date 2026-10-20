@@ -210,8 +210,11 @@ def evaluate(
             ):
                 checks[field] = type(native_run.get(field)) is int and native_run[field] == expected
     block_prefill = block != 1
+    if block_prefill and variant == "compiled-ffn-finish" and block != 16:
+        raise ValueError("compiled FFN prefill requires block16")
     if block_prefill and (
-        variant not in ("merged-kv", "merged-kv-fc1-split2") or decoder_group_size not in (None, 1)
+        variant not in ("merged-kv", "merged-kv-fc1-split2", "compiled-ffn-finish")
+        or decoder_group_size not in (None, 1)
     ):
         raise ValueError(
             "partitioned block prefill requires a shared merged-kv variant and group 1"

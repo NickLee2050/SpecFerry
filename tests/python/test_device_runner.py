@@ -16,6 +16,13 @@ from specferry.validation import device
 
 
 class DeviceRecoveryTests(unittest.TestCase):
+    def test_long_device_deadlines_are_rejected_before_any_sdk_process(self):
+        with patch.object(device.subprocess, "Popen") as spawn:
+            for timeout in (0, -1, 301, 1800, float("nan")):
+                with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, "300"):
+                    device.run_device(None, [], None, None, timeout)
+            spawn.assert_not_called()
+
     def test_private_verify_trace_rejects_unknown_sdk_and_preload_conflicts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

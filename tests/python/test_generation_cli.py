@@ -14,6 +14,55 @@ from tests.python.validation_fixtures import GraphEvidenceFixture
 
 
 class GenerationCommandTests(GraphEvidenceFixture):
+    def test_compiled_prefill_defaults_to_packaged_nbg_projections_without_device_access(self):
+        path = Path(__file__).resolve().parents[2] / "scripts/generate_opt.py"
+        main = runpy.run_path(str(path))["main"]
+        output, package = self.root / "prefill", self.root / "package"
+        request = dict(capacity=64, selection={"mode": "greedy"}, tokens=[2] * 17, prompt="test")
+
+        def prepare_request(*arguments, **kwargs):
+            arguments[2].mkdir()
+            return request, Mock()
+
+        arguments = [
+            str(path),
+            "--backend",
+            "graph",
+            "--compiled-ffn",
+            str(package),
+            "--capacity",
+            "64",
+            "--block",
+            "16",
+            "--prefill-head",
+            "last-token",
+            "--prepare-only",
+            "--output",
+            str(output),
+        ]
+        with (
+            patch.object(sys, "argv", arguments),
+            patch.dict(main.__globals__, prepare_request=prepare_request),
+            patch(
+                "specferry.models.opt.compiled.load_ffn_package",
+                return_value={
+                    "prefill": {"tokens": 16},
+                    "projections": [{}] * 24,
+                    "head": {"path": "head.nb"},
+                },
+            ),
+            patch("specferry.models.opt.graph_validation.prepare", return_value={}),
+            patch.dict(main.__globals__, run_device=Mock()) as globals_,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(), 0)
+            globals_["run_device"].assert_not_called()
+        options = dict(
+            line.split() for line in (output / "request/run-options.txt").read_text().splitlines()
+        )
+        self.assertEqual(options["projection_backend"], "nbg")
+        self.assertEqual(options["block"], "16")
+
     def test_prepare_and_benchmark_share_options_and_three_path_contract(self):
         path = Path(__file__).resolve().parents[2] / "scripts/generate_opt.py"
         main = runpy.run_path(str(path))["main"]

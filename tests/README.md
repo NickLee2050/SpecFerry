@@ -27,6 +27,8 @@ user-confirmed NP101 board power cycle; a host cold restart or changed boot ID i
 Read-only `sudo journalctl` has standing authorization (`--sudo-read-only`); other sudo actions
 require approval. Do not restore deleted convolution controls or silently substitute vendor/old OPT.
 Const/nonconst application payloads each stay ≤1 GiB, including peaks and shared backing once.
+Device child deadlines are at most 300 seconds, including Setup/Verify and inference. Do not extend
+a running deadline; preserve the gate on expiry and change the approach. Delayed checks are separate.
 
 `--prepare-only` prepares fixtures without opening the board. Recovery flags require prior agreement
 and do not themselves authorize a control. Archived binaries/commands are evidence, not test entries.
@@ -74,9 +76,28 @@ ONNX, generated C and compiler logs stay outside runtime packages.
 | `export_np101_opt_model.py` | `--scope decoders|fullgraph --capacity 64|128`, FP32 KV and optional runtime package |
 | `export_np101_qwen_blocks.py` | `--part mixer|feed-forward`, one/all layers, optional runtime package and combined mixer/FFN package |
 
+OPT's `--prefill-artifacts` imports existing source-bound M16 exports into the M1 package: layers
+0–3 retain ordinary FFNs, layers 4–23 use M16 NBGs, and both execution sets share one head. This
+requires the compiled head; regular acceptance covers C64/block16, while the bounded C256
+conversation diagnostic is recorded separately below. Full M16 const residency exceeds the
+budget. M16 uses ordinary attention; QKV/out NBGs remain M1 graphs. Numerical, KV/reset,
+capacity and release evidence is in the status document.
+
+`benchmark_opt_conversation.py --package PACKAGE --output NEW_DIRECTORY --history-mode reuse|reset`
+runs three turns in one resident NBG/M16 model; use separate processes for the two modes. It requires
+a package explicitly declaring C256
+for the fixed M1/M16 ports; original C64 packages remain unchanged. Three English turns use a
+pinned CPU greedy trajectory, last-layer mapped KV checks and the normal release/kernel gates.
+Conversation response metrics add `state_preparation_seconds` (including reset) to generation
+timings; initialization, tokenization, CPU reference, diagnostics and user think time are separate.
+The retained path consumes the pending last output exactly once and aligns later M16 blocks with
+single-token steps. Each SDK child remains limited to 300 seconds. `--history-mode compare` is the
+original six-turn diagnostic, which encountered EDMA; it is not the default acceptance path.
+
 Qwen mixer export accepts `--outer-product multiply` and `--fuse-input-norm`. OPT's
-`--projection-backend fcl|nbg-qkv|nbg-output|nbg` selects explicit implementations, with FCL the mixed
-package default. Python/native loaders reject changed identities before Context creation. Generated
+`--projection-backend fcl|nbg-qkv|nbg-output|nbg` selects explicit implementations. Packages with
+QKV/out artifacts default to NBG; older head-only packages retain FCL. Direct FCL experiments are
+stopped. Python/native loaders reject changed identities before Context creation. Generated
 ArgMax intermediate precision and re-saved public port order must match the accepted package contract;
 see the status document. `reference_dlm.py` and export verification remain CPU-only references.
 

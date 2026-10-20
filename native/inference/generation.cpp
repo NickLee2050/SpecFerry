@@ -1,21 +1,23 @@
 #include "inference/generation.hpp"
 #include "np101/diagnostics.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
 
 namespace specferry::inference {
-std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block) {
+std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block, unsigned position) {
   if (!block || block > 16) {
     throw std::invalid_argument("prefill block must be in [1,16]");
   }
   std::vector<PrefillChunk> result;
-  unsigned position = 0;
-  while (position < tokens) {
-    const auto count = tokens - position >= block ? block : 1;
-    result.push_back({position, count});
-    position += count;
+  unsigned offset = 0;
+  while (offset < tokens) {
+    const bool aligned = (position % block + offset % block) % block == 0;
+    const auto count = aligned && tokens - offset >= block ? block : 1;
+    result.push_back({offset, count});
+    offset += count;
   }
   return result;
 }
@@ -23,7 +25,7 @@ std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block) {
 Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecutor &executor,
                            const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
                            const std::function<void(std::int32_t)> &on_token,
-                           const GenerationPhaseObserver &on_phase) {
+                           const GenerationPhaseObserver &on_phase, GenerationHistory *history) {
   if (!policy.capacity || !policy.vocabulary ||
       policy.vocabulary > std::numeric_limits<std::int32_t>::max() ||
       policy.bos >= policy.vocabulary || policy.eos >= policy.vocabulary || !executor.reset ||
@@ -39,14 +41,31 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
       throw std::invalid_argument("prompt token exceeds vocabulary");
     }
   }
-  if (on_phase) {
-    on_phase(GenerationPhase::Reset);
+  if (history &&
+      (!history->valid || !maximum_new_tokens || history->consumed > history->tokens.size() ||
+       (!history->tokens.empty() && history->consumed + 1 != history->tokens.size()) ||
+       ids.size() < history->tokens.size() ||
+       !std::equal(history->tokens.begin(), history->tokens.end(), ids.begin()))) {
+    throw std::invalid_argument("generation history does not match the supplied prompt prefix");
   }
-  {
+  const unsigned prefix = history ? history->consumed : 0;
+  const bool continuing = history && !history->tokens.empty();
+  const auto preparation_start = std::chrono::steady_clock::now();
+  if (history) {
+    // A failed executor must never leave a resumable history attached to partial KV writes.
+    history->valid = false;
+  }
+  if (!continuing) {
+    if (on_phase) {
+      on_phase(GenerationPhase::Reset);
+    }
     np101::SdkScope phase("phase", "reset");
     executor.reset();
   }
   Generation result;
+  result.consumed = prefix;
+  result.state_preparation_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_start).count();
   result.stop_reason = "max_new_tokens";
   if (!maximum_new_tokens) {
     return result;
@@ -58,11 +77,11 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
   {
     np101::SdkScope phase("phase", "prefill");
     if (executor.prefill) {
-      executor.prefill(ids);
+      executor.prefill({ids.begin() + prefix, ids.end()});
       result.consumed = ids.size();
     } else {
-      for (auto token : ids) {
-        executor.consume(token);
+      for (auto index = prefix; index < ids.size(); ++index) {
+        executor.consume(ids[index]);
         ++result.consumed;
       }
     }
@@ -113,6 +132,12 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
   }
   result.total_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  if (history) {
+    history->tokens = ids;
+    history->tokens.insert(history->tokens.end(), result.tokens.begin(), result.tokens.end());
+    history->consumed = result.consumed;
+    history->valid = true;
+  }
   return result;
 }
 } // namespace specferry::inference

@@ -1,6 +1,6 @@
 # NP101 推理实现与优化结论
 
-更新：2026-10-16（离线精简；硬件证据截至10-15）。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
+更新：2026-10-16。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
 降低单请求decode延迟。未完成项见[TODO](../TODO.md)，每次上板先读
 [事故台账](np101-recovery-incidents.md)，接口见[测试手册](../tests/README.md)，
 SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
@@ -16,7 +16,8 @@ SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
 
 | 模型 | 推荐运行配置 | 已验范围 / 当前性能口径 |
 |---|---|---|
-| OPT-350m | FCL attention投影、融合NBG FFN/末LN、NBG head，M1、prefill仅末词head | C64/C128；C64的3次17输入/16输出为1.96582输出token/s、3.63403首词后decode token/s |
+| OPT-350m当前NBG组合 | QKV/out、M1融合FFN/末LN及单head用NBG；可选M16 prefill，保留手写attention | C64；同轮17输入/16输出，M1→M16为0.65109→1.08032输出token/s，首词后decode为1.24558→1.21002 token/s |
+| OPT历史最快组合 | FCL attention投影、融合NBG FFN/末LN和NBG head；本轮已停止直接FCL验证 | C64/C128历史范围保留；C64历史最高1.96582输出token/s、3.63403首词后decode token/s，不与当前时段混算 |
 | Qwen3.5-0.8B缓存模型 | 保留GATHER_ND、layer9 MatMul FFN、18 DeltaNet＋23 FFN NBG、mapped读回；最快显式组合再用完整共享FCL head、广播外积、融合input RMSNorm、合并状态提交 | C64；23输入/16输出，组合两请求为0.287186输出token/s、0.610743首词后decode token/s；保守默认仍保留 |
 
 模型、输入长度与请求数不同，上表不作跨模型速度对照；准备/reset/粗读回不计入生成。
@@ -25,20 +26,22 @@ SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
 | 本机已验包（相对`.cache/runs/`） | manifest.json SHA256 |
 |---|---|
 | `opt-entry-integration-20261014/ffn-head-package` | `ec99e136f8458c301ed4165a582ade84751c468b596fcd3ef5431d0d96cf64fd` |
+| `opt-fast-prefill-20261016/nbg-projections-prefill-package` | `910f4918102fc6569280e126aac3dc4d93d7f14320fb9fc409dade8e5438c450` |
 | `opt-qwen-integration-20261014/qwen-compiled-blocks-package` | `9ccdf15e4c8e783b5e875af8ae03960a918563326a9529c2a57e2cd0d2e7f0be` |
 
-两包均绑定v105 `srcversion=F53A3E6EFBB7D0FD7D4617C`。原始checkpoint/NBG及固定
+这些包均绑定v105 `srcversion=F53A3E6EFBB7D0FD7D4617C`。原始checkpoint/NBG及固定
 已验binary继续位于忽略缓存，源码仓库不分发这些产物；manifest/源权重不匹配应拒绝。
 Qwen Python/native默认仍为原保守组合；共享FCL head及最新递归优化需显式选择。
 OPT默认component回归路径不变，推荐混合路径由README命令显式选择。默认策略的收尾
-仅做离线请求契约/构建检查，硬件验收和性能沿用固定显式配置的既有记录，没有重新上板。
+中，含完整QKV/out产物的包现在默认选择NBG，旧head-only包保留原FCL路径；默认选择
+已做CPU契约检查，硬件证据使用相同NBG配置的显式参数，不重复数学验证。
 
 最快Qwen另用`qwen-deltanet-optimization-20261015/outer-normalized-package`，manifest SHA256
 `4c9d1100efd57e751318f0e74a5dee53bd01fca6f678db058ec6b21abc6bbd35`。
 
 当前证据覆盖有界生成、状态/隔离、预算/释放和延迟内核检查；长期稳定、Qwen C128、
 内部硬件利用率及间歇性hang/EDMA根因未解决。恢复遵守板卡断电确认及完整门禁，
-不再强制主机冷启动或boot ID改变。可选head/分块prefill、SoC对照和TLM协议见TODO。
+不再强制主机冷启动或boot ID改变。更长容量/全图prefill、SoC对照和TLM协议见TODO。
 收尾前文档及身份留存`ep-baseline-finalization-20261015/before/`、`before-manifest.json`。
 
 `M`表示GEMM一次处理的token行数：`Y[M,N] = X[M,K] × W[K,N]`。
@@ -204,7 +207,8 @@ v106的9个模型进程/15正式/240输出、重装v105后的6进程/12正式/19
 投影表固定融合FFN/NBG head，v105、17输入/16输出、每组合3请求；各自数值/KV、
 重复、预算/释放及45秒通过。全NBG准备更短，decode约慢10.5%；图数52/76/100/124
 同时变化，不能全归因提交。QKV节点内部V/K/Q与公开Q/K/V必须分别记录；错误映射
-曾致数值失败，修正后通过，未构成设备故障。保留FCL默认及显式NBG组合。
+曾致数值失败，修正后通过，未构成设备故障。此表是历史记录；当前完整投影包默认NBG，
+直接FCL已按用户要求停止本轮验证。
 
 | C64正式入口，均仅末词head | 实际输出 token/s | 首词后decode token/s | decode ms/token | TTFT s | 初始化墙钟 s |
 |---|---:|---:|---:|---:|---:|
@@ -222,15 +226,120 @@ TTFT25.452s、decode3.323726 token/s。52图/1243 operation/238 extension完整�
 长度汇总，不替代固定负载吞吐。主机全线程user+system占C64 decode墙钟约2.36%–2.47%，
 不说明板载CPU或NPU利用率。证据`opt-entry-integration-20261014/`。
 
-### M1/M16常驻预算（尚未实施）
+### NBG投影链接M16 prefill（C64已验）
 
-全部M1 FCL、融合FFN＋24层M16 FFN＋一份NBG head的const已知下界
-1,111,016,984B，超1GiB约35.55MiB；重复head超约85.64MiB。TTGT再加7,680B，
-不含未知SDK workspace，不能借改is_const或假定NBG共享绕过。
-离线选择前4层M16用现有普通FFN、其余20层NBG，保留全部M1 FCL与单head，
-const下界余约36.61MiB、nonconst下界330.69MiB。32MiB规划余量不是SDK保证；
-仍需单head所有权/固定桥接、部分M16包与真实峰值门禁。未创建Context或上板。
-证据`qwen-decode-night-20261014/offline-opt-residency.json`。
+10-16接入已有M16产物，绑定checkpoint、M1包、端口和版本。M1使用QKV/out NBG、
+融合FFN/末LN和一份NBG head；M16 attention用共享普通权重MatMul，前4层FFN为
+两路fc1/普通fc2/FP32末LN，其余20层为MLP NBG及独立残差/FP32末LN。完整24份M16
+NBG会超const预算，因此保留4层普通FFN，未改变is_const分类。大fc2先预载再共享。
+
+```text
+M16 embedding → 24层M16 → 取最后一列 → 固定copy ─┐
+                                                  ↓
+M1 embedding  → 24层M1   → 固定输入buffer → 唯一NBG head → greedy
+                      两套执行图共享FP16 KV；先释放M16消费者，再释放M1 owner
+```
+
+固定桥接只在需要head时拷贝最后一列到M1固定输入；没有NBG原地alias、端口重绑或
+第二份head。实际const/nonconst峰值1,035,583,855 / 410,013,944B，即987.61/391.02MiB，
+分别低于1GiB且释放归零；const余36.39MiB，SDK内部副本/workspace仍未知。
+
+| 同轮NBG组合，17输入/16输出、各3次 | 输出token/s | 首词s | 首词后decode token/s | 每请求s | 建图初始化s |
+|---|---:|---:|---:|---:|---:|
+| M1 | 0.65109 | 12.532 | 1.24558 | 24.574 | 15.916 |
+| M1＋M16 prefill | 1.08032 | 2.414 | 1.21002 | 14.810 | 53.096–54.724 |
+
+输出率提高65.92%，首词缩短80.74%，生成wall缩短39.73%；decode率反降2.86%，收益
+来自prefill。准备/reset/CPU参考/粗读回另计；M16初始化增加，不能将此收益解释为
+冷启动整体加速。本轮M1基线也慢于历史NBG记录，不据此宣布刷新历史最高吞吐，
+整体慢速差异尚未归因。没有新增高扰动追踪或内部搬运实验。
+
+原M16同Context的17/64/17输入、33个输出、末层KV/未写槽、重复状态逐字节一致、
+末槽/零IO拒绝和释放全部通过；64输入的单输出仅验整块末词head及容量，不入性能表。
+原生程序已完成model/Context.close，但外层监督被对话中断，原OS退出码没有保存。
+没有补造退出码；随后M1三请求及M16单请求均正常退出0并通过各45秒门禁，补齐同配置
+完整退出检查。M16性能汇总前后3个17→16请求，不重复原容量矩阵。
+M1/M16审计为124/194图、1075/2918 outer operation、238/583 extension，均完整；
+未新增并行Verify。最后11:48:53.351479 +08:00延迟检查清洁，无owner或恢复标记。
+仅接受该C64有界负载，不外推新NBG组合C128、长期稳定性或TTGT组合。
+
+直接FCL准备异常已停止验证，CPU权重压缩抓栈与中止记录见事故台账；当前所有板卡
+实验子进程均限300秒。固定binary SHA256
+`45b2683b1e5074c10b241e3a3007901e88e4da5e2e6fef5f28da579f995e9dda`；证据
+`opt-fast-prefill-20261016/summary.json`，含包身份、原监督中断记录、逐项CPU/编译审计、
+完整内核和补验结果。后续只改默认NBG选择和如实报告backend，已做CPU入口检查，
+没有改动已测显式NBG模型计算。
+
+### NBG速度差异的有界定位
+
+10-16固定C64、M1、17输入/16输出、各三请求，QKV/out/FFN/head均为NBG。
+历史与当前的M1 NBG、权重来源和已记录五库身份相同，124张常驻图及应用预算相同；
+历史与当前实际输入token不同，不能只按长度相同认定为相同请求。
+
+| 对照 | 实际输出token/s | 首词后decode token/s | 平均TTFT s |
+|---|---:|---:|---:|
+| 历史全NBG，原文本 | 1.73116 | 3.22732 | 4.595 |
+| 今天冻结程序，关闭Verify审计与SDK计时 | 0.65933 | 1.27225 | 12.477 |
+| 本轮修改前提交源码重新构建，同当前文本/NBG | 0.61912 | 1.19627 | 13.304 |
+| 今天冻结程序，开启SDK内存汇总，仅作归因 | 0.57492 | 1.10615 | 14.270 |
+
+三个新进程均各生成48 token，选词/末层KV/未写槽、预算/释放及45秒检查通过；
+只在用户显式诊断授权下豁免16:48:18.926707这一次旧EDMA，未清恢复标记。
+源码对照固定提交`eec8af1`、相同O2配置，显式选择NBG；不含本轮M16及对话改动，
+不是早期全手写模型或历史快binary的重放。关闭审计后仍慢，降低了审计、M16和
+本轮会话代码作为主要原因的可能性，尚未证明具体运行时或设备根因。
+
+汇总轮45个首词后decode步骤中，`vsi_nn_RunGraph`为894.32ms/token，约占墙钟98.93%；
+显式`CopyDataToTensor`/`ConvertTensorToData`合计8.13ms/token，约0.90%。
+24层合计QKV153.25、attention160.07、out_proj152.82、attention收尾156.29、融合FFN
+214.66ms/token；未见集中在第23层的耗时异常。图时间包含执行、内部搬运及同步等待，不能
+把98.93%称为IO占比，也不能由此断言主机CPU回退。历史首请求主机user+system约
+0.386s，今天关闭审计约4.288s，但两者文本不同，CPU增量不自动解释全部延迟。
+
+后置关闭计时的同binary/C64/M1复测发生**新的4字节EDMA**，已终止并停测，详见
+事故台账。关闭→开启→关闭未完成，不能精确量化本轮采集扰动；分段比例仅适用于
+开启轮。历史原始token的复测已离线准备但未上板，因此输入内容和更早实现差异尚未
+完全排除。没有改变生产路径、驱动、时钟或内存分类，未宣布修复性能回退。
+证据`opt-decode-regression-20261016/{summary,artifact-comparison,sdk-attribution}.json`，
+含冻结源码/编译配置、实际请求、SDK身份、逐层集合、完整内核及恢复标记链。
+
+### C256三轮对话：保留KV与完整历史重放
+
+10-16新增有界对话入口：完整前缀必须匹配上一轮输入和全部输出，末预测尚未进入KV，
+下轮只补消费一次；已缓存历史不重复prefill。M16按绝对位置对齐，前后不足整块时用M1。
+OPT使用原checkpoint greedy策略；三轮新增36/26/27 token，累计prompt36/78/121，
+各输出16，最终消费136槽。英文材料/追问/总结的原始token轨迹由CPU独立生成，两侧共
+96输出与CPU一致，末层KV/未写槽及两侧全缓存比较通过；没有加入额外BOS或重编码历史。
+
+| 同binary/NBG/SDK，独立常驻进程、各三轮 | 平均TTFT s | 实际输出token/s | 48输出的响应总s | 首词后decode token/s |
+|---|---:|---:|---:|---:|
+| 保留KV | 13.64094 | 0.602979 | 79.60470 | 1.163335 |
+| 清空KV后完整重放 | 13.74786 | 0.606478 | 79.14548 | 1.187276 |
+
+响应口径为逐轮`state_preparation_seconds + generation`，包含reset及必要token IO，
+不含初始化、tokenization、CPU参考、粗诊断、文件输出或用户思考时间。初始化分别
+56.541/51.223s；SDK子进程149.790/143.408s，各低于300秒。旧表排除reset，不混算。
+平均TTFT仅少0.78%，输出率反降0.58%；这是一次三轮对照，未观察到明确的整体收益。
+
+| 轮次 | 新输入 / 累计prompt | 保留KV TTFT s | 重放TTFT s | 保留KV的M16块 / M1 prompt步 | 重放M16块 / M1 prompt步 |
+|---|---|---:|---:|---|---|
+| 1 | 36 / 36 | 6.62349 | 6.28712 | 2 / 4 | 2 / 4 |
+| 2 | 26 / 78 | 23.13141 | 16.93983 | 0 / 27 | 4 / 14 |
+| 3 | 27 / 121 | 11.16791 | 18.01664 | 1 / 12 | 7 / 9 |
+
+第二轮从已消费位置51追加末预测及26新输入：13个M1补到64后只剩14个，不能构成
+M16整块，所以27个全用M1；重放能用4个M16块。这是短追加损失的重要线索，不能仅
+凭处理token数减少推断延迟降低。后续可另评估有限历史重算等对齐策略，当前未实现。
+
+两侧const/nonconst峰值均1,035,620,719 / 535,651,064B，释放归零；194图、2918 outer
+operation、583 extension完整。原NBG与native包字节不变，派生manifest仅声明C256；
+未扩展普通生成CLI默认范围，也未验C256末槽/溢出、其他对话、长期稳定或更长容量。
+
+**故障范围**：最初单进程串接六轮在重放第二轮发生4字节EDMA，结果不入上述表。
+用户明确授权忽略这一已记录事件后，拆为两个三轮进程，执行/数值/预算/释放及各
+45秒均通过；16:58:25.697036、17:02:40.443150完整日志无新故障/owner。没有断电，
+只在本次诊断中豁免16:48:18.926707这一旧事件，恢复标记与事故证据保留；不能据此
+宣称EDMA已修复。证据`opt-conversation-20261016/comparison.json`及事故台账。
 
 ### 全图／逐decoder C128
 
@@ -266,22 +375,8 @@ v105同boot、97/3/97输入各32输出，93个首词后间隔；末层FP32 KV/�
 其源码入口退役，原始端口修复与性能证据仍在`qwen-head-prefix-20261015/`。
 完整head证据`qwen-shared-head-20261015/`。
 
-| 段 | ms/decode token | decode墙钟占比 |
-|---|---:|---:|
-| 18层DeltaNet NBG执行 | 613.47 | 32.40% |
-| 完整共享FCL head＋greedy | 296.33 | 15.65% |
-| 23层编译FFN | 287.03 | 15.16% |
-| 6层attention投影/RoPE/reader/out_proj | 244.40 | 12.91% |
-| 24层input RMSNorm | 153.10 | 8.09% |
-| 18层DeltaNet提交图 | 98.51 | 5.20% |
-| 其他SDK及主机/日志开销 | 200.67 | 10.60% |
-
-此表为共享FCL head、23输入/16输出、SDK记录开启的15个decode间隔，
-不是最新组合的内部占比。关闭→开启→关闭的生成64.212/65.716/65.190s，
-记录增加约1.57%生成wall、1.53%decode；前后decode漂移0.19%。
-DeltaNet执行＋提交占37.60%；提交写约18.88MiB/token，SDK时长含执行/搬运/等待，
-不能认定纯IO或低利用率。MatMul回退占2.86%、KV重验2.59%，不优先重试故障构造。
-证据`qwen-shared-head-attribution-20261015/`。
+共享FCL head、尚未应用递归优化时的旧归因保存在
+`qwen-shared-head-attribution-20261015/`；最新组合归因见下节，不混用二者的占比。
 
 ### DeltaNet外积、归一化与状态提交优化
 
@@ -318,7 +413,7 @@ SDK calls关闭、Verify审计开启；每请求23输入/16输出，生成包含
 相对后置原配置，组合的生成延迟降低11.70%、实际输出率提高13.25%、decode速率提高
 11.51%（间隔缩短10.32%）。前置65.884s到后置两轮63.475/62.719s有可见漂移，
 前两项独立变化没有超出该范围，不能认定稳定单项收益或将收益相加。组合两轮分别
-55.901/55.525s；未遍历所有组合、分离编译优化交互或重新测内部算子占比。
+55.901/55.525s；未遍历所有组合或分离编译优化交互。
 
 6进程/8请求/128输出ID均与CPU一致，粗末层hidden、layer22递归状态、末层KV和未写槽
 通过原容差；设备改写后的数组不要求与原配置按位相同。组合两请求及后置原配置两请求
@@ -335,6 +430,40 @@ SDK calls关闭、Verify审计开启；每请求23输入/16输出，生成包含
 实现依赖，移除debug/build-id后与测量文件逐字节一致，证明在`final-build-identity.json`。
 同目录`summary.json`、`onnx-combined-comparison.json`、逐轮原始日志/审计/数值结果保留身份
 及计时证据；新增FP32归约拒绝回归，14项相关CPU测试、构建与格式检查通过。
+
+### 最新Qwen组合的decode归因
+
+10-16以精简后同一binary、同一包和23输入/16输出请求做SDK calls关闭→开启→关闭，
+三轮48个输出与固定CPU参考一致，粗hidden/递归状态/KV、未写槽、预算/释放、编译
+完整性及各45秒内核检查通过。完整共享FCL head、广播外积、融合input RMSNorm、
+合并提交、layer9 MatMul回退和mapped选词全部开启，没有新增模型优化。
+
+| 段 | ms/首词后decode间隔 | decode墙钟占比 |
+|---|---:|---:|
+| 18层DeltaNet NBG，包含融合input RMSNorm | 651.58 | 34.98% |
+| 23层编译FFN | 318.93 | 17.12% |
+| 完整共享FCL head＋greedy | 299.17 | 16.06% |
+| 6层attention投影/RoPE/reader/out_proj | 267.24 | 14.35% |
+| attention控制及显式IO | 75.28 | 4.04% |
+| KV重新Verify / KV copy | 62.93 / 27.09 | 3.38% / 1.45% |
+| layer9 MatMul FFN | 61.54 | 3.30% |
+| 其余6层独立input RMSNorm | 48.92 | 2.63% |
+| 单张合并状态提交图 | 13.15 | 0.71% |
+
+开启记录的15个decode间隔平均1862.51ms；固定调用序列逐项匹配全部2388次RunGraph，
+38次consume确实比旧结构少1330次调用。DeltaNet仍是最大单段，合并提交已不占主要
+时间；FFN合计380.47ms、20.43%。融合后的DeltaNet包含输入norm，不能将651.58ms
+直接与旧表不含norm的613.47ms相比。SDK区间包含计算、内部搬运与完成等待，
+不是硬件kernel时间或利用率证据。
+
+关闭前/开启/关闭后的generation为58.867/63.833/62.548s；两轮关闭合计32输出/
+121.416s，实际输出率0.263557 token/s，首词后decode率0.562295 token/s，平均
+TTFT34.031s。记录相对两轮关闭均值多5.15% generation wall、4.73% decode wall，
+但前后关闭本身漂移6.25%/6.89%，因此不能精确分离探针成本，也不能用开启记录的
+速率替代未记录吞吐。此轮低于10-15历史最好成绩，不覆盖或更新其最佳记录。
+准备、reset、CPU参考和粗读回均另计。证据
+`qwen-optimized-attribution-20261016/{summary,decode-attribution}.json`，包含固定binary/
+包/参考身份、原始逐API与完整内核日志；仅覆盖本次C64有界负载。
 
 ## GEMM、布局与设备有效算力
 

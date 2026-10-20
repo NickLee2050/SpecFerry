@@ -255,13 +255,15 @@ def run_case(
     output,
     *,
     sudo_read_only=False,
-    timeout=600,
+    timeout=300,
     audit_verify=False,
     evaluate_result=evaluate,
     numerical_diagnostic=False,
     board_power_cycled=False,
     sdk_timing=False,
 ):
+    if not 0 < timeout <= 300:
+        raise ValueError("NP101 device runs require a timeout in (0, 300] seconds")
     if numerical_diagnostic and board_power_cycled:
         raise ValueError("board power-cycle and numerical diagnostics are separate recovery paths")
     sdk = resolve_path(identity["directory"])

@@ -52,7 +52,7 @@ def main():
     )
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--capacity", type=int, default=64)
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--warmups", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
@@ -162,13 +162,13 @@ def main():
         if (
             args.backend != "graph"
             or args.capacity not in (64, 128)
-            or args.block != 1
+            or args.block not in (1, 16)
             or args.graph_layers not in (None, 24)
             or args.lifecycle_check
             or args.variant is not None
         ):
             parser.error(
-                "compiled FFN requires full OPT/C64 or C128/M1 graph mode without variant or lifecycle override"
+                "compiled FFN requires full OPT/C64 or C128 graph mode with block1/16 and no variant or lifecycle override"
             )
         if args.sdk_timing or args.sdk_summary:
             parser.error("compiled candidate entry currently uses untraced acceptance")
@@ -177,6 +177,14 @@ def main():
         compiled_package = load_ffn_package(
             args.compiled_ffn, args.model.resolve(), capacity=args.capacity
         )
+        if args.projection_backend is None and "projections" in compiled_package:
+            args.projection_backend = "nbg"
+        if args.block == 16 and (
+            args.capacity != 64
+            or "prefill" not in compiled_package
+            or args.projection_backend not in (None, "fcl", "nbg")
+        ):
+            parser.error("block16 requires its C64 prefill package and M1 FCL or NBG projections")
         args.variant = "compiled-ffn-finish"
         if args.projection_backend not in (None, "fcl") and "projections" not in compiled_package:
             parser.error("NBG projection selection requires packaged projection artifacts")

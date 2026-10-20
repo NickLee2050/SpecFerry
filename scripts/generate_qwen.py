@@ -35,7 +35,7 @@ def parse_arguments():
     parser.add_argument("--token-readback", choices=("sdk", "mapped"), default="mapped")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=2)
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--sudo-read-only", action="store_true")
     parser.add_argument(

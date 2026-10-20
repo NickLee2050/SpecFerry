@@ -366,13 +366,16 @@ class CompiledValidationTests(unittest.TestCase):
             )
             (root / "manifest.json").write_text(json.dumps(manifest))
             self.assertEqual(len(load_ffn_package(root, root)["layers"]), 24)
-            with self.assertRaisesRegex(ValueError, "C64/M1"):
+            with self.assertRaisesRegex(ValueError, "geometry"):
                 load_ffn_package(root, root, capacity=128)
             manifest["supported_capacities"] = [64, 128]
             (root / "manifest.json").write_text(json.dumps(manifest))
             self.assertEqual(len(load_ffn_package(root, root, capacity=128)["layers"]), 24)
             with self.assertRaisesRegex(ValueError, "geometry"):
                 load_ffn_package(root, root, capacity=256)
+            manifest["supported_capacities"] = [64, 128, 256]
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(len(load_ffn_package(root, root, capacity=256)["layers"]), 24)
             (root / "layer00.nb").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "identity differs"):
                 load_ffn_package(root, root)
@@ -381,6 +384,70 @@ class CompiledValidationTests(unittest.TestCase):
             (root / "manifest.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "constant bound"):
                 load_ffn_package(root, root)
+
+    def test_prefill_contract_checks_m1_binding_source_and_total_const_budget(self):
+        from specferry.models.opt.compiled import validate_prefill_package
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records, layers = {}, []
+            for index in range(4, 24):
+                name = f"prefill{index:02d}.nb"
+                (root / name).write_bytes(bytes([index]))
+                identities = {}
+                for part in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"):
+                    key = f"decoder.layers.{index}.{part}"
+                    records[key] = dict(bytes=1, sha256="a" * 64)
+                    identities[key] = "a" * 64
+                layers.append(
+                    dict(
+                        layer=index,
+                        path=name,
+                        nbg_sha256=sha256(root / name),
+                        constant_bytes=100,
+                        weight_sha256=identities,
+                    )
+                )
+            native = root / "compiled-prefill.txt"
+            native.write_text("specferry-opt-prefill 1 m1 index deployment 16 20\n")
+            prefill = dict(
+                tokens=16,
+                ordinary_layers=[0, 1, 2, 3],
+                supported_capacities=[64],
+                layers=layers,
+                native_manifest_sha256=sha256(native),
+            )
+            manifest = dict(
+                head={},
+                native_manifest_sha256="m1",
+                prefill=prefill,
+                deployment_sha256={
+                    "weights.index": "index",
+                    "deployment-manifest.json": "deployment",
+                },
+            )
+            manifest["head"] = dict(path="shared-head.nb")
+            expected = 20 * 100 + 24 * 4 * 1024 * 1024 * 2
+            self.assertEqual(validate_prefill_package(root, manifest, records), expected)
+            manifest["prefill"]["supported_capacities"] = [64, 256]
+            self.assertEqual(validate_prefill_package(root, manifest, records), expected)
+            # Outer package validation already charges the complete NBG projection set.
+            self.assertEqual(
+                validate_prefill_package(root, manifest | {"projections": [{}]}, records),
+                20 * 100,
+            )
+            # Every M16 artifact alone fits; the existing M1 FCL weights still count.
+            for item in layers:
+                item["constant_bytes"] = 42 * 1024 * 1024
+            self.assertGreater(validate_prefill_package(root, manifest, records), 2**30)
+            layers[0]["weight_sha256"][next(iter(layers[0]["weight_sha256"]))] = "b" * 64
+            with self.assertRaisesRegex(ValueError, "identity/source"):
+                validate_prefill_package(root, manifest, records)
+            with self.assertRaisesRegex(ValueError, "one head"):
+                validate_prefill_package(root, manifest | {"head": None}, records)
+            changed = manifest | {"native_manifest_sha256": "another-m1"}
+            with self.assertRaisesRegex(ValueError, "bind the M1"):
+                validate_prefill_package(root, changed, records)
 
     def test_plan_pins_independent_reference_and_rejects_changed_artifact(self):
         with tempfile.TemporaryDirectory() as temporary:

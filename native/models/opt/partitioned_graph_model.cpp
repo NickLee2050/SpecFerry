@@ -41,8 +41,13 @@ struct PartitionedGraphModel::Impl {
     std::unique_ptr<GraphBuilder> cache_commit;
     std::unique_ptr<GraphBuilder> head;
     std::unique_ptr<GraphBuilder> selection;
-    Tensor projected{}, selected{};
+    Tensor head_input{}, projected{}, selected{};
     std::vector<Tensor> logits;
+    // The M16 bridge writes the M1 head's fixed input after the decoder stack.
+    // Prefill closes before decode, which owns the shared head and input storage.
+    ExecutionSet *shared_head = nullptr;
+
+    ExecutionSet &prediction() { return shared_head ? *shared_head : *this; }
 
     std::string prefix() const { return block == 1 ? "" : "prefill" + std::to_string(block) + "."; }
 
@@ -85,6 +90,7 @@ struct PartitionedGraphModel::Impl {
   WeightBank bank;
   Graph cache;
   std::vector<Tensor> cache_tensors;
+  inference::GenerationHistory history;
   std::unique_ptr<GraphBuilder> cache_reset;
   std::unique_ptr<ExecutionSet> decode, prefill;
   ExecutionSet *latest = nullptr;
@@ -197,10 +203,14 @@ struct PartitionedGraphModel::Impl {
 
   void build(Context &context, const WeightStore &weights, const PhaseObserver &phase) {
     const auto &decoder = config.decoder;
-    if (variant == Variant::MergedKvFc1Split2) {
+    if (variant == Variant::MergedKvFc1Split2 || !compiled_prefill_ffn.empty()) {
       // Load the large fc2 tensors before decoder graphs occupy SDK resources.
       // Subsequent bindings reuse these same chunks and the same memory budget.
       for (unsigned layer = 0; layer < decoder.layers; ++layer) {
+        if (variant != Variant::MergedKvFc1Split2 &&
+            !compiled_prefill_ffn.at(layer).graph.path.empty()) {
+          continue;
+        }
         const auto &matrix = weights.find(decoder.prefix(layer) + "fc2.weight");
         bank.preload(weights, matrix, matrix.spec);
       }
@@ -359,12 +369,13 @@ struct PartitionedGraphModel::Impl {
       if (variant == Variant::MergedKvCompiledFfn) {
         const auto &artifact = (block == 1 ? compiled_ffn : compiled_prefill_ffn).at(layer);
         const auto &compiled = artifact.graph;
-        const auto version = compiled.graph_version;
+        const auto version = compiled.path.empty() ? compiled_ffn.at(layer).graph.graph_version
+                                                   : compiled.graph_version;
         check(vsi_nn_SetGraphVersion(builder.graph.get(), version[0], version[1], version[2]),
               "set compiled OPT attention graph version");
         GraphBuilder *attention_graph = nullptr;
         Tensor normalized{};
-        if (!compiled_projections.empty() &&
+        if (block == 1 && !compiled_projections.empty() &&
             (projections.compiled_query || projections.compiled_output)) {
           const auto &projection = compiled_projections.at(layer);
           Tensor attended{};
@@ -439,6 +450,26 @@ struct PartitionedGraphModel::Impl {
 
         // v105 rejected NBG mixed with ordinary decoder nodes. Separate graphs
         // retain fixed device buffers; no FFN weights enter the shared bank.
+        if (compiled.path.empty()) {
+          // The ordinary prefill FFN keeps the existing FP16 boundaries and FP32 LN.
+          // Its weights belong to the shared bank, without changing const classification.
+          auto ffn = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
+          check(vsi_nn_SetGraphVersion(ffn->graph.get(), version[0], version[1], version[2]),
+                "set ordinary prefill FFN graph version");
+          const auto input = ffn->share(*attention_graph, normalized);
+          const auto prefix = decoder.prefix(layer);
+          auto hidden = ffn->linear(input, weights, weights.find(prefix + "fc1.weight"),
+                                    weights.find(prefix + "fc1.bias"), 2);
+          hidden = ffn->unary(VSI_NN_OP_RELU, hidden, f16);
+          hidden = ffn->linear(hidden, weights, weights.find(prefix + "fc2.weight"),
+                               weights.find(prefix + "fc2.bias"));
+          const auto output = build_ffn_finish(*ffn, weights, decoder, layer, input, hidden).output;
+          compile(*ffn, stage + ".ordinary_ffn_finish", {input}, {output});
+          producer = ffn.get();
+          previous = output;
+          keep(std::move(ffn), std::to_string(layer) + ".ordinary_ffn_finish");
+          continue;
+        }
         auto ffn = std::make_unique<GraphBuilder>(context, 16, 8);
         const auto ffn_input = ffn->share(*attention_graph, normalized);
         const auto ffn_result = ffn->compiled(compiled, {ffn_input}).at(0);
@@ -484,6 +515,17 @@ struct PartitionedGraphModel::Impl {
     auto shared_hidden = output.share(*producer, previous);
     auto hidden = block == 1 ? shared_hidden
                              : output.slice(shared_hidden, {0, block - 1}, {decoder.hidden, 1});
+    execution.head_input = hidden;
+    if (block != 1 && !compiled_head.graph.path.empty()) {
+      execution.shared_head = decode.get();
+      const auto destination = output.share(*decode->head, decode->head_input);
+      output.node(VSI_NN_OP_DATACONVERT, {hidden}, destination);
+      if (phase) {
+        phase("setup." + execution.prefix() + "head-bridge");
+      }
+      output.compile({shared_hidden}, {destination});
+      return;
+    }
     if (!compiled_head.graph.path.empty()) {
       execution.logits = output.compiled(compiled_head.graph, {hidden});
       if (phase) {
@@ -654,8 +696,12 @@ struct PartitionedGraphModel::Impl {
       if (variant != Variant::CompiledFullModel) {
         run(*execution.head, execution.timing_prefix + ".head");
       }
-      if (execution.selection) {
-        run(*execution.selection, execution.timing_prefix + ".selection");
+      auto &prediction = execution.prediction();
+      if (execution.shared_head) {
+        run(*prediction.head, execution.timing_prefix + ".shared-head");
+      }
+      if (prediction.selection) {
+        run(*prediction.selection, execution.timing_prefix + ".selection");
       }
       ++completed_head_runs;
       prediction_valid = true;
@@ -678,7 +724,7 @@ struct PartitionedGraphModel::Impl {
 
   void consume_prompt(const std::vector<std::int32_t> &tokens) {
     require_open();
-    for (const auto chunk : inference::plan_prefill(tokens.size(), prefill_block)) {
+    for (const auto chunk : inference::plan_prefill(tokens.size(), prefill_block, position)) {
       auto &execution = chunk.count == 1 ? *decode : *prefill;
       const bool run_head = prefill_head_policy == PrefillHeadPolicy::EveryToken ||
                             chunk.begin + chunk.count == tokens.size();
@@ -713,8 +759,10 @@ struct PartitionedGraphModel::Impl {
       throw std::logic_error("no partitioned OPT prediction is available");
     }
     const SdkScope timing_role("role", latest->timing_prefix + ".selection");
-    const auto bytes = read_tensor(
-        latest->selection ? latest->selection->graph : latest->head->graph, latest->selected.id);
+    auto &prediction = latest->prediction();
+    const auto bytes =
+        read_tensor(prediction.selection ? prediction.selection->graph : prediction.head->graph,
+                    prediction.selected.id);
     if (bytes.size() != sizeof(std::int32_t)) {
       throw std::runtime_error("partitioned OPT prediction is not one INT32");
     }
@@ -792,8 +840,8 @@ PartitionedGraphModel::PartitionedGraphModel(
     throw std::invalid_argument("compiled full OPT artifact requires its explicit variant");
   }
   if (!compiled_head.graph.path.empty()) {
-    if (variant != Variant::MergedKvCompiledFfn || prefill_block != 1) {
-      throw std::invalid_argument("compiled head candidate requires the compiled FFN M1 variant");
+    if (variant != Variant::MergedKvCompiledFfn) {
+      throw std::invalid_argument("compiled head requires the compiled FFN variant");
     }
     validate_compiled_head(compiled_head, weights, config);
   }
@@ -803,8 +851,12 @@ PartitionedGraphModel::PartitionedGraphModel(
   if (!valid_backend(projections.attention) || !valid_backend(projections.head) ||
       ((projections.attention != LinearBackend::MatMul ||
         projections.head != LinearBackend::MatMul) &&
-       (variant != Variant::MergedKvCompiledFfn || prefill_block != 1))) {
-    throw std::invalid_argument("FCL model candidate currently requires compiled FFN and M1");
+       variant != Variant::MergedKvCompiledFfn)) {
+    throw std::invalid_argument("FCL projections require the compiled FFN variant");
+  }
+  if (prefill_block != 1 && projections.head == LinearBackend::FullyConnected &&
+      compiled_head.graph.path.empty()) {
+    throw std::invalid_argument("FCL block prefill requires the single shared compiled head");
   }
   if (variant == Variant::MergedKvCompiledFfn) {
     if ((prefill_block != 1 && prefill_block != 16) ||
@@ -817,6 +869,12 @@ PartitionedGraphModel::PartitionedGraphModel(
         throw std::invalid_argument("compiled OPT FFN requires one artifact per decoder layer");
       }
       for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
+        if (tokens == 16 && artifacts[layer].graph.path.empty()) {
+          if (layer >= 4 || artifacts[layer].graph.constant_bytes) {
+            throw std::invalid_argument("ordinary M16 FFNs are limited to the first four layers");
+          }
+          continue;
+        }
         validate_compiled_ffn(artifacts[layer], weights, config.decoder, layer, tokens);
         const auto bytes = artifacts[layer].graph.constant_bytes;
         if (bytes > segment_payload_limit - constants) {
@@ -827,8 +885,8 @@ PartitionedGraphModel::PartitionedGraphModel(
     };
     validate_set(compiled_ffn, 1);
     if (!compiled_projections.empty()) {
-      if (prefill_block != 1 || compiled_projections.size() != config.decoder.layers) {
-        throw std::invalid_argument("compiled projections require all layers and M1");
+      if (compiled_projections.size() != config.decoder.layers) {
+        throw std::invalid_argument("compiled M1 projections require all layers");
       }
       for (unsigned layer = 0; layer < config.decoder.layers; ++layer) {
         const auto &artifact = compiled_projections[layer];
@@ -901,11 +959,32 @@ PartitionedGraphModel::Impl &PartitionedGraphModel::require_impl() const {
   return *impl_;
 }
 
-void PartitionedGraphModel::step(std::int32_t token) { require_impl().step(token); }
+void PartitionedGraphModel::step(std::int32_t token) {
+  auto &impl = require_impl();
+  impl.history.valid = false;
+  impl.step(token);
+}
 
 inference::Generation
 PartitionedGraphModel::generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
                                 const inference::GenerationPhaseObserver &on_phase) {
+  require_impl().history = {};
+  // Keep the existing zero-output/reset contract outside continuation sessions.
+  if (maximum) {
+    return continue_generation(prompt, maximum, on_phase);
+  }
+  const auto &config = impl_->config;
+  return inference::generate_tokens(
+      {config.vocabulary, config.decoder.capacity, config.bos, config.eos},
+      {[&] { impl_->reset(); }, [&](std::int32_t token) { impl_->step(token); },
+       [&] { return impl_->predict(); }},
+      prompt, maximum, {}, on_phase);
+}
+
+inference::Generation
+PartitionedGraphModel::continue_generation(const std::vector<std::int32_t> &prompt,
+                                           unsigned maximum,
+                                           const inference::GenerationPhaseObserver &on_phase) {
   const auto &config = require_impl().config;
   inference::GenerationExecutor executor{[&] { impl_->reset(); },
                                          [&](std::int32_t token) { impl_->step(token); },
@@ -918,7 +997,7 @@ PartitionedGraphModel::generate(const std::vector<std::int32_t> &prompt, unsigne
   }
   return inference::generate_tokens(
       {config.vocabulary, config.decoder.capacity, config.bos, config.eos}, executor, prompt,
-      maximum, {}, on_phase);
+      maximum, {}, on_phase, &impl_->history);
 }
 
 std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool values,
@@ -969,23 +1048,23 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_output(const std::string &
   if (!impl_->prediction_valid) {
     throw std::logic_error("no partitioned OPT prediction is available");
   }
+  auto &prediction = impl_->latest->prediction();
   if (name == "projected") {
-    if (impl_->latest->selection || impl_->variant == Variant::CompiledFullModel) {
+    if (prediction.selection || impl_->variant == Variant::CompiledFullModel) {
       throw std::invalid_argument("compiled head does not expose its intermediate projection");
     }
-    return read_tensor(impl_->latest->head->graph, impl_->latest->projected.id, method);
+    return read_tensor(prediction.head->graph, prediction.projected.id, method);
   }
   if (name == "selected") {
-    return read_tensor(impl_->latest->selection ? impl_->latest->selection->graph
-                                                : impl_->latest->head->graph,
-                       impl_->latest->selected.id, method);
+    return read_tensor(prediction.selection ? prediction.selection->graph : prediction.head->graph,
+                       prediction.selected.id, method);
   }
   if (name != "logits") {
     throw std::invalid_argument("unknown partitioned OPT output");
   }
   std::vector<std::uint8_t> result;
-  for (const auto &part : impl_->latest->logits) {
-    const auto bytes = read_tensor(impl_->latest->head->graph, part.id, method);
+  for (const auto &part : prediction.logits) {
+    const auto bytes = read_tensor(prediction.head->graph, part.id, method);
     result.insert(result.end(), bytes.begin(), bytes.end());
   }
   return result;

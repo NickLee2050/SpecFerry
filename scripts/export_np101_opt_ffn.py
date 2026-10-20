@@ -153,6 +153,9 @@ def main():
         type=Path,
         help="package existing exports after repeating source, precision and identity checks",
     )
+    parser.add_argument(
+        "--prefill-artifacts", type=Path, help="existing source-bound M16 FFN exports"
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument(
         "--head-artifacts",
@@ -161,6 +164,8 @@ def main():
     )
     parser.add_argument("--rootfs", type=Path, help="device-free installed compiler image")
     args = parser.parse_args()
+    if args.prefill_artifacts is not None and args.head_artifacts is None:
+        parser.error("M16 prefill requires the single compiled head")
     if args.output.exists():
         parser.error("use a new output directory")
     artifacts = args.import_artifacts
@@ -188,6 +193,7 @@ def main():
         args.output.resolve(),
         Path("/usr/lib/ljmicro"),
         head_artifacts=args.head_artifacts.resolve() if args.head_artifacts else None,
+        prefill_artifacts=args.prefill_artifacts.resolve() if args.prefill_artifacts else None,
         projection_artifacts=args.projection_artifacts.resolve()
         if args.projection_artifacts
         else None,

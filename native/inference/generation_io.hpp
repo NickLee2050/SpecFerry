@@ -23,6 +23,7 @@ struct RunOptions {
   std::string variant = "merged-kv", prefill_head = "every-token", readback = "none";
   std::string readback_transport = "sdk";
   std::string projection_backend = "auto";
+  std::string history_mode = "reset";
 };
 
 // Each CLI consumes its own keys, then rejects leftovers before initializing the SDK.
@@ -95,11 +96,15 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
     result.readback = settings.text("readback", "none");
     result.readback_transport = settings.text("readback_transport", "sdk");
     result.projection_backend = settings.text("projection_backend", "auto");
+    result.history_mode = settings.text("history_mode", "reset");
     result.cache_first = settings.number("cache_first_layer", 0, 0, 32);
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
-    if ((result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||
+    if ((result.history_mode != "reset" && result.history_mode != "reuse" &&
+         result.history_mode != "compare") ||
+        (result.history_mode != "reset" && (result.benchmark || result.lifecycle)) ||
+        (result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||
         (result.projection_backend != "auto" && result.projection_backend != "fcl" &&
          result.projection_backend != "nbg-qkv" && result.projection_backend != "nbg-output" &&
          result.projection_backend != "nbg") ||
@@ -107,8 +112,9 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
         (result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2" &&
          result.variant != "compiled-ffn-finish" && result.variant != "compiled-decoder" &&
          result.variant != "compiled-fullgraph") ||
-        ((result.variant == "compiled-ffn-finish" || result.variant == "compiled-decoder" ||
-          result.variant == "compiled-fullgraph") &&
+        (result.variant == "compiled-ffn-finish" &&
+         ((result.block != 1 && result.block != 16) || result.lifecycle)) ||
+        ((result.variant == "compiled-decoder" || result.variant == "compiled-fullgraph") &&
          (result.block != 1 || result.lifecycle)) ||
         (result.variant == "compiled-fullgraph" && result.prefill_head != "every-token") ||
         (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
@@ -141,7 +147,8 @@ inline void write_generation(std::ostream &out, const Generation &result) {
   out << std::setprecision(17) << "\"tokens\":";
   write_array(out, result.tokens);
   out << ",\"consumed\":" << result.consumed << ",\"stop_reason\":\"" << result.stop_reason
-      << "\",\"prefill_seconds\":" << result.prefill_seconds
+      << "\",\"state_preparation_seconds\":" << result.state_preparation_seconds
+      << ",\"prefill_seconds\":" << result.prefill_seconds
       << ",\"first_token_seconds\":" << result.first_token_seconds
       << ",\"total_seconds\":" << result.total_seconds << ",\"token_seconds\":";
   write_array(out, result.token_seconds);

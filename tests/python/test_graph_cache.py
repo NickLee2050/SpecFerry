@@ -317,6 +317,7 @@ class GraphBlockPrefillTests(GraphEvidenceFixture):
     def test_unimplemented_partitioned_combinations_are_rejected(self):
         for options in (
             {"variant": "baseline"},
+            {"variant": "compiled-ffn-finish"},
             {"variant": "merged-kv-local-const"},
             {"decoder_group_size": 2},
         ):

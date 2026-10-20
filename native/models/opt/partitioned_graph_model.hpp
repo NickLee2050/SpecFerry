@@ -60,6 +60,10 @@ public:
   void step(std::int32_t token);
   inference::Generation generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
                                  const inference::GenerationPhaseObserver &on_phase = {});
+  // Full token prefix must extend the preceding prompt and every returned output token.
+  inference::Generation
+  continue_generation(const std::vector<std::int32_t> &prompt, unsigned maximum,
+                      const inference::GenerationPhaseObserver &on_phase = {});
   std::vector<std::uint8_t>
   read_cache(unsigned layer, bool values,
              np101::TensorReadback method = np101::TensorReadback::SdkCopy);
