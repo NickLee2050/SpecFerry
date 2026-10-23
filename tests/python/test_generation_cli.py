@@ -15,10 +15,18 @@ from tests.python.validation_fixtures import GraphEvidenceFixture
 
 class GenerationCommandTests(GraphEvidenceFixture):
     def test_compiled_prefill_defaults_to_packaged_nbg_projections_without_device_access(self):
+        self.check_compiled_prefill_preparation(64)
+
+    def test_compiled_prefill_accepts_declared_c256_without_device_access(self):
+        self.check_compiled_prefill_preparation(256)
+
+    def check_compiled_prefill_preparation(self, capacity):
         path = Path(__file__).resolve().parents[2] / "scripts/generate_opt.py"
         main = runpy.run_path(str(path))["main"]
         output, package = self.root / "prefill", self.root / "package"
-        request = dict(capacity=64, selection={"mode": "greedy"}, tokens=[2] * 17, prompt="test")
+        request = dict(
+            capacity=capacity, selection={"mode": "greedy"}, tokens=[2] * 17, prompt="test"
+        )
 
         def prepare_request(*arguments, **kwargs):
             arguments[2].mkdir()
@@ -31,7 +39,7 @@ class GenerationCommandTests(GraphEvidenceFixture):
             "--compiled-ffn",
             str(package),
             "--capacity",
-            "64",
+            str(capacity),
             "--block",
             "16",
             "--prefill-head",
@@ -46,7 +54,7 @@ class GenerationCommandTests(GraphEvidenceFixture):
             patch(
                 "specferry.models.opt.compiled.load_ffn_package",
                 return_value={
-                    "prefill": {"tokens": 16},
+                    "prefill": {"tokens": 16, "supported_capacities": [64, 256]},
                     "projections": [{}] * 24,
                     "head": {"path": "head.nb"},
                 },

@@ -1,5 +1,6 @@
 #include "models/opt/layer.hpp"
 #include "np101/memory_budget.hpp"
+#include "np101/sdk_identity.hpp"
 #include "vsi_nn_pub.h"
 
 #include <cmath>
@@ -55,27 +56,12 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
   std::string magic, index_digest, deployment_digest, driver, digest, name, extra;
   unsigned version = 0, count = 0;
   file >> magic >> version >> index_digest >> deployment_digest >> driver >> count;
-  if (!file || magic != "specferry-opt-ffn-finish" || version < 1 || version > 3 || count != 5 ||
-      driver != "F53A3E6EFBB7D0FD7D4617C" ||
+  if (!file || magic != "specferry-opt-ffn-finish" || version < 1 || version > 3 ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("compiled FFN package deployment/header mismatch");
   }
-  std::ifstream module("/sys/module/galcore/srcversion");
-  std::string loaded_driver;
-  module >> loaded_driver;
-  if (!module || loaded_driver != driver) {
-    throw std::invalid_argument("compiled FFN package requires its accepted loaded driver");
-  }
-  std::set<std::string> libraries{"libovxlib.so", "libOpenVX.so", "libGAL.so", "libArchModelSw.so",
-                                  "libNNArchPerf.so"};
-  for (unsigned index = 0; index < 5; ++index) {
-    file >> name >> digest;
-    if (!file || !libraries.erase(name) ||
-        file_sha256(std::filesystem::path("/usr/lib/ljmicro") / name) != digest) {
-      throw std::invalid_argument("compiled FFN package SDK identity differs");
-    }
-  }
+  verify_compiled_sdk(file, driver, count);
   file >> count;
   if (!file || count != 24) {
     throw std::invalid_argument("compiled FFN package requires 24 ordered layers");

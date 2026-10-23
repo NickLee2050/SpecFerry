@@ -1,9 +1,10 @@
 # NP101 推理实现与优化结论
 
-更新：2026-10-20。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
+更新：2026-10-23。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
 降低单请求decode延迟。未完成项见[TODO](../TODO.md)，每次上板先读
 [事故台账](np101-recovery-incidents.md)，接口见[测试手册](../tests/README.md)，
 SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
+10-23精简前文件和diff保存在`.cache/runs/commit-preparation-20261023/`；原始实验数据不删改。
 
 原始证据相对 `.cache/runs/`，不随Git分发；本次精简前全部源码/文档及HEAD身份在
 `repository-compaction-20261016/before/`、`before-inventory.json`；退役文件列于
@@ -16,7 +17,7 @@ SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
 
 | 模型 | 推荐运行配置 | 已验范围 / 当前性能口径 |
 |---|---|---|
-| OPT-350m当前NBG组合 | QKV/out、M1融合FFN/末LN及单head用NBG；可选M16 prefill，保留手写attention；选词映射读回 | C64；10-20固定17输入/16输出，M1/M16为1.21641/1.95893输出token/s，首词后decode为2.35418/2.34884 token/s；计数及审计范围见正文 |
+| OPT-350m当前NBG组合 | QKV/out、M1融合FFN/末LN及单head用NBG；可选M16 prefill，保留手写attention；选词映射读回 | C64及有界C256；C64的17输入/16输出，M1/M16为1.21641/1.95893输出token/s，首词后decode为2.35418/2.34884 token/s；C256及计数范围见正文 |
 | OPT历史最快组合 | FCL attention投影、融合NBG FFN/末LN和NBG head；本轮已停止直接FCL验证 | C64/C128历史范围保留；C64历史最高1.96582输出token/s、3.63403首词后decode token/s，不与当前时段混算 |
 | Qwen3.5-0.8B缓存模型 | 保留GATHER_ND、layer9 MatMul FFN、18 DeltaNet＋23 FFN NBG、mapped读回；最快显式组合再用完整共享FCL head、广播外积、融合input RMSNorm、合并状态提交 | C64；23输入/16输出，组合两请求为0.287186输出token/s、0.610743首词后decode token/s；保守默认仍保留 |
 
@@ -48,6 +49,117 @@ OPT默认component回归路径不变，推荐混合路径由README命令显式�
 M1用于逐token decode；M16可同时处理16个已知prompt token，不表示一次生成16个
 未知后续token，也不表示16个用户。两种固定形状可用不同图；常驻两套图是否复制权重
 取决于实现和NBG产物，不是M本身的要求。C64/C128另指上下文容量，不是M。
+
+## SoC部署与内存
+
+### 当前配置
+
+- 通过`ssh np101`访问eth1的`192.168.35.21/22`，网关`192.168.33.100`；eth0关闭。
+  仅用IPv4，已验链路为100Mbps全双工；灯速不能作为接口编号。
+- SSH服务是Dropbear，`/etc/default/dropbear`配置`-p 5062`，不是OpenSSH。
+  主机使用专用`~/.ssh/id_ed25519_np101`；开机诊断脚本已移除，rcS恢复原厂版本。
+- 主机EP驱动仍masked/未加载；板端`S90test`已移出启动目录，NPU不自动加载。
+  10-23已手动执行`cd /np101_driver && sh go.sh`，当前SYSTEM池为1792MiB。
+  脚本备份为同目录`go.sh.bak`。板卡重启会卸载驱动，不会自动重新执行脚本。
+- 当前板卡boot为`c5068ad3-5d11-4cbc-8ffd-f603a75f365f`。软件reboot曾导致失联，
+  原因未定位；后续上电能正常启动，不通过反复reboot试探恢复。
+
+### SDK与部署流程
+
+板端是四核riscv64、Linux5.10.4/Buildroot、glibc2.33，缺少本地编译工具。
+厂商SDK位于`/np101_driver/build/sdk/`；核对的36个导出接口均存在，7份核心头文件
+与主机相同。沿用现有API源码，使用厂商RISC-V GCC V2.6.1交叉编译，方法见
+[README](../README.md#soc-cross-build)。两个OPT入口已构建、动态加载通过；小NBG及
+单层计算结果见下表。x86可执行文件/动态库不能直接搬到板上。
+
+主机负责下载、导出、CPU参考和打包，通过SSH传入，生成循环留板上。无需板卡联网
+安装工具；其DNS未配置完整、系统时钟未校准，不把一次公网连接失败认定为全面断网。
+运行时使用板端`LD_LIBRARY_PATH`和`VIV_MGPU_AFFINITY=1:0`。手写EVIS图编译还需
+在私有运行目录提供SDK的CL头文件，设置`LJMICRO_SDK_DIR`；缺少`cl_viv_vx_ext.h`
+曾使shader编译失败，必须在初始化阶段拒绝，不带错继续建图。
+
+原生OPT包加载器支持显式`np101-soc-riscv64`配置，核对板端模块文件及五库哈希；
+SoC模块没有sysfs srcversion，活跃模块身份还需运行器记录boot和加载过程。
+本地SoC派生包只更新运行库身份，保持权重/NBG和端口契约；EP包不改动。
+Python导出/监督入口仍以EP为目标，不能直接视为远程SoC执行器；Qwen尚未在SoC验收。
+
+### 内存布局与分配结论
+
+| 区域／API池 | 当前范围与含义 |
+|---|---|
+| Linux系统内存 | `0x40200000–0x7fffffff`；设备树声明1GiB、前2MiB留给固件，实际MemTotal约925MiB |
+| SYSTEM连续池 | 按用户转述的厂商指引，从`0xe0000000/0x10000000`改为base=`0x80000000`、size=`0x70000000`；当前1792MiB，止于`0xefffffff` |
+| DLA保留声明 | 设备树仍声明`0xd0000000–0xdfffffff`的256MiB `dla_dma`，位于新池内；未发现memory-region消费者，但小容量通过不证明此区无其他访问者 |
+| VPU区域 | `0xf0000000–0xf07fffff`的8MiB缓冲区，不能向上并入SYSTEM |
+| 未说明尾部 | `0xf0800000–0xffffffff`的248MiB归属未确认，不因iomem未列出就当作空闲 |
+| VIRTUAL | 来自Linux页分配器，与CPU共享系统内存，不是另有一块2.7GiB |
+| external／exclusive／SRAM | 当前大小为0；显式申请返回OUT_OF_MEMORY，未在这些池配置其他地址 |
+
+const/nonconst是张量语义，不与物理池一一对应；当前两类均可进入SYSTEM，应用各1GiB
+预算保持。普通tensor没有pool选择字段，驱动可从SYSTEM回退到VIRTUAL。诊断用HAL
+接口能指定池并返回实际池及句柄；DEFAULT/LOCAL/UNIFIED均返回SYSTEM，不增加容量。
+HAL句柄导入tensor的所有权契约尚未验证，不把句柄直接当作主机指针。
+
+旧256MiB配置下，11个池选择项全部检查：只有SYSTEM、VIRTUAL及SYSTEM别名成功。
+SYSTEM保留载荷255.3125MiB后再申请64KiB被拒；VIRTUAL单独保留224MiB后因Linux
+余量保护主动停止。另一次普通tensor检查同时保留SYSTEM248MiB＋VIRTUAL176MiB，
+合计424MiB，完整性及释放通过。VIRTUAL的停止值不是容量上限，两次独立容量结果也
+不能相加成同时常驻验收。
+
+EP反汇编及历史日志追踪到external=`0x44100000–0xbbbfffff`（1915MiB）、
+exclusive=`0xc0000000–0xffffffff`（1024MiB）。这些范围与SoC Linux/保留区重叠，
+不能直接照搬EP配置。历史2840MiB累计载荷还出现过24字节损坏，不能当作可靠池容量。
+SoC固定池可以跳过资源占用检查；驱动加载成功本身不能证明地址安全。
+
+### 已验范围与整模状态
+
+| 配置／工作 | 已验结果 |
+|---|---|
+| 原256MiB池，小out_proj NBG | 两输入数值通过；3×74次纯RunGraph均值11.322ms |
+| 原池，完整layer0/M1/C64 | 位置0/1/63的hidden、FP32 KV及未写槽通过；3×22次纯图均值26.265ms |
+| 原池，VIRTUAL ADD | 三个8MiB张量确认进入VIRTUAL；两组输出逐位一致，3×16次纯图均值11.316ms |
+| 原池，VIRTUAL单decoder | 临时占位使NBG进入VIRTUAL，释放占位后数值通过；3×20次纯图均值26.459ms |
+| 新1792MiB池，小容量写读 | const/nonconst各1/4/16MiB，共42MiB；逐轮复查全部存量一致，5.53秒完成 |
+
+以上检查均正常释放，完整双端内核和至少45秒延迟检查通过，无残留owner。
+新池的参数、iomem与debugfs容量三方一致；42MiB检查期间SYSTEM峰值44729184字节，
+退出后恢复122976字节，VIRTUAL为0，GFP恢复25362432字节，Linux余量最低784.125MiB。
+它只证明新池加载和有限写读，未覆盖整个1.75GiB、DLA区域或新配置下的模型计算。
+
+图耗时排除初始化、上传、读回和比较；单层重复没有形成完整多token生成。按24层
+同结构粗估decoder主体约630ms，不能当作整模延迟、输出吞吐或EP/SoC加速比。
+
+**完整OPT尚无SoC性能结果。** 旧256MiB配置下已部署M1包并尝试初始化：先修复
+运行时CL头文件遗漏；随后NBG和手写方案分别在第16／9个decoder附近触发256MiB
+Linux余量保护，加入初始化堆回收的候选又达到240秒期限，仍未进入推理。各轮退出后
+池/GFP归位、无新内核故障，但未完成标记保留。不得原样延长或重复慢路径；新1792MiB
+配置仅验42MiB申请，整模需要后续授权及独立门禁，未改变模型精度或权重分类。
+
+### SD与网络恢复要点
+
+- SD原有至少70个inode异常；经授权修复，从匹配原件恢复BusyBox及两份shader库。
+  换USB口并固定读卡器后，13项读回核对通过。部分驱动库只与故障前副本匹配，
+  `/demo`仍可能有缺失；早期`.partial`镜像不是完整恢复备份。
+- eth1单口配置后SSH通过；曾发生eth0绑定IP而ARP返回eth1 MAC，未证明唯一故障原因。
+  五分钟链路记录及原始网络失败证据保留，不继续根据网口灯速或端口封禁猜测归因。
+- SD卡29.1GiB，但根分区仅2GiB。OPT权重约632MiB，原含M16包约912MiB；
+  M1裁剪部署包合计约1.16GiB已传入，剩余存储有限。磁盘文件大小不等于运行内存。
+- 扩容方案尚未执行：板卡断电后用稳定读卡器备份GPT/p1/p2；修正备GPT到卡尾，
+  保持p2起始扇区6144和UUID，扩尾后执行fsck/resize2fs、核对启动/网络/SDK文件，
+  同步卸载。可扩至约29.118GiB，不需重烧镜像；板上缺工具，使用主机离线处理。
+
+### 原始证据入口
+
+路径均相对`.cache/runs/`；逐次日志、脚本、哈希和完整数值留在缓存。
+
+| 内容 | 目录 |
+|---|---|
+| SD恢复、网络配置、启动隔离 | `np101-soc-network-config-20261021/`、`np101-network-finalization-20261021/` |
+| 软件重启失联与恢复只读检查 | `np101-network-post-reboot-20261021/`、`np101-soc-platform-inspection-20261022/` |
+| 交叉构建、初始写读、内存布局 | `np101-soc-build-memory-20261022/`、`np101-soc-memory-layout-20261022/` |
+| EP/SoC地址与API容量 | `np101-memory-map-audit-20261023/`、`np101-soc-capacity-20261022/`、`np101-soc-pool-capacity-20261023/` |
+| 小图、VIRTUAL计算与整模初始化尝试 | `np101-soc-graph-validation-20261022/`、`np101-soc-virtual-compute-20261023/`、`np101-soc-full-model-20261023/` |
+| 扩池配置及42MiB验收 | `np101-soc-contiguous-config-20261023/`、`np101-soc-expanded-pool-20261023/` |
 
 ## 当前实现与验收范围
 
@@ -228,7 +340,7 @@ TTFT25.452s、decode3.323726 token/s。52图/1243 operation/238 extension完整�
 长度汇总，不替代固定负载吞吐。主机全线程user+system占C64 decode墙钟约2.36%–2.47%，
 不说明板载CPU或NPU利用率。证据`opt-entry-integration-20261014/`。
 
-### NBG投影链接M16 prefill（C64已验）
+### NBG投影链接M16 prefill（C64及有界C256已验）
 
 10-16接入已有M16产物，绑定checkpoint、M1包、端口和版本。M1使用QKV/out NBG、
 融合FFN/末LN和一份NBG head；M16 attention用共享普通权重MatMul，前4层FFN为
@@ -263,7 +375,8 @@ M1 embedding  → 24层M1   → 固定输入buffer → 唯一NBG head → greedy
 完整退出检查。M16性能汇总前后3个17→16请求，不重复原容量矩阵。
 M1/M16审计为124/194图、1075/2918 outer operation、238/583 extension，均完整；
 未新增并行Verify。最后11:48:53.351479 +08:00延迟检查清洁，无owner或恢复标记。
-仅接受该C64有界负载，不外推新NBG组合C128、长期稳定性或TTGT组合。
+10-16只接受该C64有界负载；10-20新增C256边界见下文，不外推新NBG组合C128、
+长期稳定性或TTGT组合。
 
 直接FCL准备异常已停止验证，CPU权重压缩抓栈与中止记录见事故台账；当前所有板卡
 实验子进程均限300秒。固定binary SHA256
@@ -321,9 +434,30 @@ binary没有保存，当前不能完全排除更早实现及运行状态差异�
 本轮六进程/八请求/128输出均通过适用的选词、末层KV/未写槽、编译完整性、预算、
 释放和各45秒门禁，无新EDMA/hang。M1/M16分别124/194图及238/583 extension完整，
 const/nonconst峰值仍为657,302,149/77,928,016B和1,035,583,855/410,013,944B。
-仅补验该C64范围；未重跑全图、逐decoder C128或C256对话，也未证明长期稳定性。
+该轮只补验C64范围；随后C256工作见下节。未重跑全图或逐decoder C128，也未验长期稳定性。
 汇总、实际请求、冻结binary/源码、完整内核、采集对照及成本模型在
 `opt-ep-completion-20261020/{summary,tracing-comparison,execution-attribution,prefill-alignment-cost}.json`。
+
+同日后续核对`eec8af1`至当前源码，Context、tensor、GraphBuilder及mixers实现逐字节
+相同；M1仍使用固定QKV/core/out/残差/FFN及单head/selection。此前已测的提交源码对照
+也慢，不能把M16或会话改动当作必要触发条件；历史快binary及完整源码状态缺失，仍不能
+完成严格二分或排除更早实现差异。
+PCIe设备`0000:af:00.0`位于NUMA1，IRQ284有效CPU为36。固定已验映射binary、
+历史17输入/16输出、NBG及五库，每侧三请求，无采集，仅改测试进程CPU affinity：
+
+| 运行顺序 | 输出token/s | 首词后decode token/s | 平均TTFT s |
+|---|---:|---:|---:|
+| 正常调度，前置 | 1.168253 | 2.225717 | 6.95626 |
+| 固定NUMA1的CPU20 | 1.232242 | 2.324062 | 6.53025 |
+| 正常调度，后置 | 1.149025 | 2.207234 | 7.12901 |
+
+两个正常轮合并decode为2.216437token/s；固定CPU观察到+4.86%，仍比历史3.227321
+低约28%。每侧45个decode步骤的进程CPU user＋system为1.336/1.109/1.443s，
+不是全部墙钟。主机放置有小幅影响的线索，未证明NUMA、迁移、频率或IRQ中的具体原因，
+也不能解释主要回退。没有修改系统affinity、IRQ、governor、时钟、驱动或SDK；仅有这一组
+有界对照，不新增自动绑核策略。根因继续待匹配的底层事件或厂商信息，不盲目重跑FCL。
+源码审计、进程调度范围及完整结果见`opt-context-alignment-20261020/summary.json`、
+`source-and-host-audit.json`及各`*-scheduling.json`。
 
 ### C256三轮对话：保留KV与完整历史重放
 
@@ -353,22 +487,52 @@ OPT使用原checkpoint greedy策略；三轮新增36/26/27 token，累计prompt3
 M16整块，所以27个全用M1；重放能用4个M16块。这是短追加损失的重要线索，不能仅
 凭处理token数减少推断延迟降低。
 
-10-20复用上述六组prefill记录离线拟合，M16块/M1步约1.438/0.843s，最大残差0.652s。
-第二轮可重算已缓存的3个已知token，从位置48开始形成1块＋14步，模型估计省9.52s；
-第三轮需重算13个，模型仅估省1.09s，收益较小。模型只反映10-16慢速时段，不是新增
-板卡测量或可直接采用的运行时阈值。通用判断为新增整块节省的M1步成本超过M16块成本；
-禁止未知token填充。尚未实现历史回退/重算：需先验证完整前缀，再同步调整position和
-已消费历史，末预测只消费一次，因果mask及失败后状态失效语义必须保留；无需新增权重。
+10-20先用旧记录拟合成本，随后实现基于本进程实测的历史重算，不采用旧时段的固定阈值。
+完整前缀及token范围校验通过、历史临时标为无效后，才允许回退少于16个已消费token；
+原buffer不变，已知ID重新prefill，因果mask隐藏旧未来槽，末预测只消费一次。
+比较无head prompt步骤的最小M1/最大M16成本，仅在增加整块且节省成本时回退；
+没有足够样本时保持原路径。仅为M16＋NBG QKV/out的编译FFN组合启用；
+调度成本含必要控制IO，不作独立算子计时；不加权重、图或CLI参数。
+任一执行失败使历史失效；CPU契约覆盖错误前缀零状态改动、重算内容和失败后拒绝续接。
+
+| 10-20同三轮/每侧48输出，含reset的响应口径 | 平均TTFT s | 输出token/s | 首词后decode token/s |
+|---|---:|---:|---:|
+| 冻结映射版本，原保留KV策略 | 8.50476 | 0.966405 | 1.863021 |
+| 自适应历史重算＋保留KV | 6.70001 | 1.089403 | 1.878067 |
+| 候选版本，清空后完整重放 | 10.37047 | 0.875394 | 1.897048 |
+
+第二轮重算位置48–50的3个已知token，将27个M1改为1个M16＋14个M1，TTFT由
+13.58737降至8.07479s；第三轮按保守实测成本保持原路径。相对原保留KV策略，
+平均TTFT减少21.22%、输出率提高12.73%；相对清空重放，分别减少35.39%/提高24.45%。
+decode基本不变，不把不同boot的旧时段性能差异归因于本次调度。
+三侧选词/末层KV/未写槽、预算/释放及各45秒门禁通过；原始CPU轨迹复用10-16记录。
 
 两侧const/nonconst峰值均1,035,620,719 / 535,651,064B，释放归零；194图、2918 outer
 operation、583 extension完整。原NBG与native包字节不变，派生manifest仅声明C256；
-未扩展普通生成CLI默认范围，也未验C256末槽/溢出、其他对话、长期稳定或更长容量。
+10-16未扩展普通生成CLI或验C256末槽；10-20补验范围如下，仍未验其他对话、长期稳定或更长容量。
 
 **故障范围**：最初单进程串接六轮在重放第二轮发生4字节EDMA，结果不入上述表。
 用户明确授权忽略这一已记录事件后，拆为两个三轮进程，执行/数值/预算/释放及各
 45秒均通过；16:58:25.697036、17:02:40.443150完整日志无新故障/owner。没有断电，
 只在本次诊断中豁免16:48:18.926707这一旧事件，恢复标记与事故证据保留；不能据此
 宣称EDMA已修复。证据`opt-conversation-20261016/comparison.json`及事故台账。
+
+### C256长输入、隔离与容量边界
+
+10-20使用相同NBG/M16组合，241/3/241输入各生成16 token，长请求消费到256槽。
+48个选词及末层KV与独立CPU参考一致，重复长请求KV逐字节一致，短请求未写槽按位零，
+两次满容量step均在零IO/零图执行下拒绝；close拒绝、释放归零及45秒门禁通过。
+194图/2918 operation/583 extension完整，const/nonconst峰值
+1,035,620,719/535,651,064B，各低于1GiB；没有改变NBG、权重分类或绑定。
+
+两个241输入请求共32输出/57.80994s=0.553538token/s，平均TTFT21.02312s，
+首词后decode1.903106token/s；不把中间短请求混入长请求吞吐。
+长请求输出为`Alice lives in Paris. Bob lives in Rome. Alice owns a red bicycle.`，
+与本次输入事实及CPU轨迹一致；不据此泛化模型问答能力。
+普通生成入口开放显式声明C256的NBG包及block16，默认仍为C64；未开放C256直接FCL、
+全图或逐decoder候选，也未外推原生C128 M16配置。
+调度/长输入的冻结binary、CPU参考、各请求计数及内核证据在
+`opt-context-alignment-20261020/`；后续decode主机放置对照也归档于此。
 
 ### 全图／逐decoder C128
 
@@ -677,4 +841,4 @@ Begin先Flush/Commit/Stall，End收集counter后才取结束时间；采集包�
 
 本轮退役内存压力/完整性/计数/重绑实验、packed-cache矩阵、Qwen局部decoder及
 手写递归ping-pong、部分head NBG、vendor诊断入口；已验完整模型与必要保护保留。
-本轮仅做构建和CPU契约检查，未重测硬件或声明新配置通过。旧命令不是当前操作说明。
+代码精简采用离线构建和CPU检查，硬件验收按各节日期与范围区分；旧命令不是当前操作说明。

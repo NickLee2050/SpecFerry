@@ -10,7 +10,7 @@ find_package(Threads REQUIRED)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(np101_data native/np101/tensor_spec.cpp native/np101/weights.cpp native/np101/component_spec.cpp
-  native/np101/memory_budget.cpp)
+  native/np101/memory_budget.cpp native/np101/sdk_identity.cpp)
 target_compile_features(np101_data PUBLIC cxx_std_17)
 target_include_directories(np101_data PUBLIC native)
 target_link_libraries(np101_data PUBLIC OpenSSL::Crypto)

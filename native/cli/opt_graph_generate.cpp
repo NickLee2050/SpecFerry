@@ -402,109 +402,100 @@ int main(int argc, char **argv) {
       np101::TensorTransfers diagnostic_transfers;
       std::vector<BenchmarkRun> benchmark_runs;
 
-      const std::vector<std::string> history_modes =
-          options.history_mode == "compare" ? std::vector<std::string>{"reuse", "reset"}
-                                            : std::vector<std::string>{options.history_mode};
-      for (const auto &history_mode : history_modes) {
-        for (unsigned index = 0; index < requests.size(); ++index) {
-          for (unsigned repetition = 0; repetition < warmups + repeats; ++repetition) {
-            const bool warmup = repetition < warmups;
-            const unsigned iteration = warmup ? repetition : repetition - warmups;
-            const auto name = (options.history_mode == "compare" ? history_mode + "." : "") +
-                              (warmup ? "warmup." : "measured.") + std::to_string(index) +
-                              (benchmark ? "." + std::to_string(iteration) : "");
-            progress(directory, name);
+      for (unsigned index = 0; index < requests.size(); ++index) {
+        for (unsigned repetition = 0; repetition < warmups + repeats; ++repetition) {
+          const bool warmup = repetition < warmups;
+          const unsigned iteration = warmup ? repetition : repetition - warmups;
+          const auto name = (warmup ? "warmup." : "measured.") + std::to_string(index) +
+                            (benchmark ? "." + std::to_string(iteration) : "");
+          progress(directory, name);
 
-            np101::SdkScope request_scope("request", name);
-            const auto before = np101::tensor_transfers();
-            const auto launches = model.launches();
-            const auto counts_before = execution_counts(model);
-            const auto cpu_before = read_cpu_snapshot();
-            CpuPhaseBoundaries boundaries;
-            const auto observe = [&](auto phase) {
-              if (phase == inference::GenerationPhase::Prefill) {
-                boundaries.prefill = read_cpu_snapshot();
-              } else if (phase == inference::GenerationPhase::Decode) {
-                boundaries.decode = read_cpu_snapshot();
-              }
-            };
-            const auto result = history_mode == "reuse"
-                                    ? model.continue_generation(requests[index], maximum, observe)
-                                    : model.generate(requests[index], maximum, observe);
-            const auto cpu_after = read_cpu_snapshot();
-            const auto completed = model.launches();
-            const auto request_counts = execution_counts(model, counts_before);
-            save_generation(directory / (name + ".json"), result, completed - launches, before,
-                            np101::tensor_transfers(), block, request_counts, cpu_before, cpu_after,
-                            boundaries);
-            // Diagnostics run after generation, outside its transfer/time contract.
-            {
-              np101::SdkScope diagnostic_scope("phase", "diagnostic");
-              const auto diagnostic_before = np101::tensor_transfers();
-              if (readback == "logits") {
-                const auto logits = model.read_output("logits", readback_method);
-                save_diagnostic(directory / (name + ".logits.bin"), logits,
-                                "cannot save final logits diagnostic");
-              }
-              if (result.consumed == config.decoder.capacity) {
-                check_rejected_step<std::out_of_range>(
-                    model, requests[index].front(), capacity_checks, capacity_rejections,
-                    "capacity rejection performed IO or changed model state");
-              }
-              if (readback == "kv") {
-                for (unsigned layer = cache_first - 1; layer < cache_last; ++layer) {
-                  for (bool values : {false, true}) {
-                    auto bytes = model.read_cache(layer, values, readback_method);
-                    const auto head_dimension = config.decoder.kv_spec().head_dim;
-                    const auto row_bytes =
-                        std::size_t(head_dimension) * np101::dtype_bytes(model.cache_spec().type);
-                    const auto head_bytes = row_bytes * config.decoder.capacity;
-                    if (bytes.size() != head_bytes * config.decoder.heads) {
-                      throw std::runtime_error(
-                          "cache readback shape differs from configured capacity");
-                    }
-                    for (unsigned head = 0; head < config.decoder.heads; ++head) {
-                      const auto begin =
-                          bytes.begin() + head * head_bytes + result.consumed * row_bytes;
-                      const auto end = bytes.begin() + (head + 1) * head_bytes;
-                      cache_suffix_matches =
-                          std::all_of(begin, end, [](std::uint8_t value) { return value == 0; }) &&
-                          cache_suffix_matches;
-                      cache_suffix_checked_bytes += end - begin;
-                    }
-                    auto path = directory / (name + ".layer." + std::to_string(layer) +
-                                             (values ? ".values.bin" : ".keys.bin"));
-                    save_diagnostic(path, bytes, "cannot save cache diagnostic");
+          np101::SdkScope request_scope("request", name);
+          const auto before = np101::tensor_transfers();
+          const auto launches = model.launches();
+          const auto counts_before = execution_counts(model);
+          const auto cpu_before = read_cpu_snapshot();
+          CpuPhaseBoundaries boundaries;
+          const auto observe = [&](auto phase) {
+            if (phase == inference::GenerationPhase::Prefill) {
+              boundaries.prefill = read_cpu_snapshot();
+            } else if (phase == inference::GenerationPhase::Decode) {
+              boundaries.decode = read_cpu_snapshot();
+            }
+          };
+          const auto result = options.history_mode == "reuse"
+                                  ? model.continue_generation(requests[index], maximum, observe)
+                                  : model.generate(requests[index], maximum, observe);
+          const auto cpu_after = read_cpu_snapshot();
+          const auto completed = model.launches();
+          const auto request_counts = execution_counts(model, counts_before);
+          save_generation(directory / (name + ".json"), result, completed - launches, before,
+                          np101::tensor_transfers(), block, request_counts, cpu_before, cpu_after,
+                          boundaries);
+          // Diagnostics run after generation, outside its transfer/time contract.
+          {
+            np101::SdkScope diagnostic_scope("phase", "diagnostic");
+            const auto diagnostic_before = np101::tensor_transfers();
+            if (readback == "logits") {
+              const auto logits = model.read_output("logits", readback_method);
+              save_diagnostic(directory / (name + ".logits.bin"), logits,
+                              "cannot save final logits diagnostic");
+            }
+            if (result.consumed == config.decoder.capacity) {
+              check_rejected_step<std::out_of_range>(
+                  model, requests[index].front(), capacity_checks, capacity_rejections,
+                  "capacity rejection performed IO or changed model state");
+            }
+            if (readback == "kv") {
+              for (unsigned layer = cache_first - 1; layer < cache_last; ++layer) {
+                for (bool values : {false, true}) {
+                  auto bytes = model.read_cache(layer, values, readback_method);
+                  const auto head_dimension = config.decoder.kv_spec().head_dim;
+                  const auto row_bytes =
+                      std::size_t(head_dimension) * np101::dtype_bytes(model.cache_spec().type);
+                  const auto head_bytes = row_bytes * config.decoder.capacity;
+                  if (bytes.size() != head_bytes * config.decoder.heads) {
+                    throw std::runtime_error(
+                        "cache readback shape differs from configured capacity");
                   }
+                  for (unsigned head = 0; head < config.decoder.heads; ++head) {
+                    const auto begin =
+                        bytes.begin() + head * head_bytes + result.consumed * row_bytes;
+                    const auto end = bytes.begin() + (head + 1) * head_bytes;
+                    cache_suffix_matches =
+                        std::all_of(begin, end, [](std::uint8_t value) { return value == 0; }) &&
+                        cache_suffix_matches;
+                    cache_suffix_checked_bytes += end - begin;
+                  }
+                  auto path = directory / (name + ".layer." + std::to_string(layer) +
+                                           (values ? ".values.bin" : ".keys.bin"));
+                  save_diagnostic(path, bytes, "cannot save cache diagnostic");
                 }
               }
-              const auto diagnostic_after = np101::tensor_transfers();
-              diagnostic_transfers.reads += diagnostic_after.reads - diagnostic_before.reads;
-              diagnostic_transfers.read_bytes +=
-                  diagnostic_after.read_bytes - diagnostic_before.read_bytes;
             }
-            if (benchmark) {
-              benchmark_runs.push_back({name, index, iteration,
-                                        static_cast<unsigned>(requests[index].size()), warmup,
-                                        result.tokens == expected[index]});
-            }
-            // Keep the first failing request's KV, then release normally. Further
-            // requests cannot pass the gate once the independent token oracle fails.
-            if (result.tokens != expected[index]) {
-              tokens_match = false;
-              std::cerr << "Request " << index << " token mismatch; expected ";
-              inference::write_array(std::cerr, expected[index]);
-              std::cerr << ", got ";
-              inference::write_array(std::cerr, result.tokens);
-              std::cerr << ". Skipping remaining requests and releasing the model.\n";
-              break;
-            }
-            if (!cache_suffix_matches) {
-              std::cerr << "Request " << index << " has nonzero unwritten KV cache slots.\n";
-              break;
-            }
+            const auto diagnostic_after = np101::tensor_transfers();
+            diagnostic_transfers.reads += diagnostic_after.reads - diagnostic_before.reads;
+            diagnostic_transfers.read_bytes +=
+                diagnostic_after.read_bytes - diagnostic_before.read_bytes;
           }
-          if (!tokens_match || !cache_suffix_matches) {
+          if (benchmark) {
+            benchmark_runs.push_back({name, index, iteration,
+                                      static_cast<unsigned>(requests[index].size()), warmup,
+                                      result.tokens == expected[index]});
+          }
+          // Keep the first failing request's KV, then release normally. Further
+          // requests cannot pass the gate once the independent token oracle fails.
+          if (result.tokens != expected[index]) {
+            tokens_match = false;
+            std::cerr << "Request " << index << " token mismatch; expected ";
+            inference::write_array(std::cerr, expected[index]);
+            std::cerr << ", got ";
+            inference::write_array(std::cerr, result.tokens);
+            std::cerr << ". Skipping remaining requests and releasing the model.\n";
+            break;
+          }
+          if (!cache_suffix_matches) {
+            std::cerr << "Request " << index << " has nonzero unwritten KV cache slots.\n";
             break;
           }
         }

@@ -136,59 +136,47 @@ def evaluate_conversation(directory, reference, device):
             for segment in ("const", "nonconst")
         ),
     )
-    modes, arrays = {}, {}
-    selected_modes = (
-        ("reuse", "reset")
-        if reference["history_mode"] == "compare"
-        else (reference["history_mode"],)
-    )
-    for mode in selected_modes:
-        runs = []
-        for index, expected in enumerate(reference["requests"]):
-            name = (
-                f"{mode}.measured.{index}"
-                if reference["history_mode"] == "compare"
-                else f"measured.{index}"
+    runs = []
+    for index, expected in enumerate(reference["requests"]):
+        name = f"measured.{index}"
+        run = json.loads((device / f"{name}.json").read_text())
+        checks[f"request.{name}.tokens"] = run["tokens"] == expected["tokens"]
+        checks[f"request.{name}.consumed"] = run["consumed"] == expected["consumed"]
+        for part in ("keys", "values"):
+            actual = np.fromfile(device / f"{name}.layer.23.{part}.bin", dtype="<f2")
+            actual = actual.reshape(16, 256, 64)[:, : expected["consumed"]]
+            target = np.fromfile(directory / f"expected.{index}.{part}.bin", dtype="<f2")
+            target = target.reshape(actual.shape)
+            checks[f"request.{name}.{part}"] = compare_arrays(
+                actual, target, **TOLERANCES["device"]
+            )["passed"]
+        reset = run["state_preparation_seconds"]
+        runs.append(
+            expected
+            | run
+            | dict(
+                turn_ttft_seconds=reset + run["first_token_seconds"],
+                turn_seconds=reset + run["total_seconds"],
             )
-            run = json.loads((device / f"{name}.json").read_text())
-            checks[f"request.{name}.tokens"] = run["tokens"] == expected["tokens"]
-            checks[f"request.{name}.consumed"] = run["consumed"] == expected["consumed"]
-            for part in ("keys", "values"):
-                actual = np.fromfile(device / f"{name}.layer.23.{part}.bin", dtype="<f2")
-                actual = actual.reshape(16, 256, 64)[:, : expected["consumed"]]
-                target = np.fromfile(directory / f"expected.{index}.{part}.bin", dtype="<f2")
-                target = target.reshape(actual.shape)
-                checks[f"request.{name}.{part}"] = compare_arrays(
-                    actual, target, **TOLERANCES["device"]
-                )["passed"]
-                if mode == "reuse":
-                    arrays[index, part] = actual
-                elif (index, part) in arrays:
-                    checks[f"request.{name}.{part}.matches_reuse"] = compare_arrays(
-                        actual, arrays[index, part], **TOLERANCES["device"]
-                    )["passed"]
-            reset = run["state_preparation_seconds"]
-            runs.append(
-                expected
-                | run
-                | dict(
-                    turn_ttft_seconds=reset + run["first_token_seconds"],
-                    turn_seconds=reset + run["total_seconds"],
-                )
-            )
-        count = sum(len(run["tokens"]) for run in runs)
-        wall = sum(run["turn_seconds"] for run in runs)
-        decode_seconds = sum(sum(run["token_seconds"]) for run in runs)
-        decode_count = sum(len(run["token_seconds"]) for run in runs)
-        modes[mode] = dict(
-            turns=runs,
-            generated_tokens=count,
-            active_seconds=wall,
-            mean_ttft_seconds=sum(run["turn_ttft_seconds"] for run in runs) / len(runs),
-            output_tokens_per_second=count / wall,
-            decode_tokens_per_second=decode_count / decode_seconds if decode_seconds else None,
         )
-    return dict(passed=all(checks.values()), checks=checks, native=native, performance=modes)
+    count = sum(len(run["tokens"]) for run in runs)
+    wall = sum(run["turn_seconds"] for run in runs)
+    decode_seconds = sum(sum(run["token_seconds"]) for run in runs)
+    decode_count = sum(len(run["token_seconds"]) for run in runs)
+    performance = dict(
+        turns=runs,
+        generated_tokens=count,
+        active_seconds=wall,
+        mean_ttft_seconds=sum(run["turn_ttft_seconds"] for run in runs) / len(runs),
+        output_tokens_per_second=count / wall,
+        decode_tokens_per_second=decode_count / decode_seconds if decode_seconds else None,
+    )
+    return dict(
+        passed=all(checks.values()),
+        checks=checks,
+        native=native,
+        performance={reference["history_mode"]: performance},
+    )
 
 
 def main():
@@ -199,7 +187,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=ROOT / ".cache/models/facebook/opt-350m")
     parser.add_argument("--max-new-tokens", type=int, choices=range(1, 17), default=16)
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--history-mode", choices=("reuse", "reset", "compare"), default="reuse")
+    parser.add_argument("--history-mode", choices=("reuse", "reset"), default="reuse")
     args = parser.parse_args()
     args.package, args.model, args.checkpoint = (
         path.resolve(strict=True) for path in (args.package, args.model, args.checkpoint)

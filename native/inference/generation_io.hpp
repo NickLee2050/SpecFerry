@@ -101,8 +101,7 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
-    if ((result.history_mode != "reset" && result.history_mode != "reuse" &&
-         result.history_mode != "compare") ||
+    if ((result.history_mode != "reset" && result.history_mode != "reuse") ||
         (result.history_mode != "reset" && (result.benchmark || result.lifecycle)) ||
         (result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||
         (result.projection_backend != "auto" && result.projection_backend != "fcl" &&
@@ -148,6 +147,7 @@ inline void write_generation(std::ostream &out, const Generation &result) {
   write_array(out, result.tokens);
   out << ",\"consumed\":" << result.consumed << ",\"stop_reason\":\"" << result.stop_reason
       << "\",\"state_preparation_seconds\":" << result.state_preparation_seconds
+      << ",\"replayed_prompt_tokens\":" << result.replayed_prompt_tokens
       << ",\"prefill_seconds\":" << result.prefill_seconds
       << ",\"first_token_seconds\":" << result.first_token_seconds
       << ",\"total_seconds\":" << result.total_seconds << ",\"token_seconds\":";

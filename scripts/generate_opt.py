@@ -161,14 +161,15 @@ def main():
     if args.compiled_ffn is not None:
         if (
             args.backend != "graph"
-            or args.capacity not in (64, 128)
+            or args.capacity not in (64, 128, 256)
+            or (args.capacity == 256 and args.block != 16)
             or args.block not in (1, 16)
             or args.graph_layers not in (None, 24)
             or args.lifecycle_check
             or args.variant is not None
         ):
             parser.error(
-                "compiled FFN requires full OPT/C64 or C128 graph mode with block1/16 and no variant or lifecycle override"
+                "compiled FFN requires full OPT C64/C128 graph mode or C256 block16, without variant or lifecycle overrides"
             )
         if args.sdk_timing or args.sdk_summary:
             parser.error("compiled candidate entry currently uses untraced acceptance")
@@ -179,12 +180,18 @@ def main():
         )
         if args.projection_backend is None and "projections" in compiled_package:
             args.projection_backend = "nbg"
+        if args.capacity == 256 and args.projection_backend != "nbg":
+            parser.error("C256 prefill requires the packaged NBG projections")
         if args.block == 16 and (
-            args.capacity != 64
+            args.capacity not in (64, 256)
             or "prefill" not in compiled_package
+            or args.capacity
+            not in compiled_package.get("prefill", {}).get("supported_capacities", [64])
             or args.projection_backend not in (None, "fcl", "nbg")
         ):
-            parser.error("block16 requires its C64 prefill package and M1 FCL or NBG projections")
+            parser.error(
+                "block16 requires its declared prefill capacity and M1 FCL or NBG projections"
+            )
         args.variant = "compiled-ffn-finish"
         if args.projection_backend not in (None, "fcl") and "projections" not in compiled_package:
             parser.error("NBG projection selection requires packaged projection artifacts")

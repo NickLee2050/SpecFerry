@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -22,6 +23,24 @@ std::vector<PrefillChunk> plan_prefill(unsigned tokens, unsigned block, unsigned
   return result;
 }
 
+unsigned prefill_replay_tokens(unsigned position, unsigned appended, unsigned block,
+                               double single_seconds, double block_seconds) {
+  if (!block || block > 16) {
+    throw std::invalid_argument("prefill block must be in [1,16]");
+  }
+  const auto replay = position % block;
+  if (!replay || !appended || !std::isfinite(single_seconds) || !std::isfinite(block_seconds) ||
+      single_seconds <= 0 || block_seconds <= 0) {
+    return 0;
+  }
+  const auto leading = std::min(appended, block - replay);
+  const auto original_blocks = (appended - leading) / block;
+  const auto replay_blocks = (std::uint64_t(appended) + replay) / block;
+  return replay_blocks > original_blocks && (block - replay) * single_seconds > block_seconds
+             ? replay
+             : 0;
+}
+
 Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecutor &executor,
                            const std::vector<std::int32_t> &prompt, unsigned maximum_new_tokens,
                            const std::function<void(std::int32_t)> &on_token,
@@ -29,7 +48,7 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
   if (!policy.capacity || !policy.vocabulary ||
       policy.vocabulary > std::numeric_limits<std::int32_t>::max() ||
       policy.bos >= policy.vocabulary || policy.eos >= policy.vocabulary || !executor.reset ||
-      !executor.consume || !executor.predict) {
+      !executor.consume || !executor.predict || (executor.prepare_prefill && !executor.prefill)) {
     throw std::invalid_argument("invalid generation policy or executor");
   }
   const auto ids = prompt.empty() ? std::vector<std::int32_t>{std::int32_t(policy.bos)} : prompt;
@@ -48,21 +67,27 @@ Generation generate_tokens(const GenerationPolicy &policy, const GenerationExecu
        !std::equal(history->tokens.begin(), history->tokens.end(), ids.begin()))) {
     throw std::invalid_argument("generation history does not match the supplied prompt prefix");
   }
-  const unsigned prefix = history ? history->consumed : 0;
+  unsigned prefix = history ? history->consumed : 0;
   const bool continuing = history && !history->tokens.empty();
   const auto preparation_start = std::chrono::steady_clock::now();
   if (history) {
     // A failed executor must never leave a resumable history attached to partial KV writes.
     history->valid = false;
   }
-  if (!continuing) {
+  Generation result;
+  if (continuing && executor.prepare_prefill) {
+    result.replayed_prompt_tokens = executor.prepare_prefill(prefix, ids.size() - prefix);
+    if (result.replayed_prompt_tokens > prefix) {
+      throw std::runtime_error("prefill replay exceeds the validated history prefix");
+    }
+    prefix -= result.replayed_prompt_tokens;
+  } else if (!continuing) {
     if (on_phase) {
       on_phase(GenerationPhase::Reset);
     }
     np101::SdkScope phase("phase", "reset");
     executor.reset();
   }
-  Generation result;
   result.consumed = prefix;
   result.state_preparation_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_start).count();

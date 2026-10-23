@@ -1,5 +1,6 @@
 #include "models/opt/layer.hpp"
 #include "np101/memory_budget.hpp"
+#include "np101/sdk_identity.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -124,26 +125,12 @@ CompiledModelPackage load_compiled_model(const std::filesystem::path &package,
       count;
   if (!file || magic != "specferry-opt-model" || version != 1 ||
       (kind != "decoders" && kind != "fullgraph") || capacity != config.decoder.capacity ||
-      (capacity != 64 && capacity != 128) || count != 5 || driver != "F53A3E6EFBB7D0FD7D4617C" ||
+      (capacity != 64 && capacity != 128) ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("compiled OPT model deployment/header differs");
   }
-  std::ifstream module("/sys/module/galcore/srcversion");
-  std::string loaded_driver;
-  module >> loaded_driver;
-  if (!module || loaded_driver != driver) {
-    throw std::invalid_argument("compiled OPT model loaded driver differs");
-  }
-  std::set<std::string> libraries{"libovxlib.so", "libOpenVX.so", "libGAL.so", "libArchModelSw.so",
-                                  "libNNArchPerf.so"};
-  for (unsigned index = 0; index < 5; ++index) {
-    file >> name >> digest;
-    if (!file || !libraries.erase(name) ||
-        file_sha256(std::filesystem::path("/usr/lib/ljmicro") / name) != digest) {
-      throw std::invalid_argument("compiled OPT model SDK identity differs");
-    }
-  }
+  verify_compiled_sdk(file, driver, count);
   file >> count;
   if (!file || count != (kind == "decoders" ? 24u : 1u) || config.decoder.layers != 24) {
     throw std::invalid_argument("compiled OPT model requires complete ordered layers");

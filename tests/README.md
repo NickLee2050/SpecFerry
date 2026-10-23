@@ -33,6 +33,18 @@ a running deadline; preserve the gate on expiry and change the approach. Delayed
 `--prepare-only` prepares fixtures without opening the board. Recovery flags require prior agreement
 and do not themselves authorize a control. Archived binaries/commands are evidence, not test entries.
 
+### Small SoC memory check
+
+With the [cross-build setup](../README.md#soc-cross-build), configure `BUILD_TESTING=ON` and build
+only target `np101_memory_check`. This explicit device diagnostic is not registered with CTest.
+It takes an output directory, allocates FP32 tensors of 1, 4 and 16MiB for each of const/nonconst
+(21MiB each), and checks all retained contents through mapped reads after each allocation.
+It adds no operators and calls neither Setup, Verify nor RunGraph; passing is not compute acceptance.
+Graph/Context release must return application budgets to zero. Use an external bounded supervisor
+and the full ledger checks; this binary has no watchdog. Accepted 256/1792MiB pool runs used a
+90-second deadline and checked pool release and delayed logs; measurements live in the status
+document. This 42MiB check is not whole-pool integrity or model acceptance.
+
 ## Generation and compiled packages
 
 Recommended commands and package hashes are in [README](../README.md) and the status document.
@@ -78,8 +90,9 @@ ONNX, generated C and compiler logs stay outside runtime packages.
 
 OPT's `--prefill-artifacts` imports existing source-bound M16 exports into the M1 package: layers
 0–3 retain ordinary FFNs, layers 4–23 use M16 NBGs, and both execution sets share one head. This
-requires the compiled head; regular acceptance covers C64/block16, while the bounded C256
-conversation diagnostic is recorded separately below. Full M16 const residency exceeds the
+requires the compiled head; acceptance covers C64/block16 and explicitly declared C256 packages
+with 241/3/241-input requests, 16 outputs each, capacity rejection and repeated KV checks.
+The C256 conversation comparison is recorded separately below. Full M16 const residency exceeds the
 budget. M16 uses ordinary attention; QKV/out NBGs remain M1 graphs. Numerical, KV/reset,
 capacity and release evidence is in the status document.
 
@@ -90,9 +103,10 @@ for the fixed M1/M16 ports; original C64 packages remain unchanged. Three Englis
 pinned CPU greedy trajectory, last-layer mapped KV checks and the normal release/kernel gates.
 Conversation response metrics add `state_preparation_seconds` (including reset) to generation
 timings; initialization, tokenization, CPU reference, diagnostics and user think time are separate.
-The retained path consumes the pending last output exactly once and aligns later M16 blocks with
-single-token steps. Each SDK child remains limited to 300 seconds. `--history-mode compare` is the
-original six-turn diagnostic, which encountered EDMA; it is not the default acceptance path.
+The retained path consumes the pending last output once. Full-prefix validation precedes optional
+partial-block replay, selected using measured headless M1/M16 costs including control IO.
+`replayed_prompt_tokens` records recomputation. The old six-turn `compare` mode is retired;
+use independent `reuse` and `reset` runs, each limited to 300 seconds.
 
 Qwen mixer export accepts `--outer-product multiply` and `--fuse-input-norm`. OPT's
 `--projection-backend fcl|nbg-qkv|nbg-output|nbg` selects explicit implementations. Packages with

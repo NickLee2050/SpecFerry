@@ -1,5 +1,6 @@
 #include "models/qwen3_5/compiled.hpp"
 #include "np101/memory_budget.hpp"
+#include "np101/sdk_identity.hpp"
 
 #include <array>
 #include <fstream>
@@ -85,23 +86,11 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
   std::string magic, driver, name, digest, extra;
   unsigned version = 0, count = 0;
   file >> magic >> version >> driver >> count;
-  std::ifstream module("/sys/module/galcore/srcversion");
-  std::string loaded;
-  module >> loaded;
   if (!file || magic != std::string("specferry-qwen-") + label ||
-      (version != 1 && !(mixer && version == 2)) || count != 5 ||
-      driver != "F53A3E6EFBB7D0FD7D4617C" || loaded != driver) {
+      (version != 1 && !(mixer && version == 2)) || driver != "F53A3E6EFBB7D0FD7D4617C") {
     throw std::invalid_argument("compiled Qwen block package/driver differs");
   }
-  std::set<std::string> libraries{"libovxlib.so", "libOpenVX.so", "libGAL.so", "libArchModelSw.so",
-                                  "libNNArchPerf.so"};
-  for (unsigned index = 0; index < 5; ++index) {
-    file >> name >> digest;
-    if (!file || !libraries.erase(name) ||
-        file_sha256(std::filesystem::path("/usr/lib/ljmicro") / name) != digest) {
-      throw std::invalid_argument("compiled Qwen block SDK differs");
-    }
-  }
+  verify_compiled_sdk(file, driver, count);
   file >> count;
   if (!file || count == 0 || count > (mixer ? 18u : 24u)) {
     throw std::invalid_argument("compiled Qwen block package count differs");

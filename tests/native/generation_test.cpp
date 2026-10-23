@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -71,7 +72,7 @@ void run_options_contracts() {
                                       "projection_backend nbg\nprefill_head last-token\n");
   require(compiled_prefill.block == 16 && compiled_prefill.projection_backend == "nbg");
   require(parse("history_mode reuse\n").history_mode == "reuse");
-  require(parse("history_mode compare\n").history_mode == "compare");
+  rejects([&] { parse("history_mode compare\n"); });
   const auto cache = parse("readback kv\ncache_first_layer 2\ncache_last_layer 3\n");
   require(cache.cache_first == 2 && cache.cache_last == 3);
   const auto mapped = parse("readback kv\ncache_first_layer 23\ncache_last_layer 24\n"
@@ -162,6 +163,57 @@ void conversation_contracts() {
   const auto aligned = plan_prefill(34, 16, 15);
   require(aligned.size() == 4 && aligned[0].count == 1 && aligned[1].count == 16 &&
           aligned[2].count == 16 && aligned[3].count == 1);
+}
+
+void prefill_replay_contracts() {
+  using namespace specferry::inference;
+  require(prefill_replay_tokens(51, 27, 16, 0.843, 1.438) == 3);
+  require(prefill_replay_tokens(93, 28, 16, 0.843, 1.438) == 13);
+  require(prefill_replay_tokens(15, 32, 16, 0.843, 1.438) == 0);
+  require(prefill_replay_tokens(16, 32, 16, 0.843, 1.438) == 0);
+  require(prefill_replay_tokens(3, 1, 16, 0.843, 1.438) == 0);
+  require(prefill_replay_tokens(51, 27, 16, 0, 1.438) == 0);
+  require(prefill_replay_tokens(51, 27, 16, 0.843, std::numeric_limits<double>::infinity()) == 0);
+  rejects([&] { prefill_replay_tokens(51, 27, 0, 0.843, 1.438); });
+
+  std::vector<std::int32_t> consumed, replayed;
+  GenerationHistory history;
+  unsigned preparations = 0;
+  bool fail = false;
+  GenerationExecutor executor{
+      [&] { consumed.clear(); }, [&](std::int32_t token) { consumed.push_back(token); },
+      [&] { return consumed.back() + 1; },
+      [&](const std::vector<std::int32_t> &tokens) {
+        if (fail) {
+          throw std::runtime_error("prefill failed after rewind");
+        }
+        replayed = tokens;
+        consumed.insert(consumed.end(), tokens.begin(), tokens.end());
+      },
+      [&](unsigned prefix, unsigned appended) {
+        require(!history.valid && prefix == consumed.size() && appended > 0);
+        ++preparations;
+        consumed.resize(prefix - 3);
+        return 3;
+      }};
+  const GenerationPolicy policy{100, 32, 2, 99};
+  generate_tokens(policy, executor, {2, 3, 4, 5, 6, 7}, 2, {}, {}, &history);
+  require(preparations == 0 && history.consumed == 7);
+  auto prompt = history.tokens;
+  prompt.insert(prompt.end(), {10, 11});
+  auto invalid = prompt;
+  invalid[0] = 0;
+  const auto before = consumed;
+  rejects([&] { generate_tokens(policy, executor, invalid, 1, {}, {}, &history); });
+  require(history.valid && preparations == 0 && consumed == before);
+  const auto result = generate_tokens(policy, executor, prompt, 1, {}, {}, &history);
+  require(result.replayed_prompt_tokens == 3 && result.consumed == prompt.size() &&
+          result.tokens == std::vector<std::int32_t>{12} && consumed == prompt &&
+          replayed == std::vector<std::int32_t>({6, 7, 8, 9, 10, 11}) && history.valid);
+  fail = true;
+  rejects([&] { generate_tokens(policy, executor, history.tokens, 1, {}, {}, &history); });
+  require(!history.valid);
+  rejects([&] { generate_tokens(policy, executor, history.tokens, 1, {}, {}, &history); });
 }
 
 void contracts() {
@@ -265,6 +317,7 @@ int main() {
     run_options_contracts();
     contracts();
     conversation_contracts();
+    prefill_replay_contracts();
     std::cout << "Generation BOS, EOS, capacity, limits and consumed-token contracts passed.\n";
     return 0;
   } catch (const std::exception &error) {

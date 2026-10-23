@@ -10,7 +10,7 @@ Use the pinned v105 SDK/driver identities in each package manifest and follow th
 
 | Model | Recommended configuration | Accepted scope |
 |---|---|---|
-| OPT-350m | NBG QKV/out projections, fused M1 FFN/final norm and one NBG head; optional budgeted M16 prefill | Current NBG M1/M16: C64; earlier C128 configurations remain documented separately |
+| OPT-350m | NBG QKV/out projections, fused M1 FFN/final norm and one NBG head; optional budgeted M16 prefill | Current NBG M1/M16: C64 and bounded C256; earlier C128 configurations remain documented separately |
 | Cached Qwen3.5-0.8B | GATHER_ND, zero-based layer9 device MatMul FFN, 18 DeltaNet + 23 FFN NBGs, mapped token readback | C64 greeting, repeated arithmetic and 16-token natural generation |
 
 The [status document](docs/np101-status.md) pins package identities, measurements and acceptance
@@ -31,6 +31,39 @@ cmake --build build -j 4
 Update with `conda env update -n SpecFerry -f environment.yml`. SDK defaults are `/usr/inc`
 and `/usr/lib/ljmicro`; override `LJMICRO_SDK_INCLUDE_DIR` / `LJMICRO_SDK_LIBRARY_DIR`
 at CMake configure time. `build/compile_commands.json` supports clangd.
+
+### SoC cross-build
+
+Use the vendor RISC-V GCC V2.6.1 toolchain and a snapshot of the board's SDK and RISC-V
+`libcrypto.so.1.1`. Keep host and board build directories separate. No board internet access is
+needed. `soc_root` below must contain the board paths and compatible OpenSSL development headers;
+the accepted build used OpenSSL 1.1.1f public headers with a checked LP64 configuration because the
+board had no development headers. Do not copy host libraries into the target snapshot.
+
+```bash
+soc_toolchain=/absolute/path/to/NP101-riscv-gcc-linux-5.10.4-glibc-x86_64-V2.6.1
+soc_root=/absolute/path/to/board-root
+CCACHE_DIR="$PWD/.cache/ccache" cmake -S . -B build-soc \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/np101-riscv64.cmake" \
+  -DNP101_TOOLCHAIN_ROOT="$soc_toolchain" -DCMAKE_FIND_ROOT_PATH="$soc_root" \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+  -DLJMICRO_SDK_INCLUDE_DIR="$soc_root/np101_driver/build/sdk/include" \
+  -DLJMICRO_SDK_LIBRARY_DIR="$soc_root/np101_driver/build/sdk/drivers" \
+  -DOPENSSL_INCLUDE_DIR="$soc_root/usr/include" \
+  -DOPENSSL_CRYPTO_LIBRARY="$soc_root/usr/lib/libcrypto.so.1.1"
+CCACHE_DIR="$PWD/.cache/ccache" cmake --build build-soc -j 4 \
+  --target specferry_opt_graph_generate specferry_opt_generate
+```
+
+Transfer `build-soc/bin/` over SSH; on the board, use
+`LD_LIBRARY_PATH=/np101_driver/build/sdk/drivers` and `VIV_MGPU_AFFINITY=1:0`.
+Runtime EVIS compilation needs the SDK's CL headers in a private working directory, exposed through
+`LJMICRO_SDK_DIR`. Native OPT packages can use the pinned `np101-soc-riscv64` SDK profile; existing
+Python exporters/runners still target EP. Small NBGs and a complete decoder passed on SoC;
+full-model inference remains unaccepted. The expanded 1792MiB pool has only passed a 42MiB
+allocation/readback check. See [status](docs/np101-status.md#soc部署与内存) for deployment evidence.
+SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
+isolation. Driver autoload remains disabled.
 
 ## Prepare and generate
 
@@ -72,15 +105,12 @@ Checkpoint generation defaults are preserved; sampling is limited to the compone
 validated FP32-logit path and needs explicit `--sample --seed 42`.
 
 An OPT package with the accepted partial M16 exports also supports `--block 16 --capacity 64`.
-It keeps four ordinary FFNs and twenty NBG FFNs for prefill, shares FP16 KV and one head with M1,
-and retains FP32 normalization. Packages containing QKV/out exports default to NBG projections;
-the earlier head-only package retains its legacy FCL path. Direct FCL experiments are stopped.
-Each device child is limited to 300 seconds, including preparation; release and the required
-45-second delayed kernel check are separate.
-
-A user-confirmed NP101 board power cycle is sufficient to begin agreed recovery checks; host cold
-restart or a changed host boot ID is not required. Preserve fault markers until all acceptance and
-at least 45 seconds of delayed checks pass. Read-only `sudo journalctl` has standing authorization.
+An explicitly C256-capable package supports `--block 16 --capacity 256` with NBG projections;
+capacity/reset acceptance and the mixed prefill composition are in the status document.
+Packages containing QKV/out exports default to NBG; earlier head-only packages retain FCL.
+Conversation reuse may recompute a partial historical block when measured headless prompt costs
+favor M16; full-prefix validation precedes state changes. No padding or extra weight copies are used.
+Device deadlines and recovery requirements are centralized in the incident ledger.
 
 ## Measurement and regressions
 

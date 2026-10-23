@@ -9,6 +9,7 @@
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -103,6 +104,7 @@ struct PartitionedGraphModel::Impl {
   bool prediction_valid = false;
   bool failed = false;
   bool closed = false;
+  double single_prefill_seconds = 0, block_prefill_seconds = 0;
 
   Impl(Context &context, const WeightStore &weights, const ModelConfig &spec,
        const PhaseObserver &phase, Variant selected_variant, PrefillHeadPolicy prefill_head,
@@ -730,7 +732,20 @@ struct PartitionedGraphModel::Impl {
                             chunk.begin + chunk.count == tokens.size();
       const std::vector<std::int32_t> block_tokens(tokens.begin() + chunk.begin,
                                                    tokens.begin() + chunk.begin + chunk.count);
+      const auto started = std::chrono::steady_clock::now();
       consume(execution, block_tokens, run_head);
+      if (!run_head && prefill_block > 1) {
+        const auto seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        // Headless prompt steps are comparable. Conservative extrema avoid
+        // treating head execution or a slow first single step as replay savings.
+        if (chunk.count == 1) {
+          single_prefill_seconds =
+              single_prefill_seconds > 0 ? std::min(single_prefill_seconds, seconds) : seconds;
+        } else {
+          block_prefill_seconds = std::max(block_prefill_seconds, seconds);
+        }
+      }
     }
   }
 
@@ -994,6 +1009,25 @@ PartitionedGraphModel::continue_generation(const std::vector<std::int32_t> &prom
   if (impl_->prefill_block != 1 || impl_->prefill_head_policy == PrefillHeadPolicy::LastToken) {
     executor.prefill = [&](const std::vector<std::int32_t> &tokens) {
       impl_->consume_prompt(tokens);
+    };
+  }
+  if (impl_->prefill_block == 16 && impl_->variant == Variant::MergedKvCompiledFfn &&
+      impl_->projections.compiled_query && impl_->projections.compiled_output) {
+    executor.prepare_prefill = [&](unsigned prefix, unsigned appended) {
+      impl_->require_open();
+      if (impl_->position != prefix) {
+        throw std::logic_error("OPT position differs from the validated generation history");
+      }
+      const auto replay = inference::prefill_replay_tokens(prefix, appended, impl_->prefill_block,
+                                                           impl_->single_prefill_seconds,
+                                                           impl_->block_prefill_seconds);
+      if (replay) {
+        // Keep the buffers; causal masks hide old future slots while known IDs
+        // overwrite this partial block. The generation history is already invalid.
+        impl_->position -= replay;
+        impl_->prediction_valid = false;
+      }
+      return replay;
     };
   }
   return inference::generate_tokens(
