@@ -277,6 +277,12 @@ int main(int argc, char **argv) {
                                  ? PartitionedModel::PrefillHeadPolicy::LastToken
                                  : PartitionedModel::PrefillHeadPolicy::EveryToken;
     const auto config = models::opt::read_model_config(argv[2]);
+    const auto kv_transfer = options.kv_transfer == "mapped-slot"
+                                 ? PartitionedModel::KvTransfer::MappedSlot
+                                 : PartitionedModel::KvTransfer::DeviceCopy;
+    if (kv_transfer == PartitionedModel::KvTransfer::MappedSlot && config.decoder.capacity != 64) {
+      throw std::invalid_argument("mapped-slot KV is limited to the validated C64 layout");
+    }
     const auto cache_first = options.cache_first, cache_last = options.cache_last;
     if (cache_last > config.decoder.layers) {
       throw std::invalid_argument("cache layer range must be within the configured model");
@@ -335,7 +341,10 @@ int main(int argc, char **argv) {
       if (!(manifest >> std::quoted(package)) || manifest >> extra) {
         throw std::invalid_argument("compiled model variant requires one package path");
       }
-      compiled_model = models::opt::load_compiled_model(package, argv[1], config, weights);
+      const fs::path package_path(package);
+      compiled_model = models::opt::load_compiled_model(
+          package_path.is_absolute() ? package_path : fs::path(argv[2]) / package_path, argv[1],
+          config, weights);
       if ((variant == PartitionedModel::Variant::CompiledDecoder) !=
           !compiled_model.decoders.empty()) {
         throw std::invalid_argument("compiled model scope differs from selected variant");
@@ -371,7 +380,7 @@ int main(int argc, char **argv) {
       PartitionedModel model(
           context, weights, config, [&](const std::string &stage) { progress(directory, stage); },
           variant, head_policy, block, compiled_ffn, compiled_model.decoders, compiled_prefill_ffn,
-          projections, compiled_head, compiled_projections, compiled_model.full);
+          projections, compiled_head, compiled_projections, compiled_model.full, kv_transfer);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
@@ -382,6 +391,7 @@ int main(int argc, char **argv) {
                     << variant_name << "\",\"decoder_group_size\":1"
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
+                    << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
                     << ",\"token_readback_transport\":\"mapped\""
                     << ",\"head_backend\":\"" << head_backend << "\""
                     << ",\"attention_projection_backend\":\"" << projection_backend << "\""
@@ -536,6 +546,7 @@ int main(int argc, char **argv) {
           << ",\"head_runs\":" << counts.head_runs << ",\"prefill_block\":" << block
           << ",\"capacity\":" << config.decoder.capacity << ",\"launches\":" << launches
           << ",\"history_mode\":\"" << options.history_mode << "\""
+          << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
           << ",\"weight_payload_bytes\":" << weight_bytes
           << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request
           << ",\"initialize_seconds\":" << initialize

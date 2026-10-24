@@ -36,6 +36,16 @@ a running deadline; preserve the gate on expiry and change the approach. Delayed
 `--prepare-only` prepares fixtures without opening the board. Recovery flags require prior agreement
 and do not themselves authorize a control. Archived binaries/commands are evidence, not test entries.
 
+### SoC formal generation
+
+Use the separate `np101_soc.py prepare/deploy/run/collect` workflow in the root README. Packaging
+checks source weights, NBG ports and SDK identities; board runs require explicit C64/M1 mapped-slot
+requests and the documented driver parameters. Reuse an existing independent CPU reference when
+the request is unchanged. Host numerical checks share the OPT validation code with EP.
+`python -m unittest tests.python.test_soc` checks packaging integrity, architecture/path rejection,
+watchdog termination despite blocked sampling, fault handling and retained recovery gates without
+opening a device. SSH failure alone never authorizes another model submission.
+
 ### Small SoC memory check
 
 With the [cross-build setup](../README.md#soc-cross-build), configure `BUILD_TESTING=ON` and build

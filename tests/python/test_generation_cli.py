@@ -14,6 +14,62 @@ from tests.python.validation_fixtures import GraphEvidenceFixture
 
 
 class GenerationCommandTests(GraphEvidenceFixture):
+    def test_mapped_slot_is_explicit_and_limited_to_fullgraph_c64(self):
+        path = Path(__file__).resolve().parents[2] / "scripts/generate_opt.py"
+        main = runpy.run_path(str(path))["main"]
+
+        def prepare_request(*arguments, **kwargs):
+            arguments[2].mkdir()
+            return dict(
+                capacity=64, selection={"mode": "greedy"}, tokens=[2], prompt="test"
+            ), Mock()
+
+        for kind, capacity, accepted in (
+            ("fullgraph", 64, True),
+            ("decoders", 64, False),
+            ("fullgraph", 128, False),
+        ):
+            output = self.root / f"{kind}.{capacity}"
+            arguments = [
+                str(path),
+                "--backend",
+                "graph",
+                "--compiled-model",
+                str(self.root / "package"),
+                "--capacity",
+                str(capacity),
+                "--kv-transfer",
+                "mapped-slot",
+                "--prepare-only",
+                "--output",
+                str(output),
+            ]
+            with (
+                self.subTest(kind=kind, capacity=capacity),
+                patch.object(sys, "argv", arguments),
+                patch.dict(
+                    main.__globals__, prepare_request=prepare_request, run_device=Mock()
+                ) as globals_,
+                patch(
+                    "specferry.models.opt.compiled_model.load_model_package",
+                    return_value={"kind": kind},
+                ),
+                patch("specferry.models.opt.graph_validation.prepare", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                if accepted:
+                    self.assertEqual(main(), 0)
+                    self.assertIn(
+                        "kv_transfer mapped-slot\n",
+                        (output / "request/run-options.txt").read_text(),
+                    )
+                else:
+                    with self.assertRaises(SystemExit) as raised:
+                        main()
+                    self.assertEqual(raised.exception.code, 2)
+                globals_["run_device"].assert_not_called()
+
     def test_compiled_prefill_defaults_to_packaged_nbg_projections_without_device_access(self):
         self.check_compiled_prefill_preparation(64)
 

@@ -135,6 +135,47 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
                     document[field] = original
         self.save_metadata()
 
+    def test_mapped_slot_counts_bytes_and_request_reset_are_required(self):
+        self.metadata.update(capacity=64, layers=24, heads=16, width=64)
+        options = self.options | {
+            "variant": "compiled-fullgraph",
+            "prefill_head_policy": "every-token",
+            "kv_transfer": "mapped-slot",
+        }
+        self.initialized.update(options)
+        self.native_run.update(options, head_runs=10, kv_reset_uploads_per_request=48)
+        self.save_metadata()
+        for index, request in enumerate(self.metadata["requests"]):
+            path = self.device / f"measured.{index}.json"
+            observed = json.loads(path.read_text())
+            steps = request["consumed"]
+            observed.update(
+                uploads=steps * 52 + (48 if index else 0),
+                upload_bytes=steps * (392 + 196608) + (12582912 if index else 0),
+                reads=steps * 48 + 2,
+                read_bytes=steps * 196608 + 8,
+            )
+            path.write_text(json.dumps(observed))
+        self.assertTrue(all(self.evaluate(**options).values()), self.evaluate(**options))
+        path = self.device / "measured.1.json"
+        correct = json.loads(path.read_text())
+        for field, wrong in (
+            ("uploads", correct["uploads"] - 48),  # Omitted request reset.
+            ("reads", 2),  # KV reads must not disappear into token readback.
+            ("upload_bytes", correct["upload_bytes"] + 12582912),  # Full-cache copy.
+            ("read_bytes", 8),
+        ):
+            with self.subTest(field=field):
+                path.write_text(json.dumps(correct | {field: wrong}))
+                self.assertFalse(self.evaluate(**options)["request.1"])
+        path.write_text(json.dumps(correct))
+        self.native_run["kv_transfer"] = "device-copy"
+        self.save_metadata()
+        self.assertFalse(self.evaluate(**options)["run.kv_transfer"])
+        self.metadata["capacity"] = 128
+        with self.assertRaises(ValueError):
+            self.evaluate(**options)
+
     def test_missing_initialization_or_wrong_head_count_cannot_accept_optimization(self):
         (self.device / "initialization.json").unlink()
         self.assertFalse(self.evaluate(**self.options)["initialization.prefill_head_policy"])

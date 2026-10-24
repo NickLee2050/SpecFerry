@@ -47,7 +47,7 @@ void run_options_contracts() {
 
   const auto defaults = read_run_options(directory, true);
   require(defaults.maximum == 8 && defaults.block == 1 && defaults.readback == "none" &&
-          defaults.repeats == 1 && !defaults.sampling);
+          defaults.repeats == 1 && !defaults.sampling && defaults.kv_transfer == "device-copy");
   const auto parse = [&](const std::string &text, bool graph = true) {
     {
       std::ofstream output(directory / "run-options.txt");
@@ -72,6 +72,14 @@ void run_options_contracts() {
                                       "projection_backend nbg\nprefill_head last-token\n");
   require(compiled_prefill.block == 16 && compiled_prefill.projection_backend == "nbg");
   require(parse("history_mode reuse\n").history_mode == "reuse");
+  require(parse("variant compiled-fullgraph\nkv_transfer mapped-slot\n").kv_transfer ==
+          "mapped-slot");
+  for (const auto *extra : {"variant compiled-decoder\n", "variant merged-kv\n",
+                            "variant compiled-fullgraph\nhistory_mode reuse\n",
+                            "variant compiled-fullgraph\nblock 16\n"}) {
+    rejects([&] { parse(std::string(extra) + "kv_transfer mapped-slot\n"); });
+  }
+  rejects([&] { parse("kv_transfer unknown\n"); });
   rejects([&] { parse("history_mode compare\n"); });
   const auto cache = parse("readback kv\ncache_first_layer 2\ncache_last_layer 3\n");
   require(cache.cache_first == 2 && cache.cache_last == 3);

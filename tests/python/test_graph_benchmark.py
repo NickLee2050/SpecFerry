@@ -108,6 +108,37 @@ class GraphBenchmarkTests(GraphEvidenceFixture):
         (self.device / "measured.0.1.json").unlink()
         self.assertFalse(self.evaluate()[0]["measured.0.1"])
 
+    def test_mapped_slot_benchmark_counts_reset_between_repetitions(self):
+        from specferry.models.opt.graph_validation import evaluate_benchmark
+
+        self.metadata.update(capacity=64, prefill_block=1, heads=16, width=64, layers=24)
+        self.options.update(variant="compiled-fullgraph", kv_transfer="mapped-slot")
+        counts = dict(launches=7, prefill_steps=0, decode_steps=7, head_runs=7)
+        self.initialized.update(self.options, prefill_block=1)
+        self.native_run.update(
+            self.options,
+            **{key: 3 * value for key, value in counts.items()},
+            prefill_block=1,
+            kv_reset_uploads_per_request=48,
+        )
+        self.save_metadata()
+        for index, record in enumerate(self.manifest["runs"]):
+            path = self.device / record["result_file"]
+            result = json.loads(path.read_text())
+            result.update(
+                counts,
+                prefill_block=1,
+                uploads=364 + (48 if index else 0),
+                upload_bytes=1379000 + (12582912 if index else 0),
+                reads=339,
+                read_bytes=1376268,
+            )
+            path.write_text(json.dumps(result))
+        checks, _ = evaluate_benchmark(
+            self.device, self.metadata, 1, warmups=1, repeats=2, **self.options
+        )
+        self.assertTrue(all(checks.values()), checks)
+
     def test_incomplete_manifest_diagnostic_reads_and_live_memory_fail(self):
         self.manifest["runs"].pop()
         (self.device / "benchmark.json").write_text(json.dumps(self.manifest))

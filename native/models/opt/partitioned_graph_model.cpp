@@ -78,6 +78,7 @@ struct PartitionedGraphModel::Impl {
 
   ModelConfig config;
   Variant variant;
+  KvTransfer kv_transfer;
   PrefillHeadPolicy prefill_head_policy;
   unsigned prefill_block;
   const std::vector<CompiledFfn> compiled_ffn;
@@ -88,9 +89,12 @@ struct PartitionedGraphModel::Impl {
   const std::vector<CompiledProjections> compiled_projections;
   const CompiledFullModel compiled_full_model;
   Tensor compiled_indices{}, compiled_mask{};
-  WeightBank bank;
-  Graph cache;
+  std::unique_ptr<WeightBank> bank;
+  std::unique_ptr<Graph> cache;
   std::vector<Tensor> cache_tensors;
+  std::vector<Tensor> mapped_cache_outputs;
+  std::vector<std::uint8_t> cache_zeroes, cache_slot;
+  Shape slot_start{0, 0, 0}, slot_end;
   inference::GenerationHistory history;
   std::unique_ptr<GraphBuilder> cache_reset;
   std::unique_ptr<ExecutionSet> decode, prefill;
@@ -111,15 +115,20 @@ struct PartitionedGraphModel::Impl {
        unsigned block, std::vector<CompiledFfn> compiled, std::vector<CompiledDecoder> decoders,
        std::vector<CompiledFfn> prefill_artifacts, ProjectionPolicy projection_policy,
        CompiledHead head_artifact, std::vector<CompiledProjections> projection_artifacts,
-       CompiledFullModel full_artifact)
-      : config(spec), variant(selected_variant), prefill_head_policy(prefill_head),
-        prefill_block(block), compiled_ffn(std::move(compiled)),
+       CompiledFullModel full_artifact, KvTransfer transfer)
+      : config(spec), variant(selected_variant), kv_transfer(transfer),
+        prefill_head_policy(prefill_head), prefill_block(block), compiled_ffn(std::move(compiled)),
         compiled_decoders(std::move(decoders)), compiled_prefill_ffn(std::move(prefill_artifacts)),
         projections(projection_policy), compiled_head(std::move(head_artifact)),
         compiled_projections(std::move(projection_artifacts)),
-        compiled_full_model(std::move(full_artifact)), bank(context),
-        cache(context, 2 * spec.decoder.layers + 2, 0) {
+        compiled_full_model(std::move(full_artifact)) {
     try {
+      // The mapped full-model path has exactly one graph, with independent fixed
+      // input/output allocations. It does not share backing across SDK graphs.
+      if (kv_transfer == KvTransfer::DeviceCopy) {
+        bank = std::make_unique<WeightBank>(context);
+        cache = std::make_unique<Graph>(context, 2 * spec.decoder.layers + 2, 0);
+      }
       build(context, weights, phase);
     } catch (...) {
       try {
@@ -146,7 +155,7 @@ struct PartitionedGraphModel::Impl {
     const auto key_storage = cache_tensors.at(layer * 2);
     const auto value_storage = cache_tensors.at(layer * 2 + 1);
     const auto append = [&](Tensor column, Tensor storage) {
-      auto bound = builder.bind({cache, storage.id}, storage.spec);
+      auto bound = builder.bind({*cache, storage.id}, storage.spec);
       if (block != 1) {
         // This writable alias is fixed before Verify and shares the original allocation.
         bound = storage_reshape(builder, bound, {decoder.hidden * block, decoder.capacity / block});
@@ -204,6 +213,12 @@ struct PartitionedGraphModel::Impl {
   }
 
   void build(Context &context, const WeightStore &weights, const PhaseObserver &phase) {
+    if (kv_transfer == KvTransfer::MappedSlot) {
+      decode = std::make_unique<ExecutionSet>(1);
+      build_full_execution(*decode, context, phase);
+      latest = decode.get();
+      return;
+    }
     const auto &decoder = config.decoder;
     if (variant == Variant::MergedKvFc1Split2 || !compiled_prefill_ffn.empty()) {
       // Load the large fc2 tensors before decoder graphs occupy SDK resources.
@@ -214,7 +229,7 @@ struct PartitionedGraphModel::Impl {
           continue;
         }
         const auto &matrix = weights.find(decoder.prefix(layer) + "fc2.weight");
-        bank.preload(weights, matrix, matrix.spec);
+        bank->preload(weights, matrix, matrix.spec);
       }
     }
     const auto cache_count = 2 * decoder.layers;
@@ -226,12 +241,12 @@ struct PartitionedGraphModel::Impl {
                          : TensorSpec{f16, {decoder.hidden, decoder.capacity}};
     if (compiled_decoder) {
       const auto ports = compiled_decoder_inputs(decoder);
-      compiled_indices = {add_tensor(cache, ports[3]), ports[3]};
-      compiled_mask = {add_tensor(cache, ports[4]), ports[4]};
+      compiled_indices = {add_tensor(*cache, ports[3]), ports[3]};
+      compiled_mask = {add_tensor(*cache, ports[4]), ports[4]};
     }
     const std::vector<std::uint8_t> zeros(cache_spec.bytes());
     for (unsigned index = 0; index < cache_count; ++index) {
-      cache_tensors.push_back({add_tensor(cache, cache_spec, false, zeros), cache_spec});
+      cache_tensors.push_back({add_tensor(*cache, cache_spec, false, zeros), cache_spec});
     }
 
     decode = std::make_unique<ExecutionSet>(1);
@@ -257,7 +272,7 @@ struct PartitionedGraphModel::Impl {
         add_tensor(builder.graph, spec, false, std::vector<std::uint8_t>(spec.bytes())), spec};
     std::vector<Tensor> outputs;
     for (const auto &storage : cache_tensors) {
-      const auto destination = builder.bind({cache, storage.id}, storage.spec);
+      const auto destination = builder.bind({*cache, storage.id}, storage.spec);
       builder.node(VSI_NN_OP_DATACONVERT, {zeros}, destination);
       outputs.push_back(destination);
     }
@@ -275,7 +290,7 @@ struct PartitionedGraphModel::Impl {
     }
     const auto &decoder = config.decoder;
     const auto block = execution.block;
-    execution.embedding = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
+    execution.embedding = std::make_unique<GraphBuilder>(context, 512, 256, bank.get());
     auto &entry = *execution.embedding;
     const auto controls = entry.tensor({DataType::Int32, {2 * block + 1}});
     execution.controls = controls;
@@ -314,7 +329,7 @@ struct PartitionedGraphModel::Impl {
     for (unsigned layer = 0; layer < decoder.layers; ++layer) {
       auto owner =
           std::make_unique<GraphBuilder>(context, variant == Variant::CompiledDecoder ? 16 : 512,
-                                         variant == Variant::CompiledDecoder ? 1 : 256, &bank);
+                                         variant == Variant::CompiledDecoder ? 1 : 256, bank.get());
       auto &builder = *owner;
       const auto group_input = builder.share(*producer, previous);
 
@@ -337,10 +352,10 @@ struct PartitionedGraphModel::Impl {
         std::vector<Tensor> inputs{group_input};
         for (unsigned index : {0u, 1u}) {
           const auto storage = cache_tensors.at(2 * layer + index);
-          inputs.push_back(builder.bind({cache, storage.id}, storage.spec));
+          inputs.push_back(builder.bind({*cache, storage.id}, storage.spec));
         }
-        inputs.push_back(builder.bind({cache, compiled_indices.id}, compiled_indices.spec));
-        inputs.push_back(builder.bind({cache, compiled_mask.id}, compiled_mask.spec));
+        inputs.push_back(builder.bind({*cache, compiled_indices.id}, compiled_indices.spec));
+        inputs.push_back(builder.bind({*cache, compiled_mask.id}, compiled_mask.spec));
         std::vector<Tensor> sdk_inputs(inputs.size());
         for (std::size_t index = 0; index < inputs.size(); ++index) {
           sdk_inputs.at(artifact.input_order[index]) = inputs[index];
@@ -410,7 +425,7 @@ struct PartitionedGraphModel::Impl {
             const auto out_input = projected_output->share(builder, attended);
             const auto mixer = projected_output->compiled(projection.output, {out_input}).at(0);
             compile(*projected_output, stage + ".out_proj", {out_input}, {mixer});
-            auto finish = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
+            auto finish = std::make_unique<GraphBuilder>(context, 128, 64, bank.get());
             check(vsi_nn_SetGraphVersion(finish->graph.get(), version[0], version[1], version[2]),
                   "set compiled projection residual graph version");
             const auto residual_input = finish->share(*producer, previous);
@@ -455,7 +470,7 @@ struct PartitionedGraphModel::Impl {
         if (compiled.path.empty()) {
           // The ordinary prefill FFN keeps the existing FP16 boundaries and FP32 LN.
           // Its weights belong to the shared bank, without changing const classification.
-          auto ffn = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
+          auto ffn = std::make_unique<GraphBuilder>(context, 128, 64, bank.get());
           check(vsi_nn_SetGraphVersion(ffn->graph.get(), version[0], version[1], version[2]),
                 "set ordinary prefill FFN graph version");
           const auto input = ffn->share(*attention_graph, normalized);
@@ -486,7 +501,7 @@ struct PartitionedGraphModel::Impl {
           continue;
         }
 
-        auto finish = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
+        auto finish = std::make_unique<GraphBuilder>(context, 128, 64, bank.get());
         check(vsi_nn_SetGraphVersion(finish->graph.get(), version[0], version[1], version[2]),
               "set compiled OPT residual graph version");
         const auto residual = finish->share(*attention_graph, normalized);
@@ -512,7 +527,7 @@ struct PartitionedGraphModel::Impl {
       }
       execution.cache_commit->compile(commit_inputs, commit_outputs);
     }
-    execution.head = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
+    execution.head = std::make_unique<GraphBuilder>(context, 512, 256, bank.get());
     auto &output = *execution.head;
     auto shared_hidden = output.share(*producer, previous);
     auto hidden = block == 1 ? shared_hidden
@@ -577,22 +592,39 @@ struct PartitionedGraphModel::Impl {
 
   void build_full_execution(ExecutionSet &execution, Context &context, const PhaseObserver &phase) {
     const auto &artifact = compiled_full_model;
-    execution.head = std::make_unique<GraphBuilder>(context, 128, 1);
+    const bool mapped = kv_transfer == KvTransfer::MappedSlot;
+    execution.head = std::make_unique<GraphBuilder>(context, mapped ? 104 : 128, 1);
     auto &builder = *execution.head;
-    const auto semantic_port = [&](unsigned index) {
-      return artifact.graph.inputs.at(artifact.input_order.at(index));
-    };
-    execution.controls = builder.tensor(semantic_port(0));
-    execution.full_position = builder.tensor(semantic_port(1));
-    std::vector<Tensor> inputs{execution.controls, execution.full_position,
-                               builder.bind({cache, compiled_indices.id}, compiled_indices.spec),
-                               builder.bind({cache, compiled_mask.id}, compiled_mask.spec)};
-    for (const auto &storage : cache_tensors) {
-      inputs.push_back(builder.bind({cache, storage.id}, storage.spec));
-    }
-    std::vector<Tensor> sdk_inputs(inputs.size());
-    for (unsigned index = 0; index < inputs.size(); ++index) {
-      sdk_inputs.at(artifact.input_order.at(index)) = inputs[index];
+    std::vector<Tensor> inputs, sdk_inputs;
+    if (mapped) {
+      // Preserve the validated single-graph construction order in the transfer check.
+      for (const auto &port : artifact.graph.inputs) {
+        sdk_inputs.push_back(builder.tensor(port));
+      }
+      for (const auto index : artifact.input_order) {
+        inputs.push_back(sdk_inputs.at(index));
+      }
+      execution.controls = inputs.at(0);
+      execution.full_position = inputs.at(1);
+      compiled_indices = inputs.at(2);
+      compiled_mask = inputs.at(3);
+      cache_tensors.assign(inputs.begin() + 4, inputs.end());
+    } else {
+      const auto semantic_port = [&](unsigned index) {
+        return artifact.graph.inputs.at(artifact.input_order.at(index));
+      };
+      execution.controls = builder.tensor(semantic_port(0));
+      execution.full_position = builder.tensor(semantic_port(1));
+      inputs = {execution.controls, execution.full_position,
+                builder.bind({*cache, compiled_indices.id}, compiled_indices.spec),
+                builder.bind({*cache, compiled_mask.id}, compiled_mask.spec)};
+      for (const auto &storage : cache_tensors) {
+        inputs.push_back(builder.bind({*cache, storage.id}, storage.spec));
+      }
+      sdk_inputs.resize(inputs.size());
+      for (unsigned index = 0; index < inputs.size(); ++index) {
+        sdk_inputs.at(artifact.input_order.at(index)) = inputs[index];
+      }
     }
     const auto sdk_outputs = builder.compiled(artifact.graph, sdk_inputs);
     std::vector<Tensor> outputs;
@@ -602,10 +634,20 @@ struct PartitionedGraphModel::Impl {
     if (phase) {
       phase("setup.fullgraph");
     }
-    builder.compile(inputs, outputs);
+    builder.compile(mapped ? sdk_inputs : inputs, mapped ? sdk_outputs : outputs);
     execution.logits = {outputs[0]};
     execution.selected = outputs[1];
     constant_weight_bytes += artifact.graph.constant_bytes;
+    if (mapped) {
+      mapped_cache_outputs.assign(outputs.begin() + 2, outputs.end());
+      const auto &spec = cache_tensors.front().spec;
+      cache_zeroes.resize(spec.bytes());
+      slot_end = {spec.shape.at(0), 1, spec.shape.at(2)};
+      cache_slot.resize(std::size_t(slot_end[0]) * slot_end[2] * dtype_bytes(spec.type));
+      // Verify is finished; initialize runtime KV once, outside generation timing.
+      clear_mapped_cache();
+      return;
+    }
     execution.cache_commit = std::make_unique<GraphBuilder>(context, 4 * config.decoder.layers,
                                                             2 * config.decoder.layers);
     auto &commit = *execution.cache_commit;
@@ -621,6 +663,30 @@ struct PartitionedGraphModel::Impl {
       phase("setup.kv-commit");
     }
     commit.compile(commit_inputs, commit_outputs);
+  }
+
+  Graph &cache_storage() {
+    return kv_transfer == KvTransfer::MappedSlot ? decode->head->graph : *cache;
+  }
+
+  void clear_mapped_cache() {
+    for (const auto &tensor : cache_tensors) {
+      upload_tensor(cache_storage(), tensor.id, cache_zeroes);
+    }
+  }
+
+  void commit_mapped_slot() {
+    const SdkScope timing_role("role", "block1.kv-commit-mapped-slot");
+    slot_start[1] = position;
+    slot_end[1] = position + 1;
+    auto &graph = cache_storage();
+    // RunGraph has completed synchronously. Each map is unmapped before the
+    // next operation; failure leaves consume() unusable with no position advance.
+    for (std::size_t index = 0; index < cache_tensors.size(); ++index) {
+      read_tensor_region_into(graph, mapped_cache_outputs.at(index).id, slot_start, slot_end,
+                              cache_slot);
+      upload_tensor_region(graph, cache_tensors[index].id, slot_start, slot_end, cache_slot);
+    }
   }
 
   void require_open() const {
@@ -680,8 +746,8 @@ struct PartitionedGraphModel::Impl {
       std::fill_n(mask.begin(), position + 1, 0.0f);
       std::vector<std::uint8_t> mask_bytes(mask.size() * sizeof(float));
       std::memcpy(mask_bytes.data(), mask.data(), mask_bytes.size());
-      upload_tensor(cache, compiled_indices.id, integers(indices));
-      upload_tensor(cache, compiled_mask.id, mask_bytes);
+      upload_tensor(cache_storage(), compiled_indices.id, integers(indices));
+      upload_tensor(cache_storage(), compiled_mask.id, mask_bytes);
     }
     if (variant == Variant::CompiledFullModel) {
       run(*execution.head, execution.timing_prefix + ".fullgraph");
@@ -693,6 +759,8 @@ struct PartitionedGraphModel::Impl {
     }
     if (execution.cache_commit) {
       run(*execution.cache_commit, execution.timing_prefix + ".kv-commit");
+    } else if (kv_transfer == KvTransfer::MappedSlot) {
+      commit_mapped_slot();
     }
     if (run_head) {
       if (variant != Variant::CompiledFullModel) {
@@ -758,9 +826,11 @@ struct PartitionedGraphModel::Impl {
       if (cache_reset) {
         // Synchronous completion precedes control upload and every next-request consumer.
         run(*cache_reset, "kv-reset");
+      } else if (kv_transfer == KvTransfer::MappedSlot) {
+        clear_mapped_cache();
       } else {
         for (const auto &tensor : cache_tensors) {
-          upload_tensor(cache, tensor.id, std::vector<std::uint8_t>(tensor.spec.bytes()));
+          upload_tensor(*cache, tensor.id, std::vector<std::uint8_t>(tensor.spec.bytes()));
         }
       }
     }
@@ -809,8 +879,12 @@ struct PartitionedGraphModel::Impl {
       decode->close();
       decode.reset();
     }
-    cache.close();
-    bank.close();
+    if (cache) {
+      cache->close();
+    }
+    if (bank) {
+      bank->close();
+    }
     closed = true;
   }
 };
@@ -821,8 +895,16 @@ PartitionedGraphModel::PartitionedGraphModel(
     std::vector<CompiledFfn> compiled_ffn, std::vector<CompiledDecoder> compiled_decoders,
     std::vector<CompiledFfn> compiled_prefill_ffn, ProjectionPolicy projections,
     CompiledHead compiled_head, std::vector<CompiledProjections> compiled_projections,
-    CompiledFullModel compiled_full_model) {
+    CompiledFullModel compiled_full_model, KvTransfer kv_transfer) {
   config.validate();
+  if (kv_transfer != KvTransfer::DeviceCopy && kv_transfer != KvTransfer::MappedSlot) {
+    throw std::invalid_argument("unknown OPT KV transfer strategy");
+  }
+  if (kv_transfer == KvTransfer::MappedSlot &&
+      (variant != Variant::CompiledFullModel || config.decoder.capacity != 64 ||
+       prefill_block != 1)) {
+    throw std::invalid_argument("mapped-slot KV requires compiled full OPT C64/M1");
+  }
   if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2 &&
       variant != Variant::MergedKvCompiledFfn && variant != Variant::CompiledDecoder &&
       variant != Variant::CompiledFullModel) {
@@ -959,11 +1041,11 @@ PartitionedGraphModel::PartitionedGraphModel(
   } else if (!compiled_decoders.empty()) {
     throw std::invalid_argument("compiled decoder artifacts require the compiled decoder variant");
   }
-  impl_ =
-      std::make_unique<Impl>(context, weights, config, phase, variant, prefill_head, prefill_block,
-                             std::move(compiled_ffn), std::move(compiled_decoders),
-                             std::move(compiled_prefill_ffn), projections, std::move(compiled_head),
-                             std::move(compiled_projections), std::move(compiled_full_model));
+  impl_ = std::make_unique<Impl>(
+      context, weights, config, phase, variant, prefill_head, prefill_block,
+      std::move(compiled_ffn), std::move(compiled_decoders), std::move(compiled_prefill_ffn),
+      projections, std::move(compiled_head), std::move(compiled_projections),
+      std::move(compiled_full_model), kv_transfer);
 }
 
 PartitionedGraphModel::~PartitionedGraphModel() = default;
@@ -1002,6 +1084,10 @@ PartitionedGraphModel::continue_generation(const std::vector<std::int32_t> &prom
                                            unsigned maximum,
                                            const inference::GenerationPhaseObserver &on_phase) {
   const auto &config = require_impl().config;
+  if (impl_->kv_transfer == KvTransfer::MappedSlot && !impl_->history.tokens.empty()) {
+    throw std::invalid_argument(
+        "mapped-slot continuation has not been validated; reset the request");
+  }
   inference::GenerationExecutor executor{[&] { impl_->reset(); },
                                          [&](std::int32_t token) { impl_->step(token); },
                                          [&] { return impl_->predict(); },
@@ -1043,7 +1129,7 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool
     throw std::out_of_range("partitioned OPT cache layer exceeds configuration");
   }
   const auto tensor = impl_->cache_tensors.at(layer * 2 + values);
-  const auto packed = read_tensor(impl_->cache, tensor.id, method);
+  const auto packed = read_tensor(impl_->cache_storage(), tensor.id, method);
   if (impl_->variant == Variant::CompiledDecoder || impl_->variant == Variant::CompiledFullModel) {
     if (packed.size() != cache_spec().bytes()) {
       throw std::runtime_error("compiled OPT cache readback has an unexpected size");
@@ -1125,7 +1211,8 @@ std::size_t PartitionedGraphModel::cache_reset_uploads_per_request() const {
 }
 
 std::size_t PartitionedGraphModel::weight_bytes() const {
-  return impl_ ? impl_->bank.payload_bytes() + impl_->constant_weight_bytes : 0;
+  return impl_ ? (impl_->bank ? impl_->bank->payload_bytes() : 0) + impl_->constant_weight_bytes
+               : 0;
 }
 
 void PartitionedGraphModel::close() {

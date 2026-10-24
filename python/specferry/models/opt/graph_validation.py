@@ -139,6 +139,28 @@ def prepare(
     return metadata
 
 
+def _mapped_slot_enabled(metadata, variant, block, kv_transfer):
+    if kv_transfer not in (None, "device-copy", "mapped-slot"):
+        raise ValueError("unknown KV transfer strategy")
+    mapped = kv_transfer == "mapped-slot"
+    if mapped and (variant != "compiled-fullgraph" or metadata["capacity"] != 64 or block != 1):
+        raise ValueError("mapped-slot KV requires compiled fullgraph C64/M1")
+    return mapped
+
+
+def _mapped_slot_transfers(metadata, launches, predictions, reset):
+    caches = 2 * metadata["layers"]
+    slot_bytes = caches * metadata["heads"] * metadata["width"] * 4
+    control_bytes = 8 + metadata["heads"] * 8 + metadata["capacity"] * 4
+    return {
+        "uploads": launches * (4 + caches) + (caches if reset else 0),
+        "upload_bytes": launches * (control_bytes + slot_bytes)
+        + (slot_bytes * metadata["capacity"] if reset else 0),
+        "reads": launches * caches + predictions,
+        "read_bytes": launches * slot_bytes + 4 * predictions,
+    }
+
+
 def evaluate(
     fixture,
     device,
@@ -151,7 +173,9 @@ def evaluate(
     cache_readback="none",
     cache_layer_range=None,
     readback_transport=None,
+    kv_transfer=None,
 ):
+    mapped = _mapped_slot_enabled(metadata, variant, block, kv_transfer)
     cache_layers = generation_cache_layers(cache_readback, metadata["layers"], cache_layer_range)
     read_logits = cache_readback == "logits"
     if type(block) is not int or block not in (1, 4, 8, 16):
@@ -240,7 +264,8 @@ def evaluate(
             raise ValueError("unknown partitioned-model variant")
         expected_reset = (
             0
-            if variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
+            if not mapped
+            and variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
             else 2 * metadata["layers"]
         )
         checks["variant"] = (
@@ -250,6 +275,8 @@ def evaluate(
             and reset_uploads_per_request == expected_reset
         )
     expected_options = {}
+    if kv_transfer is not None:
+        expected_options["kv_transfer"] = kv_transfer
     if readback_transport is not None:
         if readback_transport not in ("sdk", "mapped"):
             raise ValueError("unknown diagnostic readback transport")
@@ -326,15 +353,21 @@ def evaluate(
             raise ValueError("repeat_of must refer to an earlier request")
         length = reference["prompt_length"]
         launches = step_counts[index]["launches"]
+        transfers = {
+            "uploads": launches
+            * (4 if variant == "compiled-fullgraph" else 3 if variant == "compiled-decoder" else 1)
+            + (reset_uploads_per_request if index else 0),
+            "reads": len(reference["tokens"]),
+        }
+        if mapped:
+            transfers = _mapped_slot_transfers(
+                metadata, launches, len(reference["tokens"]), index > 0
+            )
         checks[f"request.{index}"] = (
             result.get("tokens") == reference["tokens"]
             and result.get("consumed") == prefix
             and result.get("launches") == launches
-            and result.get("uploads")
-            == launches
-            * (4 if variant == "compiled-fullgraph" else 3 if variant == "compiled-decoder" else 1)
-            + (reset_uploads_per_request if index else 0)
-            and result.get("reads") == len(reference["tokens"])
+            and all(result.get(name) == value for name, value in transfers.items())
         )
         if block_prefill:
             checks[f"reference.{index}.consumed"] = (
@@ -358,8 +391,8 @@ def evaluate(
                     type(observed) is int and observed == expected_count
                 )
         if cache_readback == "none":
-            checks[f"request.{index}.read_bytes"] = result.get("read_bytes") == 4 * len(
-                reference["tokens"]
+            checks[f"request.{index}.read_bytes"] = result.get("read_bytes") == transfers.get(
+                "read_bytes", 4 * len(reference["tokens"])
             )
             continue
         if read_logits:
@@ -398,7 +431,7 @@ def evaluate(
                 )
                 # Ignore unconsumed slots while checking every head in the valid prefix.
                 actual = actual.reshape(metadata["heads"], metadata["capacity"], metadata["width"])
-                if block_prefill:
+                if block_prefill or mapped:
                     checks[key + ".suffix"] = bool(np.all(actual[:, prefix:].view("u2") == 0))
                 actual = actual[:, :prefix].reshape(-1)
                 checks[key] = compare_arrays(actual, expected, **TOLERANCES["device"])["passed"]
@@ -429,8 +462,10 @@ def evaluate_benchmark(
     variant,
     decoder_group_size,
     prefill_head_policy,
+    kv_transfer=None,
 ):
     """Validate every resident repetition without requesting diagnostic tensor readback."""
+    mapped = _mapped_slot_enabled(metadata, variant, block, kv_transfer)
     if block not in (1, 4, 8, 16) or not 0 <= warmups <= 5 or not 1 <= repeats <= 20:
         raise ValueError("invalid resident benchmark counts or prefill block")
     if prefill_head_policy not in ("every-token", "last-token"):
@@ -463,13 +498,16 @@ def evaluate_benchmark(
         "prefill_head_policy": prefill_head_policy,
         "prefill_block": block,
     }
+    if kv_transfer is not None:
+        options["kv_transfer"] = kv_transfer
     for scope, observed in (("run", native), ("initialization", initialized)):
         for name, expected in options.items():
             actual = observed.get(name)
             checks[f"{scope}.{name}"] = type(actual) is type(expected) and actual == expected
     reset_uploads = (
         0
-        if variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
+        if not mapped
+        and variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
         else 2 * metadata["layers"]
     )
     checks["reset_uploads"] = native.get("kv_reset_uploads_per_request") == reset_uploads
@@ -522,6 +560,15 @@ def evaluate_benchmark(
                     "reads": len(reference["tokens"]),
                     "read_bytes": 4 * len(reference["tokens"]),
                 }
+                if mapped:
+                    expected_result.update(
+                        _mapped_slot_transfers(
+                            metadata,
+                            counts["launches"],
+                            len(reference["tokens"]),
+                            len(expected_records) > 1,
+                        )
+                    )
                 checks[name] = all(
                     result.get(key) == value for key, value in expected_result.items()
                 )

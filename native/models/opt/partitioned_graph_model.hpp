@@ -28,8 +28,8 @@ class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
-  // All variants retain shared mutable vocabulary blocks. Compiled decoders use FP32
-  // head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
+  // Except full-model NBGs, variants retain shared mutable vocabulary blocks. Compiled decoders use
+  // FP32 head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
   // candidates; the source-bound FFN finish package is available through an explicit CLI option.
   enum class Variant {
     MergedKv,
@@ -43,6 +43,10 @@ public:
   // EveryToken runs the head for each consumed block's final column.
   enum class PrefillHeadPolicy { EveryToken, LastToken };
 
+  // Independent of EP/SoC. MappedSlot keeps full-model ports in one graph and
+  // copies only the current FP32 KV slot through a reusable host buffer.
+  enum class KvTransfer { DeviceCopy, MappedSlot };
+
   PartitionedGraphModel(np101::Context &context, const np101::WeightStore &weights,
                         const ModelConfig &config, PhaseObserver phase = {},
                         Variant variant = Variant::MergedKv,
@@ -52,7 +56,8 @@ public:
                         std::vector<CompiledFfn> compiled_prefill_ffn = {},
                         ProjectionPolicy projections = {}, CompiledHead compiled_head = {},
                         std::vector<CompiledProjections> compiled_projections = {},
-                        CompiledFullModel compiled_full_model = {});
+                        CompiledFullModel compiled_full_model = {},
+                        KvTransfer kv_transfer = KvTransfer::DeviceCopy);
   ~PartitionedGraphModel();
   PartitionedGraphModel(const PartitionedGraphModel &) = delete;
   PartitionedGraphModel &operator=(const PartitionedGraphModel &) = delete;

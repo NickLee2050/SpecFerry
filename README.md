@@ -64,14 +64,32 @@ CCACHE_DIR="$PWD/.cache/ccache" cmake --build build/soc -j 4 \
   --target specferry_opt_graph_generate specferry_opt_generate
 ```
 
-Transfer `build/soc/bin/` over SSH; on the board, use
-`LD_LIBRARY_PATH=/np101_driver/build/sdk/drivers` and `VIV_MGPU_AFFINITY=1:0`.
-Runtime EVIS compilation needs the SDK's CL headers in a private working directory, exposed through
-`LJMICRO_SDK_DIR`. Native OPT packages can use the pinned `np101-soc-riscv64` SDK profile; existing
-Python exporters/runners still target EP. Bounded complete OPT C64/M1 generation and partial
-KV writeback passed on SoC with the 1792MiB pool, using diagnostic runners. These runners are not
-yet integrated into the normal CLI; the cross-built CLI alone does not reproduce that accepted
-path. Qwen on SoC, whole-pool integrity and long-term stability remain unvalidated.
+The SoC deployment command packages the native binary, weights, one full-model NBG, prepared
+requests/references and SDK CL headers. It pins the installed board libraries and places shader
+headers in a private runtime directory. Source NBGs and EP packages are unchanged; the derived
+package uses the `np101-soc-riscv64` profile. Python model exporters still run on the host.
+
+```bash
+python scripts/np101_soc.py prepare --package /absolute/path/to/opt-fullgraph-package \
+  --request /absolute/path/to/prepared-request --sdk /absolute/path/to/board-sdk \
+  --output .cache/deploy/opt-soc
+python scripts/np101_soc.py deploy .cache/deploy/opt-soc --host np101
+python scripts/np101_soc.py run .cache/deploy/opt-soc --host np101 \
+  --output .cache/runs/opt-soc --timeout 180
+# Resume evidence retrieval after a transport interruption; never relaunch the model:
+python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/opt-soc
+```
+
+`prepare` is offline; `deploy` transfers files and checks hashes without opening the NPU.
+`run` currently accepts fullgraph C64/M1, mapped-slot KV, independent reset requests and no Context
+rebuild. It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
+host EP isolation. The detached board supervisor owns the child deadline (maximum 300 seconds),
+kernel monitoring, Linux memory reserve and 45-second delayed release checks. SSH interruptions
+retry discovery of the same run; `collect` performs host numerical acceptance. Existing recovery
+markers block ordinary runs. `--diagnostic-baseline` is only for explicitly authorized diagnostics:
+it binds exact boot, old timestamped fault occurrences, marker/bundle hashes and deadline; success
+retains the old marker. Neither command loads or resets the driver. Qwen on SoC, whole-pool
+integrity and long-term stability remain unvalidated.
 See [status](docs/np101-status.md#soc部署与内存) for deployment evidence and acceptance boundaries.
 SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
 isolation. Driver autoload remains disabled.
@@ -86,14 +104,22 @@ isolation. Driver autoload remains disabled.
 | `native/platform/ep/`, `native/platform/soc/` | Target-specific SDK paths and driver identity checks |
 | `cmake/platforms/` | Target architecture, SDK defaults and implementation source selection |
 | `cmake/toolchains/`, `cmake/np101-sdk.cmake` | Compiler/sysroot settings and shared SDK linkage |
-| `scripts/`, `python/specferry/` | Host export/reference tools and EP supervision; SoC deployment integration remains pending |
+| `python/specferry/platforms/soc/`, `scripts/np101_soc.py` | SoC packaging, SSH transport and standalone board supervision |
+| Other `scripts/`, `python/specferry/` modules | Shared host export/reference/acceptance tools and existing EP launchers |
 
 The selected `specferry_platform_ep` or `specferry_platform_soc` library implements the same
 interface; `np101_sdk_identity` retains shared package validation. A package for the other target
 is rejected before driver inspection. Native generation records the linked target, architecture,
 required SDK identity and runtime library directory in `platform.json`, outside inference timings.
-Compilation does not change graph composition or select a KV transfer policy. SoC partial KV
-writeback remains an explicit diagnostic until its separate integration is accepted.
+Compilation does not select a KV transfer policy. Existing configurations retain their device
+copy/update path. For a fullgraph C64/M1 package, `--kv-transfer mapped-slot` writes
+`kv_transfer mapped-slot` in the request's `run-options.txt`; omission means `device-copy`.
+The mapped strategy keeps fixed, independent inputs and outputs in one NBG graph, then copies
+only the current FP32 KV slot through a reused host buffer after each synchronous run. It has
+no extra device copy/reset graphs. Requests reset KV; continuation and other capacities are
+rejected. Initialization/reset and coarse diagnostics remain outside generation timing.
+Use `--prepare-only` to prepare requests; the Python launcher still executes locally on EP,
+not remotely on SoC. The native SoC entry accepts the same request setting with a SoC package.
 
 ## Prepare and generate
 

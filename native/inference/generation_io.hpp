@@ -24,6 +24,7 @@ struct RunOptions {
   std::string readback_transport = "sdk";
   std::string projection_backend = "auto";
   std::string history_mode = "reset";
+  std::string kv_transfer = "device-copy";
 };
 
 // Each CLI consumes its own keys, then rejects leftovers before initializing the SDK.
@@ -97,10 +98,16 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
     result.readback_transport = settings.text("readback_transport", "sdk");
     result.projection_backend = settings.text("projection_backend", "auto");
     result.history_mode = settings.text("history_mode", "reset");
+    result.kv_transfer = settings.text("kv_transfer", "device-copy");
     result.cache_first = settings.number("cache_first_layer", 0, 0, 32);
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
+    if ((result.kv_transfer != "device-copy" && result.kv_transfer != "mapped-slot") ||
+        (result.kv_transfer == "mapped-slot" &&
+         (result.variant != "compiled-fullgraph" || result.history_mode != "reset"))) {
+      throw std::invalid_argument("mapped-slot KV requires compiled fullgraph with request reset");
+    }
     if ((result.history_mode != "reset" && result.history_mode != "reuse") ||
         (result.history_mode != "reset" && (result.benchmark || result.lifecycle)) ||
         (result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||

@@ -102,6 +102,7 @@ SYSTEM峰值191309856字节、VIRTUAL为0、Linux余量最低805.117MiB。45.064
 | 独立固定tensor、CPU衔接hidden/KV，取消共享及独立提交图 | 8/16/24层各4个连续输入通过，共32/64/96次RunGraph；多个条件同时变化，不能认定共享或提交图就是根因；`np101-soc-independent-decoder-chain-20261024/` |
 | 接回完整生成，再验单个整图NBG | 分段两请求32个输出、整图一请求16个输出通过；`np101-soc-opt-generation-20261024/`、`np101-soc-fullgraph-generation-20261024/` |
 | 同整图轻量测量及局部KV回写 | 五请求80个输出、160次RunGraph；全部48个KV及局部写边界通过，129.143秒正常退出、45.001秒无新故障；`np101-soc-kv-transfer-20261024/` |
+| 正式OPT入口、可迁移包与板端独立监督 | 用户要求能运行则继续；同boot仅识别上述旧故障。17输入/16输出、32次RunGraph、末层KV/未写槽及预算/释放通过，131.939秒退出、45.092秒无新故障；旧主机标记逐字节保留；`soc-formal-deployment-20261024/formal-run/` |
 
 各目录保存原始时序、身份及授权范围。局部回写保留同步Run后Map/Unmap和固定端口，
 未恢复失败共享链；首次部署缺执行位的SDK前拒绝另存`launch-rejected/`，不是设备事故。

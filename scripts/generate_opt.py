@@ -102,6 +102,11 @@ def main():
     )
     parser.add_argument("--prefill-head", choices=("every-token", "last-token"))
     parser.add_argument(
+        "--kv-transfer",
+        choices=("device-copy", "mapped-slot"),
+        help="compiled fullgraph C64/M1: explicit mapped slot writeback (default: device-copy)",
+    )
+    parser.add_argument(
         "--variant",
         choices=(
             "merged-kv",
@@ -207,6 +212,7 @@ def main():
             args.cache_readback,
             args.readback_transport,
             args.cache_layer_range,
+            args.kv_transfer,
         )
     ):
         parser.error("graph variant, head and readback require --backend graph")
@@ -218,6 +224,11 @@ def main():
         parser.error("benchmark and lifecycle diagnostics are mutually exclusive")
     args.prefill_head = args.prefill_head or "every-token"
     args.variant = args.variant or "merged-kv"
+    args.kv_transfer = args.kv_transfer or "device-copy"
+    if args.kv_transfer == "mapped-slot" and (
+        args.variant != "compiled-fullgraph" or args.capacity != 64 or args.block != 1
+    ):
+        parser.error("mapped-slot KV requires a compiled fullgraph C64/M1 package")
     args.cache_readback = args.cache_readback or "none"
     args.readback_transport = args.readback_transport or "sdk"
     if args.readback_transport == "mapped" and args.cache_readback == "none":
@@ -323,6 +334,7 @@ def main():
             readback_transport=args.readback_transport,
             benchmark=int(args.benchmark),
             lifecycle=int(args.lifecycle_check),
+            kv_transfer=args.kv_transfer,
         )
         if args.cache_layer_range is not None:
             settings.update(
@@ -355,6 +367,7 @@ def main():
                     variant=args.variant,
                     decoder_group_size=1,
                     prefill_head_policy=args.prefill_head,
+                    kv_transfer=args.kv_transfer,
                 )
             else:
                 checks, _ = evaluate(
@@ -365,6 +378,7 @@ def main():
                     variant=args.variant,
                     decoder_group_size=1,
                     prefill_head_policy=args.prefill_head,
+                    kv_transfer=args.kv_transfer,
                     cache_readback=args.cache_readback,
                     cache_layer_range=args.cache_layer_range,
                     readback_transport=args.readback_transport,
@@ -434,6 +448,7 @@ def main():
             variant=args.variant,
             decoder_group_size=1,
             prefill_head_policy=args.prefill_head,
+            kv_transfer=args.kv_transfer,
         )
     elif metadata:
         from specferry.models.opt.graph_validation import evaluate
@@ -451,6 +466,7 @@ def main():
                 variant=args.variant,
                 decoder_group_size=1,
                 prefill_head_policy=args.prefill_head,
+                kv_transfer=args.kv_transfer,
                 cache_readback=args.cache_readback,
                 cache_layer_range=args.cache_layer_range,
                 readback_transport=args.readback_transport,
@@ -508,6 +524,7 @@ def main():
         ),
         "execution": execution,
         "graph_variant": args.variant if args.backend == "graph" else None,
+        "kv_transfer": args.kv_transfer if args.backend == "graph" else None,
         "benchmark": args.benchmark,
         "validation_scope": (
             {
