@@ -54,6 +54,20 @@ std::vector<std::uint8_t> read_tensor_region(Graph &graph, vsi_nn_tensor_id_t id
                                              const std::vector<std::uint32_t> &start,
                                              const std::vector<std::uint32_t> &end);
 
+// Reuse the caller's packed host buffer; resize only when the region size changes.
+void read_tensor_region_into(Graph &graph, vsi_nn_tensor_id_t id,
+                             const std::vector<std::uint32_t> &start,
+                             const std::vector<std::uint32_t> &end,
+                             std::vector<std::uint8_t> &data);
+
+// Explicit mapped write with the same region/layout restrictions as mapped readback.
+// Write every element inside the half-open patch, preserving storage outside it.
+// Call only with no graph executing; unmap completes before the helper returns.
+void upload_tensor_region(Graph &graph, vsi_nn_tensor_id_t id,
+                          const std::vector<std::uint32_t> &start,
+                          const std::vector<std::uint32_t> &end,
+                          const std::vector<std::uint8_t> &data);
+
 // Retain one materialized ordinary tensor in a second SDK wrapper before setup.
 // Each graph owns its own OpenVX reference. This does not copy tensor contents.
 vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver);

@@ -59,9 +59,10 @@ M1用于逐token decode；M16可同时处理16个已知prompt token，不表示�
 - SSH服务是Dropbear，`/etc/default/dropbear`配置`-p 5062`，不是OpenSSH。
   主机使用专用`~/.ssh/id_ed25519_np101`；开机诊断脚本已移除，rcS恢复原厂版本。
 - 主机EP驱动仍masked/未加载；板端`S90test`已移出启动目录，NPU不自动加载。
-  10-23已手动执行`cd /np101_driver && sh go.sh`，当前SYSTEM池为1792MiB。
+  10-23重启后沿用go.sh参数手动加载，另加`stuckDump=1`，当前SYSTEM池为1792MiB。
+  故障转储选项仅用于本次加载，未写入go.sh。
   脚本备份为同目录`go.sh.bak`。板卡重启会卸载驱动，不会自动重新执行脚本。
-- 当前板卡boot为`c5068ad3-5d11-4cbc-8ffd-f603a75f365f`。软件reboot曾导致失联，
+- 最近已记录板卡boot为`7013aa1c-2105-4d00-8de1-08aa32569a22`。软件reboot曾导致失联，
   原因未定位；后续上电能正常启动，不通过反复reboot试探恢复。
 
 ### SDK与部署流程
@@ -82,6 +83,14 @@ M1用于逐token decode；M16可同时处理16个已知prompt token，不表示�
 SoC模块没有sysfs srcversion，活跃模块身份还需运行器记录boot和加载过程。
 本地SoC派生包只更新运行库身份，保持权重/NBG和端口契约；EP包不改动。
 Python导出/监督入口仍以EP为目标，不能直接视为远程SoC执行器；Qwen尚未在SoC验收。
+
+驱动身份：10-24测试前核验的SoC模块SHA256为`4c9a6ca2…78449bc`，内部版本
+`6.4.9.9.452545`，目标为RISC-V/Linux5.10.4，无srcversion。fpga02安装包为
+`ljmnp 1.0.5`，源码在`/usr/src/ljmnp-1.0.5-ubuntu20.04/`，模块在
+`/usr/lib/ljmicro/driver/galcore.ko`；内部版本相同，但目标为x86-64/Linux5.15，
+srcversion为`F53A3E6EFBB7D0FD7D4617C`。同一内部版本不证明补丁/配置相同，不能
+把SoC直接标作v105/v106或互换模块。官方ModelTestSoc包也有同号但不同哈希的模块。
+证据为`np101-soc-driver-comparison-20261024/summary.json`，使用当日已核验身份及匹配副本。
 
 ### 内存布局与分配结论
 
@@ -111,55 +120,112 @@ exclusive=`0xc0000000–0xffffffff`（1024MiB）。这些范围与SoC Linux/保�
 不能直接照搬EP配置。历史2840MiB累计载荷还出现过24字节损坏，不能当作可靠池容量。
 SoC固定池可以跳过资源占用检查；驱动加载成功本身不能证明地址安全。
 
-### 已验范围与整模状态
+### 已验范围与实现边界
 
-| 配置／工作 | 已验结果 |
+完整OPT已在SoC完成C64/M1短请求生成，计算包含设备embedding、24层decoder、
+最终归一化、head和选词。逐decoder保守链及单个整图NBG均使用固定独立输入/输出，
+CPU衔接状态；最新整图只回写当前token的KV位置。**最新路径仍在实验入口，尚未接入
+正式模型入口。** Python导出/监督命令不能直接当作SoC远程运行器；Qwen未在SoC验收。
+
+| 范围 | 结论 |
 |---|---|
-| 原256MiB池，小out_proj NBG | 两输入数值通过；3×74次纯RunGraph均值11.322ms |
-| 原池，完整layer0/M1/C64 | 位置0/1/63的hidden、FP32 KV及未写槽通过；3×22次纯图均值26.265ms |
-| 原池，VIRTUAL ADD | 三个8MiB张量确认进入VIRTUAL；两组输出逐位一致，3×16次纯图均值11.316ms |
-| 原池，VIRTUAL单decoder | 临时占位使NBG进入VIRTUAL，释放占位后数值通过；3×20次纯图均值26.459ms |
-| 新1792MiB池，小容量写读 | const/nonconst各1/4/16MiB，共42MiB；逐轮复查全部存量一致，5.53秒完成 |
+| 原256MiB池 | 小out_proj及完整layer0/M1/C64通过，纯图均值11.322/26.265ms；完整模型未进入推理，受Linux余量与初始化期限限制 |
+| VIRTUAL计算 | 三个8MiB张量的ADD通过；单decoder进入VIRTUAL后数值通过，纯图26.459ms。不是大容量整模验收 |
+| 新1792MiB池 | 42MiB存量写读及小out_proj通过；单层重复执行和共享八层链曾hang，详见事故台账 |
+| 独立固定绑定 | 单图36次轮换输入通过；CPU衔接的8/16/24层各4个连续输入通过。24层图执行617.613ms/输入，含CPU衔接906.952ms；未接head，不是输出吞吐 |
+| 完整生成 | 逐decoder两请求共32个输出与CPU参考一致；整图科学博物馆样例16个输出一致；logits、首末层KV及未写槽通过 |
+| 最新局部KV回写 | 同请求五轮共80个输出一致，160次RunGraph返回；位置63局部写及全部48个输入KV与完整输出逐字节核对通过 |
 
-以上检查均正常释放，完整双端内核和至少45秒延迟检查通过，无残留owner。
-新池的参数、iomem与debugfs容量三方一致；42MiB检查期间SYSTEM峰值44729184字节，
-退出后恢复122976字节，VIRTUAL为0，GFP恢复25362432字节，Linux余量最低784.125MiB。
-它只证明新池加载和有限写读，未覆盖整个1.75GiB、DLA区域或新配置下的模型计算。
+成功轮均检查预算、释放、完整内核和至少45秒延迟日志。当前整图const/nonconst峰值
+662,593,528/25,266,764字节，SYSTEM采样峰值632.502MiB，Linux余量最低约815MiB，
+VIRTUAL为0；各段1GiB预算保持。未覆盖全池/DLA区域、新上下文容量或长期稳定。
+用户曾明确授权同boot故障后的诊断；这些成功不证明旧hang修复，原恢复标记保留。
 
-图耗时排除初始化、上传、读回和比较；单层重复没有形成完整多token生成。按24层
-同结构粗估decoder主体约630ms，不能当作整模延迟、输出吞吐或EP/SoC加速比。
+### SoC完整生成性能
 
-**完整OPT尚无SoC性能结果。** 旧256MiB配置下已部署M1包并尝试初始化：先修复
-运行时CL头文件遗漏；随后NBG和手写方案分别在第16／9个decoder附近触发256MiB
-Linux余量保护，加入初始化堆回收的候选又达到240秒期限，仍未进入推理。各轮退出后
-池/GFP归位、无新内核故障，但未完成标记保留。不得原样延长或重复慢路径；新1792MiB
-配置仅验42MiB申请，整模需要后续授权及独立门禁，未改变模型精度或权重分类。
+以下均为相同科学博物馆样例、17输入/16输出，C64/M1；EP最后一行仅prefill使用M16。
+实际吞吐为16/生成wall，首词后速率为15/后续decode时间。初始化、reset、最终校验和
+释放另计；早期SoC两行含逐调用记录及每步logits诊断，不能作纯粹的实现单变量比较。
 
-### SD与网络恢复要点
+| 配置 | TTFT秒 | 实际输出token/s | 首词后decode token/s |
+|---|---:|---:|---:|
+| SoC逐decoder，完整KV搬运 | 16.180 | 0.514 | 1.003 |
+| SoC单个整图NBG，完整KV搬运 | 13.939 | 0.609 | 1.216 |
+| SoC整图轻量完整KV，同轮候选前后基线 | 13.665 | 0.622 | 1.243 |
+| **SoC整图局部KV回写** | **9.467** | **0.898** | **1.796** |
+| EP已验混合M1 | 6.782 | 1.216 | 2.354 |
+| EP已验混合M1＋M16 prefill | 1.782 | 1.959 | 2.349 |
 
-- SD原有至少70个inode异常；经授权修复，从匹配原件恢复BusyBox及两份shader库。
-  换USB口并固定读卡器后，13项读回核对通过。部分驱动库只与故障前副本匹配，
-  `/demo`仍可能有缺失；早期`.partial`镜像不是完整恢复备份。
-- eth1单口配置后SSH通过；曾发生eth0绑定IP而ARP返回eth1 MAC，未证明唯一故障原因。
-  五分钟链路记录及原始网络失败证据保留，不继续根据网口灯速或端口封禁猜测归因。
-- SD卡29.1GiB，但根分区仅2GiB。OPT权重约632MiB，原含M16包约912MiB；
-  M1裁剪部署包合计约1.16GiB已传入，剩余存储有限。磁盘文件大小不等于运行内存。
-- 扩容方案尚未执行：板卡断电后用稳定读卡器备份GPT/p1/p2；修正备GPT到卡尾，
-  保持p2起始扇区6144和UUID，扩尾后执行fsck/resize2fs、核对启动/网络/SDK文件，
-  同步卸载。可扩至约29.118GiB，不需重烧镜像；板上缺工具，使用主机离线处理。
+各路径输出相同续文：` the history of computing from the early days of the computer to today.\n\n`。
+逐decoder另验6输入/16输出，实际0.775、首词后1.007token/s。旧EP单个整图的0.920/
+1.839token/s使用不同实际输入，仅作历史参照；不能用旧request.json的文本替代实际
+requests.txt。SoC与EP的SDK、图组织、连接和监测也不同，尚不能归因为硬件模式本身。
+
+### 局部KV回写的收益与限制
+
+复用同一636,651,008字节整图NBG（SHA256 `be581668…8a7a`），固定52入50出、FP32 KV。
+每请求完整清零一次；同步RunGraph返回后，只读回当前位置，经
+`vxMapTensorPatch(VX_WRITE_ONLY)`写入输入相同位置，Unmap后再Run。不重绑端口、
+不使用输入输出别名或独立设备提交图。通用接口为`read_tensor_region_into`和
+`upload_tensor_region`，复用缓冲，检查区域/字节数/stride/可写属性，无SDK-copy回退。
+
+| 同轮测量，每请求 | 轻量完整KV，候选前后均值 | 局部KV回写 |
+|---|---:|---:|
+| 生成wall | 25.729秒 | 17.819秒 |
+| 显式上传＋读回 | 8.042秒 | 0.163秒 |
+| 每步逻辑KV往返量 | 24MiB | 384KiB |
+
+首词后及实际输出吞吐均提升约44%，显式IO时间下降约98%。读/写辅助函数次数未减，
+且上传API也换为映射写入，不能把收益全部归因字节数。完整KV逐API日志关闭/开启/
+关闭对照测得生成wall增加1.56%、decode延迟增加1.51%；仅量化该项日志开销。
+普通生成只读选词，最终logits/KV在计时外校验；稀疏RunGraph起止及内核监控仍保留。
+
+候选首词后整步556.798ms，其中RunGraph551.387ms，约99%已在图执行区间；该区间
+包含内部搬运及完成等待，不代表纯算术时间。外部IO已低于1%，暂缓设备复制候选，
+优先图内归因。入口为`np101_compiled_model_transfer_check`；源代码、端口契约、
+数值和性能原始结果保存在`np101-soc-kv-transfer-20261024/`。
+
+### 单层加载与离线命令审计
+
+官方生成加载器和仓库包装均用一个NBG FILE节点、5入3出、graph版本1.1.34，执行
+Setup(false)/Verify/同步Run；实际tensor均为8个。`.nb`分支端口为hidden/K/V，
+另一分支顺序不同，必须按部署契约绑定。图先于Context释放，路径所有权已核对。
+RunGraph下接vxProcessGraph，NBG执行含gcoVX_Replay→gcoHARDWAREVX_ReplayCmd，
+仍有运行时提交/完成等待；这是静态反汇编证据，不是逐内部函数动态追踪。
+
+已验单层NBG `653469ac…c7259`含6个FCL、2个MATRIXMUL；容器记录为
+START1/TP33/SH70/NN33。attention的两次MATRIXMUL各展开16组SH+NN，FCL共28个TP。
+这揭示与纯手写MatMul的路径差异，但不能证明利用率或定位故障算子；EP最终混合方案
+已采用NBG投影/FFN。证据见`np101-soc-decoder-artifact-audit-20261024/`。
+
+### SD完整性与恢复边界
+
+- 网络现状见本节配置。原SD曾有至少70个inode异常，已修复并从匹配原件恢复关键文件；
+  demo可能缺失，早期partial镜像不是完整备份。
+- 根分区已从2GiB扩至29.118GiB，可用约25.353GiB；保留p2起点6144及UUID，修正备GPT，
+  离线fsck通过且扩容后已启动。容量和文件系统检查通过不等于介质可靠。
+- 六份异常NBG已恢复，待用SDK/模型身份逐项校验。USB读卡器和板端原生SD控制器均
+  复现同一4KiB块O_DIRECT三读不同，期间无写入；不能仅归咎读卡器。SD健康未确认，
+  对hang的贡献也未证实，逐次偏移/哈希留原始证据，不继续无目的扫描。
+- 换卡不能保证缺失数据恢复，旧备份不能直接当作可信原件。主机OPT checkpoint、
+  weights/index、24份decoder及93份混合M1/M16产物约2.81GB已全量验哈希，可重部署。
+  现有官方镜像完整性通过，但为4月内核，与当前7月内核及关键SDK不同；等价重装仍需
+  匹配版本的厂商镜像。重建后迁移已核对配置、校验部署文件，并做有界启动/数值验收。
 
 ### 原始证据入口
 
-路径均相对`.cache/runs/`；逐次日志、脚本、哈希和完整数值留在缓存。
+路径均相对`.cache/runs/`；目录内保留summary、逐次日志、脚本、文件身份和完整数值。
+设备事故的精确时序、boot ID、原因边界及后续规避只在[事故台账](np101-recovery-incidents.md)维护。
 
 | 内容 | 目录 |
 |---|---|
-| SD恢复、网络配置、启动隔离 | `np101-soc-network-config-20261021/`、`np101-network-finalization-20261021/` |
-| 软件重启失联与恢复只读检查 | `np101-network-post-reboot-20261021/`、`np101-soc-platform-inspection-20261022/` |
-| 交叉构建、初始写读、内存布局 | `np101-soc-build-memory-20261022/`、`np101-soc-memory-layout-20261022/` |
-| EP/SoC地址与API容量 | `np101-memory-map-audit-20261023/`、`np101-soc-capacity-20261022/`、`np101-soc-pool-capacity-20261023/` |
-| 小图、VIRTUAL计算与整模初始化尝试 | `np101-soc-graph-validation-20261022/`、`np101-soc-virtual-compute-20261023/`、`np101-soc-full-model-20261023/` |
-| 扩池配置及42MiB验收 | `np101-soc-contiguous-config-20261023/`、`np101-soc-expanded-pool-20261023/` |
+| 网络/启动与SDK准备 | `np101-soc-network-config-20261021/`、`np101-network-finalization-20261021/`、`np101-soc-platform-inspection-20261022/`、`np101-soc-build-memory-20261022/` |
+| 内存布局与容量 | `np101-soc-memory-layout-20261022/`、`np101-memory-map-audit-20261023/`、`np101-soc-capacity-20261022/`、`np101-soc-pool-capacity-20261023/` |
+| 旧池计算及整模初始化 | `np101-soc-graph-validation-20261022/`、`np101-soc-virtual-compute-20261023/`、`np101-soc-full-model-20261023/` |
+| 新池配置及写读 | `np101-soc-contiguous-config-20261023/`、`np101-soc-expanded-pool-20261023/` |
+| 独立绑定递进及完整生成 | `np101-soc-independent-decoder-chain-20261024/`、`np101-soc-opt-generation-20261024/`、`np101-soc-fullgraph-generation-20261024/` |
+| 轻量基线及局部KV回写 | `np101-soc-kv-transfer-20261024/` |
+| SD扩容、启动及双路径完整性 | `np101-soc-sd-expand-20261023/`、`np101-soc-storage-boot-20261024/`、`np101-soc-sd-integrity-20261024/` |
 
 ## 当前实现与验收范围
 

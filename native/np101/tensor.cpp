@@ -48,19 +48,23 @@ std::size_t tensor_bytes(vsi_nn_tensor_t *tensor) {
   return TensorSpec{type, shape}.bytes();
 }
 
-std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_t element_bytes,
-                                             const std::vector<std::uint32_t> &region_start,
-                                             const std::vector<std::uint32_t> &region_end) {
+void transfer_mapped_tensor(vsi_nn_tensor_t *tensor, const std::vector<std::uint32_t> &region_start,
+                            const std::vector<std::uint32_t> &region_end,
+                            std::vector<std::uint8_t> *read_data,
+                            const std::vector<std::uint8_t> *write_data) {
+  const auto storage_bytes = tensor_bytes(tensor);
   const auto rank = tensor->attr.dim_num;
   if (!tensor->t || tensor->attr.vtl || tensor->attr.is_created_from_handle || rank > 3 ||
-      tensor->attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE) {
-    throw std::invalid_argument(
-        "mapped readback requires an ordinary unquantized rank-1/2/3 tensor");
+      tensor->attr.dtype.qnt_type != VSI_NN_QNT_TYPE_NONE ||
+      (write_data && tensor->attr.is_const)) {
+    throw std::invalid_argument("mapped transfer requires an ordinary unquantized rank-1/2/3 "
+                                "tensor; writes require mutable storage");
   }
   if (region_start.size() != rank || region_end.size() != rank) {
     throw std::invalid_argument("mapped tensor region rank differs");
   }
   std::array<vx_size, 3> start{}, end{0, 1, 1}, length{1, 1, 1};
+  std::size_t elements = 1;
   for (unsigned axis = 0; axis < rank; ++axis) {
     if (region_start[axis] >= region_end[axis] || region_end[axis] > tensor->attr.size[axis]) {
       throw std::out_of_range("mapped tensor region exceeds storage");
@@ -68,20 +72,28 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
     start[axis] = region_start[axis];
     end[axis] = region_end[axis];
     length[axis] = end[axis] - start[axis];
+    elements *= tensor->attr.size[axis];
   }
+  const auto element_bytes = storage_bytes / elements;
   const auto row_bytes = length[0] * element_bytes;
   const auto bytes = row_bytes * length[1] * length[2];
   std::array<vx_size, 3> stride{};
-  std::vector<std::uint8_t> result(bytes);
+  if (write_data) {
+    if (write_data->size() != bytes) {
+      throw std::invalid_argument("mapped write byte count differs from region");
+    }
+  } else {
+    read_data->resize(bytes);
+  }
   void *pointer = nullptr;
   vx_map_id map_id = 0;
   check(sdk_call("vxMapTensorPatch",
                  [&] {
-                   return vxMapTensorPatch(tensor->t, rank, start.data(), end.data(), &map_id,
-                                           stride.data(), &pointer, VX_READ_ONLY,
-                                           VX_MEMORY_TYPE_HOST);
+                   return vxMapTensorPatch(
+                       tensor->t, rank, start.data(), end.data(), &map_id, stride.data(), &pointer,
+                       write_data ? VX_WRITE_ONLY : VX_READ_ONLY, VX_MEMORY_TYPE_HOST);
                  }),
-        "map tensor for host readback");
+        "map tensor for host transfer");
 
   struct Mapping {
     vx_tensor tensor;
@@ -97,7 +109,7 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
     void close() {
       active = false;
       check(sdk_call("vxUnmapTensorPatch", [&] { return vxUnmapTensorPatch(tensor, id); }),
-            "unmap host tensor readback");
+            "unmap host tensor transfer");
     }
   } mapping{tensor->t, map_id};
 
@@ -112,18 +124,21 @@ std::vector<std::uint8_t> read_mapped_tensor(vsi_nn_tensor_t *tensor, std::size_
     }
   }
   if (!valid) {
-    throw std::runtime_error("mapped tensor pointer or strides violate the readback contract");
+    throw std::runtime_error("mapped tensor pointer or strides violate the transfer contract");
   }
   // The pointer expires at unmap. Copy rows while honoring padding in every mapped axis.
   for (vx_size plane = 0; plane < length[2]; ++plane) {
     for (vx_size row = 0; row < length[1]; ++row) {
-      std::memcpy(result.data() + (plane * length[1] + row) * row_bytes,
-                  static_cast<const std::uint8_t *>(pointer) + plane * stride[2] + row * stride[1],
-                  row_bytes);
+      auto *mapped = static_cast<std::uint8_t *>(pointer) + plane * stride[2] + row * stride[1];
+      const auto packed = (plane * length[1] + row) * row_bytes;
+      if (write_data) {
+        std::memcpy(mapped, write_data->data() + packed, row_bytes);
+      } else {
+        std::memcpy(read_data->data() + packed, mapped, row_bytes);
+      }
     }
   }
   mapping.close();
-  return result;
 }
 } // namespace
 
@@ -212,20 +227,27 @@ TensorTransfers tensor_transfers() { return transfers; }
 std::vector<std::uint8_t> read_tensor_region(Graph &graph, vsi_nn_tensor_id_t id,
                                              const std::vector<std::uint32_t> &start,
                                              const std::vector<std::uint32_t> &end) {
-  auto *tensor = get_tensor(graph, id);
-  const auto bytes = tensor_bytes(tensor);
-  const auto rank = tensor->attr.dim_num;
-  if (rank > 3) {
-    throw std::invalid_argument("mapped tensor regions require rank-1/2/3");
-  }
-  std::size_t elements = 1;
-  for (unsigned axis = 0; axis < rank; ++axis) {
-    elements *= tensor->attr.size[axis];
-  }
-  auto result = read_mapped_tensor(tensor, bytes / elements, start, end);
-  ++transfers.reads;
-  transfers.read_bytes += result.size();
+  std::vector<std::uint8_t> result;
+  read_tensor_region_into(graph, id, start, end, result);
   return result;
+}
+
+void read_tensor_region_into(Graph &graph, vsi_nn_tensor_id_t id,
+                             const std::vector<std::uint32_t> &start,
+                             const std::vector<std::uint32_t> &end,
+                             std::vector<std::uint8_t> &data) {
+  transfer_mapped_tensor(get_tensor(graph, id), start, end, &data, nullptr);
+  ++transfers.reads;
+  transfers.read_bytes += data.size();
+}
+
+void upload_tensor_region(Graph &graph, vsi_nn_tensor_id_t id,
+                          const std::vector<std::uint32_t> &start,
+                          const std::vector<std::uint32_t> &end,
+                          const std::vector<std::uint8_t> &data) {
+  transfer_mapped_tensor(get_tensor(graph, id), start, end, nullptr, &data);
+  ++transfers.uploads;
+  transfers.upload_bytes += data.size();
 }
 
 vsi_nn_tensor_id_t retain_tensor(Graph &owner, vsi_nn_tensor_id_t id, Graph &receiver) {

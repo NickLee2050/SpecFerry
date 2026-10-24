@@ -73,6 +73,8 @@ class RecoveryControlTests(unittest.TestCase):
             "kernel: BUG: unable to handle page fault for address: 0000000100000008",
             "kernel: Oops: 0000 [#1] SMP PTI",
             "kernel: [galcore]: NP[0] hang, automatic recovery.",
+            "kernel: ***   GPU DRV CONFIG   ***",
+            "kernel: [galcore]: Stop driver to keep scene.",
             "--------gckEDMA_StartTransfer---timeout---src:0x55c24e40",
         ):
             self.assertIsNotNone(recovery_controls.FAULT.search(line), line)

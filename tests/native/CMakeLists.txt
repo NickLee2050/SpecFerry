@@ -40,6 +40,8 @@ specferry_native_test(np101_projection_check np101/projection_check.cpp np101_op
 specferry_native_test(np101_fp16_preservation_check np101/fp16_preservation_check.cpp np101_ops)
 specferry_native_test(np101_generation_check np101/generation_check.cpp np101_opt_decoder)
 specferry_native_test(np101_compiled_model_check np101/compiled_model_check.cpp np101_opt_decoder)
+specferry_test_executable(np101_compiled_model_transfer_check
+  np101/compiled_model_transfer_check.cpp np101_ops specferry_generation)
 specferry_test_executable(np101_memory_check np101/memory_check.cpp np101_context)
 
 specferry_cpu_test(np101_data_test np101/data_test.cpp np101_data_contract np101_context opt_data qwen_data)

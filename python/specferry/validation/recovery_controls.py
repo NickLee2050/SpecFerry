@@ -12,9 +12,10 @@ from .device import (
     write_json,
 )
 
+# The matched SoC driver's stuckDump mode replaces the terse NP hang message with this banner.
 FAULT = re.compile(
     r"NP.*hang|EDMA.*timeout|\bBUG:|\bOops:|unable to handle|general protection fault|"
-    r"invalid opcode|soft lockup|Hardware Error",
+    r"invalid opcode|soft lockup|Hardware Error|GPU DRV CONFIG|Stop driver to keep scene",
     re.I,
 )
 

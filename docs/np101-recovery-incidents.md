@@ -12,7 +12,8 @@
 
 1. 运行前查boot ID、`np101-recovery-required.json`、`/dev/galcore` owner及全boot内核：
    NP hang、EDMA timeout、BUG/Oops/page fault/general protection fault/invalid opcode/
-   soft lockup。`Waiting for HDMA Transfer...` 单独出现不算超时。串行、限时、运行中监控；
+   soft lockup；stuckDump模式还检测`GPU DRV CONFIG`及`Stop driver to keep scene`。
+   `Waiting for HDMA Transfer...` 单独出现不算超时。串行、限时、运行中监控；
    任一故障停止板卡工作并保留标记，不能靠正确输出、owner清空或`recovery done`放行。
 2. **10-13按用户要求删除自写卷积，禁止重建或作为恢复检查重新启用**。
    源码、binary、缓存副本、构建残留、专用测试和`check_np101.py conv/recovery`
@@ -51,13 +52,114 @@
 | 10-23 原256MiB池整模尝试 | CL头文件缺失已修正；后续因Linux余量保护或240秒初始化期限停止，未推理。退出后池/GFP复位、完整日志及延迟检查无新故障，旧标记保留，不原样延长重试 |
 | 10-23 新1792MiB池 | 用户在获知DLA保留声明后明确授权go.sh加载及有限写读；42MiB全部存量一致、释放正常，46.51秒无新故障。仅接受此范围，不接受全池、DLA覆盖或模型计算 |
 
-最新有限检查：主机boot `93f645a8-2be8-42f9-8429-07687f265c8c`，板卡boot
+扩池后的首轮内存检查：主机boot `93f645a8-2be8-42f9-8429-07687f265c8c`，板卡boot
 `c5068ad3-5d11-4cbc-8ffd-f603a75f365f`；用户报告重启，不额外记为已确认断电。
 内核uptime2413.923637开始加载、2416.728042 probe成功，2417.663075打开设备、
 2422.677330释放；15:12:44结束延迟检查。此后驱动保持加载，自动加载仍停用。
-原始模块/SDK/binary身份、各轮boot/API/内核日志见上述总结的证据入口；旧整模恢复标记
-仍指向`np101-soc-full-model-20261023/model-heap-release/`。以上不是新增需断电恢复的
-设备事故；下节主机卡死记录及所有独立NPU事故继续保留。
+原始模块/SDK/binary身份、各轮boot/API/内核日志见上述总结的证据入口。
+随后发生下述新池decoder故障；最新恢复标记指向10-24八层故障，旧事件及整模未完成记录保留。
+
+## 10-24 SoC八层decoder第四次输入挂起
+
+事件`soc-eight-decoder-rungraph-hang-20261024`；证据
+`np101-soc-decoder-resume-20261024/{summary,incident}.json`及`layers-8/board/`。
+主机boot为`c679b4e9-918f-4708-b2f2-2066c36e8703`，板卡boot为
+`7013aa1c-2105-4d00-8de1-08aa32569a22`。用户授权待用文件完整时继续测试并审计SD。
+59项文件身份匹配、运行前无owner或内核故障；沿用1.75GiB池及stuckDump=1。
+真实逐层NBG共享hidden，用独立DATACONVERT图提交FP32 KV；4层检查先通过。
+
+| 八层阶段 | 精确观察 |
+|---|---|
+| Setup/Verify | 8个decoder及KV提交图均返回；末个Verify于SDK单调时钟57482.742534结束 |
+| 前3个输入 | 27次RunGraph返回0，完整hidden与参考比较通过 |
+| 第4个输入 | layer0/1/2返回；第31次调用、零基layer3的`vsi_nn_RunGraph(graph.graph.get())`于57483.484111进入后未返回，归档源码`decoder_chain.cpp:116` |
+| 内核uptime | 57512.756734报`NP[0] hang`；57512.780728报core0 idle；57512.784440报recovery done；57512.921744释放设备 |
+| 停测 | 监控停止后续提交并SIGTERM，子进程32.724秒后exit=-15；保留逐调用记录及恢复标记 |
+
+SYSTEM峰值191309856字节、VIRTUAL为0、Linux余量最低805.117MiB。45.064秒后
+无新故障/owner，SYSTEM/GFP恢复122976/25362432字节；**仍判失败**。
+已证实卡在RunGraph而非Verify，不是固定第23层；同layer3此前3次返回，无容量耗尽
+证据。完成事件/同步、重复执行状态及内部地址问题仍属假设；stuckDump=1未给出
+内部命令或坏地址，不能指认FCL、槽位溢出或DLA覆盖。
+
+故障后的板端SD审计复现同址4KiB O_DIRECT三读不同，USB读卡器此前亦有同类现象。
+采集在hang之后，不能据此归因该故障；详见`np101-soc-sd-integrity-20261024/`。
+
+**规避与当前门禁**：原恢复标记保留；正常恢复须用户确认板卡断电并通过约定检查。
+不原样重复失败共享链、不延长期限或卸载驱动试恢复。后续同boot成功只在用户显式
+授权的诊断例外内成立，不能宣告自动恢复可靠或旧hang已修复。
+
+### 同boot后续诊断结论
+
+以下均由用户随后明确授权，未断电、重载驱动或改池。每轮数值、预算/释放及至少45秒
+延迟内核检查通过，无新故障；SYSTEM/GFP回到上述基线，无owner，原标记逐字节保留。
+不把这些结果外推到长期稳定或SD健康。性能统一见[实现总结](np101-status.md)。
+
+| 改变与范围 | 结论及证据目录 |
+|---|---|
+| 单层固定绑定，位置0/1/63 | 3次不同输入通过；`np101-soc-single-decoder-retry-20261024/` |
+| 单图三组输入轮换36次 | 108项比较通过，第31次也返回；排除该负载下固定调用序号必挂，不能排除原多图问题；`np101-soc-decoder-fixed-replay-20261024/` |
+| 独立固定tensor、CPU衔接hidden/KV，取消共享及独立提交图 | 8/16/24层各4个连续输入通过，共32/64/96次RunGraph；多个条件同时变化，不能认定共享或提交图就是根因；`np101-soc-independent-decoder-chain-20261024/` |
+| 接回完整生成，再验单个整图NBG | 分段两请求32个输出、整图一请求16个输出通过；`np101-soc-opt-generation-20261024/`、`np101-soc-fullgraph-generation-20261024/` |
+| 同整图轻量测量及局部KV回写 | 五请求80个输出、160次RunGraph；全部48个KV及局部写边界通过，129.143秒正常退出、45.001秒无新故障；`np101-soc-kv-transfer-20261024/` |
+
+各目录保存原始时序、身份及授权范围。局部回写保留同步Run后Map/Unmap和固定端口，
+未恢复失败共享链；首次部署缺执行位的SDK前拒绝另存`launch-rejected/`，不是设备事故。
+
+## 10-23 SoC新池单层decoder重复RunGraph挂起
+
+事件`soc-decoder-replay-hang-20261023`；证据
+`np101-soc-expanded-model-20261023/{incident,summary,kernel-audit}.json`及
+`decoder-public-ports-run/board/`。主机boot为`d4f3035c-c4c1-42ec-a2fc-cb86b9df64c2`，
+板卡boot为`c5068ad3-5d11-4cbc-8ffd-f603a75f365f`。SYSTEM为base=`0x80000000`、
+size=`0x70000000`；此前同boot小out_proj通过。固定layer0/M1/C64 NBG，binary
+SHA256=`66fb7873361e3430d81f7f23e70000dfd8497bc2adf3843d91a99fee70853114`，NBG
+SHA256=`653469acd33d6aecfe408cec79629ce5c5361f805d29d1d04806da5e448c7259`。
+模块、SDK和binary/NBG与原256MiB池已验身份相同，完整哈希留incident文件。
+
+| 阶段／时间 | 精确观察 |
+|---|---|
+| Setup/Verify | 分别215.011/5.879ms；Verify在SDK时间4245.577615返回 |
+| 三次数值运行 | 位置0/1/63的hidden/KV及未写槽通过；最后Run在4245.776081返回 |
+| 重复运行 | 三批各20次直接RunGraph，耗时0.535712/52.907354/0.524266秒；区间无应用分配、上传或读回 |
+| 内核uptime4268.592793、4299.312740 | 两次`NP[0] hang, automatic recovery`均在第二批；未逐调用记录，不能定位次数或NBG内部命令 |
+| 释放与后置 | ReleaseGraph从4299.820588开始，ReleaseContext于4299.848519返回；进程55.598秒、exit0，46.641秒后无第三次故障/owner |
+
+应用const/nonconst峰值25,200,810/1,053,056字节；SYSTEM峰值24,654,560字节，
+VIRTUAL为0，Linux余量最低843,407,360字节；退出后池/GFP归位。**整轮失败，性能
+不接受**；正确输出、正常退出和自动恢复不清除门禁。后续更大模型须另行约定。
+
+临时SoC监控的`NP\s+hang`漏掉`NP[0] hang`，未在首次故障时终止；人工发现时进程
+已退出，未实际发送信号。原误判clean报告保留，由统一内核审计改判失败。后续板端
+规则从仓库`recovery_controls.FAULT`导出，另覆盖stuckDump详细转储标题；离线复查
+112份日志未发现其他NPU故障漏报。禁止再复制简化表达式。
+
+**原因与规避**：故障在重复RunGraph，非Verify；无容量耗尽、应用越界、新增建图/
+分配或并发Run证据。boot及物理放置变化，不能认定扩池是原因。匹配驱动反汇编显示
+`_MonitorTimerFunction`在lastCommitStamp/lastWaitLink/pendingEvent停滞时触发
+`gckKERNEL_Recovery`；两次相隔30.719947秒符合监控节律，不是非法地址证明。
+stuckDump=0跳过详细转储，Reset/Notify也不保证每次正确重算。重复不变输入的正确
+输出可能是旧结果，优先用不同已知输入、逐次起止及完整日志区分执行/同步问题。
+驱动追查保存在`np101-soc-decoder-hang-audit-20261023/`；FCL、槽位、DLA及坏地址
+均未确定。不原样重跑未记录的循环或靠卸载驱动恢复，先按门禁约定有界诊断。
+
+### 后续诊断与文件完整性拦截
+
+用户报告重启并授权有界诊断；板卡boot变为`7760df9c-264b-4f8c-8ac0-04f0ea2dbd73`，
+主机boot仍为上述值。相同SDK/NBG/池，加载时加stuckDump=1，每次RunGraph记录序号、
+起止和状态，连续采集kmsg；63次调用全部返回、数值/释放及45.009秒检查通过。
+未复现hang，不证明转储选项修复问题，真实故障终止分支也尚未在本轮验证。
+证据`np101-soc-rungraph-diagnostic-20261023/`。
+
+随后主机boot变为`a66e9fcb-c864-42be-adef-1f523bdf731e`，板卡boot不变。2层连续
+4个已知输入通过；4层在SDK前被layer2哈希不符拦截，未出现新NP hang。后续确认
+layer2–7共六份NBG不符，并发生SSH MAC错误、截断归档及同文件读回差异；不得修改
+期望哈希放行。文件偏移是逻辑偏移，不能据此判断物理坏地址或hang根因。证据
+`np101-soc-decoder-ladder-20261023/`，含逐次读回、异常副本和完整双端日志。
+
+断电后从原件恢复六份NBG，57项SDK/诊断文件哈希通过，fsck及扩容通过；但读卡器
+路径同一4KiB物理块三读不同，不能保证介质可靠或归因卡/读卡器哪一方。后续先核对
+全部待用产物，SD记录见`np101-soc-sd-expand-20261023/`；10-24续测及新故障独立记于上节。
 
 ## 主机无响应观察：2026-10-21（NP101因果未确认）
 

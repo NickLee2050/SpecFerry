@@ -59,9 +59,11 @@ Transfer `build-soc/bin/` over SSH; on the board, use
 `LD_LIBRARY_PATH=/np101_driver/build/sdk/drivers` and `VIV_MGPU_AFFINITY=1:0`.
 Runtime EVIS compilation needs the SDK's CL headers in a private working directory, exposed through
 `LJMICRO_SDK_DIR`. Native OPT packages can use the pinned `np101-soc-riscv64` SDK profile; existing
-Python exporters/runners still target EP. Small NBGs and a complete decoder passed on SoC;
-full-model inference remains unaccepted. The expanded 1792MiB pool has only passed a 42MiB
-allocation/readback check. See [status](docs/np101-status.md#soc部署与内存) for deployment evidence.
+Python exporters/runners still target EP. Bounded complete OPT C64/M1 generation and partial
+KV writeback passed on SoC with the 1792MiB pool, using diagnostic runners. These runners are not
+yet integrated into the normal CLI; the cross-built CLI alone does not reproduce that accepted
+path. Qwen on SoC, whole-pool integrity and long-term stability remain unvalidated.
+See [status](docs/np101-status.md#soc部署与内存) for deployment evidence and acceptance boundaries.
 SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
 isolation. Driver autoload remains disabled.
 
