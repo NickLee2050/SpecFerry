@@ -46,6 +46,11 @@ the request is unchanged. Host numerical checks share the OPT validation code wi
 watchdog termination despite blocked sampling, fault handling and retained recovery gates without
 opening a device. SSH failure alone never authorizes another model submission.
 
+The retired standalone KV transfer experiment is archived outside the source tree. Its maintained
+replacement is the formal OPT entry: one resident Context processes long/short/repeated-long reset
+requests, checking tokens, coarse final-layer KV, unused slots, repeated-state equality and release.
+Performance comparisons use matching input/output lengths; the short isolation request is separate.
+
 ### Small SoC memory check
 
 With the [cross-build setup](../README.md#soc-cross-build), configure `BUILD_TESTING=ON` and build
