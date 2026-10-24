@@ -2,13 +2,15 @@ add_library(np101_test_support np101/test_support.cpp)
 target_link_libraries(np101_test_support PUBLIC np101_context)
 target_compile_options(np101_test_support PRIVATE -Wall -Wextra -Wpedantic)
 
-# Explicit diagnostic preload only; this target does not link or initialize the SDK.
-add_library(np101_verify_trace SHARED np101/verify_trace.cpp)
-target_compile_features(np101_verify_trace PRIVATE cxx_std_17)
-target_link_libraries(np101_verify_trace PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
-target_compile_options(np101_verify_trace PRIVATE -Wall -Wextra -Wpedantic)
-set_target_properties(np101_verify_trace PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+# This diagnostic is tied to the accepted x86 EP SDK, not validated on SoC.
+if(SPECFERRY_TARGET STREQUAL "ep")
+  add_library(np101_verify_trace SHARED np101/verify_trace.cpp)
+  target_compile_features(np101_verify_trace PRIVATE cxx_std_17)
+  target_link_libraries(np101_verify_trace PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  target_compile_options(np101_verify_trace PRIVATE -Wall -Wextra -Wpedantic)
+  set_target_properties(np101_verify_trace PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endif()
 
 function(specferry_test_executable name source)
   add_executable(${name} ${source})
@@ -24,8 +26,10 @@ endfunction()
 # Device diagnostics remain explicit commands; ordinary CTest must not open NP101.
 function(specferry_cpu_test name source contract)
   specferry_test_executable(${name} ${source} ${ARGN})
-  add_test(NAME ${contract} COMMAND ${name})
-  set_tests_properties(${contract} PROPERTIES LABELS "unit;cpu" TIMEOUT 30)
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME ${contract} COMMAND ${name})
+    set_tests_properties(${contract} PROPERTIES LABELS "unit;cpu;${SPECFERRY_TARGET}" TIMEOUT 30)
+  endif()
 endfunction()
 
 

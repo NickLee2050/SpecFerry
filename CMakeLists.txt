@@ -1,20 +1,49 @@
 cmake_minimum_required(VERSION 3.18)
+
+set(SPECFERRY_TARGET "" CACHE STRING "Execution platform: ep or soc")
+set_property(CACHE SPECFERRY_TARGET PROPERTY STRINGS ep soc)
+if(NOT SPECFERRY_TARGET MATCHES "^(ep|soc)$")
+  message(FATAL_ERROR "Select -DSPECFERRY_TARGET=ep or soc and a separate build directory")
+endif()
+if(DEFINED SPECFERRY_CONFIGURED_TARGET AND
+   NOT SPECFERRY_CONFIGURED_TARGET STREQUAL SPECFERRY_TARGET)
+  message(FATAL_ERROR "Do not change platforms in an existing build directory; use build/ep or build/soc")
+endif()
+set(SPECFERRY_CONFIGURED_TARGET "${SPECFERRY_TARGET}" CACHE INTERNAL "Platform bound to this build")
+
 project(SpecFerry LANGUAGES CXX)
 
 # Export compiler flags and include paths for clangd.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(LJMICRO_SDK_INCLUDE_DIR "/usr/inc" CACHE PATH "NP101 SDK header root")
-set(LJMICRO_SDK_LIBRARY_DIR "/usr/lib/ljmicro" CACHE PATH "NP101 SDK library directory")
+include(cmake/platforms/${SPECFERRY_TARGET}.cmake)
 find_package(Threads REQUIRED)
-
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+include(cmake/np101-sdk.cmake)
+message(STATUS "SpecFerry target: ${SPECFERRY_TARGET} (${CMAKE_SYSTEM_PROCESSOR})")
+message(STATUS "Platform implementation: ${SPECFERRY_PLATFORM_SOURCE}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER}")
+message(STATUS "SDK headers: ${LJMICRO_SDK_INCLUDE_DIR}")
+message(STATUS "SDK libraries: ${LJMICRO_SDK_LIBRARY_DIR}")
+
+# Shared data contracts and integrity checks do not depend on the device SDK.
 add_library(np101_data native/np101/tensor_spec.cpp native/np101/weights.cpp native/np101/component_spec.cpp
-  native/np101/memory_budget.cpp native/np101/sdk_identity.cpp)
+  native/np101/memory_budget.cpp)
 target_compile_features(np101_data PUBLIC cxx_std_17)
 target_include_directories(np101_data PUBLIC native)
 target_link_libraries(np101_data PUBLIC OpenSSL::Crypto)
 target_compile_options(np101_data PRIVATE -Wall -Wextra -Wpedantic)
+
+# Link one concrete platform implementation; no EP/SoC preprocessor definitions.
+add_library(specferry_platform_${SPECFERRY_TARGET}
+  native/platform/runtime_profile.cpp ${SPECFERRY_PLATFORM_SOURCE})
+target_link_libraries(specferry_platform_${SPECFERRY_TARGET} PUBLIC np101_data)
+target_compile_options(specferry_platform_${SPECFERRY_TARGET} PRIVATE -Wall -Wextra -Wpedantic)
+add_library(specferry_platform ALIAS specferry_platform_${SPECFERRY_TARGET})
+
+add_library(np101_sdk_identity native/np101/sdk_identity.cpp)
+target_link_libraries(np101_sdk_identity PUBLIC specferry_platform)
+target_compile_options(np101_sdk_identity PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(specferry_diagnostics native/np101/diagnostics.cpp)
 target_compile_features(specferry_diagnostics PUBLIC cxx_std_17)
@@ -23,23 +52,8 @@ target_compile_options(specferry_diagnostics PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(np101_context native/np101/context.cpp native/np101/tensor.cpp native/np101/weight_bank.cpp)
 target_compile_features(np101_context PUBLIC cxx_std_17)
-target_compile_definitions(np101_context PUBLIC LINUX)
 target_include_directories(np101_context PUBLIC native)
-target_include_directories(np101_context SYSTEM PUBLIC
-  "${LJMICRO_SDK_INCLUDE_DIR}"
-  "${LJMICRO_SDK_INCLUDE_DIR}/HAL"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/utils"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/client"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/ops")
-foreach(name ovxlib OpenVX OpenVXU CLC VSC GAL ArchModelSw NNArchPerf)
-  find_library(SDK_${name} NAMES ${name} PATHS "${LJMICRO_SDK_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
-  target_link_libraries(np101_context PUBLIC "${SDK_${name}}")
-endforeach()
-target_link_libraries(np101_context PUBLIC np101_data specferry_diagnostics Threads::Threads m)
-target_link_options(np101_context PUBLIC "-Wl,-rpath-link,${LJMICRO_SDK_LIBRARY_DIR}")
-set(CMAKE_BUILD_RPATH "${LJMICRO_SDK_LIBRARY_DIR}")
-
+target_link_libraries(np101_context PUBLIC np101_sdk np101_sdk_identity specferry_diagnostics)
 target_compile_options(np101_context PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(qwen_data native/models/qwen3_5/config.cpp)

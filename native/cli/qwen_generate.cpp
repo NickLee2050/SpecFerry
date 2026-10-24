@@ -3,6 +3,7 @@
 #include "np101/diagnostics.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/weights.hpp"
+#include "platform/runtime_profile.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -126,6 +127,7 @@ int main(int argc, char **argv) {
     // Validate the complete package before selecting the existing device MatMul FFN.
     feed_forward.erase(matmul_layer);
     fs::create_directories(output);
+    platform::write_runtime_profile(output);
     np101::SdkTimings timings(output);
     phase(output, "initialize");
     const auto start = std::chrono::steady_clock::now();

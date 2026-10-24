@@ -155,7 +155,7 @@ def main():
 
     result = run_case(
         dict(
-            binary=ROOT / "build/bin/specferry_qwen_generate",
+            binary=ROOT / "build/ep/bin/specferry_qwen_generate",
             arguments=[
                 str(args.model.resolve()),
                 str(args.compiled_mixers.resolve()),

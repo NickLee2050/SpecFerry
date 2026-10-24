@@ -274,7 +274,7 @@ def run_case(
     if Path("/sys/module/galcore/srcversion").read_text().strip() != identity["module_srcversion"]:
         raise ValueError("compiled validation requires the pinned loaded driver")
     if audit_verify:
-        (ROOT / "build/tests/libnp101_verify_trace.so").resolve(strict=True)
+        (ROOT / "build/ep/tests/libnp101_verify_trace.so").resolve(strict=True)
         if sha256(sdk / "libOpenVX.so") != VERIFY_TRACE_OPENVX_SHA256:
             raise ValueError("Verify-only compilation audit requires pinned v105")
     (ROOT / "docs/np101-recovery-incidents.md").read_text()
@@ -337,7 +337,7 @@ def run_case(
                 timeout,
                 recovery_control=True,
                 sdk_timing=sdk_timing,
-                verify_trace=ROOT / "build/tests/libnp101_verify_trace.so"
+                verify_trace=ROOT / "build/ep/tests/libnp101_verify_trace.so"
                 if audit_verify
                 else None,
                 require_compiled_operations=audit_verify,

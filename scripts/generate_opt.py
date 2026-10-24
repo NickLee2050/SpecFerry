@@ -300,13 +300,13 @@ def main():
             cache_layer_range=args.cache_layer_range,
             request_tokens=request_tokens,
         )
-        binary = ROOT / "build/bin/specferry_opt_graph_generate"
+        binary = ROOT / "build/ep/bin/specferry_opt_graph_generate"
     else:
         if args.compare_cpu:
             from specferry.models.opt.validation_generation import reference_generation
 
             expected = reference_generation(args.checkpoint, request, args.max_new_tokens)["tokens"]
-        binary = ROOT / "build/bin/specferry_opt_generate"
+        binary = ROOT / "build/ep/bin/specferry_opt_generate"
     settings = {
         "max_new_tokens": args.max_new_tokens,
         "warmups": args.warmups,
@@ -409,7 +409,7 @@ def main():
                 args.timeout,
                 sdk_timing=args.sdk_timing,
                 sdk_summary=args.sdk_summary,
-                verify_trace=ROOT / "build/tests/libnp101_verify_trace.so"
+                verify_trace=ROOT / "build/ep/tests/libnp101_verify_trace.so"
                 if args.lifecycle_check
                 else None,
                 require_compiled_operations=args.lifecycle_check,

@@ -60,7 +60,7 @@ def main():
         "cache-append": "cache_append_check",
         "fp16-preservation": "fp16_preservation_check",
     }
-    binary = ROOT / "build/tests" / ("np101_" + targets[args.case])
+    binary = ROOT / "build/ep/tests" / ("np101_" + targets[args.case])
     arguments = [device]
     evaluate = None
     if args.case in ("lookup", "projection", "fp16-preservation"):

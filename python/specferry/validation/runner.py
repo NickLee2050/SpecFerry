@@ -42,7 +42,7 @@ def run_check(binary, arguments, output, options, *, evaluate=None, timeout=None
             else (120 if options.timeout is None else options.timeout),
             sdk_timing=options.sdk_timing,
             trace_driver=options.trace_driver,
-            verify_trace=RECOVERY_ROOT.parents[1] / "build/tests/libnp101_verify_trace.so"
+            verify_trace=RECOVERY_ROOT.parents[1] / "build/ep/tests/libnp101_verify_trace.so"
             if options.trace_verify
             else None,
         )

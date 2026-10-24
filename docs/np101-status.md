@@ -84,6 +84,11 @@ SoC模块没有sysfs srcversion，活跃模块身份还需运行器记录boot和
 本地SoC派生包只更新运行库身份，保持权重/NBG和端口契约；EP包不改动。
 Python导出/监督入口仍以EP为目标，不能直接视为远程SoC执行器；Qwen尚未在SoC验收。
 
+构建显式选择`SPECFERRY_TARGET=ep|soc`，产物分置`build/ep`和`build/soc`。共用模型/
+tensor逻辑调用`native/platform/runtime_profile.hpp`，CMake仅链接对应平台实现，
+无模式宏；驱动身份与库路径按平台归属，包校验共用。正式生成记录`platform.json`。
+目录职责与命令见README；此结构整理未改变图/KV策略，SoC最新路径仍待正式接入。
+
 驱动身份：10-24测试前核验的SoC模块SHA256为`4c9a6ca2…78449bc`，内部版本
 `6.4.9.9.452545`，目标为RISC-V/Linux5.10.4，无srcversion。fpga02安装包为
 `ljmnp 1.0.5`，源码在`/usr/src/ljmnp-1.0.5-ubuntu20.04/`，模块在

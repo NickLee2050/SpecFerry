@@ -107,14 +107,14 @@ def main(argv=None):
     if args.case in ("selection", "io", "teacher"):
         from specferry.models.opt.validation_generation import evaluate
 
-        binary = ROOT / "build/tests/np101_opt_io_check"
+        binary = ROOT / "build/ep/tests/np101_opt_io_check"
         if args.case == "teacher":
-            binary = ROOT / "build/tests/np101_generation_check"
+            binary = ROOT / "build/ep/tests/np101_generation_check"
             arguments += [metadata["layers"], metadata["count"]]
     elif args.case == "opt":
         from specferry.models.opt.validation import evaluate
 
-        binary = ROOT / "build/tests/np101_decoder_check"
+        binary = ROOT / "build/ep/tests/np101_decoder_check"
         arguments += [metadata["steps"]]
     return run_check(
         binary,

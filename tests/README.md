@@ -9,14 +9,17 @@ Repeat device checks only for a changed contract, observed failure or required a
 
 ```sh
 python -m unittest discover -s tests -t .
-ctest --test-dir build -L cpu --output-on-failure
+ctest --test-dir build/ep -L cpu --output-on-failure
 python scripts/format_python.py --check
 python scripts/format_cpp.py --check
 ```
 
 Python covers source/package identity, generation policy/counts, numerical/state acceptance,
 port permutations, memory budgets and device/recovery guards with mocked device calls.
-The four native CTest cases have `unit;cpu` labels and never open NP101. Device tests are explicit.
+The four native CTest cases have `unit;cpu` and target labels and never open NP101. The data
+contract also checks that foreign-platform packages fail before driver inspection. Device tests
+are explicit. Cross-builds produce test binaries but do not register them with host CTest.
+The pinned x86 Verify tracing library is built only for EP.
 
 ## Device discipline
 

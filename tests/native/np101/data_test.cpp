@@ -2,16 +2,20 @@
 #include "models/opt/config.hpp"
 #include "models/qwen3_5/config.hpp"
 #include "np101/component_spec.hpp"
+#include "np101/sdk_identity.hpp"
 #include "np101/tensor_spec.hpp"
 #include "np101/weight_bank.hpp"
 #include "np101/weights.hpp"
+#include "platform/runtime_profile.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -49,6 +53,32 @@ struct TemporaryDirectory {
     std::filesystem::remove_all(path, ignored);
   }
 };
+
+void platform_package_contract() {
+  const auto &profile = specferry::platform::runtime_profile();
+  // A package for the other platform must fail before reading the live driver or SDK.
+  const std::string foreign =
+      std::string(profile.target) == "ep" ? "np101-soc-riscv64" : "F53A3E6EFBB7D0FD7D4617C";
+  for (const auto &identity : {foreign, std::string("unsupported")}) {
+    std::istringstream manifest;
+    bool rejected = false;
+    try {
+      verify_compiled_sdk(manifest, identity, 5);
+    } catch (const std::invalid_argument &error) {
+      rejected = std::string(error.what()).find("SDK profile differs from build target") !=
+                 std::string::npos;
+    }
+    require(rejected, "foreign platform package must fail before device inspection");
+  }
+  TemporaryDirectory directory;
+  specferry::platform::write_runtime_profile(directory.path);
+  std::ifstream input(directory.path / "platform.json");
+  std::ostringstream contents;
+  contents << input.rdbuf();
+  require(contents.str().find("\"target\":\"" + std::string(profile.target) + "\"") !=
+              std::string::npos,
+          "run record must identify the linked platform");
+}
 
 void binary_io_contract() {
   TemporaryDirectory directory;
@@ -218,6 +248,7 @@ void opt_contracts() {
 
 int main() {
   try {
+    platform_package_contract();
     binary_io_contract();
     tensor_boundaries();
     weight_integrity();

@@ -6,6 +6,7 @@
 #include "np101/memory_budget.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
+#include "platform/runtime_profile.hpp"
 #include "sys/resource.h"
 #include "sys/time.h"
 
@@ -354,6 +355,7 @@ int main(int argc, char **argv) {
         : variant == PartitionedModel::Variant::CompiledFullModel ? "nbg-fullgraph"
                                                                   : "matmul";
     fs::create_directories(directory);
+    platform::write_runtime_profile(directory);
     progress(directory, "initialize");
     np101::SdkTimings timings(directory);
     // A closed SDK Context retains registration slots; each rebuild needs a fresh Context.

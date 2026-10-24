@@ -18,19 +18,28 @@ boundaries. [TODO](TODO.md) lists optional follow-up work; it does not block thi
 
 ## Environment and build
 
-Use Linux x86_64 with matching NP101 driver/SDK and read/write access to `/dev/galcore`.
+Select the execution target explicitly: `ep` (Linux x86_64) or `soc` (Linux riscv64).
+Use separate build directories; a configured directory cannot switch platforms. CMake selects
+one platform implementation and checks SDK/OpenSSL compilation and linking without running it.
+No EP/SoC preprocessor macros are used; the SDK's required `LINUX` definition remains.
+
+### EP build
+
+Use matching EP driver/SDK libraries; device execution also requires access to `/dev/galcore`.
 Install Conda, a C++17 compiler, CMake 3.18+ and OpenSSL development headers.
 
 ```bash
 conda env create -f environment.yml
 conda activate SpecFerry
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build -j 4
+cmake -S . -B build/ep -DSPECFERRY_TARGET=ep -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/ep -j 4
 ```
 
 Update with `conda env update -n SpecFerry -f environment.yml`. SDK defaults are `/usr/inc`
 and `/usr/lib/ljmicro`; override `LJMICRO_SDK_INCLUDE_DIR` / `LJMICRO_SDK_LIBRARY_DIR`
-at CMake configure time. `build/compile_commands.json` supports clangd.
+at CMake configure time. Python generation/check commands use `build/ep/bin` and `build/ep/tests`.
+Existing binaries under `build/bin` are not selected. Point clangd at the chosen target's
+`build/ep/compile_commands.json` or `build/soc/compile_commands.json` when reviewing that platform.
 
 ### SoC cross-build
 
@@ -43,19 +52,19 @@ board had no development headers. Do not copy host libraries into the target sna
 ```bash
 soc_toolchain=/absolute/path/to/NP101-riscv-gcc-linux-5.10.4-glibc-x86_64-V2.6.1
 soc_root=/absolute/path/to/board-root
-CCACHE_DIR="$PWD/.cache/ccache" cmake -S . -B build-soc \
-  -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/np101-riscv64.cmake" \
+CCACHE_DIR="$PWD/.cache/ccache" cmake -S . -B build/soc -DSPECFERRY_TARGET=soc \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/np101-riscv64.cmake" \
   -DNP101_TOOLCHAIN_ROOT="$soc_toolchain" -DCMAKE_FIND_ROOT_PATH="$soc_root" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
   -DLJMICRO_SDK_INCLUDE_DIR="$soc_root/np101_driver/build/sdk/include" \
   -DLJMICRO_SDK_LIBRARY_DIR="$soc_root/np101_driver/build/sdk/drivers" \
   -DOPENSSL_INCLUDE_DIR="$soc_root/usr/include" \
   -DOPENSSL_CRYPTO_LIBRARY="$soc_root/usr/lib/libcrypto.so.1.1"
-CCACHE_DIR="$PWD/.cache/ccache" cmake --build build-soc -j 4 \
+CCACHE_DIR="$PWD/.cache/ccache" cmake --build build/soc -j 4 \
   --target specferry_opt_graph_generate specferry_opt_generate
 ```
 
-Transfer `build-soc/bin/` over SSH; on the board, use
+Transfer `build/soc/bin/` over SSH; on the board, use
 `LD_LIBRARY_PATH=/np101_driver/build/sdk/drivers` and `VIV_MGPU_AFFINITY=1:0`.
 Runtime EVIS compilation needs the SDK's CL headers in a private working directory, exposed through
 `LJMICRO_SDK_DIR`. Native OPT packages can use the pinned `np101-soc-riscv64` SDK profile; existing
@@ -66,6 +75,25 @@ path. Qwen on SoC, whole-pool integrity and long-term stability remain unvalidat
 See [status](docs/np101-status.md#soc部署与内存) for deployment evidence and acceptance boundaries.
 SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
 isolation. Driver autoload remains disabled.
+
+### Source and platform boundaries
+
+| Location | Responsibility |
+|---|---|
+| `native/np101/` | Shared SDK wrappers, tensors, operators, budgets and package checks |
+| `native/models/`, `native/inference/`, `native/cli/` | Shared model composition, generation and native commands |
+| `native/platform/runtime_profile.hpp` | Common platform interface; ordinary functions, no mode macros or virtual dispatch |
+| `native/platform/ep/`, `native/platform/soc/` | Target-specific SDK paths and driver identity checks |
+| `cmake/platforms/` | Target architecture, SDK defaults and implementation source selection |
+| `cmake/toolchains/`, `cmake/np101-sdk.cmake` | Compiler/sysroot settings and shared SDK linkage |
+| `scripts/`, `python/specferry/` | Host export/reference tools and EP supervision; SoC deployment integration remains pending |
+
+The selected `specferry_platform_ep` or `specferry_platform_soc` library implements the same
+interface; `np101_sdk_identity` retains shared package validation. A package for the other target
+is rejected before driver inspection. Native generation records the linked target, architecture,
+required SDK identity and runtime library directory in `platform.json`, outside inference timings.
+Compilation does not change graph composition or select a KV transfer policy. SoC partial KV
+writeback remains an explicit diagnostic until its separate integration is accepted.
 
 ## Prepare and generate
 
@@ -126,7 +154,7 @@ CPU-only regression and formatting commands:
 ```bash
 python -m unittest tests.python.test_generation_cli tests.python.test_compiled_validation \
   tests.python.test_recovery
-ctest --test-dir build -L cpu --output-on-failure
+ctest --test-dir build/ep -L cpu --output-on-failure
 python scripts/format_python.py --check
 python scripts/format_cpp.py --check
 ```

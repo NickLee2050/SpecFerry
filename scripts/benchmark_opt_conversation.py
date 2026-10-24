@@ -200,7 +200,7 @@ def main():
     if args.prepare_only:
         return
     binary = args.output / "specferry_opt_graph_generate"
-    shutil.copy2(ROOT / "build/bin/specferry_opt_graph_generate", binary)
+    shutil.copy2(ROOT / "build/ep/bin/specferry_opt_graph_generate", binary)
     write_json(args.output / "identities.json", dict(binary_sha256=sha256(binary)))
     report = run_case(
         dict(binary=binary, arguments=[str(args.model), str(args.output / "request"), "{output}"]),

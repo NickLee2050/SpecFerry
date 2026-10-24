@@ -4,6 +4,7 @@
 #include "np101/diagnostics.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
+#include "platform/runtime_profile.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -24,6 +25,7 @@ int main(int argc, char **argv) {
   try {
     const std::filesystem::path output(argv[3]);
     std::filesystem::create_directories(output);
+    specferry::platform::write_runtime_profile(output);
     const auto options = specferry::inference::read_run_options(argv[2], false);
     const auto config = specferry::models::opt::read_model_config(argv[2]);
     std::ifstream input(std::filesystem::path(argv[2]) / "tokens.txt");
