@@ -12,6 +12,15 @@ namespace specferry::np101 {
 // Bounded host-only integrity check; does not initialize the SDK.
 std::string file_sha256(const std::filesystem::path &path);
 
+struct FileChecksum {
+  std::filesystem::path path;
+  std::string sha256;
+};
+
+// Check every complete file with at most four independent workers. Callers own
+// package path, size and semantic validation; no result is cached between calls.
+void verify_files(const std::vector<FileChecksum> &files);
+
 struct WeightRecord {
   std::string name;
   TensorSpec spec;

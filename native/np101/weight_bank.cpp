@@ -1,3 +1,4 @@
+#include "np101/diagnostics.hpp"
 #include "np101/weight_bank.hpp"
 #include "vsi_nn_dtype_util.h"
 
@@ -8,6 +9,7 @@
 namespace specferry::np101 {
 std::vector<std::uint8_t> prepare_weight_chunk(const WeightStore &store, const WeightRecord &record,
                                                const TensorSpec &target, std::size_t offset) {
+  const SdkTimer preparation("weight_prepare");
   if (target.type != record.spec.type &&
       !(record.spec.type == DataType::Float16 && target.type == DataType::Float32)) {
     throw std::invalid_argument("weight preparation only supports identity or FP16 to FP32");
@@ -15,7 +17,9 @@ std::vector<std::uint8_t> prepare_weight_chunk(const WeightStore &store, const W
   if (offset % dtype_bytes(record.spec.type)) {
     throw std::invalid_argument("weight chunk offset is not aligned to its source dtype");
   }
-  auto source = store.read(record, offset, TensorSpec{record.spec.type, target.shape}.bytes());
+  auto source = sdk_call("weight_read", [&] {
+    return store.read(record, offset, TensorSpec{record.spec.type, target.shape}.bytes());
+  });
   if (target.type == record.spec.type) {
     return source;
   }

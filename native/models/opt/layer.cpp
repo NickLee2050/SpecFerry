@@ -244,6 +244,7 @@ load_compiled_block_prefill(const std::filesystem::path &package,
     throw std::invalid_argument("compiled block prefill source/geometry differs");
   }
   std::vector<CompiledPrefillLayer> result;
+  std::vector<FileChecksum> checksums;
   std::size_t constants = 0;
   for (unsigned layer = 0; layer < count; ++layer) {
     CompiledPrefillLayer item;
@@ -289,11 +290,12 @@ load_compiled_block_prefill(const std::filesystem::path &package,
     const auto binary = std::filesystem::canonical(root / name);
     if (!expected.empty() || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
         std::filesystem::file_size(binary) > item.graph.constant_bytes ||
-        source_bytes > item.graph.constant_bytes || file_sha256(binary) != digest ||
+        source_bytes > item.graph.constant_bytes ||
         item.graph.constant_bytes > segment_payload_limit - constants) {
       throw std::invalid_argument("compiled block prefill path/hash/budget differs");
     }
     item.graph.path = binary.string();
+    checksums.push_back({binary, digest});
     const TensorSpec hidden{f16, {1024, 16}}, state{DataType::Float32, {64, capacity, 16}};
     item.graph.inputs = {
         hidden, state, state, {DataType::Int32, {1}}, {DataType::Float32, {capacity, 16}}};
@@ -304,6 +306,7 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   if (stream >> extra) {
     throw std::invalid_argument("trailing compiled block prefill data");
   }
+  verify_files(checksums);
   return result;
 }
 

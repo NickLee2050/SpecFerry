@@ -222,6 +222,7 @@ struct PartitionedGraphModel::Impl {
       decode = std::make_unique<ExecutionSet>(1);
       build_full_execution(*decode, context, phase);
       if (prefill_block == 16) {
+        const SdkScope timing_role("role", "block16.storage");
         std::vector<TensorBinding> shared_cache;
         if (!compiled_prefill_layers.empty()) {
           for (const auto &tensor : cache_tensors) {
@@ -607,6 +608,7 @@ struct PartitionedGraphModel::Impl {
   }
 
   void build_full_execution(ExecutionSet &execution, Context &context, const PhaseObserver &phase) {
+    const SdkScope timing_role("role", "block1.fullgraph");
     const auto &artifact = compiled_full_model;
     const bool mapped = kv_transfer == KvTransfer::MappedSlot;
     execution.head = std::make_unique<GraphBuilder>(context, mapped ? 104 : 128, 1);

@@ -26,6 +26,19 @@ std::uint64_t parse_offset(const std::string &text) {
 bool valid_digest(const std::string &text) {
   return text.size() == 64 && text.find_first_not_of("0123456789abcdef") == std::string::npos;
 }
+
+template <class Worker> void run_verification_workers(std::size_t jobs, Worker worker) {
+  const auto count =
+      std::min<std::size_t>(jobs, std::min(4u, std::max(1u, std::thread::hardware_concurrency())));
+  std::atomic<std::size_t> next{0};
+  std::vector<std::future<void>> workers;
+  for (std::size_t index = 0; index < count; ++index) {
+    workers.push_back(std::async(std::launch::async, [&] { worker(next); }));
+  }
+  for (auto &result : workers) {
+    result.get();
+  }
+}
 } // namespace
 
 std::string file_sha256(const std::filesystem::path &path) {
@@ -51,6 +64,31 @@ std::string file_sha256(const std::filesystem::path &path) {
     encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[index]);
   }
   return encoded.str();
+}
+
+void verify_files(const std::vector<FileChecksum> &files) {
+  struct PendingFile {
+    const FileChecksum *checksum;
+    std::uintmax_t bytes;
+  };
+
+  std::vector<PendingFile> ordered;
+  for (const auto &file : files) {
+    if (!valid_digest(file.sha256)) {
+      throw std::invalid_argument("invalid file checksum: " + file.path.string());
+    }
+    ordered.push_back({&file, std::filesystem::file_size(file.path)});
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [](const auto &left, const auto &right) { return left.bytes > right.bytes; });
+  run_verification_workers(ordered.size(), [&](std::atomic<std::size_t> &next) {
+    for (auto index = next.fetch_add(1); index < ordered.size(); index = next.fetch_add(1)) {
+      const auto &file = *ordered[index].checksum;
+      if (file_sha256(file.path) != file.sha256) {
+        throw std::runtime_error("file checksum mismatch: " + file.path.string());
+      }
+    }
+  });
 }
 
 WeightStore::WeightStore(const std::filesystem::path &directory) {
@@ -140,55 +178,46 @@ void WeightStore::verify() const {
   }
   std::sort(ordered.begin(), ordered.end(),
             [](const auto *left, const auto *right) { return left->bytes > right->bytes; });
-  const auto count = std::min<std::size_t>(
-      ordered.size(), std::min(4u, std::max(1u, std::thread::hardware_concurrency())));
-  std::atomic<std::size_t> next{0};
-  std::vector<std::future<void>> workers;
-  for (std::size_t worker = 0; worker < count; ++worker) {
-    workers.push_back(std::async(std::launch::async, [&] {
-      // Each worker owns its stream, digest and at most 8 MiB of read storage.
-      // Verification never shares a seek position or invokes an SDK operation.
-      std::ifstream input(data_path_, std::ios::binary);
-      Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-      std::vector<char> block(std::min<std::uint64_t>(8 * 1024 * 1024, ordered.front()->bytes));
-      if (!input || !context) {
-        throw std::runtime_error("cannot initialize weight verification");
+  run_verification_workers(ordered.size(), [&](std::atomic<std::size_t> &next) {
+    // Each worker owns its stream, digest and at most 8 MiB of read storage.
+    // Verification never shares a seek position or invokes an SDK operation.
+    std::ifstream input(data_path_, std::ios::binary);
+    Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    std::vector<char> block(std::min<std::uint64_t>(8 * 1024 * 1024, ordered.front()->bytes));
+    if (!input || !context) {
+      throw std::runtime_error("cannot initialize weight verification");
+    }
+    for (auto index = next.fetch_add(1); index < ordered.size(); index = next.fetch_add(1)) {
+      const auto &record = *ordered[index];
+      if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+        throw std::runtime_error("cannot initialize SHA256");
       }
-      for (auto index = next.fetch_add(1); index < ordered.size(); index = next.fetch_add(1)) {
-        const auto &record = *ordered[index];
-        if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
-          throw std::runtime_error("cannot initialize SHA256");
+      input.seekg(record.offset);
+      std::uint64_t offset = 0;
+      while (offset < record.bytes) {
+        const auto bytes = std::min<std::uint64_t>(block.size(), record.bytes - offset);
+        input.read(block.data(), bytes);
+        if (!input) {
+          throw std::runtime_error("weight pack read failed: " + record.name);
         }
-        input.seekg(record.offset);
-        std::uint64_t offset = 0;
-        while (offset < record.bytes) {
-          const auto bytes = std::min<std::uint64_t>(block.size(), record.bytes - offset);
-          input.read(block.data(), bytes);
-          if (!input) {
-            throw std::runtime_error("weight pack read failed: " + record.name);
-          }
-          if (EVP_DigestUpdate(context.get(), block.data(), bytes) != 1) {
-            throw std::runtime_error("SHA256 update failed");
-          }
-          offset += bytes;
+        if (EVP_DigestUpdate(context.get(), block.data(), bytes) != 1) {
+          throw std::runtime_error("SHA256 update failed");
         }
-        std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-        unsigned size = 0;
-        if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1) {
-          throw std::runtime_error("SHA256 finalization failed");
-        }
-        std::ostringstream encoded;
-        for (unsigned byte = 0; byte < size; ++byte) {
-          encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[byte]);
-        }
-        if (encoded.str() != record.sha256) {
-          throw std::runtime_error("weight checksum mismatch: " + record.name);
-        }
+        offset += bytes;
       }
-    }));
-  }
-  for (auto &worker : workers) {
-    worker.get();
-  }
+      std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+      unsigned size = 0;
+      if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1) {
+        throw std::runtime_error("SHA256 finalization failed");
+      }
+      std::ostringstream encoded;
+      for (unsigned byte = 0; byte < size; ++byte) {
+        encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[byte]);
+      }
+      if (encoded.str() != record.sha256) {
+        throw std::runtime_error("weight checksum mismatch: " + record.name);
+      }
+    }
+  });
 }
 } // namespace specferry::np101

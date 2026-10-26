@@ -177,6 +177,27 @@ void prepared_weight_contract() {
           "converted read must remain bounded by its source record");
 }
 
+void file_integrity_collection() {
+  TemporaryDirectory directory;
+  std::vector<FileChecksum> files;
+  for (unsigned index = 0; index < 6; ++index) {
+    const auto path = directory.path / ("artifact-" + std::to_string(index) + ".bin");
+    write_text(path, std::string(64 * 1024 + index + 1, static_cast<char>(index + 1)));
+    files.push_back({path, file_sha256(path)});
+  }
+  verify_files(files);
+  {
+    std::fstream damaged(files[2].path, std::ios::in | std::ios::out | std::ios::binary);
+    damaged.seekp(-1, std::ios::end);
+    damaged.put('\0');
+    require(bool(damaged), "test corruption must reach the end of the file");
+  }
+  rejects([&] { verify_files(files); }, "worker must reject same-size tail corruption");
+  write_text(files[2].path, std::string(64 * 1024 + 3, '\3'));
+  std::filesystem::remove(files.back().path);
+  rejects([&] { verify_files(files); }, "missing file must not be silently skipped");
+}
+
 void component_contracts() {
   const TensorSpec index{DataType::Int32, {1}}, storage{DataType::Float16, {8, 16}};
   validate_cache_append({DataType::Float16, {8, 1}}, index, storage);
@@ -268,6 +289,7 @@ int main() {
     binary_io_contract();
     tensor_boundaries();
     weight_integrity();
+    file_integrity_collection();
     prepared_weight_contract();
     component_contracts();
     opt_contracts();

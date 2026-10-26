@@ -298,6 +298,7 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("expected tokens exceed generation limit");
       }
     }
+    const auto preparation_started = Clock::now();
     np101::WeightStore weights(argv[1]);
     weights.verify();
     std::vector<models::opt::CompiledFfn> compiled_ffn, compiled_prefill_ffn;
@@ -376,6 +377,8 @@ int main(int argc, char **argv) {
         : variant == PartitionedModel::Variant::CompiledDecoder   ? "nbg-decoder"
         : variant == PartitionedModel::Variant::CompiledFullModel ? "nbg-fullgraph"
                                                                   : "matmul";
+    const auto preparation =
+        std::chrono::duration<double>(Clock::now() - preparation_started).count();
     fs::create_directories(directory);
     platform::write_runtime_profile(directory);
     progress(directory, "initialize");
@@ -396,6 +399,8 @@ int main(int argc, char **argv) {
           projections, compiled_head, compiled_projections, compiled_model.full, kv_transfer,
           compiled_prefill_layers);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
+      // Rebuild cycles reuse file validation; report one preparation plus this construction.
+      const auto ready = preparation + initialize;
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
       const auto prefill_cache_policy =
@@ -403,6 +408,7 @@ int main(int argc, char **argv) {
       {
         std::ofstream initialized(directory / "initialization.json");
         initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
+                    << ",\"preparation_seconds\":" << preparation << ",\"ready_seconds\":" << ready
                     << ",\"weight_payload_bytes\":" << weight_bytes << ",\"variant\":\""
                     << variant_name << "\",\"decoder_group_size\":1"
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
@@ -574,8 +580,8 @@ int main(int argc, char **argv) {
           << "\""
           << ",\"weight_payload_bytes\":" << weight_bytes
           << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request
-          << ",\"initialize_seconds\":" << initialize
-          << ",\"host_peak_rss_kib\":" << usage.ru_maxrss
+          << ",\"initialize_seconds\":" << initialize << ",\"preparation_seconds\":" << preparation
+          << ",\"ready_seconds\":" << ready << ",\"host_peak_rss_kib\":" << usage.ru_maxrss
           << ",\"capacity_checks\":" << capacity_checks
           << ",\"capacity_rejections\":" << capacity_rejections
           << ",\"closed_checks\":" << closed_checks

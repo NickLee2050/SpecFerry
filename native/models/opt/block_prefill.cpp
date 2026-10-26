@@ -134,6 +134,7 @@ struct BlockPrefill::Impl {
   std::pair<std::unique_ptr<GraphBuilder>, Tensor>
   build_embedding(Context &context, const WeightStore &weights,
                   const std::array<unsigned, 3> &version = {}) {
+    const SdkScope timing_role("role", "block16.embedding");
     auto embedding = std::make_unique<GraphBuilder>(context, 512, 256, &bank);
     auto &entry = *embedding;
     if (compiled_attention) {
@@ -174,6 +175,7 @@ struct BlockPrefill::Impl {
     const auto &decoder = config.decoder;
     for (const auto &artifact : artifacts) {
       if (!artifact.full_decoder) {
+        const SdkScope timing_role("role", "block16.preload");
         const auto &matrix = weights.find(decoder.prefix(artifact.layer) + "fc2.weight");
         bank.preload(weights, matrix, matrix.spec);
       }
@@ -183,6 +185,7 @@ struct BlockPrefill::Impl {
       zeroes.resize(state.bytes());
     }
     for (unsigned index = 0; index < 2 * decoder.layers; ++index) {
+      const SdkScope timing_role("role", "block16.cache-bindings");
       // Only input backing is shared. Every NBG still owns separate outputs,
       // committed into this cache after synchronous completion of the block.
       const auto id = shared_decode_cache ? bind_tensor(shared_cache.at(index), cache, state)
@@ -196,6 +199,7 @@ struct BlockPrefill::Impl {
     const auto compile = [&](std::unique_ptr<GraphBuilder> graph, const std::string &role,
                              const std::vector<Tensor> &inputs,
                              const std::vector<Tensor> &outputs) {
+      const SdkScope timing_role("role", "block16." + role);
       if (phase) {
         phase("setup.prefill16." + role);
       }
@@ -212,6 +216,8 @@ struct BlockPrefill::Impl {
     for (unsigned layer = 0; layer < decoder.layers; ++layer) {
       const auto &artifact = artifacts.at(layer);
       const auto role = "decoder." + std::to_string(layer);
+      const SdkScope timing_role("role", "block16." + role +
+                                             (artifact.full_decoder ? ".compiled" : ".attention"));
       auto graph = std::make_unique<GraphBuilder>(context, 8, 1);
       const auto input = graph->share(*stages.back().builder, hidden);
       const auto key = graph->bind({cache, caches[2 * layer].id}, state);
@@ -227,6 +233,7 @@ struct BlockPrefill::Impl {
               outputs);
       constants += artifact.graph.constant_bytes;
       if (!artifact.full_decoder) {
+        const SdkScope ffn_timing_role("role", "block16." + role + ".ordinary_ffn");
         auto ffn = std::make_unique<GraphBuilder>(context, 128, 64, &bank);
         const auto &version = artifact.graph.graph_version;
         check(vsi_nn_SetGraphVersion(ffn->graph.get(), version[0], version[1], version[2]),
