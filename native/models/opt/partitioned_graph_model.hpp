@@ -24,6 +24,8 @@ struct ProjectionPolicy {
 // Block prefill shares ordinary weights and KV. Compiled FFNs require separately
 // budgeted fixed-shape artifacts for the prefill and decode execution sets.
 // The compiled block-prefill candidate clears KV with a separate fixed copy graph.
+// Full-model mapped-slot M1 instead accepts a headless M16 chain with an explicit
+// FP16-to-FP32 prefix handoff. It remains resident and uses reset requests only.
 class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
@@ -57,7 +59,8 @@ public:
                         ProjectionPolicy projections = {}, CompiledHead compiled_head = {},
                         std::vector<CompiledProjections> compiled_projections = {},
                         CompiledFullModel compiled_full_model = {},
-                        KvTransfer kv_transfer = KvTransfer::DeviceCopy);
+                        KvTransfer kv_transfer = KvTransfer::DeviceCopy,
+                        std::vector<CompiledPrefillLayer> compiled_prefill_layers = {});
   ~PartitionedGraphModel();
   PartitionedGraphModel(const PartitionedGraphModel &) = delete;
   PartitionedGraphModel &operator=(const PartitionedGraphModel &) = delete;

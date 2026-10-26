@@ -19,7 +19,7 @@ from specferry.export.compiled import SIMULATOR, compile_model, compiled_ports
 from specferry.models.opt.checkpoint import load_checkpoint
 from specferry.models.opt.compiled import DRIVER, SDK_FILES
 from specferry.models.opt.export import verify_export
-from specferry.models.opt.onnx import decoder_model, full_model
+from specferry.models.opt.onnx import decoder_model, full_model, select_cache_updates
 from specferry.validation.device import write_json
 
 
@@ -169,6 +169,12 @@ def main():
     parser.add_argument("--rootfs", type=Path, required=True)
     parser.add_argument("--scope", choices=("fullgraph", "decoders"), required=True)
     parser.add_argument("--capacity", type=int, choices=(64, 128), required=True)
+    parser.add_argument(
+        "--kv-update",
+        choices=("scatter", "select"),
+        default="scatter",
+        help="graph-internal FP32 cache update; select requires indices in head order",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--package-output", type=Path, help="write a portable source-bound runtime package"
@@ -188,6 +194,8 @@ def main():
         directory = output / ("model" if layer is None else f"layer{layer}")
         directory.mkdir()
         model = graph.model()
+        if args.kv_update == "select":
+            select_cache_updates(model)
         onnx.save(model, directory / "model.onnx")
         write_json(
             directory / "source.json",
@@ -195,6 +203,7 @@ def main():
                 kind=args.scope,
                 layer=layer,
                 capacity=args.capacity,
+                kv_update=args.kv_update,
                 weight_sha256=graph.identities,
                 onnx_sha256=sha256(directory / "model.onnx"),
                 constant_bytes=sum(len(t.raw_data) for t in graph.constants),

@@ -120,9 +120,11 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
          result.variant != "compiled-fullgraph") ||
         (result.variant == "compiled-ffn-finish" &&
          ((result.block != 1 && result.block != 16) || result.lifecycle)) ||
-        ((result.variant == "compiled-decoder" || result.variant == "compiled-fullgraph") &&
-         (result.block != 1 || result.lifecycle)) ||
-        (result.variant == "compiled-fullgraph" && result.prefill_head != "every-token") ||
+        (result.variant == "compiled-decoder" && (result.block != 1 || result.lifecycle)) ||
+        (result.variant == "compiled-fullgraph" &&
+         (result.lifecycle || !((result.block == 1 && result.prefill_head == "every-token") ||
+                                (result.block == 16 && result.prefill_head == "last-token" &&
+                                 result.kv_transfer == "mapped-slot")))) ||
         (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
         (result.prefill_head != "every-token" && result.prefill_head != "last-token") ||
         (result.readback != "none" && result.readback != "logits" && result.readback != "kv") ||

@@ -23,6 +23,113 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_compiled_prefill_accounts_for_fp32_block_commits_and_reset(self):
+        from specferry.models.opt.graph_validation import _mapped_prefill_transfers
+
+        metadata = dict(
+            layers=24, heads=16, width=64, capacity=64, prefill_backend="compiled-attention"
+        )
+        for blocks, reset, expected in (
+            (1, False, (931, 9447688, 880, 9437248)),
+            (3, True, (1129, 47204888, 976, 22020160)),
+            (1, True, (1027, 34613512, 880, 9437248)),
+        ):
+            actual = _mapped_prefill_transfers(
+                metadata, dict(decode_steps=16, prefill_steps=blocks), 16, reset
+            )
+            self.assertEqual(
+                tuple(actual[k] for k in ("uploads", "upload_bytes", "reads", "read_bytes")),
+                expected,
+            )
+
+    def test_mapped_prefill_requires_tail_handoff_and_complete_reset_accounting(self):
+        from specferry.models.opt.graph_validation import evaluate, evaluate_benchmark
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Exact-block input deliberately leaves all sixteen tokens to M1:
+            # the prefill consumer has no head and must leave a final M1 token.
+            expected = [
+                (16, 31, 0, 31, 1612, 6107000, 1504, 6094912),
+                (17, 17, 1, 16, 977, 25172228, 832, 4718656),
+                (49, 19, 3, 16, 979, 31463948, 832, 7864384),
+            ]
+            metadata = dict(layers=24, heads=16, width=64, capacity=64, prefill_block=16)
+            metadata["requests"] = [
+                dict(prompt_length=row[0], consumed=row[0] + 15, tokens=[7] * 16)
+                for row in expected
+            ]
+            options = dict(
+                variant="compiled-fullgraph",
+                decoder_group_size=1,
+                prefill_head_policy="last-token",
+                kv_transfer="mapped-slot",
+            )
+            native = options | dict(
+                graph_layout="partitioned",
+                history_mode="reset",
+                prefill_block=16,
+                cache_readback="none",
+                diagnostic_reads=0,
+                diagnostic_read_bytes=0,
+                kv_reset_uploads_per_request=96,
+                launches=67,
+                prefill_steps=4,
+                decode_steps=63,
+                head_runs=63,
+            )
+            (root / "run.json").write_text(json.dumps(native))
+            initialized = native | dict(launches=0, prefill_steps=0, decode_steps=0, head_runs=0)
+            (root / "initialization.json").write_text(json.dumps(initialized))
+            results = []
+            for index, row in enumerate(expected):
+                length, launches, prefill, decode, uploads, upload_bytes, reads, read_bytes = row
+                result = dict(
+                    tokens=[7] * 16,
+                    consumed=length + 15,
+                    launches=launches,
+                    prefill_steps=prefill,
+                    decode_steps=decode,
+                    head_runs=decode,
+                    prefill_block=16,
+                    uploads=uploads,
+                    upload_bytes=upload_bytes,
+                    reads=reads,
+                    read_bytes=read_bytes,
+                )
+                results.append(result)
+                (root / f"measured.{index}.json").write_text(json.dumps(result))
+
+            checks, _ = evaluate(root, root, metadata, 16, **options)
+            self.assertTrue(
+                all(checks.values()), [name for name, passed in checks.items() if not passed]
+            )
+            for field in (
+                "uploads",
+                "upload_bytes",
+                "reads",
+                "read_bytes",
+                "launches",
+                "head_runs",
+            ):
+                with self.subTest(field=field):
+                    changed = results[1] | {field: results[1][field] - 1}
+                    (root / "measured.1.json").write_text(json.dumps(changed))
+                    checks, _ = evaluate(root, root, metadata, 16, **options)
+                    self.assertFalse(all(checks.values()))
+            (root / "measured.1.json").write_text(json.dumps(results[1]))
+            for field, value in (("kv_reset_uploads_per_request", 48), ("history_mode", "retain")):
+                with self.subTest(field=field):
+                    (root / "run.json").write_text(json.dumps(native | {field: value}))
+                    checks, _ = evaluate(root, root, metadata, 16, **options)
+                    self.assertFalse(all(checks.values()))
+            with self.assertRaisesRegex(ValueError, "last-token"):
+                evaluate(
+                    root, root, metadata, 16, **(options | {"prefill_head_policy": "every-token"})
+                )
+            with self.assertRaisesRegex(ValueError, "benchmark is not yet supported"):
+                evaluate_benchmark(root, metadata, 16, warmups=0, repeats=1, **options)
+
     def test_compiled_delta_norm_rejects_narrowed_reduction(self):
         from specferry.models.qwen3_5.compiled import audit_mixer
 

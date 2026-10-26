@@ -122,17 +122,18 @@ def host_health(output, name):
 def numerical_acceptance(bundle, board):
     options = read_json(bundle / "bundle.json")["request_options"]
     metadata = read_json(bundle / "request/reference.json")
+    block = int(options["block"])
     common = dict(
         variant="compiled-fullgraph",
         decoder_group_size=1,
-        prefill_head_policy="every-token",
+        prefill_head_policy=options["prefill_head"],
         kv_transfer="mapped-slot",
     )
     if options.get("benchmark", "0") == "1":
         checks, generations = evaluate_benchmark(
             board / "native",
             metadata,
-            1,
+            block,
             warmups=int(options.get("warmups", 0)),
             repeats=int(options.get("repeats", 1)),
             **common,
@@ -143,7 +144,7 @@ def numerical_acceptance(bundle, board):
             bundle / "request",
             board / "native",
             metadata,
-            1,
+            block,
             cache_readback=readback,
             cache_layer_range=[int(options["cache_first_layer"]), int(options["cache_last_layer"])]
             if readback == "kv"
@@ -199,7 +200,7 @@ def collect(bundle, output):
             "board": board,
             "numerical": numerical,
             "host_boot_id": host_boot_id(),
-            "scope": "formal OPT fullgraph C64/M1 mapped-slot",
+            "scope": "formal OPT fullgraph C64 mapped-slot with explicit prefill policy",
         }
         save(output / "summary.json", summary)
         if summary["checks_passed"]:

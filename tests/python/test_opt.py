@@ -9,14 +9,48 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import onnx
 import torch
+from onnx import TensorProto, helper
+from onnx.reference import ReferenceEvaluator
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.export.weights import write_weight_pack
 from specferry.models.opt.checkpoint import load_checkpoint
 from specferry.models.opt.config import CHECKPOINT_SHA256, TOLERANCES, Components
+from specferry.models.opt.onnx import select_cache_updates
 from specferry.models.opt.validation import compare_prefix, evaluate, load_inputs
+
+
+class CacheSelectionTests(unittest.TestCase):
+    def test_continuous_updates_overwrite_boundaries_and_preserve_fp32_bits(self):
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("ScatterND", ["past_key", "kv_indices", "update"], ["present"])],
+                "cache-update",
+                [
+                    helper.make_tensor_value_info("past_key", TensorProto.FLOAT, [2, 4, 3]),
+                    helper.make_tensor_value_info("kv_indices", TensorProto.INT64, [2, 2]),
+                    helper.make_tensor_value_info("update", TensorProto.FLOAT, [2, 3]),
+                ],
+                [helper.make_tensor_value_info("present", TensorProto.FLOAT, [2, 4, 3])],
+            ),
+            opset_imports=[helper.make_opsetid("", 11)],
+            ir_version=7,
+        )
+        original = ReferenceEvaluator(onnx.ModelProto.FromString(model.SerializeToString()))
+        candidate = ReferenceEvaluator(select_cache_updates(model))
+        cache = np.arange(24, dtype="f4").reshape(2, 4, 3)
+        cache[0, 0, 0] = -0.0
+        update = np.array([[1e-30, -0.0, 1.0000001], [-2.1, 0.0, 4.9]], dtype="f4")
+        for position in (0, 1, 2, 3, 0):
+            feed = dict(
+                past_key=cache, kv_indices=np.array([[0, position], [1, position]]), update=update
+            )
+            expected = original.run(None, feed)[0]
+            cache = candidate.run(None, feed)[0]
+            np.testing.assert_array_equal(cache.view("u4"), expected.view("u4"))
 
 
 class OptContractTests(unittest.TestCase):

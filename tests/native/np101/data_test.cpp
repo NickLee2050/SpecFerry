@@ -131,6 +131,22 @@ void weight_integrity() {
   write_text(directory.path / "weights.bin", payload);
   write_text(directory.path / "weights.index", "specferry-np101-weights 1\n" + record + record);
   rejects([&] { WeightStore duplicate(directory.path); }, "duplicate tensor and overlap");
+
+  std::string parallel_payload, parallel_index = "specferry-np101-weights 1\n";
+  for (unsigned index = 0; index < 4; ++index) {
+    parallel_payload.resize(index * 64, '\0');
+    parallel_payload += payload;
+    parallel_index += "block" + std::to_string(index) + ".weight F16 2,2 " +
+                      std::to_string(index * 64) + " 8 " +
+                      "66840dda154e8a113c31dd0ad32f7f3a366a80e8136979d8f5a101d3d29d6f72\n";
+  }
+  write_text(directory.path / "weights.bin", parallel_payload);
+  write_text(directory.path / "weights.index", parallel_index);
+  WeightStore parallel(directory.path);
+  parallel.verify();
+  parallel_payload.back() ^= 1;
+  write_text(directory.path / "weights.bin", parallel_payload);
+  rejects([&] { parallel.verify(); }, "parallel worker checksum failure must propagate");
 }
 
 void prepared_weight_contract() {

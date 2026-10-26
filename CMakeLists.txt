@@ -31,7 +31,7 @@ add_library(np101_data native/np101/tensor_spec.cpp native/np101/weights.cpp nat
   native/np101/memory_budget.cpp)
 target_compile_features(np101_data PUBLIC cxx_std_17)
 target_include_directories(np101_data PUBLIC native)
-target_link_libraries(np101_data PUBLIC OpenSSL::Crypto)
+target_link_libraries(np101_data PUBLIC OpenSSL::Crypto Threads::Threads)
 target_compile_options(np101_data PRIVATE -Wall -Wextra -Wpedantic)
 
 # Link one concrete platform implementation; no EP/SoC preprocessor definitions.
@@ -99,7 +99,7 @@ set_target_properties(specferry_qwen_generate PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 
 add_library(np101_opt_decoder native/models/opt/decoder.cpp native/models/opt/model.cpp
   native/models/opt/layer.cpp native/models/opt/compiled_model.cpp
-  native/models/opt/partitioned_graph_model.cpp)
+  native/models/opt/partitioned_graph_model.cpp native/models/opt/block_prefill.cpp)
 target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data specferry_generation)
 target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
 

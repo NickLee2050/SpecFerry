@@ -143,8 +143,10 @@ def _mapped_slot_enabled(metadata, variant, block, kv_transfer):
     if kv_transfer not in (None, "device-copy", "mapped-slot"):
         raise ValueError("unknown KV transfer strategy")
     mapped = kv_transfer == "mapped-slot"
-    if mapped and (variant != "compiled-fullgraph" or metadata["capacity"] != 64 or block != 1):
-        raise ValueError("mapped-slot KV requires compiled fullgraph C64/M1")
+    if mapped and (
+        variant != "compiled-fullgraph" or metadata["capacity"] != 64 or block not in (1, 16)
+    ):
+        raise ValueError("mapped-slot KV requires compiled fullgraph C64 with M1 or M16 prefill")
     return mapped
 
 
@@ -159,6 +161,40 @@ def _mapped_slot_transfers(metadata, launches, predictions, reset):
         "reads": launches * caches + predictions,
         "read_bytes": launches * slot_bytes + 4 * predictions,
     }
+
+
+def _mapped_prefill_transfers(metadata, counts, predictions, reset):
+    """Count the separate prefill cache and its one-time FP32 handoff."""
+    transfers = _mapped_slot_transfers(metadata, counts["decode_steps"], predictions, reset)
+    caches = 2 * metadata["layers"]
+    hidden = metadata["heads"] * metadata["width"]
+    blocks = counts["prefill_steps"]
+    transfers["uploads"] += blocks + (caches if blocks else 0) + (caches if reset else 0)
+    transfers["upload_bytes"] += blocks * (2 * 16 + 1) * 4 + caches * hidden * blocks * 16 * 4
+    transfers["reads"] += caches if blocks else 0
+    transfers["read_bytes"] += caches * hidden * blocks * 16 * 2
+    if reset:
+        transfers["upload_bytes"] += caches * hidden * metadata["capacity"] * 2
+    if metadata.get("prefill_backend") == "compiled-attention":
+        # One index/mask update and one mapped FP32 block commit per cache/block;
+        # the final prefix handoff and reset also use FP32 rather than FP16.
+        commit_bytes = caches * hidden * blocks * 16 * 4
+        transfers["uploads"] += blocks * (2 + caches)
+        transfers["upload_bytes"] += blocks * (4 + metadata["capacity"] * 16 * 4) + commit_bytes
+        transfers["reads"] += blocks * caches
+        transfers["read_bytes"] += commit_bytes + caches * hidden * blocks * 16 * 2
+        if reset:
+            transfers["upload_bytes"] += caches * hidden * metadata["capacity"] * 2
+    return transfers
+
+
+def _request_steps(reference, block, mapped):
+    length = reference["prompt_length"]
+    # The M16-only consumer has no head. Leave the final prompt token to M1,
+    # including when the prompt is exactly a multiple of sixteen.
+    prefill = (length - int(mapped)) // block if block > 1 else 0
+    decode = length - prefill * block + len(reference["tokens"]) - 1
+    return dict(prefill_steps=prefill, decode_steps=decode, launches=prefill + decode)
 
 
 def evaluate(
@@ -176,6 +212,9 @@ def evaluate(
     kv_transfer=None,
 ):
     mapped = _mapped_slot_enabled(metadata, variant, block, kv_transfer)
+    mapped_prefill = mapped and block == 16
+    if mapped_prefill and prefill_head_policy != "last-token":
+        raise ValueError("mapped fullgraph M16 prefill requires last-token head policy")
     cache_layers = generation_cache_layers(cache_readback, metadata["layers"], cache_layer_range)
     read_logits = cache_readback == "logits"
     if type(block) is not int or block not in (1, 4, 8, 16):
@@ -194,6 +233,12 @@ def evaluate(
     native_run = json.loads(run_path.read_text()) if run_path.is_file() else {}
     if native_run.get("graph_layout") != "partitioned":
         raise ValueError("graph validation requires partitioned execution")
+    if mapped_prefill:
+        checks["history_mode"] = native_run.get("history_mode") == "reset"
+        if "prefill_backend" in metadata:
+            checks["prefill_backend"] = (
+                native_run.get("prefill_backend") == metadata["prefill_backend"]
+            )
     checks["cache_readback"] = native_run.get("cache_readback") == cache_readback
     if cache_readback == "none":
         for field in ("diagnostic_reads", "diagnostic_read_bytes"):
@@ -237,7 +282,10 @@ def evaluate(
     if block_prefill and variant == "compiled-ffn-finish" and block != 16:
         raise ValueError("compiled FFN prefill requires block16")
     if block_prefill and (
-        variant not in ("merged-kv", "merged-kv-fc1-split2", "compiled-ffn-finish")
+        (
+            variant not in ("merged-kv", "merged-kv-fc1-split2", "compiled-ffn-finish")
+            and not mapped_prefill
+        )
         or decoder_group_size not in (None, 1)
     ):
         raise ValueError(
@@ -268,6 +316,8 @@ def evaluate(
             and variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
             else 2 * metadata["layers"]
         )
+        if mapped_prefill:
+            expected_reset *= 2
         checks["variant"] = (
             native_run.get("graph_layout") == "partitioned"
             and native_run.get("variant") == variant
@@ -307,21 +357,14 @@ def evaluate(
                 checks[f"{scope}.{name}"] = (
                     type(actual) is type(expected_value) and actual == expected_value
                 )
-    step_counts = []
-    for reference in metadata["requests"]:
-        length = reference["prompt_length"]
-        prefill_steps = length // block if block > 1 else 0
-        decode_steps = (length % block if block > 1 else length) + len(reference["tokens"]) - 1
-        step_counts.append(
-            {
-                "prefill_steps": prefill_steps,
-                "decode_steps": decode_steps,
-                "launches": prefill_steps + decode_steps,
-            }
-        )
+    step_counts = [_request_steps(reference, block, mapped) for reference in metadata["requests"]]
     if prefill_head_policy is not None or block_prefill:
         expected_heads = sum(
-            len(reference["tokens"]) if prefill_head_policy == "last-token" else counts["launches"]
+            counts["decode_steps"]
+            if mapped_prefill
+            else len(reference["tokens"])
+            if prefill_head_policy == "last-token"
+            else counts["launches"]
             for reference, counts in zip(metadata["requests"], step_counts, strict=True)
         )
         observed_heads = native_run.get("head_runs")
@@ -359,7 +402,11 @@ def evaluate(
             + (reset_uploads_per_request if index else 0),
             "reads": len(reference["tokens"]),
         }
-        if mapped:
+        if mapped_prefill:
+            transfers = _mapped_prefill_transfers(
+                metadata, step_counts[index], len(reference["tokens"]), index > 0
+            )
+        elif mapped:
             transfers = _mapped_slot_transfers(
                 metadata, launches, len(reference["tokens"]), index > 0
             )
@@ -381,7 +428,9 @@ def evaluate(
                 step_counts[index]
                 | {
                     "prefill_block": block,
-                    "head_runs": len(reference["tokens"])
+                    "head_runs": step_counts[index]["decode_steps"]
+                    if mapped_prefill
+                    else len(reference["tokens"])
                     if prefill_head_policy == "last-token"
                     else launches,
                 }
@@ -466,6 +515,10 @@ def evaluate_benchmark(
 ):
     """Validate every resident repetition without requesting diagnostic tensor readback."""
     mapped = _mapped_slot_enabled(metadata, variant, block, kv_transfer)
+    if mapped and block == 16:
+        raise ValueError(
+            "mapped fullgraph M16 benchmark is not yet supported; use request acceptance"
+        )
     if block not in (1, 4, 8, 16) or not 0 <= warmups <= 5 or not 1 <= repeats <= 20:
         raise ValueError("invalid resident benchmark counts or prefill block")
     if prefill_head_policy not in ("every-token", "last-token"):

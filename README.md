@@ -81,14 +81,27 @@ python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/o
 ```
 
 `prepare` is offline; `deploy` transfers files and checks hashes without opening the NPU.
-`run` currently accepts fullgraph C64/M1, mapped-slot KV, independent reset requests and no Context
-rebuild. It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
+`run` accepts fullgraph C64/M1, mapped-slot KV, independent reset requests and no Context
+rebuild. Optional block16 prefill uses `prepare --prefill-package` and request options
+`block 16`, `prefill_head last-token`. The original handwritten-attention/MLP-NBG candidate failed
+Linux memory acceptance. The accepted bounded C64 configuration uses compiled attention, nineteen
+shared ordinary-weight FCL FFNs and five full decoder NBGs. FCL also replaces the M16 input
+projection, avoiding numerical errors observed in the original MatMul path. Three reset requests
+with 17/49/17 input tokens and 16 outputs each passed numerical, state and release checks.
+The shared implementation is
+`native/models/opt/block_prefill.*`; no platform macros are needed. Independent prefill caches
+(FP16 for handwritten attention, FP32 for compiled attention) supply one FP32 prefix handoff to M1,
+which consumes the remaining 1–16 prompt tokens and all generated tokens.
+M1's embedded head still executes on every M1 step. This path does not support continuation or the
+resident benchmark entry. Acceptance scopes and measurements are recorded in the status document.
+It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
 host EP isolation. The detached board supervisor owns the child deadline (maximum 300 seconds),
 kernel monitoring, Linux memory reserve and 45-second delayed release checks. SSH interruptions
 retry discovery of the same run; `collect` performs host numerical acceptance. Existing recovery
 markers block ordinary runs. `--diagnostic-baseline` is only for explicitly authorized diagnostics:
 it binds exact boot, old timestamped fault occurrences, marker/bundle hashes and deadline; success
-retains the old marker. Neither command loads or resets the driver. Qwen on SoC, whole-pool
+retains the old marker. Diagnostic authorization does not automatically enable per-SDK-call tracing.
+Neither command loads or resets the driver. Qwen on SoC, whole-pool
 integrity and long-term stability remain unvalidated.
 See [status](docs/np101-status.md#soc部署与内存) for deployment evidence and acceptance boundaries.
 SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
@@ -120,6 +133,11 @@ no extra device copy/reset graphs. Requests reset KV; continuation and other cap
 rejected. Initialization/reset and coarse diagnostics remain outside generation timing.
 Use `--prepare-only` to prepare requests; the Python launcher still executes locally on EP,
 not remotely on SoC. The native SoC entry accepts the same request setting with a SoC package.
+
+For graph-internal KV updates, `export_np101_opt_model.py --kv-update select` exports FP32
+broadcast selection in place of ScatterND. It preserves the runtime ports and pairs with the
+mapped-slot writeback above. SoC C64/M1 is validated; the default export remains `scatter` to
+preserve accepted EP configurations. Performance and scope are recorded in the status document.
 
 ## Prepare and generate
 

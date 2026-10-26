@@ -23,6 +23,9 @@ def main():
     prepare.add_argument("--deployment", type=Path, default=ROOT / ".cache/np101/opt-350m")
     for name in ("package", "request", "sdk", "output"):
         prepare.add_argument("--" + name, type=Path, required=True)
+    prepare.add_argument(
+        "--prefill-package", type=Path, help="pinned EP M16 FFN package for block16 prefill"
+    )
     for name in ("deploy", "run", "collect"):
         command = commands.add_parser(name)
         command.add_argument("bundle", type=Path)
@@ -43,7 +46,13 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare":
         result = prepare_bundle(
-            args.binary, args.deployment, args.package, args.request, args.sdk, args.output
+            args.binary,
+            args.deployment,
+            args.package,
+            args.request,
+            args.sdk,
+            args.output,
+            prefill_package=args.prefill_package,
         )
         print(
             json.dumps(

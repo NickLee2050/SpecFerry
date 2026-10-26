@@ -180,10 +180,12 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
   std::string magic, m1_digest, index_digest, deployment_digest, name, digest, extra;
   unsigned version = 0, tokens = 0, count = 0;
   file >> magic >> version >> m1_digest >> index_digest >> deployment_digest >> tokens >> count;
-  if (!file || magic != "specferry-opt-prefill" || version != 1 || tokens != 16 || count != 20 ||
-      config.decoder.layers != 24 ||
+  const bool full_model = version == 2;
+  if (!file || magic != "specferry-opt-prefill" || (version != 1 && version != 2) || tokens != 16 ||
+      count != (full_model ? 18u : 20u) || config.decoder.layers != 24 ||
       (config.decoder.capacity != 64 && config.decoder.capacity != 256) ||
-      file_sha256(root / "compiled-ffn.txt") != m1_digest ||
+      (full_model && config.decoder.capacity != 64) ||
+      file_sha256(root / (full_model ? "compiled-model.txt" : "compiled-ffn.txt")) != m1_digest ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("M16 FFN package source/M1/geometry differs");
@@ -193,7 +195,7 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
     result[layer].layer = layer;
   }
   std::size_t total = 0;
-  for (unsigned layer = 4; layer < result.size(); ++layer) {
+  for (unsigned layer = full_model ? 6u : 4u; layer < result.size(); ++layer) {
     auto &artifact = result[layer];
     file >> artifact.layer >> std::quoted(name) >> digest >> artifact.graph.constant_bytes;
     for (auto &part : artifact.graph.graph_version) {
@@ -217,6 +219,89 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
   }
   if (file >> extra) {
     throw std::invalid_argument("trailing M16 FFN package data");
+  }
+  return result;
+}
+
+std::vector<CompiledPrefillLayer>
+load_compiled_block_prefill(const std::filesystem::path &package,
+                            const std::filesystem::path &deployment, const ModelConfig &config,
+                            const WeightStore &weights) {
+  const auto root = std::filesystem::canonical(package);
+  std::ifstream stream(root / "compiled-block-prefill.txt");
+  std::string magic, model_digest, index_digest, deployment_digest, extra;
+  unsigned version = 0, capacity = 0, tokens = 0, count = 0;
+  stream >> magic >> version >> model_digest >> index_digest >> deployment_digest >> capacity >>
+      tokens >> count;
+  if (!stream || magic != "specferry-opt-compiled-block-prefill" || version != 1 ||
+      capacity != 64 || tokens != 16 || count != 24 || config.decoder.capacity != capacity ||
+      config.decoder.layers != count || config.decoder.hidden != 1024 ||
+      config.decoder.heads != 16 || config.decoder.intermediate != 4096 ||
+      config.decoder.epsilon != 1e-5f || file_sha256(root / "compiled-model.txt") != model_digest ||
+      file_sha256(deployment / "weights.index") != index_digest ||
+      file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
+    throw std::invalid_argument("compiled block prefill source/geometry differs");
+  }
+  std::vector<CompiledPrefillLayer> result;
+  std::size_t constants = 0;
+  for (unsigned layer = 0; layer < count; ++layer) {
+    CompiledPrefillLayer item;
+    std::string name, digest;
+    unsigned full = 0, identities = 0;
+    stream >> item.layer >> full >> std::quoted(name) >> digest >> item.graph.constant_bytes;
+    for (auto &part : item.graph.graph_version) {
+      stream >> part;
+    }
+    stream >> identities;
+    if (!stream || item.layer != layer || full > 1 || identities != (full ? 16u : 10u) ||
+        item.graph.graph_version != std::array<unsigned, 3>{1, 1, 35}) {
+      throw std::invalid_argument("compiled block prefill layer/version differs");
+    }
+    item.full_decoder = full;
+    std::set<std::string> expected;
+    for (const std::string projection : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                                         "self_attn.out_proj", "self_attn_layer_norm"}) {
+      for (const std::string suffix : {".weight", ".bias"}) {
+        expected.insert(config.decoder.prefix(layer) + projection + suffix);
+      }
+    }
+    if (full) {
+      for (const std::string part : {"fc1", "fc2", "final_layer_norm"}) {
+        for (const std::string suffix : {".weight", ".bias"}) {
+          expected.insert(config.decoder.prefix(layer) + part + suffix);
+        }
+      }
+    }
+    std::size_t source_bytes = 0;
+    for (unsigned index = 0; index < identities; ++index) {
+      std::string weight_name, weight_digest;
+      stream >> weight_name >> weight_digest;
+      if (!stream || !expected.erase(weight_name)) {
+        throw std::invalid_argument("compiled block prefill weight name differs");
+      }
+      const auto &weight = weights.find(weight_name);
+      if (weight.sha256 != weight_digest) {
+        throw std::invalid_argument("compiled block prefill source weight differs");
+      }
+      source_bytes += weight.bytes;
+    }
+    const auto binary = std::filesystem::canonical(root / name);
+    if (!expected.empty() || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
+        std::filesystem::file_size(binary) > item.graph.constant_bytes ||
+        source_bytes > item.graph.constant_bytes || file_sha256(binary) != digest ||
+        item.graph.constant_bytes > segment_payload_limit - constants) {
+      throw std::invalid_argument("compiled block prefill path/hash/budget differs");
+    }
+    item.graph.path = binary.string();
+    const TensorSpec hidden{f16, {1024, 16}}, state{DataType::Float32, {64, 64, 16}};
+    item.graph.inputs = {
+        hidden, state, state, {DataType::Int32, {1}}, {DataType::Float32, {64, 16}}};
+    item.graph.outputs = {hidden, state, state};
+    constants += item.graph.constant_bytes;
+    result.push_back(std::move(item));
+  }
+  if (stream >> extra) {
+    throw std::invalid_argument("trailing compiled block prefill data");
   }
   return result;
 }

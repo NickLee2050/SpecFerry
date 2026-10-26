@@ -2,9 +2,89 @@
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from specferry.export.onnx import OnnxGraph
+
+
+def select_cache_updates(model):
+    """Replace fixed OPT ScatterND updates in place without changing public ports.
+
+    The runtime supplies one index per head, in head order: [head, position].
+    Broadcasting a selection preserves FP32 values (including untouched slots),
+    unlike adding sparse updates, which would require an initially empty slot.
+    """
+    ports = {port.name: port for port in model.graph.input}
+    nodes, constants, masks = [], [], {}
+    count = 0
+    for node in model.graph.node:
+        if node.op_type != "ScatterND":
+            nodes.append(node)
+            continue
+        past, indices, update = node.input
+        port = ports.get(past)
+        if port is None or not past.endswith(("past_key", "past_value")):
+            raise ValueError("selection update requires a public OPT cache input")
+        shape = [dim.dim_value for dim in port.type.tensor_type.shape.dim]
+        index_port = ports.get(indices)
+        index_shape = (
+            [dim.dim_value for dim in index_port.type.tensor_type.shape.dim]
+            if index_port is not None
+            else []
+        )
+        if (
+            len(shape) != 3
+            or min(shape) <= 0
+            or port.type.tensor_type.elem_type != TensorProto.FLOAT
+            or index_shape != [shape[0], 2]
+        ):
+            raise ValueError("selection update requires FP32 [heads, capacity, width] cache")
+        key = (indices, tuple(shape))
+        if key not in masks:
+            prefix = "cache_selection_" + str(len(masks))
+            constants.extend(
+                numpy_helper.from_array(value, prefix + suffix)
+                for suffix, value in (
+                    ("_start", np.array([1], "i8")),
+                    ("_end", np.array([2], "i8")),
+                    ("_axis", np.array([1], "i8")),
+                    ("_slots", np.arange(shape[1], dtype="i8").reshape(1, -1)),
+                    ("_shape", np.array([shape[0], shape[1], 1], "i8")),
+                )
+            )
+            nodes.extend(
+                (
+                    # This converter requires a newer SDK for Gather; Slice has
+                    # the same fixed-column semantics on the pinned SDK.
+                    helper.make_node(
+                        "Slice",
+                        [indices, prefix + "_start", prefix + "_end", prefix + "_axis"],
+                        [prefix + "_positions"],
+                    ),
+                    helper.make_node(
+                        "Equal", [prefix + "_positions", prefix + "_slots"], [prefix + "_mask"]
+                    ),
+                    helper.make_node(
+                        "Reshape", [prefix + "_mask", prefix + "_shape"], [prefix + "_expanded"]
+                    ),
+                )
+            )
+            masks[key] = prefix + "_expanded"
+        expanded = node.output[0] + "_update_column"
+        nodes.extend(
+            (
+                helper.make_node("Unsqueeze", [update], [expanded], axes=[1]),
+                helper.make_node("Where", [masks[key], expanded, past], node.output),
+            )
+        )
+        count += 1
+    if not count:
+        raise ValueError("no OPT ScatterND cache updates found")
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    model.graph.initializer.extend(constants)
+    onnx.checker.check_model(model, full_check=True)
+    return model
 
 
 class Graph(OnnxGraph):
@@ -109,6 +189,72 @@ def decoder_model(weights, layer, capacity):
     roles = ("hidden", "past_key", "past_value", "kv_indices", "attention_mask")
     graph.inputs.sort(key=lambda port: roles.index(port.name))
     graph.port(output, TensorProto.FLOAT16, [1, 1024], True)
+    for state in states:
+        graph.port(state, TensorProto.FLOAT, [16, capacity, 64], True)
+    return graph
+
+
+def prefill_decoder_model(weights, layer, capacity=64):
+    """Compile sixteen prompt tokens with an aligned, FP32 cache-block update.
+
+    The caller supplies a causal mask and a block index in [0, capacity / 16).
+    All sixteen rows are real input tokens; padded final blocks are unsupported.
+    """
+    graph = Graph(weights, capacity)
+    hidden = graph.port("hidden", TensorProto.FLOAT16, [16, 1024])
+    past = [
+        graph.port("past_" + part, TensorProto.FLOAT, [16, capacity, 64])
+        for part in ("key", "value")
+    ]
+    index = graph.port("block_index", TensorProto.INT64, [1])
+    index = graph.reshape(index, "block_index_broadcast", [1, 1, 1, 1])
+    mask = graph.port("attention_mask", TensorProto.FLOAT, [16, capacity])
+    blocks = graph.constant(
+        "cache_blocks", np.arange(capacity // 16, dtype="i8").reshape(1, -1, 1, 1)
+    )
+    selected = graph.node("Equal", [index, blocks], "selected_block")
+    source = f"decoder.layers.{layer}."
+    projections = {}
+    for part in ("q", "k", "v"):
+        value = graph.project(hidden, part + "_proj", source + "self_attn." + part + "_proj")
+        if part == "q":
+            value = graph.node(
+                "Mul", [value, graph.constant("query_scale", np.array(0.125, "f2"))], "scaled_query"
+            )
+        value = graph.reshape(value, part + "_rows", [16, 16, 64])
+        projections[part] = graph.node("Transpose", [value], part + "_heads", perm=[1, 0, 2])
+    states, narrow = [], []
+    for ordinal, (part, projection) in enumerate((("key", "k"), ("value", "v"))):
+        old = graph.reshape(past[ordinal], part + "_blocks", [16, capacity // 16, 16, 64])
+        update = graph.node(
+            "Cast", [projections[projection]], part + "_update_fp32", to=TensorProto.FLOAT
+        )
+        update = graph.reshape(update, part + "_new_block", [16, 1, 16, 64])
+        state = graph.node("Where", [selected, update, old], part + "_updated_blocks")
+        state = graph.reshape(state, "present_" + part, [16, capacity, 64])
+        states.append(state)
+        narrow.append(graph.node("Cast", [state], part + "_attention", to=TensorProto.FLOAT16))
+    key = graph.node("Transpose", [narrow[0]], "transposed_key", perm=[0, 2, 1])
+    scores = graph.node("MatMul", [projections["q"], key], "scores")
+    scores = graph.node("Cast", [scores], "scores_fp32", to=TensorProto.FLOAT)
+    scores = graph.node("Add", [scores, mask], "masked_scores")
+    scores = graph.reshape(scores, "flat_scores", [256, capacity])
+    probability = graph.node("Softmax", [scores], "probability_fp32", axis=1)
+    probability = graph.node("Cast", [probability], "probability_fp16", to=TensorProto.FLOAT16)
+    probability = graph.reshape(probability, "probability", [16, 16, capacity])
+    attended = graph.node("MatMul", [probability, narrow[1]], "attended_heads")
+    attended = graph.node("Transpose", [attended], "attended_rows", perm=[1, 0, 2])
+    attended = graph.reshape(attended, "attended", [16, 1024])
+    projected = graph.project(attended, "out_proj", source + "self_attn.out_proj")
+    residual = graph.node("Add", [hidden, projected], "attention_residual")
+    norm = graph.norm(residual, "attention_norm", source + "self_attn_layer_norm")
+    fc1 = graph.project(norm, "fc1", source + "fc1")
+    activation = graph.node("Relu", [fc1], "activation")
+    fc2 = graph.project(activation, "fc2", source + "fc2")
+    residual = graph.node("Add", [norm, fc2], "ffn_residual")
+    normalized = graph.norm(residual, "final_norm", source + "final_layer_norm")
+    output = graph.node("Identity", [normalized], "hidden_out")
+    graph.port(output, TensorProto.FLOAT16, [16, 1024], True)
     for state in states:
         graph.port(state, TensorProto.FLOAT, [16, capacity, 64], True)
     return graph

@@ -73,6 +73,7 @@ def package_model_exports(artifacts, deployment, output):
             source["kind"] != kind
             or source["capacity"] != capacity
             or source["layer"] != (index if kind == "decoders" else None)
+            or source.get("kv_update", "scatter") not in ("scatter", "select")
         ):
             raise ValueError("compiled OPT model source geometry differs")
         identities = source["weight_sha256"]
@@ -103,6 +104,7 @@ def package_model_exports(artifacts, deployment, output):
         entry.update(
             path=f"decoder{index:02d}.nb" if kind == "decoders" else "model.nb",
             weight_sha256=identities,
+            kv_update=source.get("kv_update", "scatter"),
         )
         entries.append(entry)
     if sum(entry["constant_bytes"] for entry in entries) > 2**30:

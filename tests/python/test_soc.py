@@ -41,6 +41,158 @@ class SocTests(unittest.TestCase):
         self.assertEqual(board.new_faults(old + "\n" + old, pattern, [old]), [old])
         self.assertEqual(board.new_faults(old, pattern), [old])
 
+    def released_board_marker(self):
+        return {
+            "board_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "faults": [],
+            "kernel_faults": [],
+            "remaining_processes": [],
+            "owners_delayed": [],
+            "pool_released": True,
+            "gfp_released": True,
+            "delayed_seconds": 45.1,
+            "stop_reason": "Linux memory reserve breached",
+        }
+
+    def test_board_diagnostic_requires_exact_marker_and_complete_fault_free_release(self):
+        marker = self.root / "np101-recovery-required.json"
+        output = self.root / "run"
+        output.mkdir()
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        for authorization in (None, {}, {"board_marker_sha256": "stale"}):
+            with self.subTest(authorization=authorization), self.assertRaises(RuntimeError):
+                board.retain_diagnostic_marker(
+                    marker, output, authorization, previous["board_boot_id"]
+                )
+        for change in (
+            {"board_boot_id": "different-boot"},
+            {"faults": ["NP hang"]},
+            {"kernel_faults": ["EDMA timeout"]},
+            {"remaining_processes": [42]},
+            {"owners_delayed": [42]},
+            {"pool_released": False},
+            {"gfp_released": False},
+            {"delayed_seconds": 44.9},
+            {"delayed_seconds": None},
+            {"kernel_faults": None},
+            {"monitor_error": "lost records"},
+            {"final_check_error": "unreadable kernel"},
+        ):
+            board.save(marker, previous | change)
+            authorization = {"board_marker_sha256": board.sha256(marker)}
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                board.retain_diagnostic_marker(
+                    marker, output, authorization, previous["board_boot_id"]
+                )
+        self.assertFalse((output / "retained-prior-board-marker.json").exists())
+        marker.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            board.retain_diagnostic_marker(marker, output, authorization, previous["board_boot_id"])
+
+    def test_failed_board_diagnostic_preserves_previous_marker_and_evidence_chain(self):
+        marker = self.root / "np101-recovery-required.json"
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        original = marker.read_bytes()
+        (self.root / "bundle.json").write_text("{}")
+        diagnostic = {
+            "board_marker_sha256": board.sha256(marker),
+            "board_boot_id": previous["board_boot_id"],
+            "bundle_sha256": board.sha256(self.root / "bundle.json"),
+            "authorization": "bounded diagnostic",
+            "timeout": 180,
+            "kernel_faults": [],
+        }
+        manifest = {"fault_pattern": "hang", "driver_parameters": {"contiguousSize": 1024}}
+        state = {
+            "mem_available_kib": board.RESERVE_KIB + 1,
+            "pool": "POOL SYSTEM: Total : 1024",
+            "pool_used": ["0"],
+            "gfp": "0",
+        }
+        original_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/sys/module/galcore/parameters/contiguousSize":
+                return "1024"
+            return original_read(path, *args, **kwargs)
+
+        stream = self.root / "fake-kmsg"
+        stream.write_bytes(b"")
+        descriptor = os.open(stream, os.O_RDONLY)
+        output = self.root / "run"
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "DELAY_SECONDS", 0),
+            patch.object(board, "verify_bundle", return_value=manifest),
+            patch.object(board, "kernel", return_value=""),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "snapshot", return_value=state),
+            patch.object(Path, "read_text", read_text),
+            patch.object(board.os, "open", return_value=descriptor),
+            patch.object(
+                board,
+                "supervise",
+                return_value={
+                    "exit": -15,
+                    "remaining_processes": [],
+                    "stop_reason": "child deadline expired",
+                },
+            ),
+        ):
+            result = board.run(self.root, output, 180, diagnostic)
+        self.assertTrue(result["child_started"])
+        self.assertFalse(result["clean"])
+        retained = output / "retained-prior-board-marker.json"
+        self.assertEqual(retained.read_bytes(), original)
+        pending = board.read_json(marker)
+        self.assertEqual(pending["output"], str(output))
+        self.assertEqual(
+            pending["retained_prior_board_marker"],
+            {"path": str(retained), "sha256": diagnostic["board_marker_sha256"]},
+        )
+
+    def test_board_accept_restores_previous_gate_and_rejects_new_faults_or_tampering(self):
+        marker = self.root / "np101-recovery-required.json"
+        output = self.root / "run"
+        output.mkdir()
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        diagnostic = {"board_marker_sha256": board.sha256(marker)}
+        board.retain_diagnostic_marker(marker, output, diagnostic, previous["board_boot_id"])
+        original = marker.read_bytes()
+        result = {
+            "clean": True,
+            "board_boot_id": previous["board_boot_id"],
+            "fault_pattern": "hang",
+            "diagnostic": diagnostic,
+        }
+        board.save(output / "result.json", result)
+        board.save(marker, {"output": str(output)})
+        pending = marker.read_bytes()
+        digest = board.sha256(output / "result.json")
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "kernel", return_value="[123.456] NP hang") as kernel,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "kernel fault"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
+            retained = output / "retained-prior-board-marker.json"
+            retained.write_bytes(original + b"\n")
+            with self.assertRaisesRegex(RuntimeError, "retained board marker differs"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
+            retained.write_bytes(original)
+            kernel.return_value = ""
+            board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), original)
+            self.assertEqual((output / "accepted-marker.json").read_bytes(), pending)
+            board.accept(output, digest)  # Recollection cannot clear the restored gate.
+            self.assertEqual(marker.read_bytes(), original)
+
     def test_bundle_rejects_corruption_wrong_architecture_and_missing_execution_bit(self):
         binary = self.root / "bin/specferry_opt_graph_generate"
         binary.parent.mkdir()
@@ -57,6 +209,15 @@ class SocTests(unittest.TestCase):
         }
         board.save(self.root / "bundle.json", manifest)
         board.verify_bundle(self.root, check_sdk=False)
+        sdk = self.root / "libexample.so"
+        sdk.write_bytes(b"test SDK")
+        manifest["sdk"] = {sdk.name: board.sha256(sdk)}
+        board.save(self.root / "bundle.json", manifest)
+        with patch.object(board, "SDK", self.root):
+            board.verify_bundle(self.root)
+            sdk.write_bytes(b"bad! SDK")
+            with self.assertRaisesRegex(ValueError, "board SDK identity"):
+                board.verify_bundle(self.root)
         binary.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "permission"):
             board.verify_bundle(self.root, check_sdk=False)

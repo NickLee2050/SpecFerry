@@ -3,13 +3,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <ios>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace specferry::np101 {
 namespace {
@@ -131,32 +134,61 @@ std::vector<std::uint8_t> WeightStore::read(const WeightRecord &record,
 
 void WeightStore::verify() const {
   using Digest = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+  std::vector<const WeightRecord *> ordered;
   for (const auto &record : records_) {
-    Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-    if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
-      throw std::runtime_error("cannot initialize SHA256");
-    }
-    std::uint64_t offset = 0;
-    while (offset < record.bytes) {
-      auto block =
-          read(record, offset, std::min<std::uint64_t>(8 * 1024 * 1024, record.bytes - offset));
-      if (EVP_DigestUpdate(context.get(), block.data(), block.size()) != 1) {
-        throw std::runtime_error("SHA256 update failed");
+    ordered.push_back(&record);
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [](const auto *left, const auto *right) { return left->bytes > right->bytes; });
+  const auto count = std::min<std::size_t>(
+      ordered.size(), std::min(4u, std::max(1u, std::thread::hardware_concurrency())));
+  std::atomic<std::size_t> next{0};
+  std::vector<std::future<void>> workers;
+  for (std::size_t worker = 0; worker < count; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&] {
+      // Each worker owns its stream, digest and at most 8 MiB of read storage.
+      // Verification never shares a seek position or invokes an SDK operation.
+      std::ifstream input(data_path_, std::ios::binary);
+      Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+      std::vector<char> block(std::min<std::uint64_t>(8 * 1024 * 1024, ordered.front()->bytes));
+      if (!input || !context) {
+        throw std::runtime_error("cannot initialize weight verification");
       }
-      offset += block.size();
-    }
-    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned size = 0;
-    if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1) {
-      throw std::runtime_error("SHA256 finalization failed");
-    }
-    std::ostringstream encoded;
-    for (unsigned index = 0; index < size; ++index) {
-      encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[index]);
-    }
-    if (encoded.str() != record.sha256) {
-      throw std::runtime_error("weight checksum mismatch: " + record.name);
-    }
+      for (auto index = next.fetch_add(1); index < ordered.size(); index = next.fetch_add(1)) {
+        const auto &record = *ordered[index];
+        if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+          throw std::runtime_error("cannot initialize SHA256");
+        }
+        input.seekg(record.offset);
+        std::uint64_t offset = 0;
+        while (offset < record.bytes) {
+          const auto bytes = std::min<std::uint64_t>(block.size(), record.bytes - offset);
+          input.read(block.data(), bytes);
+          if (!input) {
+            throw std::runtime_error("weight pack read failed: " + record.name);
+          }
+          if (EVP_DigestUpdate(context.get(), block.data(), bytes) != 1) {
+            throw std::runtime_error("SHA256 update failed");
+          }
+          offset += bytes;
+        }
+        std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+        unsigned size = 0;
+        if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1) {
+          throw std::runtime_error("SHA256 finalization failed");
+        }
+        std::ostringstream encoded;
+        for (unsigned byte = 0; byte < size; ++byte) {
+          encoded << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[byte]);
+        }
+        if (encoded.str() != record.sha256) {
+          throw std::runtime_error("weight checksum mismatch: " + record.name);
+        }
+      }
+    }));
+  }
+  for (auto &worker : workers) {
+    worker.get();
   }
 }
 } // namespace specferry::np101

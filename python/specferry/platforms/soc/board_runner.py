@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent import futures
 from pathlib import Path
 
 STATE = Path("/root/specferry-soc")
@@ -53,20 +54,36 @@ def verify_bundle(root, check_sdk=True):
     manifest = read_json(root / "bundle.json")
     if (manifest.get("schema_version"), manifest.get("target")) != (1, "np101-soc-riscv64"):
         raise ValueError("unsupported SoC bundle")
+    checks = []
     for name, expected in manifest["files"].items():
         path = bundle_file(root, name)
-        if path.stat().st_size != expected["bytes"] or sha256(path) != expected["sha256"]:
+        if path.stat().st_size != expected["bytes"]:
             raise ValueError("bundle identity differs: " + name)
         if expected["executable"] and not os.access(path, os.X_OK):
             raise ValueError("missing executable permission: " + name)
+        checks.append((path, expected["bytes"], expected["sha256"], "bundle", name))
+    if check_sdk:
+        for name, digest in manifest["sdk"].items():
+            if Path(name).name != name:
+                raise ValueError("board SDK identity differs: " + name)
+            path = SDK / name
+            checks.append((path, path.stat().st_size, digest, "board SDK", name))
+
+    def verify_file(item):
+        path, _, digest, kind, name = item
+        if sha256(path) != digest:
+            raise ValueError(kind + " identity differs: " + name)
+
+    # Independent hashes only; SDK graph initialization remains sequential.
+    # Start large files first so the weight pack overlaps the smaller artifacts.
+    checks.sort(key=lambda item: item[1], reverse=True)
+    with futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as workers:
+        for _ in workers.map(verify_file, checks):
+            pass
     with (root / "bin/specferry_opt_graph_generate").open("rb") as binary:
         header = binary.read(20)
     if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 243:
         raise ValueError("SoC executable must be ELF64 little-endian RISC-V")
-    if check_sdk:
-        for name, digest in manifest["sdk"].items():
-            if Path(name).name != name or sha256(SDK / name) != digest:
-                raise ValueError("board SDK identity differs: " + name)
     return manifest
 
 
@@ -217,6 +234,40 @@ def native_complete(output):
     )
 
 
+def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
+    """Preserve a fully released non-device failure; never clear an older gate."""
+    expected = diagnostic.get("board_marker_sha256") if diagnostic else None
+    if not marker.exists():
+        if expected is not None:
+            raise RuntimeError("authorized board recovery marker is missing")
+        return None
+    if not expected:
+        raise RuntimeError("board recovery marker remains; follow the incident ledger")
+    original = marker.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    if digest != expected:
+        raise RuntimeError("diagnostic board marker hash does not match")
+    previous = json.loads(original)
+    delayed = previous.get("delayed_seconds")
+    if (
+        previous.get("board_boot_id") != boot_id
+        or any(
+            previous.get(name) != []
+            for name in ("faults", "kernel_faults", "remaining_processes", "owners_delayed")
+        )
+        or previous.get("pool_released") is not True
+        or previous.get("gfp_released") is not True
+        or type(delayed) not in (int, float)
+        or not 45 <= delayed < float("inf")
+        or previous.get("monitor_error")
+        or previous.get("final_check_error")
+    ):
+        raise RuntimeError("board marker does not establish fault-free release and delayed checks")
+    retained = output / "retained-prior-board-marker.json"
+    retained.write_bytes(original)
+    return {"path": str(retained), "sha256": digest}
+
+
 def run(root, output, timeout, diagnostic=None):
     if not 0 < timeout <= 300:
         raise ValueError("child deadline must be in (0, 300] seconds")
@@ -237,7 +288,7 @@ def run(root, output, timeout, diagnostic=None):
     fault = None
     acknowledged = []
     try:
-        if marker.exists():
+        if marker.exists() and diagnostic is None:
             raise RuntimeError("board recovery marker remains; follow the incident ledger")
         # Installed libraries are checked before native loading. This does not load the driver.
         manifest = verify_bundle(root)
@@ -255,6 +306,9 @@ def run(root, output, timeout, diagnostic=None):
             if not all(re.match(r"^\[\s*\d+\.\d+\]", line) for line in acknowledged):
                 raise ValueError("diagnostic baseline requires timestamped kernel occurrences")
             result["diagnostic"] = diagnostic
+        retained = retain_diagnostic_marker(marker, output, diagnostic, result["board_boot_id"])
+        if retained is not None:
+            result["retained_prior_board_marker"] = retained
         if new_faults(kernel(output, "kernel-before.log"), fault, acknowledged) or owners():
             raise RuntimeError("kernel fault or existing galcore owner")
         parameters = {
@@ -318,7 +372,9 @@ def run(root, output, timeout, diagnostic=None):
             VIV_MGPU_AFFINITY="1:0",
             VIVANTE_SDK_DIR=str(SDK.parent),
             LJMICRO_SDK_DIR=str(root / "runtime"),
-            SPECFERRY_SDK_TIMING="calls" if diagnostic else "off",
+            # A recovery exception authorizes execution; it does not request
+            # per-call tracing. Keep diagnostic IO out of workload measurements.
+            SPECFERRY_SDK_TIMING="off",
             VIV_VX_PROFILE="0",
             VP_ENABLE_PRINT="0",
         )
@@ -403,6 +459,17 @@ def accept(output, expected_digest):
     result = read_json(output / "result.json")
     marker = STATE / "np101-recovery-required.json"
     prior = marker if marker.exists() else output / "accepted-marker.json"
+    retained_bytes = None
+    retained_digest = result.get("diagnostic", {}).get("board_marker_sha256")
+    if retained_digest:
+        retained = output / "retained-prior-board-marker.json"
+        retained_bytes = retained.read_bytes()
+        if hashlib.sha256(retained_bytes).hexdigest() != retained_digest:
+            raise RuntimeError("retained board marker differs; retain recovery marker")
+        # Retrying collection after an accepted diagnostic must leave the restored
+        # older gate untouched, while still rejecting any unrelated newer marker.
+        if marker.exists() and sha256(marker) == retained_digest:
+            prior = output / "accepted-marker.json"
     if (
         sha256(output / "result.json") != expected_digest
         or not result["clean"]
@@ -418,8 +485,12 @@ def accept(output, expected_digest):
         result.get("diagnostic", {}).get("kernel_faults", []),
     ):
         raise RuntimeError("kernel fault after delayed check; retain recovery marker")
-    if marker.exists():
+    if marker.exists() and prior == marker:
         marker.rename(output / "accepted-marker.json")
+    if retained_bytes is not None:
+        temporary = marker.with_suffix(marker.suffix + ".tmp")
+        temporary.write_bytes(retained_bytes)
+        temporary.replace(marker)
 
 
 def main():

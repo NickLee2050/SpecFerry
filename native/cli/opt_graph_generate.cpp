@@ -300,6 +300,7 @@ int main(int argc, char **argv) {
     np101::WeightStore weights(argv[1]);
     weights.verify();
     std::vector<models::opt::CompiledFfn> compiled_ffn, compiled_prefill_ffn;
+    std::vector<models::opt::CompiledPrefillLayer> compiled_prefill_layers;
     models::opt::CompiledHead compiled_head;
     std::vector<models::opt::CompiledProjections> compiled_projections;
     models::opt::CompiledModelPackage compiled_model;
@@ -349,6 +350,17 @@ int main(int argc, char **argv) {
           !compiled_model.decoders.empty()) {
         throw std::invalid_argument("compiled model scope differs from selected variant");
       }
+      if (block == 16) {
+        const auto resolved =
+            package_path.is_absolute() ? package_path : fs::path(argv[2]) / package_path;
+        if (fs::exists(resolved / "compiled-block-prefill.txt")) {
+          compiled_prefill_layers =
+              models::opt::load_compiled_block_prefill(resolved, argv[1], config, weights);
+        } else {
+          compiled_prefill_ffn =
+              models::opt::load_compiled_prefill(resolved, argv[1], config, weights);
+        }
+      }
     }
     const auto head_backend = variant == PartitionedModel::Variant::CompiledFullModel
                                   ? "fullgraph-nbg"
@@ -380,7 +392,8 @@ int main(int argc, char **argv) {
       PartitionedModel model(
           context, weights, config, [&](const std::string &stage) { progress(directory, stage); },
           variant, head_policy, block, compiled_ffn, compiled_model.decoders, compiled_prefill_ffn,
-          projections, compiled_head, compiled_projections, compiled_model.full, kv_transfer);
+          projections, compiled_head, compiled_projections, compiled_model.full, kv_transfer,
+          compiled_prefill_layers);
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
@@ -392,6 +405,10 @@ int main(int argc, char **argv) {
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
                     << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
+                    << ",\"prefill_backend\":\""
+                    << (compiled_prefill_layers.empty() ? "handwritten-attention"
+                                                        : "compiled-attention")
+                    << "\""
                     << ",\"token_readback_transport\":\"mapped\""
                     << ",\"head_backend\":\"" << head_backend << "\""
                     << ",\"attention_projection_backend\":\"" << projection_backend << "\""
@@ -547,6 +564,9 @@ int main(int argc, char **argv) {
           << ",\"capacity\":" << config.decoder.capacity << ",\"launches\":" << launches
           << ",\"history_mode\":\"" << options.history_mode << "\""
           << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
+          << ",\"prefill_backend\":\""
+          << (compiled_prefill_layers.empty() ? "handwritten-attention" : "compiled-attention")
+          << "\""
           << ",\"weight_payload_bytes\":" << weight_bytes
           << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request
           << ",\"initialize_seconds\":" << initialize

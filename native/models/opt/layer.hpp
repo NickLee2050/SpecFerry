@@ -46,6 +46,19 @@ struct CompiledDecoder {
   std::array<unsigned, 3> output_order{0, 1, 2};
 };
 
+// M16 NBG: attention plus normalization, or a complete decoder. FP32 cache
+// ports use [width,capacity,heads]; ordinary FFNs retain their original weights.
+struct CompiledPrefillLayer {
+  np101::ops::CompiledGraphSpec graph;
+  unsigned layer = 0;
+  bool full_decoder = false;
+};
+
+std::vector<CompiledPrefillLayer>
+load_compiled_block_prefill(const std::filesystem::path &package,
+                            const std::filesystem::path &deployment, const ModelConfig &config,
+                            const np101::WeightStore &weights);
+
 struct CompiledFullModel {
   np101::ops::CompiledGraphSpec graph;
   std::vector<std::string> input_names, output_names;
@@ -87,8 +100,8 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
                                            const ModelConfig &config,
                                            const np101::WeightStore &weights, CompiledHead &head,
                                            std::vector<CompiledProjections> *projections = nullptr);
-// Optional M16 package: first four layers use ordinary weights, remaining twenty use NBG.
-// Its manifest binds the already validated M1 package and deployment; no SDK calls are made.
+// M16 manifests bind their M1 package and deployment; no SDK calls are made.
+// Version 1: mixed M1, four ordinary layers. Version 2: full-model M1, six ordinary layers.
 std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &package,
                                                const std::filesystem::path &deployment,
                                                const ModelConfig &config,
