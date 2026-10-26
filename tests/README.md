@@ -39,12 +39,15 @@ and do not themselves authorize a control. Archived binaries/commands are eviden
 ### SoC formal generation
 
 Use the separate `np101_soc.py prepare/deploy/run/collect` workflow in the root README. Packaging
-checks source weights, NBG ports and SDK identities; board runs require explicit C64/M1 mapped-slot
-requests and the documented driver parameters. Reuse an existing independent CPU reference when
+checks source weights, NBG ports and SDK identities; board runs require explicit C64/C128 mapped-slot
+requests with M1 or packaged M16 prefill and the documented driver parameters. Reuse a CPU reference when
 the request is unchanged. Host numerical checks share the OPT validation code with EP.
 `python -m unittest tests.python.test_soc` checks packaging integrity, architecture/path rejection,
 watchdog termination despite blocked sampling, fault handling and retained recovery gates without
 opening a device. SSH failure alone never authorizes another model submission.
+Shared prefill acceptance additionally checks the declared input-cache policy and reduced transfer
+counts; older records retain independent-cache accounting. Current shared-input hardware evidence
+covers C128 long/short reset requests; capacity and stability limits remain in the status document.
 
 The retired standalone KV transfer experiment is archived outside the source tree. Its maintained
 replacement is the formal OPT entry: one resident Context processes long/short/repeated-long reset

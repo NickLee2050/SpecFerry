@@ -175,6 +175,30 @@ PID3518于171520.748942启动，110.082秒exit=0，45.100秒检查、owner及池
 均通过，45.059秒延迟日志无新故障。共享普通权重FCL绕开本次M16 MatMul数值错误；
 不证明历史hang已修复，旧标记继续保留。未改驱动、内存布局或扩大验收容量。
 
+## 10-26 SoC prefill合图拒绝与C128验收
+
+用户批准继续优化prefill并扩展C128；沿用上述同boot有界诊断、精确旧故障基线、
+1GiB分段预算、192MiB Linux余量、300秒子进程及45秒延迟检查，不改驱动或内存布局。
+
+`soc-prefill-followup-20261026/merged-c64/run/`将19层attention NBG与各自共享FCL FFN
+合为一图，在初始化时`vsi_nn_VerifyGraph`返回-1，尚未RunGraph。PID4117于板端单调
+时间231521.182069启动，169.948秒exit=1；45.102秒后无新内核故障，SYSTEM/GFP回归、
+owner为空。最低Linux余量724.77MiB、SYSTEM峰值904.95MiB，无容量耗尽证据。
+最终phase被失败状态覆盖，无法确定失败层或SDK内部原因；不据此认定API禁止混图。
+候选源码、binary和失败标记保留；已回退合图，后续C128先使用已验独立attention/FCL
+拓扑，不能用该失败轮推算性能或清除旧恢复标记。
+
+安全分图的C128验收`soc-context-prefill-20261026/run/`通过：PID4281于232505.630311
+启动，233.099秒exit=0；97/17输入各16输出、末层KV/未写槽、reset、传输计数均通过。
+最低Linux余量667.26MiB、SYSTEM峰值1409.88MiB；释放及45.090秒延迟检查无新故障，
+owner为空，池/GFP回归。原恢复标记及合图失败标记均保留，不外推长期稳定或更大容量。
+
+随后共享M1/M16输入KV候选`soc-prefill-followup-20261026/shared-kv-c128/run/`通过同一
+集合：PID4466于232974.888578启动，234.977秒exit=0；32输出、末层KV/未写槽/reset、
+显式共享策略及减少后的传输计数通过。最低Linux余量672.12MiB、SYSTEM峰值1385.86MiB；
+池/GFP释放、owner及45.034秒延迟检查正常，无新故障。仅共享输入，NBG输出仍独立；
+保留所有旧恢复标记，不宣称历史hang已修复。初始化专项优化未实施。
+
 ## 10-24 SoC八层decoder第四次输入挂起
 
 事件`soc-eight-decoder-rungraph-hang-20261024`；证据

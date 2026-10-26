@@ -280,8 +280,9 @@ int main(int argc, char **argv) {
     const auto kv_transfer = options.kv_transfer == "mapped-slot"
                                  ? PartitionedModel::KvTransfer::MappedSlot
                                  : PartitionedModel::KvTransfer::DeviceCopy;
-    if (kv_transfer == PartitionedModel::KvTransfer::MappedSlot && config.decoder.capacity != 64) {
-      throw std::invalid_argument("mapped-slot KV is limited to the validated C64 layout");
+    if (kv_transfer == PartitionedModel::KvTransfer::MappedSlot && config.decoder.capacity != 64 &&
+        config.decoder.capacity != 128) {
+      throw std::invalid_argument("mapped-slot KV requires the C64/C128 layout");
     }
     const auto cache_first = options.cache_first, cache_last = options.cache_last;
     if (cache_last > config.decoder.layers) {
@@ -397,6 +398,8 @@ int main(int argc, char **argv) {
       const auto initialize = std::chrono::duration<double>(Clock::now() - start).count();
       const auto weight_bytes = model.weight_bytes();
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
+      const auto prefill_cache_policy =
+          model.shares_prefill_cache() ? "shared-input" : "independent";
       {
         std::ofstream initialized(directory / "initialization.json");
         initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
@@ -405,6 +408,7 @@ int main(int argc, char **argv) {
                     << ",\"prefill_head_policy\":\"" << head_policy_name << "\""
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
                     << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
+                    << ",\"prefill_cache_policy\":\"" << prefill_cache_policy << "\""
                     << ",\"prefill_backend\":\""
                     << (compiled_prefill_layers.empty() ? "handwritten-attention"
                                                         : "compiled-attention")
@@ -564,6 +568,7 @@ int main(int argc, char **argv) {
           << ",\"capacity\":" << config.decoder.capacity << ",\"launches\":" << launches
           << ",\"history_mode\":\"" << options.history_mode << "\""
           << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
+          << ",\"prefill_cache_policy\":\"" << prefill_cache_policy << "\""
           << ",\"prefill_backend\":\""
           << (compiled_prefill_layers.empty() ? "handwritten-attention" : "compiled-attention")
           << "\""

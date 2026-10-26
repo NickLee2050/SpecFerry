@@ -24,8 +24,9 @@ struct ProjectionPolicy {
 // Block prefill shares ordinary weights and KV. Compiled FFNs require separately
 // budgeted fixed-shape artifacts for the prefill and decode execution sets.
 // The compiled block-prefill candidate clears KV with a separate fixed copy graph.
-// Full-model mapped-slot M1 instead accepts a headless M16 chain with an explicit
-// FP16-to-FP32 prefix handoff. It remains resident and uses reset requests only.
+// Full-model mapped-slot M1 accepts a headless M16 chain. Compiled attention shares
+// its FP32 inputs; handwritten attention widens and transfers its independent KV.
+// Both remain resident and use reset requests only.
 class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
@@ -90,6 +91,7 @@ public:
   std::size_t head_runs() const;
   // Uploads required to reset a nonempty cache; the initial empty state needs none.
   std::size_t cache_reset_uploads_per_request() const;
+  bool shares_prefill_cache() const;
   std::size_t weight_bytes() const;
   void close();
 

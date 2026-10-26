@@ -200,7 +200,7 @@ def collect(bundle, output):
             "board": board,
             "numerical": numerical,
             "host_boot_id": host_boot_id(),
-            "scope": "formal OPT fullgraph C64 mapped-slot with explicit prefill policy",
+            "scope": "formal OPT fullgraph mapped-slot with explicit prefill policy",
         }
         save(output / "summary.json", summary)
         if summary["checks_passed"]:

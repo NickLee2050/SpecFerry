@@ -234,10 +234,11 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   stream >> magic >> version >> model_digest >> index_digest >> deployment_digest >> capacity >>
       tokens >> count;
   if (!stream || magic != "specferry-opt-compiled-block-prefill" || version != 1 ||
-      capacity != 64 || tokens != 16 || count != 24 || config.decoder.capacity != capacity ||
-      config.decoder.layers != count || config.decoder.hidden != 1024 ||
-      config.decoder.heads != 16 || config.decoder.intermediate != 4096 ||
-      config.decoder.epsilon != 1e-5f || file_sha256(root / "compiled-model.txt") != model_digest ||
+      (capacity != 64 && capacity != 128) || tokens != 16 || count != 24 ||
+      config.decoder.capacity != capacity || config.decoder.layers != count ||
+      config.decoder.hidden != 1024 || config.decoder.heads != 16 ||
+      config.decoder.intermediate != 4096 || config.decoder.epsilon != 1e-5f ||
+      file_sha256(root / "compiled-model.txt") != model_digest ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("compiled block prefill source/geometry differs");
@@ -293,9 +294,9 @@ load_compiled_block_prefill(const std::filesystem::path &package,
       throw std::invalid_argument("compiled block prefill path/hash/budget differs");
     }
     item.graph.path = binary.string();
-    const TensorSpec hidden{f16, {1024, 16}}, state{DataType::Float32, {64, 64, 16}};
+    const TensorSpec hidden{f16, {1024, 16}}, state{DataType::Float32, {64, capacity, 16}};
     item.graph.inputs = {
-        hidden, state, state, {DataType::Int32, {1}}, {DataType::Float32, {64, 16}}};
+        hidden, state, state, {DataType::Int32, {1}}, {DataType::Float32, {capacity, 16}}};
     item.graph.outputs = {hidden, state, state};
     constants += item.graph.constant_bytes;
     result.push_back(std::move(item));

@@ -92,7 +92,7 @@ struct BlockPrefill::Impl {
   std::vector<std::uint8_t> zeroes, readback;
   std::vector<Stage> stages;
   Tensor controls{}, block_index{}, attention_mask{};
-  bool compiled_attention = false;
+  bool compiled_attention = false, shared_decode_cache = false;
   std::vector<std::pair<GraphBuilder *, Tensor>> cache_outputs;
   unsigned position = 0;
   std::size_t constants = 0;
@@ -100,13 +100,14 @@ struct BlockPrefill::Impl {
 
   Impl(Context &context, const WeightStore &weights, const ModelConfig &spec,
        const std::vector<CompiledFfn> &artifacts, const PhaseObserver &phase,
-       const std::vector<CompiledPrefillLayer> &compiled_layers)
+       const std::vector<CompiledPrefillLayer> &compiled_layers,
+       const std::vector<TensorBinding> &shared_cache)
       : config(spec), bank(context), cache(context, 2 * spec.decoder.layers + 2, 0) {
     try {
       if (compiled_layers.empty()) {
         build(context, weights, artifacts, phase);
       } else {
-        build_compiled(context, weights, compiled_layers, phase);
+        build_compiled(context, weights, compiled_layers, phase, shared_cache);
       }
     } catch (...) {
       try {
@@ -167,8 +168,9 @@ struct BlockPrefill::Impl {
 
   void build_compiled(Context &context, const WeightStore &weights,
                       const std::vector<CompiledPrefillLayer> &artifacts,
-                      const PhaseObserver &phase) {
+                      const PhaseObserver &phase, const std::vector<TensorBinding> &shared_cache) {
     compiled_attention = true;
+    shared_decode_cache = !shared_cache.empty();
     const auto &decoder = config.decoder;
     for (const auto &artifact : artifacts) {
       if (!artifact.full_decoder) {
@@ -177,9 +179,15 @@ struct BlockPrefill::Impl {
       }
     }
     const TensorSpec state{DataType::Float32, {64, decoder.capacity, decoder.heads}};
-    zeroes.resize(state.bytes());
+    if (!shared_decode_cache) {
+      zeroes.resize(state.bytes());
+    }
     for (unsigned index = 0; index < 2 * decoder.layers; ++index) {
-      caches.push_back({add_tensor(cache, state, false, zeroes), state});
+      // Only input backing is shared. Every NBG still owns separate outputs,
+      // committed into this cache after synchronous completion of the block.
+      const auto id = shared_decode_cache ? bind_tensor(shared_cache.at(index), cache, state)
+                                          : add_tensor(cache, state, false, zeroes);
+      caches.push_back({id, state});
     }
     const TensorSpec index_spec{DataType::Int32, {1}};
     const TensorSpec mask_spec{DataType::Float32, {decoder.capacity, block}};
@@ -191,7 +199,11 @@ struct BlockPrefill::Impl {
       if (phase) {
         phase("setup.prefill16." + role);
       }
-      graph->compile(inputs, outputs);
+      try {
+        graph->compile(inputs, outputs);
+      } catch (const std::exception &error) {
+        throw std::runtime_error("compile OPT prefill " + role + ": " + error.what());
+      }
       stages.push_back({std::move(graph), "block16." + role});
     };
     auto [embedding, hidden] =
@@ -338,16 +350,24 @@ struct BlockPrefill::Impl {
 
 BlockPrefill::BlockPrefill(Context &context, const WeightStore &weights, const ModelConfig &config,
                            std::vector<CompiledFfn> compiled_ffn, PhaseObserver phase,
-                           std::vector<CompiledPrefillLayer> compiled_layers) {
+                           std::vector<CompiledPrefillLayer> compiled_layers,
+                           const std::vector<TensorBinding> &shared_cache) {
   config.validate();
   const auto &decoder = config.decoder;
+  const bool supported_capacity =
+      decoder.capacity == 64 || (!compiled_layers.empty() && decoder.capacity == 128);
   if (decoder.layers != 24 || decoder.hidden != 1024 || decoder.heads != 16 ||
-      decoder.intermediate != 4096 || decoder.capacity != 64 || decoder.epsilon != 1e-5f ||
+      decoder.intermediate != 4096 || !supported_capacity || decoder.epsilon != 1e-5f ||
       config.embedding != 512 || config.vocabulary != 50272 || config.position_offset != 2 ||
       (compiled_layers.empty()
            ? compiled_ffn.size() != decoder.layers
            : (!compiled_ffn.empty() || compiled_layers.size() != decoder.layers))) {
-    throw std::invalid_argument("OPT block prefill requires fixed C64/M16 geometry");
+    throw std::invalid_argument(
+        "OPT block prefill requires C64/M16 or compiled-attention C128/M16 geometry");
+  }
+  if (!shared_cache.empty() &&
+      (compiled_layers.empty() || shared_cache.size() != 2 * decoder.layers)) {
+    throw std::invalid_argument("shared prefill cache requires all compiled-attention KV inputs");
   }
   validate_model_weights(weights, config, decoder.layers);
   for (unsigned layer = 0; layer < compiled_ffn.size(); ++layer) {
@@ -363,7 +383,8 @@ BlockPrefill::BlockPrefill(Context &context, const WeightStore &weights, const M
       }
     }
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, compiled_ffn, phase, compiled_layers);
+  impl_ = std::make_unique<Impl>(context, weights, config, compiled_ffn, phase, compiled_layers,
+                                 shared_cache);
 }
 
 BlockPrefill::~BlockPrefill() = default;
@@ -443,12 +464,15 @@ void BlockPrefill::reset() {
   auto &impl = require_impl();
   const SdkScope role("role", "block16.kv-reset");
   impl.failed = true;
-  for (const auto &storage : impl.caches) {
-    if (impl.compiled_attention) {
-      upload_tensor_region(impl.cache, storage.id, Shape(storage.spec.shape.size(), 0),
-                           storage.spec.shape, impl.zeroes);
-    } else {
-      upload_tensor(impl.cache, storage.id, impl.zeroes);
+  // The M1 owner clears shared inputs once, after resetting this chain's position.
+  if (!impl.shared_decode_cache) {
+    for (const auto &storage : impl.caches) {
+      if (impl.compiled_attention) {
+        upload_tensor_region(impl.cache, storage.id, Shape(storage.spec.shape.size(), 0),
+                             storage.spec.shape, impl.zeroes);
+      } else {
+        upload_tensor(impl.cache, storage.id, impl.zeroes);
+      }
     }
   }
   impl.position = 0;
@@ -456,6 +480,8 @@ void BlockPrefill::reset() {
 }
 
 unsigned BlockPrefill::position() const { return require_impl().position; }
+
+bool BlockPrefill::shares_decode_cache() const { return require_impl().shared_decode_cache; }
 
 std::vector<std::uint8_t> BlockPrefill::read_cache(unsigned layer, bool values) {
   auto &impl = require_impl();

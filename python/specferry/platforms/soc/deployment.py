@@ -30,19 +30,19 @@ def request_options(request):
         options.get("block"),
         options.get("prefill_head"),
     ) not in (("1", "every-token"), ("16", "last-token")):
-        raise ValueError("SoC bundle requires fullgraph C64 mapped-slot with explicit M1/M16")
+        raise ValueError("SoC bundle requires fullgraph mapped-slot with explicit M1/M16")
     if options["block"] == "16" and options.get("benchmark", "0") != "0":
         raise ValueError("fullgraph block prefill requires independent reset requests")
     if options.get("history_mode", "reset") != "reset" or options.get("lifecycle", "0") != "0":
         raise ValueError("SoC bundle requires reset requests without Context rebuilding")
     metadata = read_json(request / "reference.json")
-    if (metadata["capacity"], metadata["layers"], metadata["heads"], metadata["width"]) != (
-        64,
+    capacity = metadata["capacity"]
+    if capacity not in (64, 128) or (metadata["layers"], metadata["heads"], metadata["width"]) != (
         24,
         16,
         64,
     ):
-        raise ValueError("SoC reference geometry differs from OPT C64")
+        raise ValueError("SoC reference geometry differs from OPT C64/C128")
     requests = [
         [int(x) for x in line.split()]
         for line in (request / "requests.txt").read_text().splitlines()
@@ -60,7 +60,7 @@ def request_options(request):
             or tokens != reference["tokens"]
             or reference["prompt_length"] != len(prompt)
             or reference["consumed"] != len(prompt) + len(tokens) - 1
-            or reference["consumed"] > 64
+            or reference["consumed"] > capacity
         ):
             raise ValueError("request differs from its independent reference")
     return options
@@ -80,7 +80,8 @@ def package_block_prefill(source, output, model, deployment):
     if original.get("kind") == "opt-compiled-block-prefill":
         return package_compiled_prefill(source, output, model, original, records)
     if (
-        original["deployment_sha256"] != model["deployment_sha256"]
+        model["capacity"] != 64
+        or original["deployment_sha256"] != model["deployment_sha256"]
         or sha256(source / "compiled-ffn.txt") != original["native_manifest_sha256"]
     ):
         raise ValueError("prefill source package/deployment differs")
@@ -128,10 +129,12 @@ def package_block_prefill(source, output, model, deployment):
 def package_compiled_prefill(source, output, model, original, records):
     """Bind public M16 NBG ports and source identities before any SDK calls."""
     layers = original["layers"]
+    capacity = model["capacity"]
     if (
         original["deployment_sha256"] != model["deployment_sha256"]
         or original["tokens"] != 16
-        or original["capacity"] != 64
+        or capacity not in (64, 128)
+        or original["capacity"] != capacity
         or [item["layer"] for item in layers] != list(range(24))
     ):
         raise ValueError("compiled prefill source/geometry differs")
@@ -146,14 +149,14 @@ def package_compiled_prefill(source, output, model, original, records):
             model["deployment_sha256"][name]
             for name in ("weights.index", "deployment-manifest.json")
         )
-        + " 64 16 24"
+        + f" {capacity} 16 24"
     ]
     inputs = [
         ("hidden", "F16", [1024, 16]),
-        ("past_key", "F32", [64, 64, 16]),
-        ("past_value", "F32", [64, 64, 16]),
+        ("past_key", "F32", [64, capacity, 16]),
+        ("past_value", "F32", [64, capacity, 16]),
         ("block_index", "I32", [1]),
-        ("attention_mask", "F32", [64, 16]),
+        ("attention_mask", "F32", [capacity, 16]),
     ]
     for item in layers:
         full = item["full_decoder"]
@@ -168,8 +171,8 @@ def package_compiled_prefill(source, output, model, original, records):
         path = (source / item["path"]).resolve(strict=True)
         outputs = [
             ("hidden_out" if full else "attention_norm_output", "F16", [1024, 16]),
-            ("present_key", "F32", [64, 64, 16]),
-            ("present_value", "F32", [64, 64, 16]),
+            ("present_key", "F32", [64, capacity, 16]),
+            ("present_value", "F32", [64, capacity, 16]),
         ]
 
         def ports(direction):
@@ -203,7 +206,7 @@ def package_compiled_prefill(source, output, model, original, records):
         layers=layers,
         native_manifest_sha256=sha256(native),
         combined_nbg_constant_bytes=bound,
-        cache_handoff="mapped-fp32-head-major-prefix",
+        cache_handoff="shared-fp32-input",
         final_prompt_token="m1",
     )
 
@@ -217,7 +220,8 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
     options = request_options(request)
     if (options["block"] == "16") != (prefill_package is not None):
         raise ValueError("block16 requires an explicit source-bound prefill package")
-    model = load_model_package(package, deployment, capacity=64)
+    capacity = read_json(request / "reference.json")["capacity"]
+    model = load_model_package(package, deployment, capacity=capacity)
     if model["kind"] != "fullgraph":
         raise ValueError("SoC bundle currently supports one full-model NBG")
     graph = model["graphs"][0]
@@ -246,7 +250,7 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
         # Only the platform identity changes. The original graph, weights and ports stay pinned.
         native = (package / "compiled-model.txt").read_text().splitlines()
         if (
-            native[0] != "specferry-opt-model 1 fullgraph 64"
+            native[0] != f"specferry-opt-model 1 fullgraph {capacity}"
             or len(native[2].split()) != 2
             or native[2].split()[1] != "5"
             or tuple(line.split()[0] for line in native[3:8]) != SDK_FILES
@@ -277,6 +281,7 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
         if model.get("prefill", {}).get("backend") == "compiled-attention":
             reference = read_json(root / "request/reference.json")
             reference["prefill_backend"] = "compiled-attention"
+            reference["prefill_cache_policy"] = "shared-input"
             save(root / "request/reference.json", reference)
         shutil.copytree(sdk / "include/CL", root / "runtime/include/CL")
         # The validated vendor shader compiler also resolves these headers from cwd.

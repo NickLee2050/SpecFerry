@@ -81,17 +81,19 @@ python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/o
 ```
 
 `prepare` is offline; `deploy` transfers files and checks hashes without opening the NPU.
-`run` accepts fullgraph C64/M1, mapped-slot KV, independent reset requests and no Context
+`run` accepts fullgraph C64/C128, mapped-slot KV, independent reset requests and no Context
 rebuild. Optional block16 prefill uses `prepare --prefill-package` and request options
 `block 16`, `prefill_head last-token`. The original handwritten-attention/MLP-NBG candidate failed
-Linux memory acceptance. The accepted bounded C64 configuration uses compiled attention, nineteen
+Linux memory acceptance. The compiled-attention path uses nineteen
 shared ordinary-weight FCL FFNs and five full decoder NBGs. FCL also replaces the M16 input
 projection, avoiding numerical errors observed in the original MatMul path. Three reset requests
-with 17/49/17 input tokens and 16 outputs each passed numerical, state and release checks.
-The shared implementation is
-`native/models/opt/block_prefill.*`; no platform macros are needed. Independent prefill caches
-(FP16 for handwritten attention, FP32 for compiled attention) supply one FP32 prefix handoff to M1,
-which consumes the remaining 1–16 prompt tokens and all generated tokens.
+with 17/49/17 input tokens and 16 outputs each passed the original C64 independent-cache checks.
+Compiled-attention prefill now retains M1's FP32 input KV, with separate NBG outputs and block
+commits. C128 passed 97/17 input tokens and 16 outputs each with both independent and shared KV;
+the shared change has not been separately accepted on C64. Shared inputs remove the final prefix
+handoff and duplicate reset. Handwritten attention retains its independent FP16 cache and widening
+handoff. The implementation is `native/models/opt/block_prefill.*`, without platform macros.
+M1 consumes the remaining 1–16 prompt tokens and all generated tokens.
 M1's embedded head still executes on every M1 step. This path does not support continuation or the
 resident benchmark entry. Acceptance scopes and measurements are recorded in the status document.
 It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
@@ -125,7 +127,7 @@ interface; `np101_sdk_identity` retains shared package validation. A package for
 is rejected before driver inspection. Native generation records the linked target, architecture,
 required SDK identity and runtime library directory in `platform.json`, outside inference timings.
 Compilation does not select a KV transfer policy. Existing configurations retain their device
-copy/update path. For a fullgraph C64/M1 package, `--kv-transfer mapped-slot` writes
+copy/update path. For a fullgraph C64/C128 package, `--kv-transfer mapped-slot` writes
 `kv_transfer mapped-slot` in the request's `run-options.txt`; omission means `device-copy`.
 The mapped strategy keeps fixed, independent inputs and outputs in one NBG graph, then copies
 only the current FP32 KV slot through a reused host buffer after each synchronous run. It has

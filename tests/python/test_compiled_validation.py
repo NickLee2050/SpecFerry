@@ -23,6 +23,22 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_mapped_slot_capacity_contract_includes_c128_but_not_unbounded_layouts(self):
+        from specferry.models.opt.graph_validation import _mapped_slot_enabled
+
+        for capacity in (64, 128):
+            for block in (1, 16):
+                self.assertTrue(
+                    _mapped_slot_enabled(
+                        {"capacity": capacity}, "compiled-fullgraph", block, "mapped-slot"
+                    )
+                )
+        for capacity in (96, 256):
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                _mapped_slot_enabled(
+                    {"capacity": capacity}, "compiled-fullgraph", 16, "mapped-slot"
+                )
+
     def test_compiled_prefill_accounts_for_fp32_block_commits_and_reset(self):
         from specferry.models.opt.graph_validation import _mapped_prefill_transfers
 
@@ -41,6 +57,107 @@ class CompiledValidationTests(unittest.TestCase):
                 tuple(actual[k] for k in ("uploads", "upload_bytes", "reads", "read_bytes")),
                 expected,
             )
+
+    def test_shared_prefill_keeps_block_commits_without_handoff_or_duplicate_reset(self):
+        from specferry.models.opt.graph_validation import _mapped_prefill_transfers
+
+        metadata = dict(
+            layers=24,
+            heads=16,
+            width=64,
+            prefill_backend="compiled-attention",
+            prefill_cache_policy="shared-input",
+        )
+        for capacity, blocks, reset, expected in (
+            (64, 1, False, (883, 6301960, 832, 6291520)),
+            (64, 3, True, (1033, 25184792, 928, 12582976)),
+            (128, 6, True, (1186, 47246256, 1072, 22020160)),
+        ):
+            actual = _mapped_prefill_transfers(
+                metadata | {"capacity": capacity},
+                dict(decode_steps=16, prefill_steps=blocks),
+                16,
+                reset,
+            )
+            self.assertEqual(
+                tuple(actual[k] for k in ("uploads", "upload_bytes", "reads", "read_bytes")),
+                expected,
+            )
+        for change in (
+            {"prefill_backend": "handwritten-attention"},
+            {"prefill_cache_policy": "unknown"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                _mapped_prefill_transfers(
+                    metadata | {"capacity": 64} | change,
+                    dict(decode_steps=16, prefill_steps=1),
+                    16,
+                    False,
+                )
+
+    def test_shared_prefill_acceptance_requires_matching_cache_policy(self):
+        from specferry.models.opt.graph_validation import evaluate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            counts = dict(launches=17, prefill_steps=1, decode_steps=16, head_runs=16)
+            metadata = dict(
+                layers=24,
+                heads=16,
+                width=64,
+                capacity=64,
+                prefill_block=16,
+                prefill_backend="compiled-attention",
+                prefill_cache_policy="shared-input",
+                requests=[dict(prompt_length=17, consumed=32, tokens=[7] * 16)],
+            )
+            options = dict(
+                variant="compiled-fullgraph",
+                decoder_group_size=1,
+                prefill_head_policy="last-token",
+                kv_transfer="mapped-slot",
+            )
+            native = (
+                options
+                | counts
+                | dict(
+                    graph_layout="partitioned",
+                    history_mode="reset",
+                    prefill_block=16,
+                    prefill_backend="compiled-attention",
+                    prefill_cache_policy="shared-input",
+                    cache_readback="none",
+                    diagnostic_reads=0,
+                    diagnostic_read_bytes=0,
+                    kv_reset_uploads_per_request=48,
+                )
+            )
+            initialized = native | dict.fromkeys(counts, 0)
+            result = counts | dict(
+                tokens=[7] * 16,
+                consumed=32,
+                prefill_block=16,
+                uploads=883,
+                upload_bytes=6301960,
+                reads=832,
+                read_bytes=6291520,
+            )
+            (root / "run.json").write_text(json.dumps(native))
+            (root / "initialization.json").write_text(json.dumps(initialized))
+            (root / "measured.0.json").write_text(json.dumps(result))
+            checks, _ = evaluate(root, root, metadata, 16, **options)
+            self.assertTrue(all(checks.values()), [k for k, v in checks.items() if not v])
+            for scope, original in (("run", native), ("initialization", initialized)):
+                for policy in (None, "independent", "unknown"):
+                    changed = original.copy()
+                    if policy is None:
+                        changed.pop("prefill_cache_policy")
+                    else:
+                        changed["prefill_cache_policy"] = policy
+                    (root / f"{scope}.json").write_text(json.dumps(changed))
+                    checks, _ = evaluate(root, root, metadata, 16, **options)
+                    self.assertFalse(checks[f"{scope}.prefill_cache_policy"])
+                (root / f"{scope}.json").write_text(json.dumps(original))
 
     def test_mapped_prefill_requires_tail_handoff_and_complete_reset_accounting(self):
         from specferry.models.opt.graph_validation import evaluate, evaluate_benchmark

@@ -144,9 +144,11 @@ def _mapped_slot_enabled(metadata, variant, block, kv_transfer):
         raise ValueError("unknown KV transfer strategy")
     mapped = kv_transfer == "mapped-slot"
     if mapped and (
-        variant != "compiled-fullgraph" or metadata["capacity"] != 64 or block not in (1, 16)
+        variant != "compiled-fullgraph"
+        or metadata["capacity"] not in (64, 128)
+        or block not in (1, 16)
     ):
-        raise ValueError("mapped-slot KV requires compiled fullgraph C64 with M1 or M16 prefill")
+        raise ValueError("mapped-slot KV requires compiled fullgraph C64/C128 with M1/M16")
     return mapped
 
 
@@ -163,28 +165,40 @@ def _mapped_slot_transfers(metadata, launches, predictions, reset):
     }
 
 
+def _shared_prefill_cache(metadata):
+    policy = metadata.get("prefill_cache_policy", "independent")
+    if policy not in ("independent", "shared-input") or (
+        policy == "shared-input" and metadata.get("prefill_backend") != "compiled-attention"
+    ):
+        raise ValueError("shared prefill inputs require the compiled-attention cache contract")
+    return policy == "shared-input"
+
+
 def _mapped_prefill_transfers(metadata, counts, predictions, reset):
-    """Count the separate prefill cache and its one-time FP32 handoff."""
+    """Count block commits plus an independent cache's handoff/reset, when present."""
+    shared = _shared_prefill_cache(metadata)
     transfers = _mapped_slot_transfers(metadata, counts["decode_steps"], predictions, reset)
     caches = 2 * metadata["layers"]
     hidden = metadata["heads"] * metadata["width"]
     blocks = counts["prefill_steps"]
-    transfers["uploads"] += blocks + (caches if blocks else 0) + (caches if reset else 0)
-    transfers["upload_bytes"] += blocks * (2 * 16 + 1) * 4 + caches * hidden * blocks * 16 * 4
-    transfers["reads"] += caches if blocks else 0
-    transfers["read_bytes"] += caches * hidden * blocks * 16 * 2
-    if reset:
-        transfers["upload_bytes"] += caches * hidden * metadata["capacity"] * 2
-    if metadata.get("prefill_backend") == "compiled-attention":
-        # One index/mask update and one mapped FP32 block commit per cache/block;
-        # the final prefix handoff and reset also use FP32 rather than FP16.
+    compiled = metadata.get("prefill_backend") == "compiled-attention"
+    transfers["uploads"] += blocks
+    transfers["upload_bytes"] += blocks * (2 * 16 + 1) * 4
+    if compiled:
+        # Index/mask updates and mapped FP32 block commits are unchanged by sharing.
         commit_bytes = caches * hidden * blocks * 16 * 4
         transfers["uploads"] += blocks * (2 + caches)
         transfers["upload_bytes"] += blocks * (4 + metadata["capacity"] * 16 * 4) + commit_bytes
         transfers["reads"] += blocks * caches
-        transfers["read_bytes"] += commit_bytes + caches * hidden * blocks * 16 * 2
+        transfers["read_bytes"] += commit_bytes
+    if not shared:
+        item_bytes = 4 if compiled else 2
+        transfers["uploads"] += (caches if blocks else 0) + (caches if reset else 0)
+        transfers["upload_bytes"] += caches * hidden * blocks * 16 * 4
+        transfers["reads"] += caches if blocks else 0
+        transfers["read_bytes"] += caches * hidden * blocks * 16 * item_bytes
         if reset:
-            transfers["upload_bytes"] += caches * hidden * metadata["capacity"] * 2
+            transfers["upload_bytes"] += caches * hidden * metadata["capacity"] * item_bytes
     return transfers
 
 
@@ -213,6 +227,7 @@ def evaluate(
 ):
     mapped = _mapped_slot_enabled(metadata, variant, block, kv_transfer)
     mapped_prefill = mapped and block == 16
+    shared_prefill = mapped_prefill and _shared_prefill_cache(metadata)
     if mapped_prefill and prefill_head_policy != "last-token":
         raise ValueError("mapped fullgraph M16 prefill requires last-token head policy")
     cache_layers = generation_cache_layers(cache_readback, metadata["layers"], cache_layer_range)
@@ -316,7 +331,7 @@ def evaluate(
             and variant in ("compiled-ffn-finish", "compiled-decoder", "compiled-fullgraph")
             else 2 * metadata["layers"]
         )
-        if mapped_prefill:
+        if mapped_prefill and not shared_prefill:
             expected_reset *= 2
         checks["variant"] = (
             native_run.get("graph_layout") == "partitioned"
@@ -325,6 +340,10 @@ def evaluate(
             and reset_uploads_per_request == expected_reset
         )
     expected_options = {}
+    if mapped_prefill:
+        expected_options["prefill_cache_policy"] = (
+            "shared-input" if shared_prefill else "independent"
+        )
     if kv_transfer is not None:
         expected_options["kv_transfer"] = kv_transfer
     if readback_transport is not None:
@@ -353,7 +372,10 @@ def evaluate(
         initialized = json.loads(initialized_path.read_text()) if initialized_path.is_file() else {}
         for scope, observed in (("run", native_run), ("initialization", initialized)):
             for name, expected_value in expected_options.items():
-                actual = observed.get(name)
+                # Older accepted runs predate the cache policy field and use independent KV.
+                actual = observed.get(
+                    name, "independent" if name == "prefill_cache_policy" else None
+                )
                 checks[f"{scope}.{name}"] = (
                     type(actual) is type(expected_value) and actual == expected_value
                 )

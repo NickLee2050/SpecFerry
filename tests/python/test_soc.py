@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.platforms.soc import board_runner as board
 from specferry.platforms.soc import remote
+from specferry.platforms.soc.deployment import request_options
 
 
 class SocTests(unittest.TestCase):
@@ -23,6 +24,27 @@ class SocTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+
+    def test_request_capacity_limits_long_prompt_and_rejects_unsupported_geometry(self):
+        (self.root / "run-options.txt").write_text(
+            "variant compiled-fullgraph\nkv_transfer mapped-slot\n"
+            "block 16\nprefill_head last-token\n"
+        )
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 97) + "\n")
+        (self.root / "expected.txt").write_text(" ".join(["8"] * 16) + "\n")
+        metadata = dict(
+            capacity=128,
+            layers=24,
+            heads=16,
+            width=64,
+            requests=[dict(tokens=[8] * 16, prompt_length=97, consumed=112)],
+        )
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        for capacity in (64, 96, 256):
+            board.save(self.root / "reference.json", metadata | {"capacity": capacity})
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                request_options(self.root)
 
     def test_board_script_uses_python39_and_only_standard_library(self):
         tree = ast.parse(Path(board.__file__).read_text(), feature_version=(3, 9))

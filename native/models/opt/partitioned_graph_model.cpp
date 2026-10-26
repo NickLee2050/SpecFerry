@@ -222,8 +222,15 @@ struct PartitionedGraphModel::Impl {
       decode = std::make_unique<ExecutionSet>(1);
       build_full_execution(*decode, context, phase);
       if (prefill_block == 16) {
-        full_model_prefill = std::make_unique<BlockPrefill>(
-            context, weights, config, compiled_prefill_ffn, phase, compiled_prefill_layers);
+        std::vector<TensorBinding> shared_cache;
+        if (!compiled_prefill_layers.empty()) {
+          for (const auto &tensor : cache_tensors) {
+            shared_cache.push_back({decode->head->graph, tensor.id});
+          }
+        }
+        full_model_prefill =
+            std::make_unique<BlockPrefill>(context, weights, config, compiled_prefill_ffn, phase,
+                                           compiled_prefill_layers, shared_cache);
       }
       latest = decode.get();
       return;
@@ -817,7 +824,7 @@ struct PartitionedGraphModel::Impl {
         ++completed_steps;
         ++completed_prefill_steps;
       }
-      if (prefix) {
+      if (prefix && !full_model_prefill->shares_decode_cache()) {
         const SdkScope timing_role("role", "block16.kv-handoff");
         const Shape start{0, 0, 0};
         const Shape end{config.decoder.kv_spec().head_dim, static_cast<unsigned>(prefix),
@@ -949,9 +956,10 @@ PartitionedGraphModel::PartitionedGraphModel(
     throw std::invalid_argument("unknown OPT KV transfer strategy");
   }
   if (kv_transfer == KvTransfer::MappedSlot &&
-      (variant != Variant::CompiledFullModel || config.decoder.capacity != 64 ||
+      (variant != Variant::CompiledFullModel ||
+       (config.decoder.capacity != 64 && config.decoder.capacity != 128) ||
        (prefill_block != 1 && prefill_block != 16))) {
-    throw std::invalid_argument("mapped-slot KV requires compiled full OPT C64 with M1/M16");
+    throw std::invalid_argument("mapped-slot KV requires compiled full OPT C64/C128 with M1/M16");
   }
   if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2 &&
       variant != Variant::MergedKvCompiledFfn && variant != Variant::CompiledDecoder &&
@@ -1277,7 +1285,14 @@ std::size_t PartitionedGraphModel::head_runs() const {
 
 std::size_t PartitionedGraphModel::cache_reset_uploads_per_request() const {
   const auto &impl = require_impl();
-  return impl.cache_reset ? 0 : impl.cache_tensors.size() * (impl.full_model_prefill ? 2 : 1);
+  const bool independent_prefill =
+      impl.full_model_prefill && !impl.full_model_prefill->shares_decode_cache();
+  return impl.cache_reset ? 0 : impl.cache_tensors.size() * (independent_prefill ? 2 : 1);
+}
+
+bool PartitionedGraphModel::shares_prefill_cache() const {
+  const auto &impl = require_impl();
+  return impl.full_model_prefill && impl.full_model_prefill->shares_decode_cache();
 }
 
 std::size_t PartitionedGraphModel::weight_bytes() const {

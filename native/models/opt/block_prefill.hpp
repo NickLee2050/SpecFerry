@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/opt/layer.hpp"
+#include "np101/tensor.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,24 +16,28 @@ namespace specferry::models::opt {
 std::vector<std::uint8_t> widen_prefill_cache(const std::vector<std::uint8_t> &packed,
                                               unsigned positions, unsigned heads, unsigned width);
 
-// Resident, headless M16 execution for an initial prompt. Its independent cache
-// is FP16 for handwritten attention or FP32 for compiled attention. The prefix
-// is handed to M1 once; this chain does not consume later decode state.
+// Resident, headless M16 execution for an initial prompt. Compiled attention may
+// retain M1's FP32 input cache; its owner must outlive this chain. Independent
+// caches hand their prefix to M1 once. This chain never consumes decode state.
 class BlockPrefill {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
   BlockPrefill(np101::Context &context, const np101::WeightStore &weights,
                const ModelConfig &config, std::vector<CompiledFfn> compiled_ffn,
-               PhaseObserver phase = {}, std::vector<CompiledPrefillLayer> compiled_layers = {});
+               PhaseObserver phase = {}, std::vector<CompiledPrefillLayer> compiled_layers = {},
+               const std::vector<np101::TensorBinding> &shared_cache = {});
   ~BlockPrefill();
   BlockPrefill(const BlockPrefill &) = delete;
   BlockPrefill &operator=(const BlockPrefill &) = delete;
 
   // Exactly sixteen tokens per call; callers retain at least one prompt token for M1.
   void consume(const std::vector<std::int32_t> &tokens);
+  // Shared-input mode resets position only; the caller must clear its cache owner
+  // before the next consume(). Independent mode clears its own cache as well.
   void reset();
   unsigned position() const;
+  bool shares_decode_cache() const;
   // Packed FP32 [head,position,width], containing only the populated prefix.
   std::vector<std::uint8_t> read_cache(unsigned layer, bool values);
   std::size_t constant_weight_bytes() const;

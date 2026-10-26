@@ -318,6 +318,55 @@ SYSTEM采样峰值1353.67MiB，Linux最低余量676.42MiB，VIRTUAL为0。
 请求，不外推长期稳定、分次追加或新容量。证据：
 `soc-shared-prefill-20261025/{performance.json,run/summary.json}`。
 
+### C128与共享输入KV
+
+10-26将已验分图拓扑扩展到C128：M1整图仍用Select更新和INT32 ArgMax，M16保留
+24层编译attention、19层共享FCL FFN及末5层完整decoder。attention NBG与普通FFN
+合图的候选被Verify拒绝、尚未推理，已撤回；无新增设备故障，详见事故台账。
+
+运行时改为M16固定引用M1的48份FP32输入KV；各NBG输出仍独立，每块同步完成后
+按原映射路径提交16槽。由此省掉最终完整前缀交接及重复清零，不改算术、权重分类、
+图划分或每块44次RunGraph。新结果显式记录`prefill_cache_policy=shared-input`；
+旧记录缺字段按独立缓存核验，传输计数不能混用。M16消费者先于M1 owner释放。
+
+同一C128包和SDK各运行一次97→16、reset后17→16集合；两配置共64个输出、末层KV、
+未写槽、reset、传输计数和释放均通过。每个长请求使用6个M16块、消费到112槽；
+没有满128槽、分次追加或长期稳定验收，也没有新增C64共享缓存硬件结果。
+
+| 输入→输出 | KV策略 | TTFT秒 | 实际输出token/s | 首词后decode token/s |
+|---|---|---:|---:|---:|
+| 97→16 | 独立缓存＋前缀交接 | 12.356 | 0.898 | 2.747 |
+| 97→16 | 共享输入缓存 | 11.843 | 0.925 | 2.747 |
+| 17→16 | 独立缓存＋前缀交接 | 2.365 | 2.043 | 2.743 |
+| 17→16 | 共享输入缓存 | 2.277 | 2.066 | 2.743 |
+
+单轮对照长/短TTFT分别下降4.15%/3.72%，实际输出吞吐提高2.97%/1.14%；不外推
+统计稳定收益。长请求为16输出/17.303秒，首词后15个间隔/5.460秒；短请求单列。
+97词航空展览样例续文与CPU一致：` people understand the history of flight.\n\nThe Science Museum is located at the`。
+C128短请求decode也低于历史C64约3.30token/s，记录扩容后的成本，不据此确定内部根因。
+
+长请求确实减少48次读、48次写，合计36MiB；后续reset少写24MiB，耗时0.201→0.119秒，
+reset不计入上述生成吞吐。nonconst峰值474.96→450.96MiB，const为993.85MiB；
+共享候选SYSTEM峰值1385.86MiB、Linux最低余量672.12MiB、VIRTUAL为0。
+初始化119.594秒、子进程234.977秒单列，释放及45.034秒检查通过，无新hang/EDMA。
+初始化优化尚未实施；旧恢复标记保留。证据：`soc-context-prefill-20261026/`及
+`soc-prefill-followup-20261026/{comparison.json,shared-kv-c128/run/}`。
+
+### 初始化后续方案（未实施）
+
+114.564秒覆盖Context、建图、权重加载/上传、Setup及Verify，不含此前的权重/NBG/SDK
+文件哈希；成功轮没有当前FCL链的分项计时，不能认定Verify是主要成本。
+旧独立MatMul诊断的44次Verify合计32.120秒，其中一次29.219秒；只并行这些Verify的
+理想收益至多2.902秒，不能套用为当前链的上限，也不足以支持优先做并行Verify。
+
+按用户要求，先提交prefill优化和C128验收，再实施初始化优化。下一轮借一次必要的
+完整链验收，仅在初始化阶段汇总M1导入、M16 embedding/attention/FFN的权重准备、
+AddTensor、Setup和Verify时间，生成阶段保持原测量方式。随后针对最大成本选择一项
+修改：有界预读、已证实的重复准备消除，或替换一个昂贵图；不预先宣称收益。
+native NBG/SDK哈希仍串行，可另计启动等待后决定是否并行，不能混入114.564秒指标。
+已有Python包校验和C++权重校验并行，不是SDK并行Verify；完整摘要及预算门禁保留。
+证据：`soc-prefill-followup-20261026/init-analysis.md`。
+
 ### 局部KV回写的收益与限制
 
 复用同一636,651,008字节整图NBG（SHA256 `be581668…8a7a`），固定52入50出、FP32 KV。
