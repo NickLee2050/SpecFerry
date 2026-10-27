@@ -79,6 +79,100 @@ The download script works on both Windows and Linux. The current full reference
 environment is validated on Linux x86_64; the native NP101 SDK is required to
 build and run the SDK smoke test.
 
+## Standalone Qwen target validation
+
+Use the existing pinned ARM64 vLLM image and the `SpecFerry` Conda interpreter.
+The text-only Qwen3.5-27B test uses BF16 weights, FP32 SSM state, one request at a
+time, a 2048-token context, and a 2GiB cache budget. It does not load a draft model
+or use the OPT-specific speculative adapter. Free the memory occupied by this
+project's OPT containers before launching. Following the user's later instruction,
+leave the old OPT-6.7B services stopped and stop the Qwen test instance afterward.
+
+```bash
+conda activate SpecFerry
+HF_ENDPOINT=https://hf-mirror.com python scripts/download_models.py \
+  --model Qwen/Qwen3.5-27B --http-only --file-workers 4 --range-workers 16
+python scripts/serve_qwen_tlm.py --output .cache/runs/qwen27b-server
+python scripts/validate_qwen_tlm.py --output .cache/runs/qwen27b-validation
+```
+
+The launcher binds the OpenAI-compatible API to `127.0.0.1:8020` with served
+model name `specferry-tlm-qwen`. The validation script disables thinking, saves
+the original prompts, generated text, token IDs, SSE events, finish reasons and
+timings, and checks generated-token counts against reported usage. Quality
+examples honor EOS within an explicit output budget; three warmed timing trials
+generate exactly 128 tokens each. These are standalone target measurements,
+not cross-device speculative inference results.
+
+DGX GB10 validation on 2026-10-16 passed with revision
+`fc05daec18b0a78c049392ed2e771dde82bdf654` and vLLM 0.28.0. Three warmed,
+single-request, 128-token trials measured a median decode rate of **4.66 token/s**
+and client-observed TTFT of **0.270 s**. The first warmup request incurred a
+16.96 s TTFT with an inference-time Triton JIT; it is excluded from these medians.
+Both short Chinese and English answers ended naturally (78 and 114 tokens).
+The long Chinese request had 306 input tokens and reached its 1024-output-token
+budget, so that answer is truncated. The model-loading allocation was 50.22GiB;
+the 2GiB cache, 0.75GiB graph allocation and other runtime memory are separate.
+Raw evidence is in `.cache/runs/qwen27b-validation-20261016/` and a portable
+summary is in `handoff/dgx.json`. These observations do not establish a speedup
+over OPT or speculative inference.
+
+## Standalone OPT target scaling test
+
+`scripts/serve_opt_target.py` launches the verified OPT-30B checkpoint in the
+same pinned ARM64 vLLM image, using FP16, TP=1, one sequence, CUDA graphs and a
+2048-token context. It binds `127.0.0.1:8030` with model name
+`specferry-tlm-opt-target`. OPT-30B requires at least 2.625GiB of FP16 KV state
+for 2048 tokens, so this launcher assigns 4GiB. Free the memory occupied by this
+project's other target containers before starting. Following the user's later
+2026-10-16 instruction, keep the three old OPT-6.7B instances stopped; run only
+one OPT-30B instance for this test and stop it afterward.
+
+```bash
+conda activate SpecFerry
+HF_ENDPOINT=https://hf-mirror.com python scripts/download_models.py \
+  --model facebook/opt-30b --http-only --file-workers 4 --range-workers 4
+python scripts/serve_opt_target.py --output .cache/runs/opt30b-server
+python scripts/validate_opt_target.py --output .cache/runs/opt30b-validation
+```
+
+The validation script reuses `benchmark_tlm.py`: the same three prompts and 128
+generated tokens as the original OPT-6.7B measurement, after a 64-token warmup.
+It also saves an English question/answer completion, GPU activity and exact
+tokenizer-file comparisons against the local OPT-6.7B checkpoint. This checks a
+standalone target; it does not establish real NP101 tokenizer compatibility,
+acceptance rate, or cross-device speculative speedup.
+
+On 2026-10-16, the pinned vLLM 0.28.0 runtime on dgx01 measured:
+
+| Target | Weight dtype | Median decode (tokens/s) | Median TTFT (s) |
+| --- | --- | ---: | ---: |
+| OPT-6.7B | FP16 | 16.14 | 0.069 |
+| OPT-30B | FP16 | 3.94 | 0.290 |
+
+Both OPT tests use the same three short prompts, a 64-token warmup, three
+128-token greedy streaming trials, one sequence, CUDA graphs and no prefix
+cache. Decode excludes the first token chunk; TTFT includes API and prefill
+time. KV budgets differ: 2GiB for OPT-6.7B and 4GiB for OPT-30B. The OPT-6.7B
+reference was recorded while the other two old OPT instances were idle; OPT-30B
+ran alone. These are standalone observations, not speculative speedup results.
+OPT-30B's model-loading allocation was 55.83GiB, with a 4GiB KV budget and
+0.40GiB for graph capture; its generation-time process allocation was about
+60.38GiB according to `nvidia-smi`.
+
+Raw evidence is under `.cache/runs/opt30b-validation-20261016/`: the `validation/`
+and `opt6.7-baseline/` subdirectories retain timing results and English question
+and answer files. Weights came from a pinned ModelScope mirror whose seven
+file sizes and SHA256 hashes match HF revision
+`ceea0a90ac0f6fae7c2c34bcb40477438c152546`. Small files were also verified against
+that HF revision's Git blob IDs; the mirror provenance and final verification
+are retained in the run directory and model download manifest.
+The English Q&A used 412 prompt tokens and reached the 512-token output cap;
+the answer still repeats advice. The short Chinese sample is also weak. These
+checks establish functional generation, not instruction-following quality.
+After success, the OPT-30B container was stopped and the three old OPT-6.7B
+instances were left stopped. `handoff/dgx.json` retains the portable summary.
+
 ## Record the host and device environment
 
 Run from the repository root, in a session that can see `/dev/galcore`:

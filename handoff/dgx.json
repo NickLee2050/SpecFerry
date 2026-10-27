@@ -2,9 +2,9 @@
   "updated_on": "2026-10-16",
   "owner": "DGX TLM session",
   "host": "dgx01",
-  "session_title": "SpecFerry框架搭建",
+  "session_title": "SpecFerry\u6846\u67b6\u642d\u5efa",
   "peer_host": "fpga02",
-  "peer_session_title": "SpecFerry问题排查与性能优化",
+  "peer_session_title": "SpecFerry\u95ee\u9898\u6392\u67e5\u4e0e\u6027\u80fd\u4f18\u5316",
   "branch": "dev/TLM-impl",
   "protocol": "specferry.draft.v1",
   "contract": "protocol/draft-v1.schema.json",
@@ -42,5 +42,144 @@
     "FP32 previously passed 17/17 cases; this is test coverage, not a universal guarantee",
     "No real device acceptance rate or network throughput has been established"
   ],
-  "revision_rule": "Use git rev-parse HEAD and launch.json source hashes when consuming this handoff; dated service status must be rechecked live"
+  "revision_rule": "Use git rev-parse HEAD and launch.json source hashes when consuming this handoff; dated service status must be rechecked live",
+  "qwen_standalone_validation": {
+    "checkpoint": "Qwen/Qwen3.5-27B",
+    "revision": "fc05daec18b0a78c049392ed2e771dde82bdf654",
+    "validated_at": "2026-10-16T06:04:22.555202+00:00",
+    "runtime": "Pinned vLLM 0.28.0 ARM64 image; same SpecFerry Conda Python 3.12 interpreter",
+    "image_id": "sha256:89154ef00dd15368d2b293c167e5cc7dbb521fcfb2fbb77510e0d4df2b820e8f",
+    "configuration": {
+      "weight_dtype": "bfloat16",
+      "ssm_state_dtype": "float32",
+      "thinking": false,
+      "max_model_len": 2048,
+      "concurrency": 1,
+      "kv_cache_gib": 2,
+      "prefix_cache": false
+    },
+    "timing": {
+      "method": "Client-observed SSE; three warmed short-prompt trials of 128 output tokens; decode excludes first chunk",
+      "median_decode_tokens_per_second": 4.656140311779201,
+      "median_ttft_seconds": 0.26982180799677735,
+      "first_warmup_ttft_seconds": 16.957204078997165
+    },
+    "samples": [
+      {
+        "name": "zh-short",
+        "prompt_tokens": 36,
+        "output_tokens": 78,
+        "finish_reason": "stop"
+      },
+      {
+        "name": "en-short",
+        "prompt_tokens": 37,
+        "output_tokens": 114,
+        "finish_reason": "stop"
+      },
+      {
+        "name": "zh-long",
+        "prompt_tokens": 306,
+        "output_tokens": 1024,
+        "finish_reason": "length"
+      }
+    ],
+    "model_loading_allocation_gib": 50.22,
+    "scope": "Standalone target text generation only. No draft model, acceptance-rate measurement, NP101 integration, or matched OPT comparison.",
+    "evidence": ".cache/runs/qwen27b-validation-20261016/validation/report.json",
+    "container_log": ".cache/runs/qwen27b-validation-20261016/container.log",
+    "launch_record": ".cache/runs/qwen27b-validation-20261016/server/launch.json",
+    "service_note": "Qwen test container retained stopped; OPT remains the default deployment."
+  },
+  "opt30b_standalone_validation": {
+    "checkpoint": "facebook/opt-30b",
+    "revision": "ceea0a90ac0f6fae7c2c34bcb40477438c152546",
+    "validated_at": "2026-10-16T09:41:00.039011+00:00",
+    "runtime": "Pinned vLLM 0.28.0 ARM64 image; SpecFerry Conda Python 3.12 interpreter",
+    "image_id": "sha256:89154ef00dd15368d2b293c167e5cc7dbb521fcfb2fbb77510e0d4df2b820e8f",
+    "configuration": {
+      "weight_dtype": "float16",
+      "tensor_parallel_size": 1,
+      "max_model_len": 2048,
+      "concurrency": 1,
+      "kv_cache_gib": 4,
+      "prefix_cache": false,
+      "cuda_graphs": true
+    },
+    "timing": {
+      "method": "Client-observed SSE; three warmed short-prompt trials of 128 output tokens; decode excludes first chunk; TTFT includes API and prefill",
+      "median_decode_tokens_per_second": 3.9404661330264426,
+      "median_ttft_seconds": 0.2902409970010922,
+      "trials": [
+        {
+          "decode_tokens_per_second": 3.9478597639808104,
+          "ttft_seconds": 0.3136566599969228,
+          "prompt_tokens": 12,
+          "output_tokens": 128
+        },
+        {
+          "decode_tokens_per_second": 3.9404661330264426,
+          "ttft_seconds": 0.28482013499888126,
+          "prompt_tokens": 11,
+          "output_tokens": 128
+        },
+        {
+          "decode_tokens_per_second": 3.937582456989884,
+          "ttft_seconds": 0.2902409970010922,
+          "prompt_tokens": 10,
+          "output_tokens": 128
+        }
+      ]
+    },
+    "opt6_7b_reference": {
+      "revision": "a45aa65bbeb77c1558bc99bedc6779195462dab0",
+      "median_decode_tokens_per_second": 16.14411911575696,
+      "median_ttft_seconds": 0.0693883599997207,
+      "evidence": ".cache/runs/opt30b-validation-20261016/opt6.7-baseline/report.json",
+      "comparison_conditions": "Same benchmark script, prompts, warmup and 128-token output length; FP16, one request and CUDA graphs. KV budgets: 2GiB vs 4GiB. Reference measured with two other old target instances idle; OPT-30B ran alone."
+    },
+    "memory": {
+      "model_loading_allocation_gib": 55.83,
+      "kv_cache_budget_gib": 4,
+      "graph_capture_allocation_gib": 0.4,
+      "generation_process_nvml_mib": 61831,
+      "evidence": ".cache/runs/opt30b-validation-20261016/generating-memory.json"
+    },
+    "qa": {
+      "prompt_tokens": 412,
+      "output_tokens": 512,
+      "finish_reason": "length",
+      "total_seconds": 133.36578492199988,
+      "note": "English question/answer format; answer repeats suggestions and reaches the 512-token cap. Functional generation succeeded; this is not an instruction-quality evaluation."
+    },
+    "tokenizer_files_match_opt6_7b": {
+      "vocab.json": true,
+      "merges.txt": true
+    },
+    "download_provenance": {
+      "weights": "Pinned ModelScope mirror; all seven file sizes and SHA256 match the pinned HF revision, and full local file hashes were verified.",
+      "modelscope_revision": "5b319d14523d9def53cf053d4b284beef945d582",
+      "small_files": "hf-mirror raw endpoint with ModelScope fallback; all Git blob IDs checked against the pinned HF commit metadata.",
+      "evidence": ".cache/runs/opt30b-validation-20261016/small-file-verification.json"
+    },
+    "scope": "Standalone target generation. No draft model or device acceptance-rate measurement.",
+    "evidence": ".cache/runs/opt30b-validation-20261016/validation/report.json",
+    "benchmark": ".cache/runs/opt30b-validation-20261016/validation/benchmark.json",
+    "container_log": ".cache/runs/opt30b-validation-20261016/container.log",
+    "launch_record": ".cache/runs/opt30b-validation-20261016/server/launch.json",
+    "service_note": "Test container stopped after success. The three old OPT-6.7B instances remain stopped per user request; no automatic restoration."
+  },
+  "service_state_after_opt30b_test": {
+    "checked_at": "2026-10-16T09:41:51.308982+00:00",
+    "containers": {
+      "specferry-tlm": "stopped",
+      "specferry-tlm-baseline": "stopped",
+      "specferry-tlm-spec": "stopped",
+      "specferry-tlm-opt30b": "stopped"
+    },
+    "gpu_compute_processes": [],
+    "mem_available_gib_approx": 116,
+    "other_users_containers": "Untouched",
+    "automatic_restart_or_restoration": "None scheduled by this experiment; test orchestrator exited successfully."
+  }
 }
