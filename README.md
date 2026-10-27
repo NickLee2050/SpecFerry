@@ -38,8 +38,12 @@ python scripts/download_models.py --dry-run
 python scripts/download_models.py
 ```
 
-The current DGX TLM phase enables only `facebook/opt-6.7b`; Qwen3.5 is the second
-priority and its download entries remain commented out. The script downloads
+The default DGX TLM download remains `facebook/opt-6.7b`. On 2026-10-16 the user
+explicitly selected `Qwen/Qwen3.5-27B` for standalone validation; select it with
+`--model Qwen/Qwen3.5-27B`. Other Qwen download entries remain commented out.
+The user subsequently authorized `facebook/opt-30b`; select it explicitly with
+`--model facebook/opt-30b`. The default remains OPT-6.7B.
+The script downloads
 the original checkpoint and tokenizer under `.cache/models/facebook/opt-6.7b`, pins the revision, resumes
 interrupted transfers, and writes `download-manifest.json` only after validating
 the files. This does not convert or deploy the model. OPT uses PyTorch weight
@@ -61,7 +65,15 @@ the same output directory simultaneously.
 For repeated single-file HTTP interruptions, `--http-only --range-workers 12`
 downloads the public weight file in bounded, resumable byte ranges. Each response
 must match its requested range; the assembled file must match the Hub SHA256
-before it is published. Range fragments remain under the model's `.cache/`.
+before it is published. `--file-workers` also bounds simultaneous weight shards;
+the total range concurrency is at most `file-workers * range-workers`. Range
+fragments remain under the model's `.cache/`. A failed shard prevents publication
+of the complete manifest, including when other shards have already succeeded.
+For range transfers, each shard's download redirect is resolved without a Range
+header and the signed CDN location is reused across byte ranges, then refreshed
+before expiration or after HTTP 403. This avoids resolving the same Hub URL for
+every fragment. HTTP 429 stops queued requests; honor the server's Retry-After
+before re-running. Completed fragments are retained.
 
 The download script works on both Windows and Linux. The current full reference
 environment is validated on Linux x86_64; the native NP101 SDK is required to

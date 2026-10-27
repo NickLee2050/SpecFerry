@@ -30,6 +30,19 @@ class DownloadModelsTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 downloader.validate_models((downloader.ModelSpec(name),))
 
+    def test_optional_validation_requires_explicit_selection_and_creates_no_files(self):
+        for model in ('Qwen/Qwen3.5-27B', 'facebook/opt-30b'):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as root:
+                destination = Path(root) / 'not-created'
+                stream = io.StringIO()
+                with contextlib.redirect_stdout(stream):
+                    result = downloader.main(['--dry-run', '--model', model,
+                                              '--output', str(destination)])
+                self.assertEqual(result, 0)
+                self.assertEqual([m['repo_id'] for m in json.loads(stream.getvalue())['models']],
+                                 [model])
+                self.assertFalse(destination.exists())
+
     def test_interrupted_download_resumes_the_same_commit(self):
         contents = {
             "config.json": b'{"model_type":"qwen3_5"}',
@@ -83,6 +96,52 @@ class DownloadModelsTests(unittest.TestCase):
                          "sha256": hashlib.sha256(b"good").hexdigest()}]
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 downloader.verify_files(destination, expected)
+
+    def test_parallel_shard_failure_cannot_publish_a_complete_manifest(self):
+        contents = {
+            'config.json': b'{"model_type":"qwen3_5"}',
+            'tokenizer.json': b'{"version":"1.0"}',
+            'part-1.safetensors': b'first weight',
+            'part-2.safetensors': b'second weight',
+        }
+        info = SimpleNamespace(sha='b' * 40, siblings=[
+            SimpleNamespace(rfilename=name, size=len(data),
+                            lfs={'sha256': hashlib.sha256(data).hexdigest()})
+            for name, data in contents.items()
+        ])
+        fail = True
+        snapshots = []
+
+        def transfer(url, destination, size, sha256, workers, **kwargs):
+            if fail and destination.name == 'part-2.safetensors':
+                raise OSError('one shard failed')
+            destination.write_bytes(contents[destination.name])
+
+        def snapshot(**kwargs):
+            snapshots.append(kwargs['allow_patterns'])
+            for name in kwargs['allow_patterns']:
+                (kwargs['local_dir'] / name).write_bytes(contents[name])
+
+        fake_hub = SimpleNamespace(
+            HfApi=lambda: SimpleNamespace(model_info=lambda *a, **kw: info),
+            snapshot_download=snapshot, hf_hub_url=lambda *a, **kw: 'unused',
+        )
+        with tempfile.TemporaryDirectory() as root, patch.dict('sys.modules', {
+                'huggingface_hub': fake_hub,
+                'range_download': SimpleNamespace(download_ranges=transfer),
+        }), patch.object(downloader.importlib.metadata, 'version', return_value='test'):
+            model = downloader.ModelSpec('Qwen/Qwen3.5-27B')
+            destination = Path(root) / model.repo_id
+            with self.assertRaisesRegex(OSError, 'one shard failed'):
+                downloader.download_one(model, Path(root), file_workers=2, range_workers=2)
+            self.assertFalse((destination / 'download-manifest.json').exists())
+            self.assertEqual(snapshots, [])
+            fail = False
+            downloader.download_one(model, Path(root), file_workers=2, range_workers=2)
+            self.assertEqual(set(snapshots[0]), {'config.json', 'tokenizer.json'})
+            manifest = json.loads((destination / 'download-manifest.json').read_text())
+            self.assertEqual(manifest['status'], 'complete')
+            self.assertEqual({item['path'] for item in manifest['files']}, set(contents))
 
     def test_opt_bin_weights_and_bpe_tokenizer_exclude_other_frameworks(self):
         names = ["config.json", "vocab.json", "merges.txt", "pytorch_model.bin.index.json",

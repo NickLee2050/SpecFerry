@@ -33,9 +33,11 @@ MODELS = (
     # ModelSpec("Qwen/Qwen3.5-27B"),      # Large dense experiment.
     # ModelSpec("Qwen/Qwen3.5-35B-A3B"),  # MoE experiment; all experts are downloaded.
 )
+# Explicit secondary-phase validation; default runs still download only OPT.
+OPTIONAL_MODELS = (ModelSpec("Qwen/Qwen3.5-27B"), ModelSpec("facebook/opt-30b"))
 ALLOWED_REPOS = frozenset(
     f"Qwen/Qwen3.5-{size}" for size in ("0.8B", "4B", "9B", "27B", "35B-A3B")
-) | {"facebook/opt-6.7b"}
+) | {"facebook/opt-6.7b", "facebook/opt-30b"}
 FILE_PATTERNS = (
     "*.safetensors", "*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja",
     "pytorch_model*.bin",
@@ -156,11 +158,22 @@ def download_one(model: ModelSpec, output: Path, file_workers: int, range_worker
     if range_workers > 1:
         from range_download import download_ranges
         from huggingface_hub import hf_hub_url
-        for item in files:
-            if item['path'].endswith(('.safetensors', '.bin')) and item['sha256'] and item['size']:
-                download_ranges(hf_hub_url(model.repo_id, item['path'], revision=info.sha),
-                                destination / item['path'], item['size'], item['sha256'], range_workers)
-                selected.remove(item['path'])
+        weights = [item for item in files
+                   if item['path'].endswith(('.safetensors', '.bin'))
+                   and item['sha256'] and item['size']]
+        # Bound concurrent shards separately from byte ranges within each shard.
+        # Every shard is verified before snapshot_download and manifest publication.
+        with ThreadPoolExecutor(max_workers=file_workers) as weight_pool:
+            transfers = {
+                weight_pool.submit(download_ranges,
+                    hf_hub_url(model.repo_id, item['path'], revision=info.sha),
+                    destination / item['path'], item['size'], item['sha256'], range_workers,
+                    resolve_redirects=True): item
+                for item in weights
+            }
+            for transfer in as_completed(transfers):
+                transfer.result()
+                selected.remove(transfers[transfer]['path'])
     snapshot_download(
         repo_id=model.repo_id, revision=info.sha, local_dir=destination,
         allow_patterns=selected, max_workers=file_workers,
@@ -196,20 +209,24 @@ def main(argv: list[str] | None = None) -> int:
                         help="parallel HTTP byte ranges per public weight file (default: disabled)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan without dependencies, network requests, or file writes")
+    selectable = {model.repo_id: model for model in (*MODELS, *OPTIONAL_MODELS)}
+    parser.add_argument("--model", action="append", choices=tuple(selectable),
+                        help="explicitly select an authorized model; defaults remain OPT-only")
     args = parser.parse_args(argv)
+    models = tuple(selectable[name] for name in args.model) if args.model else MODELS
     try:
-        validate_models(MODELS)
+        validate_models(models)
     except ValueError as error:
         parser.error(str(error))
     output = args.output.expanduser().resolve()
     if args.dry_run:
         print(json.dumps({
             "output": str(output),
-            "parallel_models": min(args.parallel_models, len(MODELS)),
+            "parallel_models": min(args.parallel_models, len(models)),
             "file_workers_per_model": args.file_workers,
             "http_only": args.http_only,
             "range_workers": args.range_workers,
-            "models": [{"repo_id": model.repo_id, "revision": model.revision} for model in MODELS],
+            "models": [{"repo_id": model.repo_id, "revision": model.revision} for model in models],
         }, ensure_ascii=False, indent=2))
         return 0
     if args.http_only:
@@ -221,8 +238,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Install download dependencies: python -m pip install -r requirements-download.txt", file=sys.stderr)
         return 2
     failed = []
-    with ThreadPoolExecutor(max_workers=min(args.parallel_models, len(MODELS))) as pool:
-        pending = {pool.submit(download_one, model, output, args.file_workers, args.range_workers): model for model in MODELS}
+    with ThreadPoolExecutor(max_workers=min(args.parallel_models, len(models))) as pool:
+        pending = {pool.submit(download_one, model, output, args.file_workers, args.range_workers): model for model in models}
         for future in as_completed(pending):
             model = pending[future]
             try:
