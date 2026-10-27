@@ -19,7 +19,12 @@ from specferry.export.compiled import SIMULATOR, compile_model, compiled_ports
 from specferry.models.opt.checkpoint import load_checkpoint
 from specferry.models.opt.compiled import DRIVER, SDK_FILES
 from specferry.models.opt.export import verify_export
-from specferry.models.opt.onnx import decoder_model, full_model, select_cache_updates
+from specferry.models.opt.onnx import (
+    decoder_model,
+    full_model,
+    narrow_cache_selection,
+    select_cache_updates,
+)
 from specferry.validation.device import write_json
 
 
@@ -171,15 +176,17 @@ def main():
     parser.add_argument("--capacity", type=int, choices=(64, 128), required=True)
     parser.add_argument(
         "--kv-update",
-        choices=("scatter", "select"),
+        choices=("scatter", "select", "narrow-select"),
         default="scatter",
-        help="graph-internal FP32 cache update; select requires indices in head order",
+        help="select requires head-ordered indices; narrow-select publishes FP32 current slots",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--package-output", type=Path, help="write a portable source-bound runtime package"
     )
     args = parser.parse_args()
+    if args.kv_update == "narrow-select" and args.scope != "fullgraph":
+        parser.error("narrow-select requires --scope fullgraph")
     verify_export(args.deployment)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -194,8 +201,10 @@ def main():
         directory = output / ("model" if layer is None else f"layer{layer}")
         directory.mkdir()
         model = graph.model()
-        if args.kv_update == "select":
+        if args.kv_update in ("select", "narrow-select"):
             select_cache_updates(model)
+        if args.kv_update == "narrow-select":
+            narrow_cache_selection(model)
         onnx.save(model, directory / "model.onnx")
         write_json(
             directory / "source.json",
@@ -204,6 +213,7 @@ def main():
                 layer=layer,
                 capacity=args.capacity,
                 kv_update=args.kv_update,
+                cache_output="current" if args.kv_update == "narrow-select" else "full",
                 weight_sha256=graph.identities,
                 onnx_sha256=sha256(directory / "model.onnx"),
                 constant_bytes=sum(len(t.raw_data) for t in graph.constants),

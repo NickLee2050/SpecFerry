@@ -734,8 +734,8 @@ child288.337秒，无新内核故障，所有旧标记保留。它只证明本�
 
 ### 常驻内存为何超过原始权重
 
-原始OPT有331,196,416个独立参数，FP16共631.707MiB；19层组合的SYSTEM峰值是其
-2.78倍。源码和清单确定的主要来源是：
+原始OPT有331,196,416个独立参数，FP16共631.707MiB；完整KV输出的19层基线SYSTEM
+峰值是其2.78倍，当前槽版本的节省见下节。源码和清单确定的主要来源是：
 
 | 来源 | 已有证据与数量 |
 |---|---|
@@ -761,17 +761,65 @@ Linux文件缓存/RSS和NPU SYSTEM也不是同一测量口径。
 FFN实测见前述证据，源码入口为`WeightBank::ensure_loaded`、`build_full_execution`和
 `BlockPrefill::build_compiled`。
 
-### 内部KV与attention布局的离线候选
+### 内部KV更新与attention布局
 
 10-27已查明现M1内部先FP32完整Select更新、再完整Cast FP16；host本就仅提交当前槽。
 候选改为先缩窄旧缓存、FP16 Select供attention，只输出FP32当前槽，canonical状态保持
 FP32。三组真实状态及重建KV的CPU输出按位一致；逻辑数组流量预计少24MiB/token，
-不等于实测总线流量或延迟，FP16 Select的次正规值行为及提交源/目标偏移仍须硬件验收。
+不等于实测总线流量或延迟。
+
+同日完整C128/M1第12层decoder上板，复用三组状态并增加一组已用V槽含FP16次正规值
+的输入，原图/候选/候选/原图各12次计时，共48次及16次预热。原图前后18.870/18.404ms，
+候选15.505/13.511ms，均值18.637→14.508ms（−22.15%）；候选自身漂移−12.86%，
+两段均快于原图两段。hidden通过原容差，最大绝对误差0.0078125；当前FP32槽从源0
+提交到目标position，重建完整KV及所有未改槽逐位通过。该边缘输入不等于直接观测内部
+FP16次正规值是否保留。child4.562秒、资源回归及45.100秒无新内核故障通过。
+生成C确认FP32 CL Select改为FP16 EVIS Select，但两版均139条命令、SH72/TP33/NN33；
+收益可能同时涉及后端选路和中间数据量，不能单独归因DDR流量。这里只是完整decoder
+回放，不是生成吞吐。证据：`soc-decode-layout-validation-20261027/`
+及`soc-kv-dataflow-validation-20261027/{artifact.json,static-audit.json}`。
+
+随后只替换M1整图与当前槽提交契约，M16的19层缓存卷积组合不变；复用两次独立reset的
+17输入→16输出参考，完整24层、58项数值/KV/reset/预算/释放及45.016秒检查通过，
+无新增内核故障。共32输出/10.807398秒，首词后30个间隔/8.531867秒；下表排除准备、
+初始化和诊断IO，对照为先前同负载已验记录，并非整模前后夹持。
+
+| 指标 | 原FP32完整Select | FP16 Select＋FP32当前槽 | 变化 |
+|---|---:|---:|---:|
+| 平均TTFT s | 1.232234 | 1.137763 | −7.67% |
+| 实际输出token/s | 2.382991 | 2.960935 | +24.25% |
+| 首词后decode token/s | 2.736221 | 3.516229 | +28.51% |
+| SYSTEM采样峰值 MiB | 1756.365 | 1744.549 | −11.817MiB |
+
+显式KV输入/双输出由72降至48.1875MiB，应用nonconst峰值456.737→432.925MiB；
+池峰值并未等量下降，不把公开张量节省当作物理节省。Linux最低712.781MiB，const峰值
+993.847MiB，释放归零；驱动历史高水位未清零，采样仍可能漏峰。当前采样池余量约47.45MiB，
+不能外推C256可用。准备123.769秒、构造162.275秒、就绪286.043秒，child299.265秒，
+距300秒仅0.735秒；再次整模测试前必须调整准备组织或缩小验收请求，不延长期限。
+默认导出保持不变，显式`narrow-select`仅支持fullgraph＋mapped-slot，拒绝逐decoder与
+device-copy；当前槽源0写到canonical目标position。原binary/NBG/参考不覆盖，证据在
+`soc-kv-dataflow-fullmodel-20261027/{summary.json,attempt-1/run/}`。
 
 另一候选用`K×Qᵀ`再reshape替代`Q×Kᵀ`：现NBG确有完整K转置，C128逻辑转置数据
 可由256KiB降至2KiB，三组完整decoder共9份CPU输出按位一致。现有9个reshape未有
 独立命令层，不优先改view；逐头展开命令数也不能证明物理并行或利用率。
-两候选均未转换/上板、未改正式decode；证据：`soc-decode-dataflow-20261027/{kv,attention}/`。
+原单列结果在标准导出和自动保存模式的模拟器Verify返回VX_ERROR_NO_RESOURCES
+（−7，非−8内存错误）。相同图不保存时独立Verify/Run曾成功；普通Verify之后再手动
+GenerateNBG在SaveBinaryNNTP写入阶段崩溃。改为fresh Setup后直接GenerateNBG可生成
+IO元数据与基线一致的产物，但板端Setup仍报告NBG创建失败，未到Run；异常清理中
+vxReleaseKernel访问失效对象。临时夹具的Context先于Graph析构风险已修正，单列产物
+不再重试。离线生成或容器端口相同均不能证明板端可导入，完整事故见台账。
+
+标准导出的可运行绕过将Q复制4列，计算后Slice第0列，保持原FP16乘积与FP32 KV。
+三组真实状态9份CPU输出按位一致，完整K转置消失；命令139→137（SH73/TP30/NN33），
+但QK算术增至4倍并增加Tile/Slice，不据命令数预报性能。上板四输入ABBA共48次计时、
+16次预热：原图前后17.554/18.531ms，候选17.517/17.831ms，均值18.042→17.674ms
+（−2.04%），小于原图5.56%漂移；未建立明确收益，保持正式原布局、不接整模。
+数值/完整KV未改槽通过，hidden最大误差0.0078125，child2.964秒、释放与45.006秒检查
+通过。首轮在原图第4次RunGraph发生一次hang，候选尚未Run；该轮全部计时作废，按
+常设约定重试通过，历史故障不抹去。证据：`soc-attention-layout-validation-20261027/`
+的`board-comparison-safe/attempt-2/run/`、`padded-query-command-summary.json`；原始
+分析保留在`soc-decode-dataflow-20261027/{kv,attention}/`。
 
 ### 仅当前token的KV输出：完整decoder未见收益
 

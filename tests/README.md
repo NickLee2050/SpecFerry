@@ -119,7 +119,7 @@ ONNX, generated C and compiler logs stay outside runtime packages.
 |---|---|
 | `export_np101_opt_ffn.py` | 24 M1 fused FFN/final-norm NBGs; optional head/projection artifacts, existing-artifact revalidation |
 | `export_np101_opt_projections.py` | 24 QKV/out graphs and one head, with public/SDK port permutations |
-| `export_np101_opt_model.py` | `--scope decoders|fullgraph --capacity 64|128`, FP32 KV and optional runtime package; `--kv-update select` replaces graph-internal ScatterND with broadcast selection, preserving ports |
+| `export_np101_opt_model.py` | `--scope decoders|fullgraph --capacity 64|128`, FP32 KV and optional runtime package; `--kv-update select` preserves ports; fullgraph-only `narrow-select` narrows before selection and emits FP32 current slots, requiring mapped-slot commits |
 | `export_np101_qwen_blocks.py` | `--part mixer|feed-forward`, one/all layers, optional runtime package and combined mixer/FFN package |
 
 OPT's `--prefill-artifacts` imports existing source-bound M16 exports into the M1 package: layers

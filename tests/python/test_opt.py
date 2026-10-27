@@ -18,12 +18,94 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.export.weights import write_weight_pack
 from specferry.models.opt.checkpoint import load_checkpoint
+from specferry.models.opt.compiled_model import _validate_ports, expected_ports
 from specferry.models.opt.config import CHECKPOINT_SHA256, TOLERANCES, Components
-from specferry.models.opt.onnx import select_cache_updates
+from specferry.models.opt.onnx import narrow_cache_selection, select_cache_updates
 from specferry.models.opt.validation import compare_prefix, evaluate, load_inputs
 
 
 class CacheSelectionTests(unittest.TestCase):
+    def test_narrow_selection_preserves_attention_and_committed_fp32_state(self):
+        nodes = []
+        inputs = [helper.make_tensor_value_info("kv_indices", TensorProto.INT64, [16, 2])]
+        outputs = []
+        for part in ("key", "value"):
+            inputs.extend(
+                (
+                    helper.make_tensor_value_info("past_" + part, TensorProto.FLOAT, [16, 4, 64]),
+                    helper.make_tensor_value_info(part + "_update", TensorProto.FLOAT16, [16, 64]),
+                )
+            )
+            nodes.extend(
+                (
+                    helper.make_node(
+                        "Cast", [part + "_update"], [part + "_wide"], to=TensorProto.FLOAT
+                    ),
+                    helper.make_node(
+                        "ScatterND",
+                        ["past_" + part, "kv_indices", part + "_wide"],
+                        ["present_" + part],
+                    ),
+                    helper.make_node(
+                        "Cast",
+                        ["present_" + part],
+                        ["present_" + part + "_attention"],
+                        to=TensorProto.FLOAT16,
+                    ),
+                )
+            )
+            outputs.extend(
+                (
+                    helper.make_tensor_value_info(
+                        "present_" + part, TensorProto.FLOAT, [16, 4, 64]
+                    ),
+                    helper.make_tensor_value_info(
+                        "present_" + part + "_attention", TensorProto.FLOAT16, [16, 4, 64]
+                    ),
+                )
+            )
+        model = helper.make_model(
+            helper.make_graph(nodes, "decode-cache", inputs, outputs),
+            opset_imports=[helper.make_opsetid("", 11)],
+            ir_version=7,
+        )
+        original = ReferenceEvaluator(onnx.ModelProto.FromString(model.SerializeToString()))
+        candidate = ReferenceEvaluator(narrow_cache_selection(select_cache_updates(model)))
+        values = np.array([0.0, -0.0, 2**-24, -(2**-24), 2**-126, 1.0000001], dtype="f4")
+        feed = {"past_" + part: np.resize(values, (16, 4, 64)) for part in ("key", "value")}
+        feed.update(
+            {
+                part + "_update": np.resize(values, (16, 64)).astype("f2")
+                for part in ("key", "value")
+            }
+        )
+        for position in (0, 3, 0):
+            feed["kv_indices"] = np.column_stack((np.arange(16), np.full(16, position)))
+            expected, actual = original.run(None, feed), candidate.run(None, feed)
+            for ordinal, part in enumerate(("key", "value")):
+                cache = feed["past_" + part].copy()
+                cache[:, position : position + 1] = actual[2 * ordinal]
+                np.testing.assert_array_equal(cache.view("u4"), expected[2 * ordinal].view("u4"))
+                np.testing.assert_array_equal(
+                    actual[2 * ordinal + 1].view("u2"), expected[2 * ordinal + 1].view("u2")
+                )
+                feed["past_" + part] = cache
+
+    def test_current_cache_package_requires_explicit_matching_contract(self):
+        with self.assertRaisesRegex(ValueError, "fullgraph"):
+            expected_ports("decoders", 128, "current")
+        inputs, outputs = expected_ports("fullgraph", 128, "current")
+        entry = {"kv_update": "narrow-select", "cache_output": "current"}
+        for direction, ports in (("input", inputs), ("output", outputs)):
+            entry[direction + "s"] = [dict(name=n, dtype=d, shape=s) for n, d, s in ports]
+            entry[direction + "_order"] = list(range(len(ports)))
+        _validate_ports(entry, "fullgraph", 128)
+        with self.assertRaises(ValueError):
+            _validate_ports(entry | {"kv_update": "select"}, "fullgraph", 128)
+        entry["outputs"][2]["shape"] = [64, 128, 16]
+        with self.assertRaises(ValueError):
+            _validate_ports(entry, "fullgraph", 128)
+
     def test_continuous_updates_overwrite_boundaries_and_preserve_fp32_bits(self):
         model = helper.make_model(
             helper.make_graph(

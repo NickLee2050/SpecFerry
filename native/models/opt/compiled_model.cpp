@@ -54,6 +54,11 @@ void read_ports(std::istream &file, std::vector<TensorSpec> &ports, std::vector<
 }
 } // namespace
 
+bool CompiledFullModel::current_cache_outputs() const {
+  return output_order.size() > 2 && output_order[2] < output_names.size() &&
+         output_names[output_order[2]] == "layer0.current_key";
+}
+
 void validate_compiled_full_model(const CompiledFullModel &compiled, const WeightStore &weights,
                                   const ModelConfig &config) {
   const auto &decoder = config.decoder;
@@ -72,11 +77,13 @@ void validate_compiled_full_model(const CompiledFullModel &compiled, const Weigh
   std::vector<std::pair<std::string, TensorSpec>> outputs{
       {"logits", {DataType::Float16, {50272, 1}}}, {"selected", {DataType::Int32, {1}}}};
   const TensorSpec cache{DataType::Float32, {64, decoder.capacity, 16}};
+  const bool current = compiled.current_cache_outputs();
+  const TensorSpec output_cache{DataType::Float32, {64, current ? 1u : decoder.capacity, 16}};
   for (unsigned layer = 0; layer < 24; ++layer) {
     for (const std::string part : {"key", "value"}) {
       const auto prefix = "layer" + std::to_string(layer) + ".";
       inputs.push_back({prefix + "past_" + part, cache});
-      outputs.push_back({prefix + "present_" + part, cache});
+      outputs.push_back({prefix + (current ? "current_" : "present_") + part, output_cache});
     }
   }
   const auto validate = [](const auto &ports, const auto &names, const auto &order,

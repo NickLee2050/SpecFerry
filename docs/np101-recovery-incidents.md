@@ -51,6 +51,65 @@
 或出现BUG/Oops等非NP hang故障时立即停止；3次连续失败后转离线分析，不无限重试。
 该约定仅适用于SoC，不修改EP门禁；“偶发/概率性”是操作策略，尚未证明故障根因。
 
+## 10-27 SoC attention布局对照的原图RunGraph故障
+
+证据：`soc-attention-layout-validation-20261027/board-comparison-safe/attempt-1/run/`。
+主机/板卡boot同下项，包摘要
+`68620038beb456f5a75ce0334ea626c08fa7386301d841255c0ec0d7a467da81`。
+已完全移除公开生成的单列产物；仅原已验decoder与标准四列候选，修正了临时夹具异常
+析构顺序。两图Setup/Verify均完成，四列候选尚未执行，不能把本次归因于它的RunGraph。
+
+PID10810于339498.427435启动；原图预热及前两次计时返回0，第四次RunGraph于
+339499.408174进入未返回，339522.356761内核报NP hang。监督器终止，child24.074秒
+exit=−15，未触及120秒期限。该输入集合尚无完整读回/数值结果，所有计时作废。
+SYSTEM/GFP/owner释放回归、45.025秒无进一步故障；保存本次独立marker与新第九条
+精确内核故障，连续hang计1。按SoC常设约定同一已修夹具重试，不改驱动、池或NBG，
+若连续达到3次即停止调查；正确输出不替代资源/内核门禁。
+
+相同产物`attempt-2/run/`重试通过：PID10866于339712.065806启动，child2.964秒exit=0，
+四组输入48次计时/16次预热、hidden/完整KV/未改槽及应用预算归零通过；SYSTEM/GFP/
+owner回归、45.006秒无新增故障，连续hang归零但全部历史marker保留。候选约2.04%
+变化小于基线5.56%漂移，不接整模。该成功不解释首轮hang根因。
+
+## 10-27 SoC attention公开生成NBG导入拒绝与用户态SIGSEGV
+
+证据：`soc-attention-layout-validation-20261027/board-comparison-all/attempt-1/run/`，
+主机boot `c679b4e9-918f-4708-b2f2-2066c36e8703`，板卡boot
+`7013aa1c-2105-4d00-8de1-08aa32569a22`，固定SoC SDK同本页后续记录。
+包摘要`4bdf3c47d955813116d8f6a5605836ead6c2f2c443f4f92e91b63c4afd705eac`。
+对照为已验完整C128第12层decoder、标准导出的Q四列候选，以及未先Verify而由公开
+GenerateNBG生成的单列候选；后者SHA256
+`73827ee3cbaf9163b0d7ff4ce6f75e7edbb34375b9785bf2e57dec595400347c`。
+其容器IO区与基线相同仍不足以证明板端可导入；不得仅凭离线生成成功替换正式模型。
+
+PID10762于339048.513478启动；原图和四列候选的Setup/Verify均完成，第三图在
+339049.651054–339049.652222的vsi_nn_SetupGraph区间报告Create node[0] NBG fail。
+SDK计时只记返回、没有保存返回值；没有第三图Verify或任何RunGraph记录。
+339049.777329内核记录用户态signal11，epc=0x3fb81aecfc、badaddr=0x3fb5913ae8，
+位于libOpenVX；匹配库中epc偏移0x77cfc为vxReleaseKernel+0x8，读取a4+0x1a8，
+与badaddr逐字节对应。故已定位到kernel对象释放时访问失效内存，尚无原进程maps完整
+调用栈；不能证明最初破坏者。这不是内核Oops或NP hang。child1.495秒exit=−11，339049.993306
+释放galcore，SYSTEM122976B、VIRTUAL0、GFP25362432B及owner回归；45.043秒无
+新增NP/EDMA/BUG，所有原始失败与恢复标记保留，不给未完成集合计算性能。
+
+临时夹具还存在确定的异常析构顺序风险：cases中的Graph先声明、Context后声明，
+初始化抛错时会先释放Context，再析构Graph。尚不能仅凭声明顺序确定本次故障指令的
+全部成因。后续仅复用已成功Setup/Verify的标准四列候选，修正夹具为Context owner
+先声明、Graph先析构；不重试单列生成产物、不修改正式模型或SDK私有字段。
+
+## 10-27 SoC整模文件准备期间SD控制器超时
+
+证据：`soc-kv-dataflow-fullmodel-20261027/attempt-1/run/board/`，boot同上。
+PID10561于338264.229052启动，338289.456683出现
+`mmc0: Timeout waiting for hardware interrupt`及SDHCI寄存器转储；首次galcore打开为
+338388.302046，故该事件在文件准备阶段、早于本次NPU Context，不是RunGraph hang。
+后续原生完整文件校验及58项整模验收、释放/45秒检查通过，未报告EIO或新NP/EDMA/BUG；
+只能确认本次消费文件与固定摘要一致，不能证明介质可靠，不能把自动faults为空解释为
+没有SD警告。准备123.769秒较旧记录110.879秒长，但没有单文件IO时间线，不能把全部
+差额归给该超时。按用户既有“权重校验与测试不受影响可继续”的介质边界保留结果；
+记录归入介质风险，遇到摘要不符、EIO、持续新超时或无法正常退出即停测，不混入NP
+hang连续次数。更换介质事项继续保留，不宣称SD已修复。
+
 ## 10-27 SoC十九FFN候选部署摘要拒绝，无NPU提交
 
 证据：`soc-all-prefill-cache-20261027/attempt-1/run/`。主机/板卡boot同下项，

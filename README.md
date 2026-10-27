@@ -146,6 +146,11 @@ broadcast selection in place of ScatterND. It preserves the runtime ports and pa
 mapped-slot writeback above. SoC C64/M1 is validated; the default export remains `scatter` to
 preserve accepted EP configurations. Performance and scope are recorded in the status document.
 
+The SoC optimization `--scope fullgraph --kv-update narrow-select` keeps canonical KV inputs in FP32,
+selects narrowed FP16 values for attention, and publishes only the current FP32 K/V slot. Its package
+requires mapped-slot commits from output slot zero to the requested input position. Decoder packages and
+M16 exports do not support this option; existing export defaults remain unchanged.
+
 ## Prepare and generate
 
 Only pinned `facebook/opt-350m` is enabled for download. The Qwen baseline uses its existing cached

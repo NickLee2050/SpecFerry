@@ -87,6 +87,70 @@ def select_cache_updates(model):
     return model
 
 
+def narrow_cache_selection(model):
+    """Narrow old KV before selection and publish only the FP32 current slots.
+
+    Canonical input state remains FP32. The runtime must commit output slot zero
+    to the requested destination position, preserving every untouched input bit.
+    Only the fixed Select-based decode graph is supported, never M16 prefill.
+    """
+    producers = {value: node for node in model.graph.node for value in node.output}
+    replacements, removed = {}, set()
+    for port in model.graph.output:
+        if not port.name.endswith(("present_key", "present_value")):
+            continue
+        state = port.name
+        selector = producers[state]
+        attention = producers.get(state + "_attention")
+        shape = [dim.dim_value for dim in port.type.tensor_type.shape.dim]
+        if (
+            selector.op_type != "Where"
+            or attention is None
+            or attention.op_type != "Cast"
+            or list(attention.input) != [state]
+            or port.type.tensor_type.elem_type != TensorProto.FLOAT
+            or len(shape) != 3
+            or shape[0] != 16
+            or shape[2] != 64
+        ):
+            raise ValueError("narrow selection requires fixed FP32 OPT decode cache outputs")
+        condition, expanded, old = selector.input
+        column = producers[expanded]
+        wide = producers[column.input[0]]
+        if (
+            column.op_type != "Unsqueeze"
+            or wide.op_type != "Cast"
+            or not any(a.name == "to" and a.i == TensorProto.FLOAT16 for a in attention.attribute)
+            or not any(a.name == "to" and a.i == TensorProto.FLOAT for a in wide.attribute)
+        ):
+            raise ValueError("narrow selection requires explicit FP16-to-FP32 current slots")
+        current = state.rsplit("present_", 1)[0] + "current_" + state.rsplit("_", 1)[1]
+        narrow_old, narrow_column = state + "_old_fp16", state + "_column_fp16"
+        replacements[state] = [
+            helper.make_node("Cast", [old], [narrow_old], to=TensorProto.FLOAT16),
+            helper.make_node("Unsqueeze", [wide.input[0]], [narrow_column], axes=[1]),
+            helper.make_node("Where", [condition, narrow_column, narrow_old], attention.output),
+            helper.make_node("Identity", [expanded], [current]),
+        ]
+        removed.add(attention.output[0])
+        port.CopyFrom(
+            helper.make_tensor_value_info(current, TensorProto.FLOAT, [shape[0], 1, shape[2]])
+        )
+    if not replacements:
+        raise ValueError("no public OPT Select cache outputs found")
+    nodes = []
+    for node in model.graph.node:
+        if node.output[0] in replacements:
+            nodes.extend(replacements[node.output[0]])
+        elif node.output[0] not in removed:
+            nodes.append(node)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    del model.graph.value_info[:]
+    onnx.checker.check_model(model, full_check=True)
+    return model
+
+
 class Graph(OnnxGraph):
     def __init__(self, weights, capacity):
         if capacity not in (64, 128):

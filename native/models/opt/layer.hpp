@@ -67,6 +67,9 @@ struct CompiledFullModel {
   std::vector<std::string> input_names, output_names;
   std::vector<unsigned> input_order, output_order;
   std::map<std::string, std::string> weight_sha256;
+
+  // The package validates every cache output against this fixed port contract.
+  bool current_cache_outputs() const;
 };
 
 struct CompiledModelPackage {

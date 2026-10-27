@@ -698,10 +698,16 @@ struct PartitionedGraphModel::Impl {
     slot_start[1] = position;
     slot_end[1] = position + 1;
     auto &graph = cache_storage();
+    auto source_start = slot_start;
+    auto source_end = slot_end;
+    if (compiled_full_model.current_cache_outputs()) {
+      source_start[1] = 0;
+      source_end[1] = 1;
+    }
     // RunGraph has completed synchronously. Each map is unmapped before the
     // next operation; failure leaves consume() unusable with no position advance.
     for (std::size_t index = 0; index < cache_tensors.size(); ++index) {
-      read_tensor_region_into(graph, mapped_cache_outputs.at(index).id, slot_start, slot_end,
+      read_tensor_region_into(graph, mapped_cache_outputs.at(index).id, source_start, source_end,
                               cache_slot);
       upload_tensor_region(graph, cache_tensors[index].id, slot_start, slot_end, cache_slot);
     }
@@ -997,6 +1003,9 @@ PartitionedGraphModel::PartitionedGraphModel(
           "compiled full OPT requires its embedded head and explicit prefill");
     }
     validate_compiled_full_model(compiled_full_model, weights, config);
+    if (compiled_full_model.current_cache_outputs() && kv_transfer != KvTransfer::MappedSlot) {
+      throw std::invalid_argument("current-slot OPT outputs require mapped-slot KV commits");
+    }
     std::size_t constants = compiled_full_model.graph.constant_bytes;
     if (!compiled_prefill_layers.empty() && !compiled_prefill_ffn.empty()) {
       throw std::invalid_argument("select one full-model prefill artifact contract");
