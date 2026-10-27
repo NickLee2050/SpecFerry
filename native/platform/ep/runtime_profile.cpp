@@ -5,6 +5,8 @@
 #include <string>
 
 namespace specferry::platform {
+unsigned pointwise_prefill_layers(unsigned) { return 0; }
+
 const RuntimeProfile &runtime_profile() {
   static const RuntimeProfile profile{"ep", "x86_64", "F53A3E6EFBB7D0FD7D4617C",
                                       "/usr/lib/ljmicro"};

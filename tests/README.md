@@ -16,7 +16,7 @@ python scripts/format_cpp.py --check
 
 Python covers source/package identity, generation policy/counts, numerical/state acceptance,
 port permutations, memory budgets and device/recovery guards with mocked device calls.
-The four native CTest cases have `unit;cpu` and target labels and never open NP101. The data
+The five native CTest cases have `unit;cpu` and target labels and never open NP101. The data
 contract also checks that foreign-platform packages fail before driver inspection. Device tests
 are explicit. Cross-builds produce test binaries but do not register them with host CTest.
 The pinned x86 Verify tracing library is built only for EP.
@@ -48,6 +48,19 @@ opening a device. SSH failure alone never authorizes another model submission.
 Shared prefill acceptance additionally checks the declared input-cache policy and reduced transfer
 counts; older records retain independent-cache accounting. Current shared-input hardware evidence
 covers C128 long/short reset requests; capacity and stability limits remain in the status document.
+
+An optional SoC cache package selects twelve or nineteen batch-convolution FFNs; an ordinary package keeps
+the accepted four-layer prefix. After preparing a bundle, attach existing accepted caches with
+`package_np101_opt_verify_cache.py --source SOURCE --deployment BUNDLE/weights
+--package BUNDLE/model --consumer BUNDLE/bin/specferry_opt_graph_generate`, then deploy it.
+The default remains twelve; append `--layers 19` for the accepted full prefix. Both use the
+complete 24-layer model; this number selects only the ordinary M16 FFN implementation.
+The source manifest pins successful numerical/health evidence, the producer, all six FFN weights,
+the recipe and SDK. Runtime also pins the consumer and rejects cache misses or changed files.
+Cached Verify is serial, after all bindings and ordinary compilation; a prepared ordinary graph
+refreshes the SDK's retained cache policy before model execution/release. This uses no private
+Context writes or weight reclassification. Cache generation is separate from warm-cache startup;
+neither belongs in inference throughput. The CPU layout test checks file/size/symlink isolation.
 
 The retired standalone KV transfer experiment is archived outside the source tree. Its maintained
 replacement is the formal OPT entry: one resident Context processes long/short/repeated-long reset

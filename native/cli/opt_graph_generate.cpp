@@ -377,6 +377,9 @@ int main(int argc, char **argv) {
         : variant == PartitionedModel::Variant::CompiledDecoder   ? "nbg-decoder"
         : variant == PartitionedModel::Variant::CompiledFullModel ? "nbg-fullgraph"
                                                                   : "matmul";
+    const auto cached_prefill_ffns =
+        std::count_if(compiled_prefill_layers.begin(), compiled_prefill_layers.end(),
+                      [](const auto &layer) { return layer.verify_cache.has_value(); });
     const auto preparation =
         std::chrono::duration<double>(Clock::now() - preparation_started).count();
     fs::create_directories(directory);
@@ -423,6 +426,8 @@ int main(int argc, char **argv) {
                     << ",\"head_backend\":\"" << head_backend << "\""
                     << ",\"attention_projection_backend\":\"" << projection_backend << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
+                    << ",\"verified_prefill_cache_layers\":" << cached_prefill_ffns
+                    << ",\"initialization_ffn_warmups\":" << cached_prefill_ffns
                     << ",\"decode_steps\":" << model.decode_steps()
                     << ",\"prefill_steps\":" << model.prefill_steps()
                     << ",\"head_runs\":" << model.head_runs()

@@ -84,8 +84,13 @@ python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/o
 `run` accepts fullgraph C64/C128, mapped-slot KV, independent reset requests and no Context
 rebuild. Optional block16 prefill uses `prepare --prefill-package` and request options
 `block 16`, `prefill_head last-token`. The original handwritten-attention/MLP-NBG candidate failed
-Linux memory acceptance. The compiled-attention path uses nineteen
-shared ordinary-weight FCL FFNs and five full decoder NBGs. FCL also replaces the M16 input
+Linux memory acceptance. The compiled-attention path uses nineteen shared ordinary-weight FFNs
+and five full decoder NBGs. SoC packages use batch-axis convolution for the first four FFNs;
+an optional verified cache package extends that prefix to twelve or all nineteen
+(`package_np101_opt_verify_cache.py --layers 19`), with FCL for any remainder.
+The cache packager, pinned identities and lifecycle boundary are described in
+[validation](tests/README.md#soc-formal-generation); EP selection is unchanged.
+FCL also replaces the M16 input
 projection, avoiding numerical errors observed in the original MatMul path. Three reset requests
 with 17/49/17 input tokens and 16 outputs each passed the original C64 independent-cache checks.
 Compiled-attention prefill now retains M1's FP32 input KV, with separate NBG outputs and block

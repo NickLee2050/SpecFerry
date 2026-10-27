@@ -19,6 +19,7 @@ STATE = Path("/root/specferry-soc")
 SDK = Path("/np101_driver/build/sdk/drivers")
 DELAY_SECONDS = 45
 RESERVE_KIB = 192 * 1024
+HANG_FAILURE_LIMIT = 3
 
 
 def read_json(path):
@@ -169,6 +170,8 @@ def supervise(command, cwd, environment, output, timeout, monitor):
     result = {
         "child_start_monotonic_seconds": started,
         "child_start_wall_seconds": time.time(),
+        "child_started": False,
+        "remaining_processes": [],
         "actions": [],
         "stop_reason": None,
     }
@@ -193,6 +196,7 @@ def supervise(command, cwd, environment, output, timeout, monitor):
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            result["child_started"] = True
             result["child_pid"] = child.pid
             save(output / "child.json", result)
             # A driver debugfs read can itself block. The deadline must not depend
@@ -234,8 +238,83 @@ def native_complete(output):
     )
 
 
+def recorded_hang(line, *, raw=False):
+    """Match the pinned driver's exact event, including its kernel timestamp."""
+    stamp = r"\d+,\d+,(\d+),[^;]*;" if raw else r"\[\s*(\d+)\.(\d{6})\]\s*"
+    match = (
+        re.fullmatch(stamp + r"(\[galcore\]: NP\[\d+\] hang, automatic recovery\.)", line)
+        if isinstance(line, str)
+        else None
+    )
+    if match is None:
+        raise RuntimeError("bounded SoC retry only accepts recorded NP hang events")
+    micros = int(match[1]) if raw else int(match[1]) * 1_000_000 + int(match[2])
+    return micros, match[2 if raw else 3]
+
+
+def hang_retry_state(previous, diagnostic, digest, boot_id):
+    policy = diagnostic.get("soc_hang_retry")
+    if policy is None:
+        return None
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != {"first_failed_marker_sha256"}
+        or not re.fullmatch(r"[0-9a-f]{64}", str(policy["first_failed_marker_sha256"]))
+        or not diagnostic.get("authorization")
+    ):
+        raise RuntimeError("bounded SoC retry requires an explicit immutable fault-chain anchor")
+    earlier = previous.get("diagnostic", {}).get("kernel_faults", [])
+    faults, kernel_faults = previous.get("faults"), previous.get("kernel_faults")
+    if not all(isinstance(value, list) for value in (earlier, faults, kernel_faults)):
+        raise RuntimeError("bounded SoC retry requires complete fault records")
+    baseline = earlier + kernel_faults
+    if not baseline or diagnostic.get("kernel_faults") != baseline:
+        raise RuntimeError("bounded SoC retry requires the exact complete historical baseline")
+    for line in baseline:
+        recorded_hang(line)
+    # /dev/kmsg and dmesg name the same occurrence using different timestamp formats.
+    if Counter(recorded_hang(line, raw=True) for line in faults) - Counter(
+        recorded_hang(line) for line in kernel_faults
+    ):
+        raise RuntimeError("raw NP hang events are absent from the timestamped baseline")
+    anchor = policy["first_failed_marker_sha256"]
+    inherited = previous.get("soc_hang_retry")
+    if inherited is None:
+        if anchor != digest or not kernel_faults:
+            raise RuntimeError("the initial retry must anchor the recorded failed run")
+        failures = 1
+    else:
+        if not isinstance(inherited, dict) or inherited.get("first_failed_marker_sha256") != anchor:
+            raise RuntimeError("changing the experiment name cannot reset its NP hang counter")
+        failures = inherited.get("consecutive_hang_runs")
+        if type(failures) is not int or failures < 0:
+            raise RuntimeError("invalid persisted NP hang counter")
+    accepted = STATE / "soc-hang-retry-accepted.json"
+    if accepted.exists():
+        record = read_json(accepted)
+        if (
+            record.get("board_boot_id") == boot_id
+            and record.get("first_failed_marker_sha256") == anchor
+            and record.get("restored_marker_sha256") == digest
+        ):
+            result_path = Path(record["result_path"])
+            result = read_json(result_path)
+            if (
+                sha256(result_path) != record.get("result_sha256")
+                or result.get("clean") is not True
+                or result.get("board_boot_id") != boot_id
+                or result.get("diagnostic", {}).get("board_marker_sha256") != digest
+                or result.get("soc_hang_retry", {}).get("first_failed_marker_sha256") != anchor
+            ):
+                raise RuntimeError("accepted NP hang retry evidence differs")
+            failures = 0
+    if failures >= HANG_FAILURE_LIMIT:
+        raise RuntimeError("three consecutive NP hang runs require a changed approach")
+    return {"first_failed_marker_sha256": anchor, "consecutive_hang_runs": failures}
+
+
 def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
-    """Preserve a fully released non-device failure; never clear an older gate."""
+    """Preserve released failures, with explicit bounded SoC NP hang retries."""
     expected = diagnostic.get("board_marker_sha256") if diagnostic else None
     if not marker.exists():
         if expected is not None:
@@ -249,12 +328,12 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
         raise RuntimeError("diagnostic board marker hash does not match")
     previous = json.loads(original)
     delayed = previous.get("delayed_seconds")
+    retry = hang_retry_state(previous, diagnostic, digest, boot_id)
     if (
         previous.get("board_boot_id") != boot_id
-        or any(
-            previous.get(name) != []
-            for name in ("faults", "kernel_faults", "remaining_processes", "owners_delayed")
-        )
+        or (retry is None and any(previous.get(name) != [] for name in ("faults", "kernel_faults")))
+        or any(previous.get(name) != [] for name in ("remaining_processes", "owners_delayed"))
+        or previous.get("delayed_faults", []) != []
         or previous.get("pool_released") is not True
         or previous.get("gfp_released") is not True
         or type(delayed) not in (int, float)
@@ -265,7 +344,10 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
         raise RuntimeError("board marker does not establish fault-free release and delayed checks")
     retained = output / "retained-prior-board-marker.json"
     retained.write_bytes(original)
-    return {"path": str(retained), "sha256": digest}
+    result = {"path": str(retained), "sha256": digest}
+    if retry is not None:
+        result["soc_hang_retry"] = retry
+    return result
 
 
 def run(root, output, timeout, diagnostic=None):
@@ -308,6 +390,8 @@ def run(root, output, timeout, diagnostic=None):
             result["diagnostic"] = diagnostic
         retained = retain_diagnostic_marker(marker, output, diagnostic, result["board_boot_id"])
         if retained is not None:
+            if "soc_hang_retry" in retained:
+                result["soc_hang_retry"] = retained.pop("soc_hang_retry")
             result["retained_prior_board_marker"] = retained
         if new_faults(kernel(output, "kernel-before.log"), fault, acknowledged) or owners():
             raise RuntimeError("kernel fault or existing galcore owner")
@@ -401,6 +485,7 @@ def run(root, output, timeout, diagnostic=None):
             result.update(read_json(output / "child.json"))
     finally:
         if result["child_started"]:
+            faults_before_delay = len(result["faults"])
             delayed = time.monotonic()
             while time.monotonic() - delayed < DELAY_SECONDS:
                 try:
@@ -409,9 +494,17 @@ def run(root, output, timeout, diagnostic=None):
                     result["monitor_error"] = str(error)
                 time.sleep(0.1)
             result["delayed_seconds"] = time.monotonic() - delayed
+            result["delayed_faults"] = result["faults"][faults_before_delay:]
         try:
             final = kernel(output, "kernel-delayed.log")
             result["kernel_faults"] = new_faults(final, fault, acknowledged) if fault else []
+            if (
+                result["child_started"]
+                and result.get("soc_hang_retry")
+                and (result["faults"] or result["kernel_faults"])
+            ):
+                # One failed run counts once, regardless of duplicate or multiple log events.
+                result["soc_hang_retry"]["consecutive_hang_runs"] += 1
             result["after"] = snapshot()
             result["owners_delayed"] = owners()
             result["pool_released"] = bool(
@@ -491,6 +584,19 @@ def accept(output, expected_digest):
         temporary = marker.with_suffix(marker.suffix + ".tmp")
         temporary.write_bytes(retained_bytes)
         temporary.replace(marker)
+        retry = result.get("soc_hang_retry")
+        if retry is not None:
+            # A numerically accepted run breaks the streak without clearing its old gate.
+            save(
+                STATE / "soc-hang-retry-accepted.json",
+                dict(
+                    board_boot_id=result["board_boot_id"],
+                    first_failed_marker_sha256=retry["first_failed_marker_sha256"],
+                    restored_marker_sha256=retained_digest,
+                    result_path=str(output / "result.json"),
+                    result_sha256=expected_digest,
+                ),
+            )
 
 
 def main():

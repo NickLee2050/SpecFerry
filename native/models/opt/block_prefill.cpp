@@ -4,6 +4,7 @@
 #include "np101/ops/mixers.hpp"
 #include "np101/ops/vocabulary.hpp"
 #include "np101/weight_bank.hpp"
+#include "platform/runtime_profile.hpp"
 #include "vsi_nn_pub.h"
 
 #include <algorithm>
@@ -21,14 +22,24 @@ namespace {
 constexpr auto f16 = DataType::Float16;
 constexpr unsigned block = 16, ordinary_layers = 6;
 
+TensorSpec projection_weight_spec(const WeightRecord &matrix, bool pointwise) {
+  if (pointwise) {
+    return {f16, {1, 1, matrix.spec.shape.at(0), matrix.spec.shape.at(1)}};
+  }
+  return matrix.spec;
+}
+
 Tensor shared_linear(GraphBuilder &builder, const WeightStore &weights, Tensor input,
-                     const std::string &prefix) {
+                     const std::string &prefix, bool pointwise) {
   const auto &matrix = weights.find(prefix + ".weight");
   const auto &bias = weights.find(prefix + ".bias");
   // WeightBank owns ordinary backing that remains read-only for the graph lifetime.
-  // FCL avoids the observed M16 MatMul error without duplicating constant weights.
-  const auto projected =
-      builder.fully_connected(input, builder.weight(weights, matrix, matrix.spec), true);
+  // Native 4D weight shape matches preloading: reshaping a second bank entry would
+  // duplicate backing because WeightBank keys include the requested tensor shape.
+  const auto kernel =
+      builder.weight_chunk(weights, matrix, projection_weight_spec(matrix, pointwise), 0);
+  const auto projected = pointwise ? builder.batch_pointwise_projection(input, kernel)
+                                   : builder.fully_connected(input, kernel, true);
   return builder.binary(VSI_NN_OP_ADD, projected, builder.weight(weights, bias, bias.spec));
 }
 
@@ -173,11 +184,32 @@ struct BlockPrefill::Impl {
     compiled_attention = true;
     shared_decode_cache = !shared_cache.empty();
     const auto &decoder = config.decoder;
+    const auto cached_layers =
+        std::count_if(artifacts.begin(), artifacts.end(),
+                      [](const auto &artifact) { return artifact.verify_cache.has_value(); });
+    const bool cached = cached_layers != 0;
+    const auto pointwise_layers = platform::pointwise_prefill_layers(cached_layers);
+    for (const auto &artifact : artifacts) {
+      if (artifact.verify_cache.has_value() != (cached && artifact.layer < pointwise_layers)) {
+        throw std::invalid_argument("prefill cache selection must cover the complete fast prefix");
+      }
+    }
+    auto cache_session = cached ? std::make_unique<GraphCacheSession>(context) : nullptr;
+
+    struct PendingCache {
+      GraphBuilder *builder;
+      Tensor input;
+      const VerifiedGraphCache *cache;
+      std::string role;
+    };
+
+    std::vector<PendingCache> pending;
     for (const auto &artifact : artifacts) {
       if (!artifact.full_decoder) {
         const SdkScope timing_role("role", "block16.preload");
         const auto &matrix = weights.find(decoder.prefix(artifact.layer) + "fc2.weight");
-        bank.preload(weights, matrix, matrix.spec);
+        bank.preload(weights, matrix,
+                     projection_weight_spec(matrix, artifact.layer < pointwise_layers));
       }
     }
     const TensorSpec state{DataType::Float32, {64, decoder.capacity, decoder.heads}};
@@ -197,14 +229,21 @@ struct BlockPrefill::Impl {
     block_index = {add_tensor(cache, index_spec), index_spec};
     attention_mask = {add_tensor(cache, mask_spec), mask_spec};
     const auto compile = [&](std::unique_ptr<GraphBuilder> graph, const std::string &role,
-                             const std::vector<Tensor> &inputs,
-                             const std::vector<Tensor> &outputs) {
+                             const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs,
+                             const VerifiedGraphCache *verified = nullptr) {
       const SdkScope timing_role("role", "block16." + role);
       if (phase) {
         phase("setup.prefill16." + role);
       }
       try {
-        graph->compile(inputs, outputs);
+        if (verified) {
+          // Setup must finish before the next attention graph retains this output.
+          // Defer only OpenVX Verify, which preserves the public tensor references.
+          graph->setup(inputs, outputs);
+          pending.push_back({graph.get(), inputs.front(), verified, role});
+        } else {
+          graph->compile(inputs, outputs);
+        }
       } catch (const std::exception &error) {
         throw std::runtime_error("compile OPT prefill " + role + ": " + error.what());
       }
@@ -240,12 +279,37 @@ struct BlockPrefill::Impl {
               "set compiled-attention prefill FFN version");
         const auto normalized = ffn->share(*stages.back().builder, hidden);
         const auto prefix = decoder.prefix(layer);
-        auto mlp = shared_linear(*ffn, weights, normalized, prefix + "fc1");
+        const auto pointwise = layer < pointwise_layers;
+        auto mlp = shared_linear(*ffn, weights, normalized, prefix + "fc1", pointwise);
         mlp = ffn->unary(VSI_NN_OP_RELU, mlp, f16);
-        mlp = shared_linear(*ffn, weights, mlp, prefix + "fc2");
+        mlp = shared_linear(*ffn, weights, mlp, prefix + "fc2", pointwise);
         hidden = build_ffn_finish(*ffn, weights, decoder, layer, normalized, mlp).output;
-        compile(std::move(ffn), role + ".ordinary_ffn", {normalized}, {hidden});
+        compile(std::move(ffn), role + ".ordinary_ffn", {normalized}, {hidden},
+                artifact.verify_cache ? &*artifact.verify_cache : nullptr);
       }
+    }
+    // All graph construction, NBG parameter binding and noncached Verify finish while
+    // the Context cache flag is still disabled. No graph parameters change afterwards.
+    const std::vector<std::uint8_t> warmup_input(std::size_t(decoder.hidden) * block * 2);
+    for (const auto &entry : pending) {
+      if (phase) {
+        phase("verify.prefill16." + entry.role + ".cache");
+      }
+      cache_session->verify(*entry.builder, *entry.cache);
+      // These are temporary hidden tensors, never canonical KV. Producers overwrite
+      // them during inference. Warm once now to release pending SDK import temporaries.
+      upload_tensor_region(entry.builder->graph, entry.input.id, {0, 0}, {decoder.hidden, block},
+                           warmup_input);
+      if (phase) {
+        phase("warmup.prefill16." + entry.role);
+      }
+      check(vsi_nn_RunGraph(entry.builder->graph.get()), "cached prefill FFN warmup");
+    }
+    if (cache_session) {
+      if (phase) {
+        phase("verify.prefill16.restore-cache-policy");
+      }
+      cache_session->close();
     }
   }
 

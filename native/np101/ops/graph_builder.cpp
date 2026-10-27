@@ -277,6 +277,49 @@ Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutabl
   return output;
 }
 
+Tensor GraphBuilder::batch_pointwise_projection(Tensor input, Tensor weights) {
+  const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
+  if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
+      input.spec.shape[1] != 16 || weights.spec.shape.size() != 4 || weights.spec.shape[0] != 1 ||
+      weights.spec.shape[1] != 1 || weights.spec.shape[2] != input.spec.shape[0] ||
+      !weights.spec.shape[3] || !weight_tensor || weight_tensor->attr.vtl ||
+      weight_tensor->attr.is_const) {
+    throw std::invalid_argument(
+        "batch pointwise projection requires FP16 [K,16] and ordinary [1,1,K,N] weights");
+  }
+  const auto channels = input.spec.shape[0], rows = weights.spec.shape[3];
+  const auto data = reshape(input, {1, 1, channels, 16});
+  const auto output = tensor({f16, {1, 1, rows, 16}});
+  auto *operation = sdk_call("vsi_nn_AddNode", [&] {
+    return vsi_nn_AddNode(graph.get(), VSI_NN_OP_CONV2D, 3, 1, nullptr);
+  });
+  if (!operation || !operation->input.tensors || operation->input.num != 3 ||
+      !operation->output.tensors || operation->output.num != 1) {
+    throw std::runtime_error("AddNode failed for batch pointwise projection");
+  }
+  operation->input.tensors[0] = data.id;
+  operation->input.tensors[1] = weights.id;
+  operation->input.tensors[2] = VSI_NN_TENSOR_ID_NA;
+  operation->output.tensors[0] = output.id;
+  operation->nn_param.conv2d.ksize[0] = 1;
+  operation->nn_param.conv2d.ksize[1] = 1;
+  operation->nn_param.conv2d.stride[0] = 1;
+  operation->nn_param.conv2d.stride[1] = 1;
+  for (auto &padding : operation->nn_param.conv2d.pad) {
+    padding = 0;
+  }
+  operation->nn_param.conv2d.pad_type = VSI_NN_PAD_VALID;
+  operation->nn_param.conv2d.weights = rows;
+  operation->nn_param.conv2d.group = 1;
+  operation->nn_param.conv2d.dilation[0] = 1;
+  operation->nn_param.conv2d.dilation[1] = 1;
+  operation->nn_param.conv2d.multiplier = 0;
+  operation->vx_param.overflow_policy = VX_CONVERT_POLICY_SATURATE;
+  operation->vx_param.rounding_policy = VX_ROUND_POLICY_TO_NEAREST_EVEN;
+  operation->vx_param.down_scale_size_rounding = VX_CONVOLUTIONAL_NETWORK_DS_SIZE_ROUNDING_FLOOR;
+  return reshape(output, {rows, 16});
+}
+
 Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const WeightRecord &record,
                              LinearBackend backend) {
   if (input.spec.shape.size() != 2 || !input.spec.shape[1] || record.spec.shape.size() != 2 ||
@@ -471,7 +514,7 @@ Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float s
   return convert(binary(VSI_NN_OP_MULTIPLY, normalized, reshape(multiplier, shape)), output_type);
 }
 
-void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
+void GraphBuilder::setup(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
   input_ids_.clear();
   output_ids_.clear();
   for (const auto &input : inputs) {
@@ -487,7 +530,15 @@ void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<
   }
   check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
         "SetupGraph");
+}
+
+void GraphBuilder::verify() {
   check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(graph.get()); }),
         "VerifyGraph");
+}
+
+void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
+  setup(inputs, outputs);
+  verify();
 }
 } // namespace specferry::np101::ops

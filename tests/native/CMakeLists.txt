@@ -50,3 +50,4 @@ specferry_cpu_test(np101_data_test np101/data_test.cpp np101_data_contract np101
 specferry_cpu_test(generation_test generation_test.cpp autoregressive_generation_contract specferry_generation)
 specferry_cpu_test(diagnostics_test diagnostics_test.cpp sdk_timing_contract specferry_generation)
 specferry_cpu_test(memory_budget_test memory_budget_test.cpp segmented_memory_budget np101_data)
+specferry_cpu_test(graph_cache_test graph_cache_test.cpp verified_graph_cache_layout np101_ops)

@@ -60,7 +60,7 @@ add_library(qwen_data native/models/qwen3_5/config.cpp)
 target_link_libraries(qwen_data PUBLIC np101_data)
 target_compile_options(qwen_data PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_ops native/np101/ops/graph_builder.cpp native/np101/ops/mixers.cpp
+add_library(np101_ops native/np101/ops/graph_builder.cpp native/np101/ops/graph_cache.cpp native/np101/ops/mixers.cpp
   native/np101/ops/vocabulary.cpp native/np101/ops/cache_update.cpp)
 target_link_libraries(np101_ops PUBLIC np101_context)
 target_compile_options(np101_ops PRIVATE -Wall -Wextra -Wpedantic)
@@ -99,7 +99,8 @@ set_target_properties(specferry_qwen_generate PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 
 add_library(np101_opt_decoder native/models/opt/decoder.cpp native/models/opt/model.cpp
   native/models/opt/layer.cpp native/models/opt/compiled_model.cpp
-  native/models/opt/partitioned_graph_model.cpp native/models/opt/block_prefill.cpp)
+  native/models/opt/partitioned_graph_model.cpp native/models/opt/block_prefill.cpp
+  native/models/opt/prefill_graph_cache.cpp)
 target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data specferry_generation)
 target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
 

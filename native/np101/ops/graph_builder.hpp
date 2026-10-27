@@ -77,6 +77,9 @@ public:
   // Static FP16 [K,N] weights, no fused bias/activation. Shared ordinary weights
   // require explicit opt-in and must remain unchanged for the graph's lifetime.
   Tensor fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights = false);
+  // M16 FP16 [K,16] projection through 1x1 convolution, with ordinary read-only
+  // shared backing in [1,1,K,N]. Bias remains a separate FP16 operation.
+  Tensor batch_pointwise_projection(Tensor input, Tensor weights);
   Tensor gather(Tensor input, Tensor indices, unsigned axis);
   Tensor argmax(Tensor input, unsigned axis);
   Tensor integer(std::int32_t value);
@@ -94,6 +97,9 @@ public:
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);
   Tensor rms_norm(Tensor input, Tensor scale, float epsilon, float scale_offset,
                   DataType output_type);
+  // Setup fixes the public tensor handles before another graph binds them.
+  void setup(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs);
+  void verify();
   void compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs);
 };
 } // namespace specferry::np101::ops

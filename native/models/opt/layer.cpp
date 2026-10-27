@@ -1,4 +1,5 @@
 #include "models/opt/layer.hpp"
+#include "models/opt/prefill_graph_cache.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/sdk_identity.hpp"
 #include "vsi_nn_pub.h"
@@ -307,6 +308,7 @@ load_compiled_block_prefill(const std::filesystem::path &package,
     throw std::invalid_argument("trailing compiled block prefill data");
   }
   verify_files(checksums);
+  attach_prefill_graph_caches(root, config, weights, result);
   return result;
 }
 

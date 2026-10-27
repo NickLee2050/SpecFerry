@@ -4,6 +4,13 @@
 #include <stdexcept>
 
 namespace specferry::platform {
+unsigned pointwise_prefill_layers(unsigned verified_cache_layers) {
+  if (verified_cache_layers != 0 && verified_cache_layers != 12 && verified_cache_layers != 19) {
+    throw std::invalid_argument("unsupported SoC prefill cache prefix");
+  }
+  return verified_cache_layers ? verified_cache_layers : 4;
+}
+
 const RuntimeProfile &runtime_profile() {
   static const RuntimeProfile profile{"soc", "riscv64", "np101-soc-riscv64",
                                       "/np101_driver/build/sdk/drivers"};

@@ -2,10 +2,12 @@
 
 #include "models/opt/config.hpp"
 #include "np101/ops/graph_builder.hpp"
+#include "np101/ops/graph_cache.hpp"
 
 #include <array>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,7 @@ struct CompiledPrefillLayer {
   np101::ops::CompiledGraphSpec graph;
   unsigned layer = 0;
   bool full_decoder = false;
+  std::optional<np101::ops::VerifiedGraphCache> verify_cache;
 };
 
 std::vector<CompiledPrefillLayer>

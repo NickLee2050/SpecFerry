@@ -112,6 +112,163 @@ class SocTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing"):
             board.retain_diagnostic_marker(marker, output, authorization, previous["board_boot_id"])
 
+    def released_hang_marker(self):
+        # Same raw-kmsg/dmesg structure as the released SoC decoder incident.
+        older = "[236364.592740] [galcore]: NP[0] hang, automatic recovery."
+        current = "[242641.712739] [galcore]: NP[0] hang, automatic recovery."
+        previous = self.released_board_marker() | {
+            "diagnostic": {"kernel_faults": [older]},
+            "faults": ["4,439,242641712739,-;[galcore]: NP[0] hang, automatic recovery."],
+            "kernel_faults": [current],
+            "stop_reason": "kernel fault",
+        }
+        return previous, [older, current]
+
+    def test_bounded_hang_retry_requires_exact_events_and_complete_release(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "marker.json", self.root / "run"
+        output.mkdir()
+        board.save(marker, previous)
+        digest = board.sha256(marker)
+        diagnostic = {
+            "board_marker_sha256": digest,
+            "authorization": "bounded SoC NP hang retry",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with patch.object(board, "STATE", self.root):
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 1)
+            self.assertEqual(
+                (output / "retained-prior-board-marker.json").read_bytes(), marker.read_bytes()
+            )
+            for change in (
+                {"kernel_faults": baseline[:-1]},
+                {"kernel_faults": baseline + [baseline[-1]]},
+                {"authorization": ""},
+                {"soc_hang_retry": {"first_failed_marker_sha256": "0" * 64}},
+                {
+                    "soc_hang_retry": {
+                        "first_failed_marker_sha256": digest,
+                        "consecutive_hang_runs": 0,
+                    }
+                },
+            ):
+                with self.subTest(change=change), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, diagnostic | change, previous["board_boot_id"]
+                    )
+            for change in (
+                {"faults": ["4,439,242641712738,-;[galcore]: NP[0] hang, automatic recovery."]},
+                {"faults": ["4,439,242641712739,-;EDMA timeout"]},
+                {"kernel_faults": ["[242641.712739] BUG: invalid memory"]},
+                {"pool_released": False},
+                {"gfp_released": False},
+                {"owners_delayed": [7]},
+                {"remaining_processes": [7]},
+                {"delayed_seconds": 44.9},
+                {"delayed_faults": [baseline[-1]]},
+                {"monitor_error": "lost kernel events"},
+                {"final_check_error": "cannot read kernel"},
+                {"board_boot_id": "other"},
+            ):
+                altered = previous | change
+                board.save(marker, altered)
+                current_digest = board.sha256(marker)
+                authorization = diagnostic | {
+                    "board_marker_sha256": current_digest,
+                    "soc_hang_retry": {"first_failed_marker_sha256": current_digest},
+                    "kernel_faults": altered["diagnostic"]["kernel_faults"]
+                    + altered["kernel_faults"],
+                }
+                with self.subTest(change=change), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, authorization, previous["board_boot_id"]
+                    )
+
+    def test_hang_retry_counter_cannot_be_reset_by_renaming_or_retiming(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "marker.json", self.root / "run"
+        output.mkdir()
+        anchor = "a" * 64
+        previous["soc_hang_retry"] = {
+            "first_failed_marker_sha256": anchor,
+            "consecutive_hang_runs": 2,
+        }
+        diagnostic = {
+            "authorization": "bounded retry with changed benchmark labels/timing",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": anchor},
+            "bundle_sha256": "b" * 64,
+            "timeout": 120,
+        }
+        with patch.object(board, "STATE", self.root):
+            board.save(marker, previous)
+            diagnostic["board_marker_sha256"] = board.sha256(marker)
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 2)
+            for count in (3, 4, None, True, -1):
+                previous["soc_hang_retry"]["consecutive_hang_runs"] = count
+                board.save(marker, previous)
+                diagnostic["board_marker_sha256"] = board.sha256(marker)
+                with self.subTest(count=count), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, diagnostic, previous["board_boot_id"]
+                    )
+            previous["soc_hang_retry"]["consecutive_hang_runs"] = 2
+            board.save(marker, previous)
+            diagnostic["board_marker_sha256"] = board.sha256(marker)
+            diagnostic["soc_hang_retry"]["first_failed_marker_sha256"] = board.sha256(marker)
+            with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                board.retain_diagnostic_marker(
+                    marker, output, diagnostic, previous["board_boot_id"]
+                )
+
+    def test_accepted_hang_retry_resets_streak_without_clearing_prior_marker(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "np101-recovery-required.json", self.root / "run"
+        output.mkdir()
+        board.save(marker, previous)
+        original, digest = marker.read_bytes(), board.sha256(marker)
+        diagnostic = {
+            "board_marker_sha256": digest,
+            "authorization": "bounded SoC retry",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "kernel", return_value="\n".join(baseline)),
+        ):
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            result = {
+                "clean": True,
+                "board_boot_id": previous["board_boot_id"],
+                "fault_pattern": "hang",
+                "diagnostic": diagnostic,
+                "soc_hang_retry": retained["soc_hang_retry"],
+            }
+            board.save(output / "result.json", result)
+            board.save(marker, {"output": str(output)})
+            board.accept(output, board.sha256(output / "result.json"))
+            self.assertEqual(marker.read_bytes(), original)
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 0)
+            board.save(output / "result.json", result | {"clean": False})
+            with self.assertRaisesRegex(RuntimeError, "accepted NP hang retry evidence differs"):
+                board.retain_diagnostic_marker(
+                    marker, output, diagnostic, previous["board_boot_id"]
+                )
+
     def test_failed_board_diagnostic_preserves_previous_marker_and_evidence_chain(self):
         marker = self.root / "np101-recovery-required.json"
         previous = self.released_board_marker()
@@ -299,6 +456,16 @@ class SocTests(unittest.TestCase):
         result = board.read_json(self.root / "child.json")
         self.assertLess(result["exit"], 0)
         self.assertEqual(result["remaining_processes"], [])
+
+    def test_spawn_failure_records_that_no_child_or_resources_were_created(self):
+        with patch.object(board.subprocess, "Popen", side_effect=FileNotFoundError("cwd")):
+            with self.assertRaises(FileNotFoundError):
+                self.supervise("pass")
+        result = board.read_json(self.root / "child.json")
+        self.assertFalse(result["child_started"])
+        self.assertEqual(result["remaining_processes"], [])
+        self.assertEqual(result["actions"], [])
+        self.assertNotIn("child_pid", result)
 
     def test_clean_exit_and_deadline_limit(self):
         self.assertEqual(self.supervise("print('finished')")["exit"], 0)
