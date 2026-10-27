@@ -119,6 +119,21 @@ class ExternalProposerTests(unittest.TestCase):
             finally:
                 baseline.close()
 
+    def test_optional_remote_timings_are_audited_without_changing_drafts(self):
+        self.mode('all_accept', timing_override={
+            'draft_seconds': .25, 'synchronization_seconds': .1, 'server_seconds': .4})
+        self.assertEqual(self.call(), [[12,13,14,15]])
+        row=json.loads((self.root/'audit.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(row['reported_dlm_timing']['draft_seconds'], .25)
+        self.assertGreater(row['request_bytes'], 0)
+        self.assertGreaterEqual(row['prepare_seconds'], 0)
+        self.assertGreaterEqual(row['response_validation_seconds'], 0)
+        self.mode('all_accept', timing_override={
+            'draft_seconds': -1, 'synchronization_seconds': True, 'server_seconds': 'wrong'})
+        self.assertEqual(self.call(), [[12,13,14,15]])
+        row=json.loads((self.root/'audit.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(row['reported_dlm_timing'], {})
+
 
 if __name__ == '__main__':
     unittest.main()

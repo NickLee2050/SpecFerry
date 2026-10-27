@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -202,7 +203,11 @@ public:
       std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(raw_headers,
                                                                           curl_slist_free_all);
       curl_easy_setopt(curl_.get(), CURLOPT_HTTPHEADER, headers.get());
+      json_object_object_add(audit.get(), "request_bytes", json_object_new_int64(body.size()));
+      json_object_object_add(audit.get(), "prepare_seconds", json_object_new_double(
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()));
       const auto transport = curl_easy_perform(curl_.get());
+      const auto received = std::chrono::steady_clock::now();
       long status = 0;
       curl_easy_getinfo(curl_.get(), CURLINFO_RESPONSE_CODE, &status);
       json_object_object_add(audit.get(), "http_status", json_object_new_int64(status));
@@ -247,6 +252,27 @@ public:
       count = static_cast<int>(validated.size());
       set(audit.get(), "status", "ok");
       json_object_object_add(audit.get(), "draft_token_ids", json_object_get(draft));
+      // Optional remote telemetry is untrusted and never affects token decisions.
+      // HTTP time includes queueing/device work; it must not be called network RTT.
+      json_object *timing = nullptr;
+      if (json_object_object_get_ex(reply.get(), "timing", &timing) &&
+          json_object_is_type(timing, json_type_object)) {
+        auto *reported = json_object_new_object();
+        for (const char *field : {"draft_seconds", "synchronization_seconds", "server_seconds"}) {
+          json_object *value = nullptr;
+          if (json_object_object_get_ex(timing, field, &value) &&
+              (json_object_is_type(value, json_type_double) ||
+               json_object_is_type(value, json_type_int))) {
+            double seconds = json_object_get_double(value);
+            if (std::isfinite(seconds) && seconds >= 0) {
+              json_object_object_add(reported, field, json_object_new_double(seconds));
+            }
+          }
+        }
+        json_object_object_add(audit.get(), "reported_dlm_timing", reported);
+      }
+      json_object_object_add(audit.get(), "response_validation_seconds", json_object_new_double(
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count()));
     } catch (const std::exception &error) {
       set(audit.get(), "status", "fallback");
       set(audit.get(), "error_type", error.what());

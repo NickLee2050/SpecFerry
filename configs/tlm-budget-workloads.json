@@ -1,0 +1,10 @@
+{
+  "version": "specferry.tlm-budget.v1",
+  "checkpoint": "facebook/opt-30b",
+  "context_tokens": [64, 128, 512],
+  "output_tokens": 48,
+  "repeats": 3,
+  "draft_tokens": [1, 2, 4, 8],
+  "seed": 20261027,
+  "text": "A research team is studying how to run a language model on two different computers. They record the input tokens, generated tokens, time spent computing, time spent waiting, and data transferred between the computers. Every comparison uses the same model, input length, output length, and numerical precision. They first test each computer independently, then check the communication protocol, and finally measure the complete system. "
+}

@@ -1,10 +1,10 @@
 {
-  "updated_on": "2026-10-16",
+  "updated_on": "2026-10-27",
   "owner": "DGX TLM session",
   "host": "dgx01",
-  "session_title": "SpecFerry\u6846\u67b6\u642d\u5efa",
+  "session_title": "SpecFerry框架搭建",
   "peer_host": "fpga02",
-  "peer_session_title": "SpecFerry\u95ee\u9898\u6392\u67e5\u4e0e\u6027\u80fd\u4f18\u5316",
+  "peer_session_title": "SpecFerry问题排查与性能优化",
   "branch": "dev/TLM-impl",
   "protocol": "specferry.draft.v1",
   "contract": "protocol/draft-v1.schema.json",
@@ -181,5 +181,78 @@
     "mem_available_gib_approx": 116,
     "other_users_containers": "Untouched",
     "automatic_restart_or_restoration": "None scheduled by this experiment; test orchestrator exited successfully."
+  },
+  "board_ssh_access": {
+    "checked_at": "2026-10-27T07:51:40.167204+00:00",
+    "host": "192.168.35.21",
+    "port": 5062,
+    "user": "root",
+    "ssh_alias": "np101",
+    "local_config": "~/.ssh/config",
+    "authentication_test": "public-key-only login succeeded with BatchMode=yes; password and keyboard-interactive authentication disabled for this client alias",
+    "host_key_type": "ssh-ed25519",
+    "host_key_fingerprint": "SHA256:lkz342/yBpl1ppFdhn/n9Bt+hkzQqni941lCfCIhEHk",
+    "host_key_trust": "First-use key recorded in local known_hosts; not independently fingerprint-verified",
+    "read_only_command": "id",
+    "remote_output": "uid=0(root) gid=0(root) groups=0(root),10(wheel)",
+    "remote_changes": false,
+    "scope": "SSH connectivity only; does not establish NP101 SDK execution, model deployment, HTTP draft service, or inference performance.",
+    "evidence": ".cache/runs/board-ssh-key-check-20261027/report.json",
+    "identity_file": "~/.ssh/id_ed25519_np101",
+    "public_key_fingerprint": "SHA256:P0j0YJJCJ8CCA32V9L9AOuaq1Sr2KLHJ1duWNpCWWEo",
+    "initial_password_test_evidence": ".cache/runs/board-ssh-check-20261027/report.json"
+  },
+  "np101_access_policy": {
+    "as_of": "2026-10-27",
+    "connections_authorized": false,
+    "rule": "No SSH, HTTP, probes or other NP101 traffic until the user explicitly reauthorizes it. Historical access details are not current authorization."
+  },
+  "local_tlm_budget_study": {
+    "updated_at": "2026-10-27T08:36:36.521412+00:00",
+    "scope": "Local TLM verification, modeled break-even budgets and offline integration preparation; no NP101 connection.",
+    "checkpoint": "facebook/opt-30b",
+    "workloads": "handoff/tlm-workloads-v1.json",
+    "plan": "configs/tlm-budget-workloads.json",
+    "context_tokens": [
+      64,
+      128,
+      512
+    ],
+    "output_tokens": 48,
+    "draft_tokens": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "repeats": 3,
+    "local_contract_evidence": ".cache/runs/dlm-local-contract-20261027/report.json",
+    "local_contract_cases_passed": 18,
+    "unit_tests": "13 transport/proposer/host-tool tests plus 8 budget/profiling tests passed.",
+    "gpu_measurement_state": "Queued with the final source snapshots, waiting for a GPU process owned by another user; no new OPT-30B verification timings or break-even results yet.",
+    "orchestration": ".cache/runs/tlm-budget-20261027-final/orchestration.json",
+    "command": "python scripts/run_tlm_budget.py --output .cache/runs/NEW_RUN --wait-for-gpu-seconds 3600",
+    "planned_outputs": [
+      "native/report.json",
+      "graph/report.json",
+      "analysis/report.json",
+      "analysis/measurements.csv",
+      "analysis/budgets.csv",
+      "analysis/scenarios.csv"
+    ],
+    "limits": [
+      "Empty-draft and ordinary graph baselines reported separately.",
+      "Acceptance and remote timing are unknown for real NP101.",
+      "Loopback HTTP wall time is not inter-host RTT.",
+      "Target-round instrumentation is wall time, not isolated GPU compute."
+    ],
+    "framework_smoke": {
+      "status": "pass",
+      "cases": 10,
+      "fixture": "Synthetic two-layer all-zero OPT; no performance claim.",
+      "evidence": ".cache/runs/vllm-profile-smoke-20261027/report.json",
+      "output_budget_evidence": ".cache/runs/vllm-profile-smoke-20261027/output-budget-check.json"
+    },
+    "output_accounting": "Actual API output counts and accepted prefixes surviving the output cap are separate from raw engine acceptance; unused terminal proposals are retained."
   }
 }

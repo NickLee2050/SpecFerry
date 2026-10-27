@@ -37,6 +37,7 @@ def make_handler(traces, tokenizer_sha256, log_path, *, delay=0.6):
             self.send(200 if self.path == '/health' else 404, {'type': 'synthetic-oracle'})
 
         def do_POST(self):
+            handling_started = time.perf_counter()
             try:
                 size = int(self.headers.get('Content-Length', '0'))
                 if not 0 < size <= 65536:
@@ -48,6 +49,7 @@ def make_handler(traces, tokenizer_sha256, log_path, *, delay=0.6):
                     with lock:
                         state['mode'] = obj['mode']
                         state['draft_override'] = obj.get('draft_override')
+                        state['timing_override'] = obj.get('timing_override')
                         if 'traces' in obj:
                             if not isinstance(obj['traces'], list):
                                 raise ValueError('Trace list required')
@@ -89,6 +91,11 @@ def make_handler(traces, tokenizer_sha256, log_path, *, delay=0.6):
                 reply = {key:obj[key] for key in ('protocol', 'request_id', 'prefix_sha256',
                                                   'tokenizer_sha256', 'draft_mode')}
                 reply['draft_token_ids'] = draft
+                with lock:
+                    timing_override = state.get('timing_override')
+                reply['timing'] = (timing_override if timing_override is not None else {
+                    'draft_seconds': 0.0, 'synchronization_seconds': 0.0,
+                    'server_seconds': time.perf_counter() - handling_started})
                 if mode == 'stale':
                     reply['request_id'] = 'stale-response'
                 record = {'mode': mode, 'prefix_tokens': len(prefix), 'matched_oracle': matched,

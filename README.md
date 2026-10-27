@@ -626,6 +626,22 @@ it is a controlled integration baseline, not a claim to maximum target-only spee
 
 ## NP101 connection contract and remaining work
 
+**2026-10-27 access restriction:** the user has temporarily prohibited every
+connection to NP101, including SSH, HTTP and probes. The saved access details
+below are historical evidence, not authorization to reconnect. Current tests
+use literal loopback addresses only.
+
+On 2026-10-27, the DGX successfully tested SSH access to the user-supplied board
+endpoint `root@192.168.35.21:5062` with the read-only `id` command. This host has
+the local SSH alias `np101` in `~/.ssh/config`; use `ssh np101`. The dedicated
+key `~/.ssh/id_ed25519_np101` passed a public-key-only login test with
+`BatchMode=yes`. This client alias disables password and keyboard-interactive
+authentication; remote sshd settings were not modified. No password or private
+key contents are stored in the repository. The host-key fingerprint and test
+evidence are recorded under `board_ssh_access` in `handoff/dgx.json`. This SSH
+endpoint is separate from the still-unconfirmed DLM HTTP address; successful
+login does not establish model execution or device integration.
+
 `POST /v1/draft` is a **SpecFerry-defined HTTP contract**, not an NP101 SDK API.
 Its machine-readable shape is [protocol/draft-v1.schema.json](protocol/draft-v1.schema.json).
 The DGX does not know the function names or cache ABI of the remote DLM runtime.
@@ -743,3 +759,88 @@ Docker state or live device state. Fetching a commit is not deploying its code.
 Current remaining work is the actual device HTTP handler and cache adapter,
 device capability/evidence publication, and real host-to-host validation. All
 loopback/oracle tests remain synthetic and cannot supply NP101 performance data.
+
+## Local OPT-30B verification budgets and shared test inputs
+
+The 2026-10-27 TLM study is entirely local. `configs/tlm-budget-workloads.json`
+defines 64/128/512-token inputs, 48-token greedy outputs, K=1/2/4/8 and three
+repeats. `handoff/tlm-workloads-v1.json` contains the exact prepared integer
+inputs, OPT BOS policy, tokenizer fingerprint and pinned model revision. These
+inputs were generated offline in the pinned ARM64 image with networking and GPU
+access disabled. A future DLM run must reuse these IDs and publish its own
+hardware/runtime evidence; the fixture is not a board result.
+Each workload also states its required context budget. A future device runner
+must skip cases beyond its published limit; preparing a 512-token TLM input
+does not establish that the current DLM supports that context.
+
+```bash
+conda activate SpecFerry
+python scripts/check_local_dlm_contract.py \
+  --output .cache/runs/local-contract-check
+python scripts/run_tlm_budget.py \
+  --output .cache/runs/tlm-budget-new --wait-for-gpu-seconds 3600
+```
+
+Build `native/draft` first as described above. The local contract replay passed
+18 cases on 2026-10-27, covering actual prepared prefix lengths, K choices,
+rejected suffixes and stale/invalid/timeout fallback. Eight new budget/profiling
+unit tests passed, in addition to 13 transport/proposer/host-tool tests. No board
+connection or GPU inference is established by these tests.
+
+The runner waits for other GPU processes to exit and requires at least 90GiB
+available host memory. It never stops another user's task. It launches at most
+one OPT-30B instance at a time, stops its own instances after success/failure,
+and leaves the old OPT-6.7B services stopped. Competing GPU activity during a
+measurement is recorded and prevents publication of a budget result. All URLs
+in this runner are literal loopback addresses; the profiling adapter rejects
+remote fixture URLs before loading the transport.
+
+`serve_vllm_spec.py --checkpoint facebook/opt-30b --profile-rounds` enables a
+local-only measurement adapter in `python/specferry/vllm_profile.py`. Its atomic
+control file selects empty drafts without HTTP or K up to the engine maximum
+of 8, keeping one eager/synchronous engine configuration. Ordinary target
+performance is measured separately with CUDA graphs on the identical token
+inputs. This avoids reporting gains solely against a slower integration setup.
+
+The measured target-round interval starts after the previous proposal returns
+and ends at the next proposer entry after CUDA synchronization. It includes
+native verification, sampling, bookkeeping, scheduler/IPC and device waiting.
+It excludes initial prefill, terminal rounds without a subsequent proposer
+call, the fixture callback and audit writes. It is **not isolated GPU kernel
+time**; synchronization and profiling can perturb timing. Per-round candidate
+counts and actual accepted prefix lengths are retained. FP16 differences versus
+the empty-draft reference are recorded rather than hidden or treated as proof
+of universal numerical equivalence.
+Engine-sampled acceptance before the output cap is kept separately from
+accepted tokens that survive the cap. API output counts are authoritative;
+unused terminal proposals are recorded. The budget formula describes steady
+decoding and does not include extra terminal drafting work on short requests.
+
+An actual vLLM smoke run with a synthetic two-layer all-zero OPT fixture passed
+10 functional cases: empty drafts, K=1/2/4/8, first/middle rejection and three
+failure fallbacks. Reprocessing all ten raw traces reconciled them to the exact
+20-token API output cap. Evidence is in
+`.cache/runs/vllm-profile-smoke-20261027/`; its timings are not OPT-30B results
+and must not be used as performance data.
+
+A complete run retains `native/report.json`, `graph/report.json`, per-round and
+native HTTP audit logs, GPU-process samples and `analysis/{report.json,*.csv}`.
+The analytical budget uses `sum(alpha**i, i=0..K)` committed tokens, including a
+target token, and requires `K / D + V + transport + sync < committed * T`.
+`V` is measured verification-round wall time and `T` is either the matching
+empty-draft step or ordinary graph decode time. The tables assume D=3/5/10/20/50
+tokens/s, conditional acceptance 0.5/0.8/0.95/1.0, transport delays 0/1/10/50ms and
+sync delays 0/10ms. These assumed values are not device measurements. Startup,
+prefill and other DLM catch-up costs are excluded; the zero-overhead threshold
+is optimistic. A nonpositive remaining time budget means no finite DLM speed
+wins under those assumptions. Equality only ties the baseline.
+
+Draft replies may optionally include `timing` with nonnegative finite
+`draft_seconds`, `synchronization_seconds`, and `server_seconds`. The C++ client
+retains valid values as `reported_dlm_timing`; absent or malformed values never
+change candidate validation. These are unverified remote measurements.
+`prepare_seconds`, `http_seconds`, `connect_seconds`,
+`response_validation_seconds`, and `wall_seconds` are local audit timings.
+**HTTP callback time includes device/queueing work and is not network RTT.**
+The loopback fixture reports zero synthetic draft/sync work; real board values
+remain unknown until a separately authorized hardware run.
