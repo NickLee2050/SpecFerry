@@ -965,9 +965,11 @@ PartitionedGraphModel::PartitionedGraphModel(
   }
   if (kv_transfer == KvTransfer::MappedSlot &&
       (variant != Variant::CompiledFullModel ||
-       (config.decoder.capacity != 64 && config.decoder.capacity != 128) ||
+       (config.decoder.capacity != 64 && config.decoder.capacity != 128 &&
+        config.decoder.capacity != 256) ||
        (prefill_block != 1 && prefill_block != 16))) {
-    throw std::invalid_argument("mapped-slot KV requires compiled full OPT C64/C128 with M1/M16");
+    throw std::invalid_argument(
+        "mapped-slot KV requires compiled full OPT C64/C128/C256 with M1/M16");
   }
   if (variant != Variant::MergedKv && variant != Variant::MergedKvFc1Split2 &&
       variant != Variant::MergedKvCompiledFfn && variant != Variant::CompiledDecoder &&

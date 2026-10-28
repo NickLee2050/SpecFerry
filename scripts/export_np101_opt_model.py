@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--rootfs", type=Path, required=True)
     parser.add_argument("--scope", choices=("fullgraph", "decoders"), required=True)
-    parser.add_argument("--capacity", type=int, choices=(64, 128), required=True)
+    parser.add_argument("--capacity", type=int, choices=(64, 128, 256), required=True)
     parser.add_argument(
         "--kv-update",
         choices=("scatter", "select", "narrow-select"),

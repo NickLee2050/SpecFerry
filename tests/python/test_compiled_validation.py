@@ -23,17 +23,17 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
-    def test_mapped_slot_capacity_contract_includes_c128_but_not_unbounded_layouts(self):
+    def test_mapped_slot_capacity_contract_rejects_unbounded_layouts(self):
         from specferry.models.opt.graph_validation import _mapped_slot_enabled
 
-        for capacity in (64, 128):
+        for capacity in (64, 128, 256):
             for block in (1, 16):
                 self.assertTrue(
                     _mapped_slot_enabled(
                         {"capacity": capacity}, "compiled-fullgraph", block, "mapped-slot"
                     )
                 )
-        for capacity in (96, 256):
+        for capacity in (96, 512):
             with self.subTest(capacity=capacity), self.assertRaises(ValueError):
                 _mapped_slot_enabled(
                     {"capacity": capacity}, "compiled-fullgraph", 16, "mapped-slot"

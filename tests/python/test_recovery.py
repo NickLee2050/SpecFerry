@@ -76,6 +76,9 @@ class RecoveryControlTests(unittest.TestCase):
             "kernel: ***   GPU DRV CONFIG   ***",
             "kernel: [galcore]: Stop driver to keep scene.",
             "--------gckEDMA_StartTransfer---timeout---src:0x55c24e40",
+            "[428293.680670] mmc0: Timeout waiting for hardware interrupt.",
+            "EXT4-fs error (device mmcblk0p2): failed to read inode",
+            "Buffer I/O error on dev mmcblk0p2, logical block 42",
         ):
             self.assertIsNotNone(recovery_controls.FAULT.search(line), line)
         self.assertIsNone(recovery_controls.FAULT.search("kernel: Waiting for HDMA Transfer..."))

@@ -153,8 +153,8 @@ def narrow_cache_selection(model):
 
 class Graph(OnnxGraph):
     def __init__(self, weights, capacity):
-        if capacity not in (64, 128):
-            raise ValueError("compiled OPT export supports fixed C64/C128")
+        if capacity not in (64, 128, 256):
+            raise ValueError("compiled OPT export supports fixed C64/C128/C256")
         super().__init__(weights)
         self.capacity = capacity
 

@@ -34,7 +34,7 @@ void attach_prefill_graph_caches(const std::filesystem::path &package, const Mod
       recipe != "batch-pointwise-f16-fp32-norm-v1" || (count != 12 && count != 19) ||
       platform::pointwise_prefill_layers(count) != count || config.decoder.hidden != hidden ||
       hidden != 1024 || config.decoder.intermediate != intermediate || intermediate != 4096 ||
-      tokens != 16 || capacity != config.decoder.capacity || capacity != 128 ||
+      tokens != 16 || capacity != config.decoder.capacity || (capacity != 128 && capacity != 256) ||
       config.decoder.epsilon != 1e-5f || layers.size() != 24 ||
       np101::file_sha256("/proc/self/exe") != consumer) {
     throw std::invalid_argument("verified prefill cache program/recipe/geometry differs");

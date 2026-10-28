@@ -235,7 +235,7 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   stream >> magic >> version >> model_digest >> index_digest >> deployment_digest >> capacity >>
       tokens >> count;
   if (!stream || magic != "specferry-opt-compiled-block-prefill" || version != 1 ||
-      (capacity != 64 && capacity != 128) || tokens != 16 || count != 24 ||
+      (capacity != 64 && capacity != 128 && capacity != 256) || tokens != 16 || count != 24 ||
       config.decoder.capacity != capacity || config.decoder.layers != count ||
       config.decoder.hidden != 1024 || config.decoder.heads != 16 ||
       config.decoder.intermediate != 4096 || config.decoder.epsilon != 1e-5f ||
@@ -383,10 +383,10 @@ std::vector<TensorSpec> compiled_decoder_inputs(const Config &config) {
 
 void validate_compiled_decoder(const CompiledDecoder &compiled, const WeightStore &weights,
                                const Config &config, unsigned layer) {
-  // Only this export geometry and precision policy have hardware evidence.
+  // Fixed geometry and precision must match the package; acceptance is scope-specific.
   if (config.hidden != 1024 || config.intermediate != 4096 || config.heads != 16 ||
-      (config.capacity != 64 && config.capacity != 128) || config.epsilon != 1e-5f ||
-      compiled.layer != layer || compiled.weight_sha256.size() != 16 ||
+      (config.capacity != 64 && config.capacity != 128 && config.capacity != 256) ||
+      config.epsilon != 1e-5f || compiled.layer != layer || compiled.weight_sha256.size() != 16 ||
       (compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} &&
        compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 35})) {
     throw std::invalid_argument("compiled OPT decoder differs from the accepted export contract");

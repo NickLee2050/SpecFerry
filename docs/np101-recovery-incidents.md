@@ -51,6 +51,34 @@
 或出现BUG/Oops等非NP hang故障时立即停止；3次连续失败后转离线分析，不无限重试。
 该约定仅适用于SoC，不修改EP门禁；“偶发/概率性”是操作策略，尚未证明故障根因。
 
+## 10-28 C256部署期间两次SDHCI超时
+
+证据：`opt-context-boundary-20261028/long-context/storage-incident/`的完整板端/主机
+内核、`incident.json`、`observation.json`、`release-observation.json`及旧host marker。
+主机boot`c679b4e9-918f-4708-b2f2-2066c36e8703`、板卡boot
+`7013aa1c-2105-4d00-8de1-08aa32569a22`，部署包SHA256
+`5eb71293f354ec9b954137cffb5a3b4e111e872a1ad4d4c49ded943d527232ef`。
+
+| 独立内核事件 | 实际结果 |
+|---|---|
+| 428261.420676 | `mmc0: Timeout waiting for hardware interrupt.`，随后SDHCI寄存器转储 |
+| 428293.680670 | 同一部署中再次报相同超时并转储；两次原始记录均保留 |
+
+远程tar传输达到120秒上限后退出；M1文件应为636,745,728B，实为606,860,800B，
+其余24份M16产物尚未传完。没有启动C256原生子进程或候选Setup/Verify/Run，
+不能归因于C256算子实现、KV访问或NPU内存分配。已确认是SDHCI未收到预期硬件中断，
+具体介质、控制器、信号/供电根因未知；不能仅由SSH可用认定存储健康。
+
+停止续传及全部上板工作；后查无残留本次tar、无galcore owner，SYSTEM122976B、
+VIRTUAL0、GFP保持基线。最新记录采样已距第二次超时超过45秒，完整日志无更晚SD超时。
+原host恢复标记另存后叠加storage阻断，旧板端标记不删除；为避免不可靠写入，未往
+SD新增marker。未完成目录及本地完整产物保留，缓存实验入口增加独立storage阻断。
+
+旧故障正则只匹配`I/O error`等文本，会漏掉这类纯SDHCI超时；现增加精确硬件中断
+超时、EXT4及块IO错误检测并保留CPU回归。它们不适用孤立NP hang重试约定，
+不延长现有传输、不跳过完整哈希或直接执行残缺包。需先处理存储可靠性，再从可信
+本地副本完成部署及完整校验。此前C128验收成功不覆盖其后发生的存储故障。
+
 ## 10-28 SoC初始化优化整模首个长请求hang
 
 证据：`opt-startup-prefill-20261028/formal-long/attempt-3/run/`；boot、包、binary

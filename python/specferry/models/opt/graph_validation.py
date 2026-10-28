@@ -145,10 +145,10 @@ def _mapped_slot_enabled(metadata, variant, block, kv_transfer):
     mapped = kv_transfer == "mapped-slot"
     if mapped and (
         variant != "compiled-fullgraph"
-        or metadata["capacity"] not in (64, 128)
+        or metadata["capacity"] not in (64, 128, 256)
         or block not in (1, 16)
     ):
-        raise ValueError("mapped-slot KV requires compiled fullgraph C64/C128 with M1/M16")
+        raise ValueError("mapped-slot KV requires compiled fullgraph C64/C128/C256 with M1/M16")
     return mapped
 
 

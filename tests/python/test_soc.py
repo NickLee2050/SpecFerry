@@ -41,10 +41,20 @@ class SocTests(unittest.TestCase):
         )
         board.save(self.root / "reference.json", metadata)
         self.assertEqual(request_options(self.root)["block"], "16")
-        for capacity in (64, 96, 256):
+        for capacity in (64, 96, 512):
             board.save(self.root / "reference.json", metadata | {"capacity": capacity})
             with self.subTest(capacity=capacity), self.assertRaises(ValueError):
                 request_options(self.root)
+
+        metadata.update(capacity=256)
+        metadata["requests"][0].update(prompt_length=241, consumed=256)
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 241) + "\n")
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        metadata["requests"][0]["consumed"] = 257
+        board.save(self.root / "reference.json", metadata)
+        with self.assertRaises(ValueError):
+            request_options(self.root)
 
     def test_board_script_uses_python39_and_only_standard_library(self):
         tree = ast.parse(Path(board.__file__).read_text(), feature_version=(3, 9))

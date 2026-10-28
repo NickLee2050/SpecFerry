@@ -62,8 +62,8 @@ def package_model_exports(artifacts, deployment, output):
     verify_export(deployment)
     export = json.loads((artifacts / "export.json").read_text())
     kind, capacity = export["kind"], export["capacity"]
-    if kind not in ("decoders", "fullgraph") or capacity not in (64, 128):
-        raise ValueError("compiled OPT model requires fixed C64/C128")
+    if kind not in ("decoders", "fullgraph") or capacity not in (64, 128, 256):
+        raise ValueError("compiled OPT model requires fixed C64/C128/C256")
     records = {
         row["name"]: row
         for row in json.loads((deployment / "deployment-manifest.json").read_text())["tensors"]
@@ -174,7 +174,7 @@ def load_model_package(package, deployment, *, capacity):
     if (
         manifest["schema_version"] != 1
         or manifest["capacity"] != capacity
-        or capacity not in (64, 128)
+        or capacity not in (64, 128, 256)
     ):
         raise ValueError("compiled OPT model package capacity/schema differs")
     if sha256(package / "compiled-model.txt") != manifest["native_manifest_sha256"]:

@@ -105,6 +105,10 @@ handoff and duplicate reset. Shared SoC outputs first passed two 17-input/two-ou
 reducing sampled SYSTEM peak by 23.03MiB. With the 8192-row embedding policy, the latest combination
 also passed 97/17-input reset requests with 16 outputs each and final-layer KV/unused-slot checks.
 Initialization and request-specific performance are reported separately in the status document.
+The accepted C128 entry also passed full-capacity 113/17/113/17-input reset requests with 16 outputs
+each, repeated token/KV equality and rejection after the final slot. C256 export/packaging support is
+experimental: offline artifacts are ready, but SDHCI faults interrupted deployment before any NPU
+run. Keep the accepted C128 package; storage recovery and full C256 acceptance are still required.
 Handwritten attention retains its independent FP16 cache and widening
 handoff. The implementation is `native/models/opt/block_prefill.*`, without platform macros.
 M1 consumes the remaining 1–16 prompt tokens and all generated tokens.

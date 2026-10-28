@@ -64,8 +64,8 @@ void validate_compiled_full_model(const CompiledFullModel &compiled, const Weigh
   const auto &decoder = config.decoder;
   if (decoder.layers != 24 || decoder.hidden != 1024 || decoder.heads != 16 ||
       decoder.intermediate != 4096 || decoder.epsilon != 1e-5f ||
-      (decoder.capacity != 64 && decoder.capacity != 128) || config.vocabulary != 50272 ||
-      config.embedding != 512 || config.position_offset != 2 ||
+      (decoder.capacity != 64 && decoder.capacity != 128 && decoder.capacity != 256) ||
+      config.vocabulary != 50272 || config.embedding != 512 || config.position_offset != 2 ||
       compiled.graph.graph_version != std::array<unsigned, 3>{1, 1, 35}) {
     throw std::invalid_argument("compiled full OPT model geometry/version differs");
   }
@@ -132,7 +132,7 @@ CompiledModelPackage load_compiled_model(const std::filesystem::path &package,
       count;
   if (!file || magic != "specferry-opt-model" || version != 1 ||
       (kind != "decoders" && kind != "fullgraph") || capacity != config.decoder.capacity ||
-      (capacity != 64 && capacity != 128) ||
+      (capacity != 64 && capacity != 128 && capacity != 256) ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("compiled OPT model deployment/header differs");

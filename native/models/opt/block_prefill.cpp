@@ -459,7 +459,8 @@ BlockPrefill::BlockPrefill(Context &context, const WeightStore &weights, const M
   config.validate();
   const auto &decoder = config.decoder;
   const bool supported_capacity =
-      decoder.capacity == 64 || (!compiled_layers.empty() && decoder.capacity == 128);
+      decoder.capacity == 64 ||
+      (!compiled_layers.empty() && (decoder.capacity == 128 || decoder.capacity == 256));
   if (decoder.layers != 24 || decoder.hidden != 1024 || decoder.heads != 16 ||
       decoder.intermediate != 4096 || !supported_capacity || decoder.epsilon != 1e-5f ||
       config.embedding != 512 || config.vocabulary != 50272 || config.position_offset != 2 ||
@@ -467,7 +468,7 @@ BlockPrefill::BlockPrefill(Context &context, const WeightStore &weights, const M
            ? compiled_ffn.size() != decoder.layers
            : (!compiled_ffn.empty() || compiled_layers.size() != decoder.layers))) {
     throw std::invalid_argument(
-        "OPT block prefill requires C64/M16 or compiled-attention C128/M16 geometry");
+        "OPT block prefill requires C64/M16 or compiled-attention C128/C256/M16 geometry");
   }
   if (!shared_cache.empty() &&
       (compiled_layers.empty() || shared_cache.size() != 2 * decoder.layers)) {

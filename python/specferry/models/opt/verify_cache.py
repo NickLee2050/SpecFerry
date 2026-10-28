@@ -37,7 +37,7 @@ def package_verify_cache(source, deployment, package, consumer, *, layers=12):
         metadata["schema_version"] != 1
         or metadata["recipe"] != RECIPE
         or metadata["capacity"] != 128
-        or model["capacity"] != 128
+        or model["capacity"] not in (128, 256)
         or model["sdk"]["profile"] != "np101-soc-riscv64"
         or sha256(acceptance) != metadata["acceptance_sha256"]
         or evidence.get("passed") is not True
@@ -69,8 +69,11 @@ def package_verify_cache(source, deployment, package, consumer, *, layers=12):
         record["name"]: record
         for record in json.loads((deployment / "deployment-manifest.json").read_text())["tensors"]
     }
+    # The fixed recipe has only M16 hidden/parameter ports, no KV or position input.
+    # Its accepted C128 producer is reusable at C256; pin the target geometry
+    # separately and require complete target-model acceptance before claiming support.
     lines = [
-        f"specferry-opt-verify-cache 1 {RECIPE} {layers} 1024 4096 16 128",
+        f"specferry-opt-verify-cache 1 {RECIPE} {layers} 1024 4096 16 {model['capacity']}",
         f'{sha256(consumer)} "cache-producer.bin" {metadata["producer_sha256"]}',
         f"np101-soc-riscv64 {len(metadata['sdk'])}",
         *(f"{name} {digest}" for name, digest in sorted(metadata["sdk"].items())),
@@ -121,4 +124,6 @@ def package_verify_cache(source, deployment, package, consumer, *, layers=12):
         cache_bytes=sum(path.stat().st_size for path in files),
         consumer_sha256=sha256(consumer),
         producer_sha256=metadata["producer_sha256"],
+        source_capacity=metadata["capacity"],
+        runtime_capacity=model["capacity"],
     )

@@ -39,7 +39,7 @@ and do not themselves authorize a control. Archived binaries/commands are eviden
 ### SoC formal generation
 
 Use the separate `np101_soc.py prepare/deploy/run/collect` workflow in the root README. Packaging
-checks source weights, NBG ports and SDK identities; board runs require explicit C64/C128 mapped-slot
+checks source weights, NBG ports and SDK identities; accepted board runs use explicit C64/C128 mapped-slot
 requests with M1 or packaged M16 prefill and the documented driver parameters. Reuse a CPU reference when
 the request is unchanged. Host numerical checks share the OPT validation code with EP.
 `python -m unittest tests.python.test_soc` checks packaging integrity, architecture/path rejection,
@@ -56,6 +56,12 @@ chunks also passed 97/17-input reset requests, 16 outputs each, with 56 token/KV
 execution contracts plus release and delayed logs. Different prompts do not require repeated-prompt
 equality checks. A separate real/boundary-input comparison confirmed bit-exact embedding outputs
 between 4096/8192-row chunks. EP output ownership and embedding policy are unchanged.
+The subsequent C128 boundary collection uses 113/17/113/17-input reset requests with 16 outputs
+each: 82 checks cover full-capacity rejection without IO, repeated KV equality and unused slots,
+plus release and delayed health checks. This bounded collection does not establish long-term service
+stability. C256 geometry/export support and capacity-independent FFN cache reuse have only offline
+evidence; SDHCI faults interrupted deployment before the first NPU child. Resume only after storage
+recovery and complete bundle verification; do not treat storage faults as isolated NP hangs.
 
 An optional SoC cache package selects twelve or nineteen batch-convolution FFNs; an ordinary package keeps
 the accepted four-layer prefix. After preparing a bundle, attach existing accepted caches with
@@ -127,7 +133,7 @@ ONNX, generated C and compiler logs stay outside runtime packages.
 |---|---|
 | `export_np101_opt_ffn.py` | 24 M1 fused FFN/final-norm NBGs; optional head/projection artifacts, existing-artifact revalidation |
 | `export_np101_opt_projections.py` | 24 QKV/out graphs and one head, with public/SDK port permutations |
-| `export_np101_opt_model.py` | `--scope decoders|fullgraph --capacity 64|128`, FP32 KV and optional runtime package; `--kv-update select` preserves ports; fullgraph-only `narrow-select` narrows before selection and emits FP32 current slots, requiring mapped-slot commits |
+| `export_np101_opt_model.py` | `--scope {decoders,fullgraph} --capacity {64,128,256}`, FP32 KV and optional runtime package; C256 awaits board acceptance. `--kv-update select` preserves ports; fullgraph-only `narrow-select` narrows before selection and emits FP32 current slots, requiring mapped-slot commits |
 | `export_np101_qwen_blocks.py` | `--part mixer|feed-forward`, one/all layers, optional runtime package and combined mixer/FFN package |
 
 OPT's `--prefill-artifacts` imports existing source-bound M16 exports into the M1 package: layers

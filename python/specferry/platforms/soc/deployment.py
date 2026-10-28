@@ -37,12 +37,16 @@ def request_options(request):
         raise ValueError("SoC bundle requires reset requests without Context rebuilding")
     metadata = read_json(request / "reference.json")
     capacity = metadata["capacity"]
-    if capacity not in (64, 128) or (metadata["layers"], metadata["heads"], metadata["width"]) != (
+    if capacity not in (64, 128, 256) or (
+        metadata["layers"],
+        metadata["heads"],
+        metadata["width"],
+    ) != (
         24,
         16,
         64,
     ):
-        raise ValueError("SoC reference geometry differs from OPT C64/C128")
+        raise ValueError("SoC reference geometry differs from OPT C64/C128/C256")
     requests = [
         [int(x) for x in line.split()]
         for line in (request / "requests.txt").read_text().splitlines()
@@ -133,7 +137,7 @@ def package_compiled_prefill(source, output, model, original, records):
     if (
         original["deployment_sha256"] != model["deployment_sha256"]
         or original["tokens"] != 16
-        or capacity not in (64, 128)
+        or capacity not in (64, 128, 256)
         or original["capacity"] != capacity
         or [item["layer"] for item in layers] != list(range(24))
     ):
