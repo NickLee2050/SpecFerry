@@ -48,6 +48,14 @@ opening a device. SSH failure alone never authorizes another model submission.
 Shared prefill acceptance additionally checks the declared input-cache policy and reduced transfer
 counts; older records retain independent-cache accounting. Current shared-input hardware evidence
 covers C128 long/short reset requests; capacity and stability limits remain in the status document.
+SoC compiled prefill additionally binds all decoder K/V outputs to one fixed scratch pair,
+committing each layer before reuse. Input/output and duplicate-output aliases are rejected before
+node creation. The original C128 memory acceptance reused the CPU causal prefix for two
+17-input/two-output reset requests and 58 checks. The latest combination with 8192-row SoC embedding
+chunks also passed 97/17-input reset requests, 16 outputs each, with 56 token/KV/unused-slot and
+execution contracts plus release and delayed logs. Different prompts do not require repeated-prompt
+equality checks. A separate real/boundary-input comparison confirmed bit-exact embedding outputs
+between 4096/8192-row chunks. EP output ownership and embedding policy are unchanged.
 
 An optional SoC cache package selects twelve or nineteen batch-convolution FFNs; an ordinary package keeps
 the accepted four-layer prefix. After preparing a bundle, attach existing accepted caches with

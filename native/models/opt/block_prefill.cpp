@@ -11,6 +11,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -94,6 +95,7 @@ struct BlockPrefill::Impl {
   struct Stage {
     std::unique_ptr<GraphBuilder> builder;
     std::string role;
+    std::optional<unsigned> cache_layer;
   };
 
   ModelConfig config;
@@ -104,6 +106,7 @@ struct BlockPrefill::Impl {
   std::vector<Stage> stages;
   Tensor controls{}, block_index{}, attention_mask{};
   bool compiled_attention = false, shared_decode_cache = false;
+  bool reuse_cache_outputs = false;
   std::vector<std::pair<GraphBuilder *, Tensor>> cache_outputs;
   unsigned position = 0;
   std::size_t constants = 0;
@@ -113,7 +116,7 @@ struct BlockPrefill::Impl {
        const std::vector<CompiledFfn> &artifacts, const PhaseObserver &phase,
        const std::vector<CompiledPrefillLayer> &compiled_layers,
        const std::vector<TensorBinding> &shared_cache)
-      : config(spec), bank(context), cache(context, 2 * spec.decoder.layers + 2, 0) {
+      : config(spec), bank(context), cache(context, 2 * spec.decoder.layers + 4, 0) {
     try {
       if (compiled_layers.empty()) {
         build(context, weights, artifacts, phase);
@@ -156,9 +159,12 @@ struct BlockPrefill::Impl {
     const auto tokens = entry.slice(controls, {0}, {block});
     const auto positions = entry.slice(controls, {block}, {block});
     const auto &table = weights.find("decoder.embed_tokens.weight");
+    const auto block_rows = compiled_attention
+                                ? platform::prefill_embedding_block_rows(config.block_rows)
+                                : config.block_rows;
     std::vector<Tensor> chunks;
-    for (unsigned first = 0; first < config.vocabulary; first += config.block_rows) {
-      const auto rows = std::min(config.block_rows, config.vocabulary - first);
+    for (unsigned first = 0; first < config.vocabulary; first += block_rows) {
+      const auto rows = std::min(block_rows, config.vocabulary - first);
       chunks.push_back(entry.weight_chunk(weights, table, {f16, {config.embedding, rows}},
                                           std::size_t(first) * config.embedding * 2));
     }
@@ -182,6 +188,7 @@ struct BlockPrefill::Impl {
                       const std::vector<CompiledPrefillLayer> &artifacts,
                       const PhaseObserver &phase, const std::vector<TensorBinding> &shared_cache) {
     compiled_attention = true;
+    reuse_cache_outputs = platform::reuse_prefill_cache_outputs();
     shared_decode_cache = !shared_cache.empty();
     const auto &decoder = config.decoder;
     const auto cached_layers =
@@ -218,11 +225,17 @@ struct BlockPrefill::Impl {
     }
     for (unsigned index = 0; index < 2 * decoder.layers; ++index) {
       const SdkScope timing_role("role", "block16.cache-bindings");
-      // Only input backing is shared. Every NBG still owns separate outputs,
-      // committed into this cache after synchronous completion of the block.
+      // Canonical input backing remains separate from every output. Serial SoC
+      // producers may share output scratch, consumed immediately after each Run.
       const auto id = shared_decode_cache ? bind_tensor(shared_cache.at(index), cache, state)
                                           : add_tensor(cache, state, false, zeroes);
       caches.push_back({id, state});
+    }
+    std::array<Tensor, 2> scratch{};
+    if (reuse_cache_outputs) {
+      for (auto &output : scratch) {
+        output = {add_tensor(cache, state), state};
+      }
     }
     const TensorSpec index_spec{DataType::Int32, {1}};
     const TensorSpec mask_spec{DataType::Float32, {decoder.capacity, block}};
@@ -247,7 +260,7 @@ struct BlockPrefill::Impl {
       } catch (const std::exception &error) {
         throw std::runtime_error("compile OPT prefill " + role + ": " + error.what());
       }
-      stages.push_back({std::move(graph), "block16." + role});
+      stages.push_back({std::move(graph), "block16." + role, {}});
     };
     auto [embedding, hidden] =
         build_embedding(context, weights, artifacts.front().graph.graph_version);
@@ -264,12 +277,21 @@ struct BlockPrefill::Impl {
       const auto index = graph->bind({cache, block_index.id}, index_spec);
       const auto mask = graph->bind({cache, attention_mask.id}, mask_spec);
       const std::vector<Tensor> inputs{input, key, value, index, mask};
-      const auto outputs = graph->compiled(artifact.graph, inputs);
+      std::vector<Tensor> output_bindings;
+      if (reuse_cache_outputs) {
+        output_bindings = {graph->tensor(artifact.graph.outputs.at(0)),
+                           graph->bind({cache, scratch[0].id}, state),
+                           graph->bind({cache, scratch[1].id}, state)};
+      }
+      const auto outputs = graph->compiled(artifact.graph, inputs, output_bindings);
       hidden = outputs.at(0);
       cache_outputs.emplace_back(graph.get(), outputs.at(1));
       cache_outputs.emplace_back(graph.get(), outputs.at(2));
       compile(std::move(graph), role + (artifact.full_decoder ? ".compiled" : ".attention"), inputs,
               outputs);
+      if (reuse_cache_outputs) {
+        stages.back().cache_layer = layer;
+      }
       constants += artifact.graph.constant_bytes;
       if (!artifact.full_decoder) {
         const SdkScope ffn_timing_role("role", "block16." + role + ".ordinary_ffn");
@@ -333,7 +355,7 @@ struct BlockPrefill::Impl {
         phase("setup.prefill16." + role);
       }
       graph->compile(inputs, {output});
-      stages.push_back({std::move(graph), "block16." + role});
+      stages.push_back({std::move(graph), "block16." + role, {}});
     };
 
     auto [embedding, hidden] = build_embedding(context, weights);
@@ -401,6 +423,17 @@ struct BlockPrefill::Impl {
         hidden = build_ffn_finish(*finish, weights, decoder, layer, residual, mlp).output;
         compile(std::move(finish), role + ".residual", {residual, mlp}, hidden);
       }
+    }
+  }
+
+  void commit_cache_layer(unsigned layer) {
+    const SdkScope role("role", "block16.kv-commit");
+    const Shape start{0, position, 0};
+    const Shape end{64, position + block, config.decoder.heads};
+    for (unsigned index = 2 * layer; index < 2 * layer + 2; ++index) {
+      const auto &[owner, value] = cache_outputs.at(index);
+      read_tensor_region_into(owner->graph, value.id, start, end, readback);
+      upload_tensor_region(cache, caches.at(index).id, start, end, readback);
     }
   }
 
@@ -509,22 +542,23 @@ void BlockPrefill::consume(const std::vector<std::int32_t> &tokens) {
                          {impl.config.decoder.capacity, block}, mask_bytes);
   }
   for (const auto &stage : impl.stages) {
-    const SdkScope role("role", stage.role);
-    auto &graph = stage.builder->graph;
-    if (!vxIsGraphVerified(graph.get()->g)) {
-      throw std::runtime_error("OPT block prefill graph became unverified");
+    {
+      const SdkScope role("role", stage.role);
+      auto &graph = stage.builder->graph;
+      if (!vxIsGraphVerified(graph.get()->g)) {
+        throw std::runtime_error("OPT block prefill graph became unverified");
+      }
+      check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
+            "run OPT block prefill graph");
     }
-    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
-          "run OPT block prefill graph");
+    if (stage.cache_layer) {
+      // Both scratch outputs are consumed before another NBG producer can overwrite them.
+      impl.commit_cache_layer(*stage.cache_layer);
+    }
   }
-  if (impl.compiled_attention) {
-    const SdkScope role("role", "block16.kv-commit");
-    const Shape start{0, impl.position, 0};
-    const Shape end{64, impl.position + block, impl.config.decoder.heads};
-    for (unsigned index = 0; index < impl.caches.size(); ++index) {
-      const auto &[owner, value] = impl.cache_outputs[index];
-      read_tensor_region_into(owner->graph, value.id, start, end, impl.readback);
-      upload_tensor_region(impl.cache, impl.caches[index].id, start, end, impl.readback);
+  if (impl.compiled_attention && !impl.reuse_cache_outputs) {
+    for (unsigned layer = 0; layer < impl.config.decoder.layers; ++layer) {
+      impl.commit_cache_layer(layer);
     }
   }
   impl.position += block;

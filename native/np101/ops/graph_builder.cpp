@@ -433,7 +433,8 @@ Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const Weight
 }
 
 std::vector<Tensor> GraphBuilder::compiled(const CompiledGraphSpec &spec,
-                                           const std::vector<Tensor> &inputs) {
+                                           const std::vector<Tensor> &inputs,
+                                           const std::vector<Tensor> &output_bindings) {
   if (spec.path.empty() || spec.path.find('\0') != std::string::npos ||
       !std::filesystem::is_regular_file(spec.path) || !std::filesystem::file_size(spec.path)) {
     throw std::invalid_argument("compiled graph requires a nonempty regular model file");
@@ -457,6 +458,35 @@ std::vector<Tensor> GraphBuilder::compiled(const CompiledGraphSpec &spec,
   for (const auto &output : spec.outputs) {
     output.bytes();
   }
+  if (!output_bindings.empty()) {
+    if (output_bindings.size() != spec.outputs.size()) {
+      throw std::invalid_argument("compiled graph output bindings must cover every port");
+    }
+    const auto aliases = [&](Tensor left, Tensor right) {
+      const auto *a = vsi_nn_GetTensor(graph.get(), left.id);
+      const auto *b = vsi_nn_GetTensor(graph.get(), right.id);
+      return left.id == right.id || (a && b && a->t && a->t == b->t);
+    };
+    for (std::size_t index = 0; index < output_bindings.size(); ++index) {
+      const auto &output = output_bindings[index];
+      const auto &expected = spec.outputs[index];
+      const auto *storage = vsi_nn_GetTensor(graph.get(), output.id);
+      if (!storage || storage->attr.is_const || output.spec.type != expected.type ||
+          output.spec.shape != expected.shape) {
+        throw std::invalid_argument("compiled graph output binding contract mismatch");
+      }
+      for (const auto &input : inputs) {
+        if (aliases(input, output)) {
+          throw std::invalid_argument("compiled graph input/output aliases are unsupported");
+        }
+      }
+      for (std::size_t previous = 0; previous < index; ++previous) {
+        if (aliases(output_bindings[previous], output)) {
+          throw std::invalid_argument("compiled graph output bindings must be distinct");
+        }
+      }
+    }
+  }
 
   if (!compiled_version_[0]) {
     check(vsi_nn_SetGraphVersion(graph.get(), spec.graph_version[0], spec.graph_version[1],
@@ -469,10 +499,12 @@ std::vector<Tensor> GraphBuilder::compiled(const CompiledGraphSpec &spec,
   // node is charged separately because sharing its internal backing is unproven.
   graph.reserve_compiled_constants(spec.constant_bytes);
   compiled_paths_.push_back(std::filesystem::absolute(spec.path).string());
-  std::vector<Tensor> outputs;
-  outputs.reserve(spec.outputs.size());
-  for (const auto &output : spec.outputs) {
-    outputs.push_back(tensor(output));
+  std::vector<Tensor> outputs = output_bindings;
+  if (outputs.empty()) {
+    outputs.reserve(spec.outputs.size());
+    for (const auto &output : spec.outputs) {
+      outputs.push_back(tensor(output));
+    }
   }
   auto *operation = sdk_call("vsi_nn_AddNode", [&] {
     return vsi_nn_AddNode(graph.get(), VSI_NN_OP_NBG, inputs.size(), outputs.size(), nullptr);

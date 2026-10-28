@@ -51,6 +51,166 @@
 或出现BUG/Oops等非NP hang故障时立即停止；3次连续失败后转离线分析，不无限重试。
 该约定仅适用于SoC，不修改EP门禁；“偶发/概率性”是操作策略，尚未证明故障根因。
 
+## 10-28 SoC初始化优化整模首个长请求hang
+
+证据：`opt-startup-prefill-20261028/formal-long/attempt-3/run/`；boot、包、binary
+与下项相同。PID12438于420621.12982286启动，全部19份缓存及策略恢复完成；准备
+108.847秒、构造142.200秒、就绪251.047秒。420872.65390986进入97-token首请求，
+420899.632716报NP[0] hang、420899.660448 recovery done、420899.840275释放设备。
+SIGTERM后exit=−15、child278.745秒，无完整measured输出或有效吞吐。
+
+最后阶段仅能定位到完整首请求，当前未做逐SDK跟踪，不能确定是embedding、哪个
+decoder或首次M1调用；不把固定约27秒间隔等同于真正慢算子。该次已通过上次
+restore-cache-policy位置，因此两次故障不支持“必定同一边界调用失败”的判断。
+45.059秒无新增故障，owner/进程、SYSTEM/VIRTUAL/GFP均恢复；连续hang为2。
+原报告及marker保留，只按常设约定再允许一次有界重试，第3次同实验失败即停测。
+就绪时间仅是失败轮的初始化观察，不作为新配置完整验收或生成性能收益。
+
+随后`attempt-4/run/`在相同包/SDK下完成：PID12652于421140.14159860启动，
+421408.884914释放设备，child268.919秒exit=0；97→16、reset后17→16的32选词、
+末层KV/未写槽等56项检查通过，45.040秒无新故障且池/GFP/owner回归。
+host数值accept已完成，连续hang计数按接受记录重置，原两次故障、报告和marker仍保留。
+只接受该C128有界组合，不证明驱动/SD根因修复，也不据失败轮的相近时间建立固定触发点。
+
+## 10-28 SoC初始化优化整模验收hang
+
+证据：`opt-startup-prefill-20261028/formal-long/attempt-2/run/`；boot及包身份同下项，
+binary SHA256`4f685780d79486b4ba6eb3298f6e9febc20dc2463ee3117b58b228fddea1e5dd`。
+修复后的全包校验通过，PID12218于420059.48795017启动；前置准备109.461秒，
+最后阶段420336.38411645为`verify.prefill16.restore-cache-policy`。
+内核420336.432741报NP[0] hang，420336.460426 recovery done，420336.658788
+release galcore；监督器SIGTERM后exit=−15、child277.207秒，尚无生成结果。
+
+最后阶段对应`GraphCacheSession::close()`：缓存关闭环境下对预先Setup的一元素
+FP16→FP32转换图调用`boundary_.verify()`并关闭图。之前还执行了19份缓存导入和
+各一次完整FFN预热；本轮没有逐SDK起止追踪，不能由最后阶段标签确定首次内部阻塞，
+也不能排除刚结束预热的延迟故障。`initialization.json`只创建为空，不能当作完整就绪。
+新embedding分块、文件读取顺序与此故障只有共现，未证明因果；不是长prompt触发。
+
+45.003秒延迟无新故障，owner/子进程清空，SYSTEM122976B、VIRTUAL0、GFP25362432B
+回基线。保留全部marker，当次同实验连续hang为1。按SoC常设约定可在精确增加本次
+旧故障基线后独立重试，仍完整校验、300秒期限；不因自动恢复或成功输出清除历史。
+
+## 10-28 SoC整模部署文件校验拒绝
+
+证据：`opt-startup-prefill-20261028/formal-long/`的`attempt-1/run/`、
+`integrity-audit.json`、`attempt-1/bad-artifacts/`及`repair.json`。主机boot
+`c679b4e9-918f-4708-b2f2-2066c36e8703`、板卡boot
+`7013aa1c-2105-4d00-8de1-08aa32569a22`，包SHA256
+`af513809baee41603e1656c31099cba150027ced9c5d20d7ce2222dda7e3af58`。
+外层PID12046在启动native子进程前拒绝`model/prefill-layer12.nb`；没有候选
+Setup/Verify/Run、galcore owner或新增NP/EDMA故障，SYSTEM122976B、VIRTUAL0及
+GFP25362432B不变。报告中释放标志false源于尚未建立运行前快照，不表示泄漏。
+
+独立全包106文件审计149.914秒，仅该9,731,776B文件不匹配；预期SHA256
+`a5294b0d0e4d773fc30d99f2adf2b2eb572f23773fd5980de159dc42147494ee`，
+审计读得`2d20311d…55d9`，随后下载及三次重复读取均为`3cbc641d…f5c9`。
+下载副本与主机可信源相差68字节，文件逻辑偏移9369613–9370620，不是物理地址。
+同inode不同读取结果及既有SD异常提示内容可靠性风险，未确定介质、缓存或写入者根因。
+
+保留下载副本及板端原inode254253，可信源另建文件、fsync、完整读回后原子替换，
+新inode647452哈希匹配；旧硬链接副本不自动修写或重新当作可信来源。
+原失败/marker保留，不把修复等同验收或清除恢复门禁。下一次必须重新完整校验；
+若再有内容异常则停整模验收，转存储排查，不跳过哈希或携带错误产物运行。
+
+## 10-28 SoC公开filter NBG冻结系数反例
+
+证据：`soc-shared-ffn-binding-diagnosis-20261028/attempt-2/run/`及analysis.json。
+主机boot`c679b4e9-918f-4708-b2f2-2066c36e8703`、板卡boot
+`7013aa1c-2105-4d00-8de1-08aa32569a22`，SDK/池不变。包SHA256
+`2535c97ae85cd8ca60e3fbc6c63424f3f5a2b42e6a563cfdfbeaccd99028f2a2`。
+真实参数生成NBG为`65d189e3f4def8fcd4f953a479ec625cde54f326669f1bb1c69f7482ba66a386`，
+MatMul绕过为`74b567718211f1fafceb02c0cc19c56ff1e856e727e062008b3f2d834cc84056`。
+原rank保护失败的包/代码单独保留，当前仅用已验二维view做读写，不改4D端口。
+
+真实参数生成版首次Run在416316.92057014–416316.93208639返回0且数值通过；
+新进程在Setup前绑定全零fc2，416320.81766977–416320.82812241仍返回0，但输出与
+真实版逐位一致，对零权重参考773项失败、最大误差8.182617。源fc2在Setup前和Verify后
+逐字节读回匹配预期；参数从未在已Verify图上改写。已确认至少有效fc2系数/派生表示
+被固化，未确定SDK内部首错函数；结合默认伪输入导出，是原NaN的有证据解释，不宣称
+已定位首次NaN指令。普通生成C的真实参数软件回放通过，不把模拟器当成板端验收。
+
+两个MatMul新进程真实/零权重都正确，分别在416324.66175928–416325.20039830及
+416328.94849532–416329.49242812返回0，最大误差0.015625。父PID11815于
+416313.03551980启动，child16.748秒exit=0，四worker逐次SYSTEM122976B/
+GFP25362432B/owner0恢复，45.008秒无新内核故障。总报告因冻结系数反例仍false，
+不改写成成功；这不是NP hang，原全部失败与marker保留。
+
+另以`soc-shared-ffn-binding-cost-20261028/attempt-1/run/`预热后各8次完整FFN，
+固定系数9.275ms、正确MatMul539.834ms，后续仍慢58.2倍；child12.989秒、释放与
+45.010秒检查通过。此成功只验该集合，不清除恢复门禁；按用户要求停止此优化，
+不以NaN已绕过为由接整模、不扩矩阵或修改私有属性。
+
+## 10-28 SoC绑定诊断的读回维数保护拒绝
+
+证据：`soc-shared-ffn-binding-diagnosis-20261028/attempt-1/run/`及该attempt保存的
+`original-source.cpp`、`original-bundle/`；主机/板卡boot及SDK同下项。外层PID11757
+于416125.42253715启动，在首worker的preload.parameters后，本地MappedHost读回
+拒绝rank4参数（仅支持rank1/2/3），尚无候选Setup/Verify/Run，child2.584秒exit=1。
+SYSTEM/GFP/owner回归，45.089秒无新增内核故障；原失败、binary和marker保留。
+
+原因是新增诊断辅助代码不符合仓库传输契约，不是NBG再次数值失败或hang。修复仅
+复用已验storage_reshape生成共享二维view，先于Setup做零权重写入及前后逐字节读回；
+不放宽传输维数保护，不改变NBG的原生4D端口、SDK私有字段或权重分类。
+按用户本轮绑定诊断授权继续独立attempt；原未完成运行不改写为通过。
+
+## 10-28 SoC原生4D外置权重FFN输出NaN
+
+证据：`soc-shared-ffn-weights-20261028/{analysis.json,attempt-1/run/}`。主机boot
+`c679b4e9-918f-4708-b2f2-2066c36e8703`、板卡boot
+`7013aa1c-2105-4d00-8de1-08aa32569a22`，沿用10-27记录的固定SDK及1792MiB池，未改驱动。
+包SHA256为`f29662fbea4f6cbedb88093fe1c52f055acf29ed13e13023e9fb52df27c1eacf`，
+候选NBG为`36a42a806d944e6a3e48f0ee1088ae0af523148de78ebc472ad0fe72d5b9f97b`；
+binary及原始数据身份见analysis.json。独立worker11673的原M1/现M16数值正确、53Run
+完成。worker11689将同一WeightBank六参数固定绑定M1外置NBG与现M16 API图，原生4D
+权重/FP32归一化参数及底层句柄已核对、只加载16795648B raw，Setup/Verify均返回。
+
+板端单调时415065.97102690–415065.98820592，M16首Run返回0且数值正确；
+415065.99696596–415066.00806373，候选M1首Run返回0，但1024个FP16输出全部NaN。
+因此停止候选计时、零权重worker及剩余ABBA，不把SDK成功或baseline时间当作候选收益。
+外层PID11671于415027.93973216启动，child38.562秒exit=0仅代表诊断正常收尾，整体
+数值验收为false；两worker均退出、SYSTEM122976B/GFP25362432B/owner0回归，
+45.022秒无新NP/EDMA/BUG及延迟故障，失败/恢复标记保留。这是数值失败，不是hang。
+
+已确认：同份参数供M16正常计算、原M1正常、外置M1错误，原生4D布局未解除此前公开
+filter限制。尚未确认：NBG是否正确消费每份权重、首错内部算子及编译器/运行时根因；
+未做运行期权重修改，不能归因于其同步。后续先离线查导出/端口语义或另评API备选，
+不原条件重跑、不扩大层数、不推进整模，也不改is_const或私有对象试探。
+
+## 10-27 SoC共享输出worker诊断的峰值报告缺失
+
+证据：`soc-prefill-kv-storage-workers-20261027/attempt-1/run/`及
+`supplemental-review.json`，boot同下项。四个独立worker共64次Run均正常退出，
+逐次SYSTEM/GFP/owner回启动前基线；父child6.272秒exit=0，45.095秒无新增故障。
+父run.json遗漏const_peak_bytes/nonconst_peak_bytes，原生完整性检查判false，因此原
+自动summary仍失败，不修改旧报告/marker或将其重写为成功。
+
+独立复核现有输出、memory.tsv、worker-releases.tsv等原始文件，13项数值/共享句柄/
+未改槽/相同IO/释放契约全过；真实应用峰值const19458176B、nonconst4341768B均合规。
+两图共享后SYSTEM稳态少1049728B，但ready反而多1049728B，不宣称构造峰值下降；
+原Context.close探针未覆盖全部C++owner自然析构后的存活进程，具体保留对象仍未知。
+未来报告修复仅由真实worker内存表取max，另存report-peak-fix并交叉编译，不重跑，
+原包/源码/报告/事故数据SHA保持不变。后续正式整模为独立验收，保留原诊断失败门禁，
+不削弱全局检查或凭离线成功清除恢复标记。
+
+独立正式整模随后完成：`soc-prefill-storage-fullmodel-20261027/attempt-1/run/`，
+两次17→2、58项检查通过，child280.416秒exit=0，池/GFP/owner恢复，45.049秒无新增
+故障。其自身报告包含真实峰值；此成功不改写上述失败报告或清除历史恢复门禁。
+
+## 10-27 SoC共享prefill输出对照的进程内释放边界失败
+
+证据：`soc-prefill-kv-storage-20261027/attempt-1/run/`，主机/板卡boot同下项。
+首轮仅完成独立输出基线，尚未构造共享候选；Graph关闭后应用const/nonconst已归零，
+SYSTEM仍为25736544B，Context关闭并轮询1秒后也未回进程启动前基线。夹具按原释放
+条件退出，child2.689秒exit=1；没有新NP/EDMA/BUG。进程退出后SYSTEM122976B、
+VIRTUAL0、GFP25362432B及owner回归，45.094秒无新增故障。原始失败/marker保留，
+不把不完整ABBA计为有效收益，也不把进程退出后的释放写成Context内已释放。
+
+这支持进程级保留或延迟释放，未证明具体对象泄漏/缓存；不放宽原释放检查后直接建立
+下一Context。后续改为同一120秒监督器下四个串行worker进程，父进程不创建Context，
+每个worker退出且池/GFP/owner回归后才开始下一阶段，原Run/IO/输入不增加，45秒检查
+仍独立进行。SDK物理驻留与应用记账不能互相替代。
+
 ## 10-27 SoC attention布局对照的原图RunGraph故障
 
 证据：`soc-attention-layout-validation-20261027/board-comparison-safe/attempt-1/run/`。

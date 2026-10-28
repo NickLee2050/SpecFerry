@@ -91,7 +91,10 @@ public:
                 LinearBackend backend = LinearBackend::MatMul);
   // Creates fixed NBG ports; mixing NBG with ordinary nodes needs workload validation.
   // The builder owns the path until graph destruction; the graph owns payload charges.
-  std::vector<Tensor> compiled(const CompiledGraphSpec &spec, const std::vector<Tensor> &inputs);
+  // Optional output bindings must cover every output and already belong to this
+  // graph. Shared backing requires serial execution and consumption before reuse.
+  std::vector<Tensor> compiled(const CompiledGraphSpec &spec, const std::vector<Tensor> &inputs,
+                               const std::vector<Tensor> &output_bindings = {});
   Tensor layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon);
   // FP32 square/reduce/rsqrt: mean=true is RMS; false is L2 normalization.
   Tensor normalize(Tensor input, bool mean, float epsilon, unsigned axis = 0);

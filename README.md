@@ -91,12 +91,21 @@ an optional verified cache package extends that prefix to twelve or all nineteen
 The cache packager, pinned identities and lifecycle boundary are described in
 [validation](tests/README.md#soc-formal-generation); EP selection is unchanged.
 FCL also replaces the M16 input
-projection, avoiding numerical errors observed in the original MatMul path. Three reset requests
+projection, avoiding numerical errors observed in the original MatMul path. SoC compiled-attention
+prefill uses 8192-row embedding chunks (at most 8MiB); head configuration and EP remain unchanged.
+Native `preparation.json` separates weight, prefill and M1 package validation costs. SoC validates
+M1 last before construction while preserving every integrity check. Three reset requests
 with 17/49/17 input tokens and 16 outputs each passed the original C64 independent-cache checks.
-Compiled-attention prefill now retains M1's FP32 input KV, with separate NBG outputs and block
-commits. C128 passed 97/17 input tokens and 16 outputs each with both independent and shared KV;
+Compiled-attention prefill retains M1's FP32 input KV. On SoC, all decoder NBGs share one fixed
+output K/V pair; each layer commits its current block before the next producer runs. Canonical
+inputs remain separate, and EP keeps independent outputs. C128 passed 97/17 input tokens and
+16 outputs each with both independent and shared input KV;
 the shared change has not been separately accepted on C64. Shared inputs remove the final prefix
-handoff and duplicate reset. Handwritten attention retains its independent FP16 cache and widening
+handoff and duplicate reset. Shared SoC outputs first passed two 17-input/two-output reset requests,
+reducing sampled SYSTEM peak by 23.03MiB. With the 8192-row embedding policy, the latest combination
+also passed 97/17-input reset requests with 16 outputs each and final-layer KV/unused-slot checks.
+Initialization and request-specific performance are reported separately in the status document.
+Handwritten attention retains its independent FP16 cache and widening
 handoff. The implementation is `native/models/opt/block_prefill.*`, without platform macros.
 M1 consumes the remaining 1–16 prompt tokens and all generated tokens.
 M1's embedded head still executes on every M1 step. This path does not support continuation or the

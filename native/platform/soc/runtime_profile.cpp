@@ -4,6 +4,14 @@
 #include <stdexcept>
 
 namespace specferry::platform {
+bool reuse_prefill_cache_outputs() { return true; }
+
+unsigned prefill_embedding_block_rows(unsigned configured_rows) {
+  return configured_rows == 4096 ? 8192 : configured_rows;
+}
+
+bool verify_primary_model_last() { return true; }
+
 unsigned pointwise_prefill_layers(unsigned verified_cache_layers) {
   if (verified_cache_layers != 0 && verified_cache_layers != 12 && verified_cache_layers != 19) {
     throw std::invalid_argument("unsupported SoC prefill cache prefix");

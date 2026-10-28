@@ -5,6 +5,12 @@
 #include <string>
 
 namespace specferry::platform {
+bool reuse_prefill_cache_outputs() { return false; }
+
+unsigned prefill_embedding_block_rows(unsigned configured_rows) { return configured_rows; }
+
+bool verify_primary_model_last() { return false; }
+
 unsigned pointwise_prefill_layers(unsigned) { return 0; }
 
 const RuntimeProfile &runtime_profile() {

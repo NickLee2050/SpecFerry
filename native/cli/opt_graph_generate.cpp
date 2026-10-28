@@ -299,8 +299,15 @@ int main(int argc, char **argv) {
       }
     }
     const auto preparation_started = Clock::now();
+    std::vector<std::pair<std::string, double>> preparation_steps;
+    const auto prepare = [&](const char *name, const auto &action) {
+      const auto start = Clock::now();
+      action();
+      preparation_steps.emplace_back(name,
+                                     std::chrono::duration<double>(Clock::now() - start).count());
+    };
     np101::WeightStore weights(argv[1]);
-    weights.verify();
+    prepare("weights", [&] { weights.verify(); });
     std::vector<models::opt::CompiledFfn> compiled_ffn, compiled_prefill_ffn;
     std::vector<models::opt::CompiledPrefillLayer> compiled_prefill_layers;
     models::opt::CompiledHead compiled_head;
@@ -345,23 +352,33 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("compiled model variant requires one package path");
       }
       const fs::path package_path(package);
-      compiled_model = models::opt::load_compiled_model(
-          package_path.is_absolute() ? package_path : fs::path(argv[2]) / package_path, argv[1],
-          config, weights);
+      const auto resolved =
+          package_path.is_absolute() ? package_path : fs::path(argv[2]) / package_path;
+      const auto load_prefill = [&] {
+        if (block == 16) {
+          prepare("prefill", [&] {
+            if (fs::exists(resolved / "compiled-block-prefill.txt")) {
+              compiled_prefill_layers =
+                  models::opt::load_compiled_block_prefill(resolved, argv[1], config, weights);
+            } else {
+              compiled_prefill_ffn =
+                  models::opt::load_compiled_prefill(resolved, argv[1], config, weights);
+            }
+          });
+        }
+      };
+      if (platform::verify_primary_model_last()) {
+        load_prefill();
+      }
+      prepare("model", [&] {
+        compiled_model = models::opt::load_compiled_model(resolved, argv[1], config, weights);
+      });
       if ((variant == PartitionedModel::Variant::CompiledDecoder) !=
           !compiled_model.decoders.empty()) {
         throw std::invalid_argument("compiled model scope differs from selected variant");
       }
-      if (block == 16) {
-        const auto resolved =
-            package_path.is_absolute() ? package_path : fs::path(argv[2]) / package_path;
-        if (fs::exists(resolved / "compiled-block-prefill.txt")) {
-          compiled_prefill_layers =
-              models::opt::load_compiled_block_prefill(resolved, argv[1], config, weights);
-        } else {
-          compiled_prefill_ffn =
-              models::opt::load_compiled_prefill(resolved, argv[1], config, weights);
-        }
+      if (!platform::verify_primary_model_last()) {
+        load_prefill();
       }
     }
     const auto head_backend = variant == PartitionedModel::Variant::CompiledFullModel
@@ -383,6 +400,19 @@ int main(int argc, char **argv) {
     const auto preparation =
         std::chrono::duration<double>(Clock::now() - preparation_started).count();
     fs::create_directories(directory);
+    {
+      std::ofstream prepared(directory / "preparation.json");
+      prepared << std::setprecision(17) << "{\"total_seconds\":" << preparation << ",\"steps\":[";
+      for (std::size_t index = 0; index < preparation_steps.size(); ++index) {
+        const auto &[name, duration] = preparation_steps[index];
+        prepared << (index ? "," : "") << "{\"name\":\"" << name << "\",\"seconds\":" << duration
+                 << '}';
+      }
+      prepared << "]}\n";
+      if (!prepared) {
+        throw std::runtime_error("cannot save preparation timings");
+      }
+    }
     platform::write_runtime_profile(directory);
     progress(directory, "initialize");
     np101::SdkTimings timings(directory);

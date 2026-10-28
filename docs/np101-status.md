@@ -1,6 +1,6 @@
 # NP101 推理实现与优化结论
 
-更新：2026-10-27。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
+更新：2026-10-28。活跃模型为真实 `facebook/opt-350m`；目标是保持旧实现的正确性，
 降低单请求decode延迟。未完成项见[TODO](../TODO.md)，每次上板先读
 [事故台账](np101-recovery-incidents.md)，接口见[测试手册](../tests/README.md)，
 SDK失败契约见[问题表](np101-sdk-driver-validation-report.md)。
@@ -388,11 +388,58 @@ const/nonconst峰值993.85/450.96MiB，VIRTUAL为0；恢复标记保留，没有
 TTFT2.303秒；首词后15个间隔/5.472秒=2.741token/s，与此前短请求2.743接近。
 仅接受本次最小完整链，未新增长/短reset或长期稳定验收。
 
-embedding仍保持已验实现。可进一步评估将512列词表块从4096行扩大到8192行，
-把13组Gather/边界/Select缩为7组，单块仍不超过8MiB；尚未实施/上板，不能预报收益。
+该轮embedding保持4096行分块；10-28的8192行候选及后续验收见下节。
 当前无内存耗尽证据，故障详情及恢复门禁见事故台账。
 证据：`soc-initialization-20261026/{analysis.json,trace/run/,cpu-hash/,retry/,retry-single/}`，
 当前验收/性能在`retry-single/{parallel-checks/run/summary.json,performance.json}`。
+
+### embedding分块与初始化读取组织
+
+10-28仅将SoC编译attention路径的M16 embedding词表分块4096→8192行，
+13组Gather/边界/Select缩为7组，单块最大8MiB；不改模型/head配置、精度或权重副本，
+EP及手写attention路径不变。真实16-token输入和覆盖全部分块边界的16-token输入
+均通过CPU数值检查，两种分块输出逐位一致；预热后共24次ABBA计时、4次预热Run。
+单向构造观察的Setup＋Verify为31.773→3.357秒，但共享Context且次序固定，
+不能单独当作稳定9倍启动加速。运行漂移明显，未建立embedding稳态加速结论。
+
+同时SoC改为先核验M16产物/缓存、最后完整核验M1 NBG，紧接模型构造，尝试减少
+中间读取对M1文件缓存的挤占；这是缓存局部性假设，不删减检查或宣称已定位Setup根因。
+已有文件校验均为最多4线程、大文件优先，不另造调度。原权重631.707MiB、25份NBG
+920.184MiB、19份缓存366.129MiB，至少1918.019MiB不同内容需完整校验；相同权重
+来源不能替代各自产物摘要，SDK Verify前后的缓存校验也各自保留。入口一次写入
+`preparation.json`，区分weights/prefill/model的准备耗时，SDK仍串行、生成计时不变。
+证据：`opt-startup-prefill-20261028/{embedding-comparison,integrity-review.json,formal-long}/`。
+整模验收首轮在NPU启动前发现一份旧NBG内容不匹配，保留原文件并从可信源独立替换；
+具体证据、风险及重试条件见事故台账。
+
+最新完整24层C128组合随后通过97输入→16输出、reset后17输入→16输出：
+全部32选词、末层FP32 KV、未写槽、56项契约及池/GFP/owner释放通过，
+child268.919秒、45.040秒延迟无新故障。长请求消费112槽，不等同于跑满128槽。
+此前两个独立hang分别发生在初始化尾部和首个长请求，均记录、释放后按约定重试；
+这次成功重置连续失败计数，历史事件与恢复标记不清除，不宣称根因已修复。
+
+| 初始化指标 秒 | 既有共享输出验收 | 新分块＋读取顺序 |
+|---|---:|---:|
+| 原生准备/完整校验 | 112.777 | 109.361 |
+| Context/模型构造 | 162.050 | 142.169 |
+| 准备至模型就绪 | 274.826 | 251.531 |
+
+就绪少23.296秒（8.48%），为两次独立运行观察，不将全部差值归于单项，也不据此
+预报跨启动稳定收益。新准备分解为weights26.387、prefill38.459、model44.492秒；
+该就绪口径不含Python部署包校验、推理或释放观察。SDK Setup内部原因仍未闭环。
+
+| 单次请求 | TTFT 秒 | 生成wall 秒 | 实际输出 token/s | 首词后decode token/s |
+|---|---:|---:|---:|---:|
+| 97输入→16输出 | 5.488 | 9.776 | 1.637 | 3.498 |
+| reset后17输入→16输出 | 1.152 | 5.432 | 2.945 | 3.505 |
+
+每行实际吞吐为16输出/生成wall，decode为首词后15间隔；排除准备、reset、粗读回和
+释放。两请求合计32/15.208秒=2.104输出token/s、平均TTFT3.320秒，不与两次短请求
+的2.961token/s直接对比；新短请求与旧短请求接近，未建立decode提速。
+SYSTEM采样峰值1721.181MiB、余70.819MiB、VIRTUAL0、Linux最低722.137MiB；
+const/nonconst峰值993.846/414.642MiB，均低于各段1GiB。原参数/NBG/缓存未新增副本。
+完整结果见同目录`acceptance-review.json`及`formal-long/attempt-4/run/`；
+未新增C256、满槽、长期常驻或并行Verify验收。
 
 ### 合并投影、私有存储与归一化候选
 
@@ -761,6 +808,72 @@ Linux文件缓存/RSS和NPU SYSTEM也不是同一测量口径。
 FFN实测见前述证据，源码入口为`WeightBank::ensure_loaded`、`build_full_execution`和
 `BlockPrefill::build_compiled`。
 
+公开契约审计进一步确认：M1整图与M16 attention/decoder NBG均没有权重输入端口，
+WeightBank不能接管其中的系数。19份FFN缓存逐项都是7输入/1输出，即hidden加六份
+权重/归一化参数；命中不会解除原始张量引用。CONST_TENSOR_CACHE只有模式枚举，
+压缩weights_biases对象又依赖算子与尺寸，没有跨现有NBG共享/释放的支持契约，未用
+私有指针或修改is_const试探。已有单输入完整FFN NBG可作为结构替代：一层新增
+18.067MiB const、避免约16.018MiB raw，const合计1011.913MiB；两层超过1GiB。
+此替代尚未测实际池节省，正式接入需分开快速前缀与缓存导入计数，不作为已完成优化。
+证据：`soc-weight-ownership-20261027/analysis.json`。
+
+原生4D外置权重的完整FFN进一步评估：复用第1层真实M16输入、M1首行及已验M1 NBG，
+只新增M1七输入版本；两种M的真实/零fc2 CPU参考与原M1对照均通过。共享六份参数的
+底层tensor句柄相同，raw backing16795648B只计一次；参数在Setup前固定，未在推理期
+修改。板上M16沿用已验API batch卷积，最大误差0.0078125；原M1最大误差0.015625。
+候选M1首次RunGraph返回0，却1024输出全NaN，故未进行候选计时、零权重构建、剩余
+夹持阶段或整模接入。句柄共享成立不证明NBG实际消费权重，更不证明SDK打包共享。
+
+原M1与候选静态记录分别TP13/SH13、TP13/SH14，均无NN；不能把无NN单独当作退化证据。
+候选没有大矩阵initializer，NBG仍14548928B，保守常量预算保持；未把源码小常量当作
+实际驻留量。独立M1的48次计时均值10.010ms、M16三次15.192ms仅是本轮功能段参考，
+不是整模吞吐，失败候选不报加速或有效节省。child38.562秒、两个worker逐次资源回归、
+45.022秒无新内核故障；原失败和恢复标记保留。4D布局本身不足以修复编译公开filter
+数值问题，具体NBG内部首错算子未知，现有生产配置保持。
+证据：`soc-shared-ffn-weights-20261028/{analysis.json,offline-audit.json,attempt-1/run/}`。
+
+后续绑定诊断排除了明显端口错位：生成C的普通图用真实参数在模拟器通过，最大误差
+0.0078125。用真实参数重新生成的Conv/FCL NBG在板上也正确，但另一个新进程在Setup前
+将fc2绑定为全零，输出仍与真实参数版逐字节一致；源数据在Setup前及Verify后均读回
+匹配零值，未在推理期修改。故至少fc2的有效系数或派生表示在NBG生成时固化，公开端口
+不代表运行时真正使用。结合原导出使用伪输入，支持固化伪filter是旧NaN的解释；尚未
+定位首次非有限值的内部kernel或具体打包函数，不能把此结论泛化到全部NBG输入。
+
+显式MatMul绕过将filter改为普通矩阵操作数，保留同一七输入/FP16与敏感FP32边界，
+NBG为44,992B，真实/零fc2两种新进程构建均正确，最大误差0.015625。命令记录变为
+TP3/SH16/NN2，仍有ConvolutionLayer，不意味着避开卷积硬件或证明物理利用率。
+为排除首次Run准备成本，各预热一次后仅做两组×4次完整M1 FFN集合：
+
+| 完整FFN版本 | 真实参数 | 新进程零fc2 | 预热后均值 ms |
+|---|---|---|---:|
+| 真实参数生成的固定系数NBG | 通过 | 不响应，结果错误 | 9.275 |
+| 公开参数MatMul NBG | 通过 | 通过 | 539.834 |
+
+MatMul慢约58.2倍；单图SYSTEM常驻32,243,872→25,930,976B，仅少6.020MiB，不能外推
+整模节省。没有把单次首次Run或文件缩小当成持续性能/物理内存收益。最后仅离线尝试
+TTGT，CPU等价与导出通过，却又生成约14.5MB、TP13/SH14的FCL路径；未形成有证据的
+新绑定方案，不再上板，不宣称其数值或性能失败。按用户要求暂缓此优化，原正式模型
+保持，不接整模。绑定四次Run及短集合分别child16.748/12.989秒，逐worker释放与
+45.008/45.010秒检查通过，无新增hang；原数值反例总报告仍为false，未清除历史门禁。
+证据：`soc-shared-ffn-binding-diagnosis-20261028/{analysis.json,attempt-2/run/}`及
+`soc-shared-ffn-binding-cost-20261028/attempt-1/run/`。
+
+### 选择性布局与既有实现
+
+本轮选择性TTGT是离线人工筛选，不是运行时自动调优。历史M1及fc2缺少收益，前19层
+M16 FFN已用batch卷积，因此只对末5个完整decoder中的第24层fc1改写，复用两组真实
+M16状态；六份CPU输出逐位一致。标准导出后129条命令与0xc000之后的完整payload
+相同，只78字节UID/描述区不同。ABBA为22.843→21.530ms，反向BAAB为
+21.516→22.523ms，合并22.180→22.027ms（约0.69%）；收益符号翻转，保持原实现。
+两次短完整decoder对照及释放/45秒检查通过；不为该候选重编整模或扩大尺寸矩阵。
+证据：`soc-selective-linear-layout-20261027/{hardware-summary.json,static-audit.json}`。
+
+DeepSeek官方DeepGEMM、DeepGEMM-Ascend、TileKernels所查固定快照未确认GEMM→卷积。
+确认的相关机制是[DeepGEMM的swapAB与块/cluster选择](https://github.com/deepseek-ai/DeepGEMM/blob/5081f8513af57e61696de4f4f04b0e707ffb503e/csrc/jit_kernels/heuristics/sm100.hpp#L30-L163)：按形状、布局和资源过滤并评分，kernel内交换MMA描述符、在输出端恢复布局，不能等同显式整张量转置或卷积。
+[TensorRT的tactic选择](https://docs.nvidia.com/deeplearning/tensorrt/latest/performance/optimization.html)等已有成熟调优机制，单纯selective TTGT不足以主张新颖性。潜在研究问题是闭源编译器下，如何用少量测量联合选择等价图、布局及参数驻留，计入精度、内存、初始化和调优成本；仍需新策略与未见负载验证。
+阅读清单/固定commit及源码证据保留在`deepseek-linear-implementation-research-20261027/`
+与`layout-selection-prior-work-20261027/`，第三方源码不进入Git。
+
 ### 内部KV更新与attention布局
 
 10-27已查明现M1内部先FP32完整Select更新、再完整Cast FP16；host本就仅提交当前槽。
@@ -820,6 +933,40 @@ vxReleaseKernel访问失效对象。临时夹具的Context先于Graph析构风�
 常设约定重试通过，历史故障不抹去。证据：`soc-attention-layout-validation-20261027/`
 的`board-comparison-safe/attempt-2/run/`、`padded-query-command-summary.json`；原始
 分析保留在`soc-decode-dataflow-20261027/{kv,attention}/`。
+
+### 固定复用prefill输出
+
+SoC的24层M16 NBG现在固定绑定同一对完整FP32 K/V输出；每层RunGraph同步返回后，
+立即将当前16槽提交到该层canonical输入，再执行下一生产者。hidden仍各自独立，
+输入与输出不别名，owner先于消费者创建、晚于消费者释放。EP保持独立输出策略；
+不改变权重、精度、NBG、图数量或传输次数/字节数，只缩短输出存活期。
+
+双图64次Run复核输出逐位一致、未改槽、别名拒绝及相同IO；小图计时变化小于漂移，
+不宣称提速。诊断首轮进程内释放边界和后续父报告漏字段分别记入事故台账，原失败
+报告保留。随后正式入口复用全部产物和CPU因果前缀，完成两次reset的17输入→2输出，
+完整24层、58项数值/状态/预算契约、池/GFP/owner释放及45.049秒延迟检查通过，无新故障。
+
+| 内存指标 MiB | 独立M16输出 | 共享一对输出 |
+|---|---:|---:|
+| 显式KV合计 | 48.1875 | 25.1875 |
+| 应用nonconst就绪常驻 | 430.747 | 407.747 |
+| 应用nonconst峰值 | 432.925 | 414.925 |
+| SYSTEM采样峰值 | 1744.549 | 1721.523 |
+| SYSTEM对应剩余量 | 47.451 | 70.477 |
+
+两次独立已验运行的比较，输出长度不同；不作生成吞吐加速比。应用const仍993.847MiB，
+VIRTUAL0、Linux最低716.109MiB。就绪附近池采样约1743.799→1720.774MiB，推理后
+平台约1744.549→1721.523MiB；采样不能排除瞬时峰值，驱动历史高水位未清零。
+双图小实验的ready反而升高约1MiB，因此仍按完整链实测，不等量外推其它负载。
+准备112.777秒、构造162.050秒、child280.416秒；准备时间变化未作因果归因。
+本轮平均TTFT1.161秒，仅两次decode间隔约3.497token/s；持续性能仍引用前述32输出
+的2.961实际输出token/s、3.516首词后decode token/s，不用短验收替换。
+
+当前显式KV约为`0.1953125×C＋0.1875MiB`：C128/256/512/1024分别25.1875/
+50.1875/100.1875/200.1875MiB。不含attention中间量、编译参数/命令和SDK workspace；
+70.477MiB池余量不能证明C256可用。当前入口仍仅支持已定C64/C128，未扩大容量或跑满槽。
+证据：`soc-prefill-storage-fullmodel-20261027/{memory-review.json,attempt-1/run/}`；
+双图补充复核在`soc-prefill-kv-storage-workers-20261027/supplemental-review.json`。
 
 ### 仅当前token的KV输出：完整decoder未见收益
 
