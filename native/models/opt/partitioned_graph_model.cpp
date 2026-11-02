@@ -729,6 +729,7 @@ struct PartitionedGraphModel::Impl {
   }
 
   void consume(ExecutionSet &execution, const std::vector<std::int32_t> &tokens, bool run_head) {
+    const SdkScope timing_phase("phase", "token.position." + std::to_string(position));
     require_open();
     if (tokens.size() != execution.block || (execution.block != 1 && position % execution.block)) {
       throw std::invalid_argument("partitioned OPT append differs from its fixed block geometry");

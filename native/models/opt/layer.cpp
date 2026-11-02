@@ -2,6 +2,7 @@
 #include "models/opt/prefill_graph_cache.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/sdk_identity.hpp"
+#include "platform/runtime_profile.hpp"
 #include "vsi_nn_pub.h"
 
 #include <cmath>
@@ -88,7 +89,7 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
     const auto binary = std::filesystem::canonical(root / name);
     if (binary.parent_path() != root || !std::filesystem::file_size(binary) ||
         std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
-        file_sha256(binary) != digest) {
+        (platform::verify_model_payloads() && file_sha256(binary) != digest)) {
       throw std::invalid_argument("compiled FFN package NBG path/checksum mismatch");
     }
     artifact.graph.path = binary.string();
@@ -118,7 +119,7 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
     const auto binary = std::filesystem::canonical(root / name);
     if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
         std::filesystem::file_size(binary) > head.graph.constant_bytes ||
-        file_sha256(binary) != digest ||
+        (platform::verify_model_payloads() && file_sha256(binary) != digest) ||
         head.graph.constant_bytes > segment_payload_limit - total) {
       throw std::invalid_argument("compiled head package path/checksum/budget mismatch");
     }
@@ -144,7 +145,7 @@ std::vector<CompiledFfn> load_compiled_ffn(const std::filesystem::path &package,
         const auto binary = std::filesystem::canonical(root / name);
         if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
             std::filesystem::file_size(binary) > graph->constant_bytes ||
-            file_sha256(binary) != digest ||
+            (platform::verify_model_payloads() && file_sha256(binary) != digest) ||
             graph->constant_bytes > segment_payload_limit - total) {
           throw std::invalid_argument("compiled projection path/checksum/budget mismatch");
         }
@@ -207,7 +208,8 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
     }
     const auto binary = std::filesystem::canonical(root / name);
     if (!file || artifact.layer != layer || binary.parent_path() != root ||
-        !std::filesystem::file_size(binary) || file_sha256(binary) != digest ||
+        !std::filesystem::file_size(binary) ||
+        (platform::verify_model_payloads() && file_sha256(binary) != digest) ||
         artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} ||
         std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
         artifact.graph.constant_bytes > segment_payload_limit - total) {
@@ -307,7 +309,9 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   if (stream >> extra) {
     throw std::invalid_argument("trailing compiled block prefill data");
   }
-  verify_files(checksums);
+  if (platform::verify_model_payloads()) {
+    verify_files(checksums);
+  }
   attach_prefill_graph_caches(root, config, weights, result);
   return result;
 }

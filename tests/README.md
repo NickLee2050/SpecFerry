@@ -24,14 +24,18 @@ The pinned x86 Verify tracing library is built only for EP.
 ## Device discipline
 
 Read the ledger before every run. Runners serialize device ownership, preserve full kernel logs,
-monitor faults and retain the recovery marker until agreed checks and at least 45 seconds of delayed
-checks pass. Correct output or automatic recovery does not clear a fault. Recovery requires a
+monitor faults and retain the recovery marker until agreed checks and delayed checks pass (SoC
+10 seconds; EP 45 seconds). Correct output or automatic recovery does not clear a fault. Recovery requires a
 user-confirmed NP101 board power cycle; a host cold restart or changed boot ID is unnecessary.
 Read-only `sudo journalctl` has standing authorization (`--sudo-read-only`); other sudo actions
 require approval. Do not restore deleted convolution controls or silently substitute vendor/old OPT.
 Const/nonconst application payloads each stay ≤1 GiB, including peaks and shared backing once.
-Device child deadlines are at most 300 seconds, including Setup/Verify and inference. Do not extend
+SoC OPT formal runs have a preparation budget of at most 240 seconds and a separate post-ready
+workload budget of at most 300 seconds. Readiness is reported once through a private pipe, independently
+of the sampler. Legacy/unphased diagnostics and EP retain the 300-second total limit. Never extend
 a running deadline; preserve the gate on expiry and change the approach. Delayed checks are separate.
+The shorter SoC observation does not rule out the recorded recovery Oops after about 33 seconds;
+every subsequent run must still read the complete kernel log.
 
 `--prepare-only` prepares fixtures without opening the board. Recovery flags require prior agreement
 and do not themselves authorize a control. Archived binaries/commands are evidence, not test entries.
@@ -59,9 +63,11 @@ between 4096/8192-row chunks. EP output ownership and embedding policy are uncha
 The subsequent C128 boundary collection uses 113/17/113/17-input reset requests with 16 outputs
 each: 82 checks cover full-capacity rejection without IO, repeated KV equality and unused slots,
 plus release and delayed health checks. This bounded collection does not establish long-term service
-stability. C256 geometry/export support and capacity-independent FFN cache reuse have only offline
-evidence; SDHCI faults interrupted deployment before the first NPU child. Resume only after storage
-recovery and complete bundle verification; do not treat storage faults as isolated NP hangs.
+stability. C256 also passed a 241/17/241/17-input collection, sixteen outputs each, after confirmed
+restart and recovery controls: 82 checks cover full-capacity rejection with zero extra IO, three
+resets, repeated final-layer KV equality and unused slots. Original SDHCI/hang incidents remain;
+this bounded acceptance does not establish a driver fix. Do not treat storage faults as isolated
+NP hangs.
 
 An optional SoC cache package selects twelve or nineteen batch-convolution FFNs; an ordinary package keeps
 the accepted four-layer prefix. After preparing a bundle, attach existing accepted caches with
@@ -71,6 +77,9 @@ The default remains twelve; append `--layers 19` for the accepted full prefix. B
 complete 24-layer model; this number selects only the ordinary M16 FFN implementation.
 The source manifest pins successful numerical/health evidence, the producer, all six FFN weights,
 the recipe and SDK. Runtime also pins the consumer and rejects cache misses or changed files.
+The supervisor permits timestamp-only changes solely for files named in this native manifest,
+rehashing those files before updating their deployment receipt. Inode, size, payload or unrelated
+metadata changes are rejected; native cache checks before and after SDK access remain mandatory.
 Cached Verify is serial, after all bindings and ordinary compilation; a prepared ordinary graph
 refreshes the SDK's retained cache policy before model execution/release. This uses no private
 Context writes or weight reclassification. Cache generation is separate from warm-cache startup;
@@ -92,6 +101,24 @@ Graph/Context release must return application budgets to zero. Use an external b
 and the full ledger checks; this binary has no watchdog. Accepted 256/1792MiB pool runs used a
 90-second deadline and checked pool release and delayed logs; measurements live in the status
 document. This 42MiB check is not whole-pool integrity or model acceptance.
+
+### Small compiled-graph compatibility check
+
+Build `np101_compiled_graph_check` with the SDK matching the board. This explicit device test is
+not registered with CTest. Run `np101_compiled_graph_check FIXTURE OUTPUT` for one pass through
+the existing one-to-three reference cases; append `12` only for a bounded twelve-call cycle of
+three input cases. The fixture uses the archived `contract.txt`, `model.nb` and `caseN` binary
+inputs/references. Contracts and complete fixture sizes are checked before Context creation.
+NBG constants/files are limited to 32MiB, ports to 1MiB, and the graph has one imported NBG node.
+
+Every call uploads the selected inputs to fixed independent tensors, runs synchronously, then
+maps/unmaps and checks all outputs. There is no unchanged-input/no-readback replay mode, asynchronous
+submission, additional copy graph or tensor aliasing. Each RunGraph has a flushed begin/end record;
+numerical rows survive a later failure. Healthy completion explicitly closes Graph then Context
+and requires zero application live bytes. The external supervisor must enforce the deadline,
+kernel/owner/pool/GFP gates and delayed observation; this binary has no watchdog and cannot clear
+a recovery marker. Report graph, explicit IO, preparation and release separately; the diagnostic
+trace and reference comparisons do not establish model output throughput.
 
 ## Generation and compiled packages
 
@@ -154,7 +181,7 @@ timings; initialization, tokenization, CPU reference, diagnostics and user think
 The retained path consumes the pending last output once. Full-prefix validation precedes optional
 partial-block replay, selected using measured headless M1/M16 costs including control IO.
 `replayed_prompt_tokens` records recomputation. The old six-turn `compare` mode is retired;
-use independent `reuse` and `reset` runs, each limited to 300 seconds.
+use independent `reuse` and `reset` runs, under the respective platform's deadline policy.
 
 Qwen mixer export accepts `--outer-product multiply` and `--fuse-input-norm`. OPT's
 `--projection-backend fcl|nbg-qkv|nbg-output|nbg` selects explicit implementations. Packages with

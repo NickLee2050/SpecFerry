@@ -11,6 +11,8 @@ unsigned prefill_embedding_block_rows(unsigned configured_rows) { return configu
 
 bool verify_primary_model_last() { return false; }
 
+bool verify_model_payloads() { return true; }
+
 unsigned pointwise_prefill_layers(unsigned) { return 0; }
 
 const RuntimeProfile &runtime_profile() {

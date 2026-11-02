@@ -41,7 +41,13 @@ def main():
                 help="explicit authorization and exact old fault/boot/gate/bundle identities",
             )
             command.add_argument(
-                "--timeout", type=int, default=180, help="native child seconds, maximum 300"
+                "--timeout", type=int, default=300, help="post-ready execution seconds, maximum 300"
+            )
+            command.add_argument(
+                "--prepare-timeout",
+                type=int,
+                default=240,
+                help="model preparation seconds, maximum 240",
             )
     args = parser.parse_args()
     if args.command == "prepare":
@@ -76,7 +82,15 @@ def main():
                 if args.diagnostic_baseline
                 else None
             )
-            result = run(args.bundle, args.host, destination, args.output, args.timeout, diagnostic)
+            result = run(
+                args.bundle,
+                args.host,
+                destination,
+                args.output,
+                args.timeout,
+                diagnostic,
+                preparation_timeout=args.prepare_timeout,
+            )
     print(json.dumps(result, indent=2))
     return int(result.get("passed") is False)
 

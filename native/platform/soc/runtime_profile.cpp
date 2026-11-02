@@ -12,6 +12,8 @@ unsigned prefill_embedding_block_rows(unsigned configured_rows) {
 
 bool verify_primary_model_last() { return true; }
 
+bool verify_model_payloads() { return false; }
+
 unsigned pointwise_prefill_layers(unsigned verified_cache_layers) {
   if (verified_cache_layers != 0 && verified_cache_layers != 12 && verified_cache_layers != 19) {
     throw std::invalid_argument("unsupported SoC prefill cache prefix");
@@ -26,12 +28,16 @@ const RuntimeProfile &runtime_profile() {
 }
 
 void verify_driver() {
-  // This vendor build omits sysfs srcversion. Pin its module file as well as
-  // the userspace libraries; the run guard also records the active boot/load.
+  // These vendor builds omit sysfs srcversion. Keep the accepted July image and
+  // replacement April image explicit; packages still pin all userspace libraries.
+  // The run guard also records the active boot/load and enforces recovery controls.
   const std::filesystem::path directory(runtime_profile().sdk_library_directory);
-  if (!std::filesystem::is_directory("/sys/module/galcore") ||
-      np101::file_sha256(directory / "galcore.ko") !=
-          "4c9a6ca280791ec23b13759ebee67759dd8a40bdb465536ba0f1dff3f78449bc") {
+  if (!std::filesystem::is_directory("/sys/module/galcore")) {
+    throw std::invalid_argument("compiled package requires a loaded SoC driver");
+  }
+  const auto digest = np101::file_sha256(directory / "galcore.ko");
+  if (digest != "4c9a6ca280791ec23b13759ebee67759dd8a40bdb465536ba0f1dff3f78449bc" &&
+      digest != "d19f6d06ba1b8017cb44fb3280f62f9c1a0a0ef04c299c00867040cc9ae8de77") {
     throw std::invalid_argument("compiled package requires the pinned SoC driver");
   }
 }

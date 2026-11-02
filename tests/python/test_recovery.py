@@ -77,8 +77,11 @@ class RecoveryControlTests(unittest.TestCase):
             "kernel: [galcore]: Stop driver to keep scene.",
             "--------gckEDMA_StartTransfer---timeout---src:0x55c24e40",
             "[428293.680670] mmc0: Timeout waiting for hardware interrupt.",
+            "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt.",
+            "mmc1: Timeout waiting for hardware data interrupt.",
             "EXT4-fs error (device mmcblk0p2): failed to read inode",
             "Buffer I/O error on dev mmcblk0p2, logical block 42",
+            "blk_update_request: I/O error, dev mmcblk0, sector 4096",
         ):
             self.assertIsNotNone(recovery_controls.FAULT.search(line), line)
         self.assertIsNone(recovery_controls.FAULT.search("kernel: Waiting for HDMA Transfer..."))

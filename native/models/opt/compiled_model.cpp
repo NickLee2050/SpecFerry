@@ -1,6 +1,7 @@
 #include "models/opt/layer.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/sdk_identity.hpp"
+#include "platform/runtime_profile.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -154,7 +155,7 @@ CompiledModelPackage load_compiled_model(const std::filesystem::path &package,
     if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
         std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
         artifact.graph.constant_bytes > segment_payload_limit - constants ||
-        file_sha256(binary) != digest) {
+        (platform::verify_model_payloads() && file_sha256(binary) != digest)) {
       throw std::invalid_argument("compiled OPT model NBG path/hash/budget differs");
     }
     artifact.graph.path = binary.string();

@@ -35,7 +35,7 @@ SdkTimings::SdkTimings(const std::filesystem::path &directory) : directory_(dire
     if (!output_) {
       throw std::runtime_error("cannot open SDK timing output");
     }
-    output_ << "event\tapi\tseconds\tunix_seconds\toutcome\n";
+    output_ << "event\tapi\tseconds\tunix_seconds\trequest\tphase\trole\toutcome\n";
   } else if (std::string_view(value) == "summary") {
     mode_ = Mode::Summary;
     dirty_ = true;
@@ -136,7 +136,8 @@ SdkTimer::SdkTimer(const char *api) : owner_(SdkTimings::active_), api_(api) {
   } else {
     const auto timestamp = unix_seconds();
     owner_->output_ << "begin\t" << api_ << "\t\t" << std::fixed << std::setprecision(6)
-                    << timestamp << std::defaultfloat << "\t\n"
+                    << timestamp << std::defaultfloat << '\t' << owner_->scope_[0] << '\t'
+                    << owner_->scope_[1] << '\t' << owner_->scope_[2] << "\t\n"
                     << std::flush;
   }
   uncaught_exceptions_ = std::uncaught_exceptions();
@@ -172,7 +173,8 @@ SdkTimer::~SdkTimer() noexcept {
     const auto timestamp = unix_seconds();
     owner_->output_ << "end\t" << api_ << '\t' << seconds << '\t' << std::fixed
                     << std::setprecision(6) << timestamp << std::defaultfloat << '\t'
-                    << (exception ? "exception" : "returned") << '\n'
+                    << owner_->scope_[0] << '\t' << owner_->scope_[1] << '\t' << owner_->scope_[2]
+                    << '\t' << (exception ? "exception" : "returned") << '\n'
                     << std::flush;
   } catch (...) {
     // An output failure must not replace an exception from the timed call.

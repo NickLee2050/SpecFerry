@@ -16,7 +16,8 @@ from .device import (
 FAULT = re.compile(
     r"NP.*hang|EDMA.*timeout|\bBUG:|\bOops:|unable to handle|general protection fault|"
     r"invalid opcode|soft lockup|Hardware Error|GPU DRV CONFIG|Stop driver to keep scene|"
-    r"mmc\d+:.*Timeout waiting for hardware interrupt|EXT4-fs error|Buffer I/O error",
+    r"mmc\d+:.*Timeout waiting for hardware(?: (?:cmd|data))? interrupt|EXT4-fs error|"
+    r"Buffer I/O error|(?:blk_update_request|end_request):.*I/O error",
     re.I,
 )
 

@@ -13,6 +13,10 @@ from . import board_runner
 from .board_runner import read_json, save, sha256, verify_bundle
 
 DRIVER_SHA256 = "4c9a6ca280791ec23b13759ebee67759dd8a40bdb465536ba0f1dff3f78449bc"
+SUPPORTED_DRIVER_SHA256 = {
+    DRIVER_SHA256,
+    "d19f6d06ba1b8017cb44fb3280f62f9c1a0a0ef04c299c00867040cc9ae8de77",
+}
 
 
 def request_options(request):
@@ -232,10 +236,11 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
     records = read_json(deployment / "deployment-manifest.json")["tensors"]
     if graph["weight_sha256"] != {row["name"]: row["sha256"] for row in records}:
         raise ValueError("NBG source weight identities differ")
-    if sha256(sdk / "drivers/galcore.ko") != DRIVER_SHA256:
+    driver_digest = sha256(sdk / "drivers/galcore.ko")
+    if driver_digest not in SUPPORTED_DRIVER_SHA256:
         raise ValueError("SDK snapshot is not the pinned SoC module")
     sdk_hashes = {path.name: sha256(path) for path in sorted((sdk / "drivers").glob("*.so"))}
-    sdk_hashes["galcore.ko"] = DRIVER_SHA256
+    sdk_hashes["galcore.ko"] = driver_digest
     if not all(name in sdk_hashes for name in SDK_FILES):
         raise ValueError("incomplete SDK snapshot")
     if not (sdk / "include/CL/cl_viv_vx_ext.h").is_file():

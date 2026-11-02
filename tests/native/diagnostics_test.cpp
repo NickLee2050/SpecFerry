@@ -181,6 +181,9 @@ void calls_and_errors(Environment &environment, const std::filesystem::path &dir
   environment.set("calls");
   {
     SdkTimings timings(directory);
+    SdkScope request("request", "sample-request");
+    SdkScope phase("phase", "sample-phase");
+    SdkScope role("role", "sample-role");
     sdk_call("returned", [] {});
     rejects([&] { sdk_call("exception", [] { throw std::runtime_error("mock failure"); }); });
     timings.flush();
@@ -188,9 +191,12 @@ void calls_and_errors(Environment &environment, const std::filesystem::path &dir
   std::ifstream input(directory / "sdk-calls.tsv");
   std::string line;
   std::getline(input, line);
-  require(line == "event\tapi\tseconds\tunix_seconds\toutcome", "calls schema changed");
+  require(line == "event\tapi\tseconds\tunix_seconds\trequest\tphase\trole\toutcome",
+          "calls schema changed");
   unsigned begins = 0, ends = 0, returned = 0, exceptions = 0;
   while (std::getline(input, line)) {
+    require(line.find("\tsample-request\tsample-phase\tsample-role\t") != std::string::npos,
+            "call trace lost its scope labels");
     begins += line.find("begin\t") == 0;
     ends += line.find("end\t") == 0;
     const auto outcome = line.substr(line.rfind('\t') + 1);

@@ -507,6 +507,7 @@ void BlockPrefill::consume(const std::vector<std::int32_t> &tokens) {
   if (tokens.size() != block || impl.position + block >= impl.config.decoder.capacity) {
     throw std::invalid_argument("OPT block prefill needs sixteen tokens and an M1 tail slot");
   }
+  const SdkScope timing_phase("phase", "prefill.position." + std::to_string(impl.position));
   std::vector<std::int32_t> controls(tokens);
   for (unsigned index = 0; index < block; ++index) {
     impl.config.validate_token(tokens[index]);

@@ -75,13 +75,23 @@ python scripts/np101_soc.py prepare --package /absolute/path/to/opt-fullgraph-pa
   --output .cache/deploy/opt-soc
 python scripts/np101_soc.py deploy .cache/deploy/opt-soc --host np101
 python scripts/np101_soc.py run .cache/deploy/opt-soc --host np101 \
-  --output .cache/runs/opt-soc --timeout 180
+  --output .cache/runs/opt-soc --prepare-timeout 240 --timeout 300
 # Resume evidence retrieval after a transport interruption; never relaunch the model:
 python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/opt-soc
 ```
 
 `prepare` is offline; `deploy` transfers files and checks hashes without opening the NPU.
-`run` accepts fullgraph C64/C128, mapped-slot KV, independent reset requests and no Context
+Deployment records the verified manifest and file identities. Subsequent `run`/`collect` calls do
+not rescan model payloads; execution checks the deployment record, file metadata and SDK identity.
+The SoC OPT loader also skips repeated weight/NBG payload hashes, retaining structural, port,
+source-identity and budget checks. Controlled FFN cache checks remain. If only timestamps of the
+exact native-manifest cache files change, the supervisor rehashes those files before refreshing
+their receipt metadata. Changed content, inode, size or other payload metadata still requires repair
+or full deployment verification. Copied deployments must be verified again.
+This does not detect silent payload corruption with unchanged file metadata
+on each launch. EP retains startup payload checks. Run `python3 board_runner.py verify BUNDLE` on
+the board after manual deployment; it checks the full bundle without opening the NPU.
+`run` accepts fullgraph C64/C128/C256, mapped-slot KV, independent reset requests and no Context
 rebuild. Optional block16 prefill uses `prepare --prefill-package` and request options
 `block 16`, `prefill_head last-token`. The original handwritten-attention/MLP-NBG candidate failed
 Linux memory acceptance. The compiled-attention path uses nineteen shared ordinary-weight FFNs
@@ -115,8 +125,13 @@ M1 consumes the remaining 1–16 prompt tokens and all generated tokens.
 M1's embedded head still executes on every M1 step. This path does not support continuation or the
 resident benchmark entry. Acceptance scopes and measurements are recorded in the status document.
 It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
-host EP isolation. The detached board supervisor owns the child deadline (maximum 300 seconds),
-kernel monitoring, Linux memory reserve and 45-second delayed release checks. SSH interruptions
+host EP isolation. The detached supervisor allows at most 240 seconds for model preparation and
+300 seconds for the complete post-ready workload, configured by `--prepare-timeout` and `--timeout`.
+The native entry reports readiness once through a private pipe; requests never restart the budget,
+and blocked SDK/debugfs sampling cannot delay the watchdog. Kernel monitoring, Linux memory reserve
+and release checks remain; SoC post-exit observation is 10 seconds. This shorter window can miss the
+recorded recovery Oops that appeared about 33 seconds after exit; the next run still checks the full
+kernel log. EP retains its 45-second observation. SSH interruptions
 retry discovery of the same run; `collect` performs host numerical acceptance. Existing recovery
 markers block ordinary runs. `--diagnostic-baseline` is only for explicitly authorized diagnostics:
 it binds exact boot, old timestamped fault occurrences, marker/bundle hashes and deadline; success

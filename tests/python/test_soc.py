@@ -73,6 +73,21 @@ class SocTests(unittest.TestCase):
         self.assertEqual(board.new_faults(old + "\n" + old, pattern, [old]), [old])
         self.assertEqual(board.new_faults(old, pattern), [old])
 
+    def test_legacy_bundle_cannot_hide_storage_faults(self):
+        pattern = re.compile(board.fault_pattern({"fault_pattern": "NP.*hang"}), re.I)
+        line = "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt."
+        self.assertEqual(board.new_faults(line, pattern), [line])
+        previous = self.released_board_marker()
+        previous["kernel_faults"] = [line]
+        digest = "a" * 64
+        diagnostic = {
+            "authorization": "retry isolated NP hang only",
+            "kernel_faults": [line],
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with self.assertRaisesRegex(RuntimeError, "only accepts recorded NP hang"):
+            board.hang_retry_state(previous, diagnostic, digest, previous["board_boot_id"])
+
     def released_board_marker(self):
         return {
             "board_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
@@ -82,7 +97,7 @@ class SocTests(unittest.TestCase):
             "owners_delayed": [],
             "pool_released": True,
             "gfp_released": True,
-            "delayed_seconds": 45.1,
+            "delayed_seconds": 10.1,
             "stop_reason": "Linux memory reserve breached",
         }
 
@@ -105,7 +120,7 @@ class SocTests(unittest.TestCase):
             {"owners_delayed": [42]},
             {"pool_released": False},
             {"gfp_released": False},
-            {"delayed_seconds": 44.9},
+            {"delayed_seconds": 9.9},
             {"delayed_seconds": None},
             {"kernel_faults": None},
             {"monitor_error": "lost records"},
@@ -178,7 +193,7 @@ class SocTests(unittest.TestCase):
                 {"gfp_released": False},
                 {"owners_delayed": [7]},
                 {"remaining_processes": [7]},
-                {"delayed_seconds": 44.9},
+                {"delayed_seconds": 9.9},
                 {"delayed_faults": [baseline[-1]]},
                 {"monitor_error": "lost kernel events"},
                 {"final_check_error": "cannot read kernel"},
@@ -291,6 +306,7 @@ class SocTests(unittest.TestCase):
             "bundle_sha256": board.sha256(self.root / "bundle.json"),
             "authorization": "bounded diagnostic",
             "timeout": 180,
+            "preparation_timeout": 240,
             "kernel_faults": [],
         }
         manifest = {"fault_pattern": "hang", "driver_parameters": {"contiguousSize": 1024}}
@@ -315,6 +331,7 @@ class SocTests(unittest.TestCase):
             patch.object(board, "STATE", self.root),
             patch.object(board, "DELAY_SECONDS", 0),
             patch.object(board, "verify_bundle", return_value=manifest),
+            patch.object(board, "require_verified_deployment"),
             patch.object(board, "kernel", return_value=""),
             patch.object(board, "owners", return_value=[]),
             patch.object(board, "snapshot", return_value=state),
@@ -369,6 +386,10 @@ class SocTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "kernel fault"):
                 board.accept(output, digest)
             self.assertEqual(marker.read_bytes(), pending)
+            kernel.return_value = "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt."
+            with self.assertRaisesRegex(RuntimeError, "kernel fault"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
             retained = output / "retained-prior-board-marker.json"
             retained.write_bytes(original + b"\n")
             with self.assertRaisesRegex(RuntimeError, "retained board marker differs"):
@@ -407,6 +428,8 @@ class SocTests(unittest.TestCase):
             sdk.write_bytes(b"bad! SDK")
             with self.assertRaisesRegex(ValueError, "board SDK identity"):
                 board.verify_bundle(self.root)
+            with self.assertRaisesRegex(ValueError, "board SDK identity"):
+                board.verify_bundle(self.root, verify_payload=False)
         binary.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "permission"):
             board.verify_bundle(self.root, check_sdk=False)
@@ -420,6 +443,152 @@ class SocTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RISC-V"):
             board.verify_bundle(self.root, check_sdk=False)
 
+    def test_verified_deployment_skips_payload_reads_and_rejects_changed_files(self):
+        binary = self.root / "bin/specferry_opt_graph_generate"
+        binary.parent.mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        binary.write_bytes(header)
+        binary.chmod(0o755)
+        payload = self.root / "model.nb"
+        payload.write_bytes(b"model data")
+        manifest = {
+            "schema_version": 1,
+            "target": "np101-soc-riscv64",
+            "sdk": {},
+            "files": {
+                str(path.relative_to(self.root)): {
+                    "bytes": path.stat().st_size,
+                    "sha256": board.sha256(path),
+                    "executable": path == binary,
+                }
+                for path in (binary, payload)
+            },
+        }
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(RuntimeError, "verification required"):
+            board.require_verified_deployment(self.root, manifest)
+        board.verify_deployment(self.root)
+        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
+            board.verify_bundle(self.root, verify_payload=False)
+            board.require_verified_deployment(self.root, manifest)
+            self.assertNotIn(unittest.mock.call(payload), hashes.call_args_list)
+            self.assertNotIn(unittest.mock.call(binary), hashes.call_args_list)
+        state = payload.stat()
+        payload.write_bytes(b"damaged nb")
+        os.utime(payload, ns=(state.st_atime_ns, state.st_mtime_ns))
+        with self.assertRaisesRegex(RuntimeError, "deployment changed"):
+            board.require_verified_deployment(self.root, manifest)
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            board.verify_deployment(self.root)
+
+    def verified_cache_deployment(self):
+        binary = self.root / "bin/specferry_opt_graph_generate"
+        binary.parent.mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        binary.write_bytes(header)
+        binary.chmod(0o755)
+        payload = self.root / "model/model.nb"
+        payload.parent.mkdir()
+        payload.write_bytes(b"immutable model")
+        caches = []
+        lines = [
+            "specferry-opt-verify-cache 1 batch-pointwise-f16-fp32-norm-v1 12 1024 4096 16 256",
+            f'{board.sha256(binary)} "cache-producer.bin" {board.sha256(binary)}',
+            "np101-soc-riscv64 0",
+        ]
+        for layer in range(12):
+            path = self.root / f"model/verify-cache/layer-{layer}/accepted.nb"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(f"cache {layer}".encode())
+            caches.append(path)
+            digest = board.sha256(path)
+            lines.append(f'{layer} "accepted.nb" {path.stat().st_size} {digest}')
+            lines.extend([digest] * 6)
+        (payload.parent / "verified-prefill-cache.txt").write_text("\n".join(lines) + "\n")
+        unlisted = self.root / "model/verify-cache/unlisted.nb"
+        unlisted.write_bytes(b"not a controlled native cache")
+        manifest = {
+            "schema_version": 1,
+            "target": "np101-soc-riscv64",
+            "sdk": {},
+            "files": {
+                path.relative_to(self.root).as_posix(): {
+                    "bytes": path.stat().st_size,
+                    "sha256": board.sha256(path),
+                    "executable": path == binary,
+                }
+                for path in self.root.rglob("*")
+                if path.is_file()
+            },
+        }
+        board.save(self.root / "bundle.json", manifest)
+        board.verify_deployment(self.root)
+        return manifest, payload, caches, unlisted
+
+    def test_cache_timestamp_refresh_hashes_only_changed_controlled_files(self):
+        manifest, payload, caches, _ = self.verified_cache_deployment()
+        state = caches[0].stat()
+        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
+            board.require_verified_deployment(self.root, manifest)
+            self.assertIn(unittest.mock.call(caches[0]), hashes.call_args_list)
+            for path in (payload, *caches[1:]):
+                self.assertNotIn(unittest.mock.call(path), hashes.call_args_list)
+        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
+            board.require_verified_deployment(self.root, manifest)
+            self.assertNotIn(unittest.mock.call(caches[0]), hashes.call_args_list)
+
+    def test_cache_refresh_rejects_corruption_and_keeps_the_prior_receipt(self):
+        manifest, _, caches, _ = self.verified_cache_deployment()
+        receipt = self.root / ".deployment-verified.json"
+        original = receipt.read_bytes()
+        state = caches[0].stat()
+        caches[0].write_bytes(b"damaged")
+        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns))
+        with self.assertRaisesRegex(RuntimeError, "cache identity differs"):
+            board.require_verified_deployment(self.root, manifest)
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def test_cache_refresh_rejects_files_changed_during_hashing(self):
+        manifest, payload, caches, _ = self.verified_cache_deployment()
+        receipt = self.root / ".deployment-verified.json"
+        original = receipt.read_bytes()
+        state = caches[0].stat()
+        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+        checksum = board.sha256
+
+        def concurrent_change(path):
+            digest = checksum(path)
+            if path == caches[0]:
+                payload.write_bytes(b"changed model!!")
+            return digest
+
+        with (
+            patch.object(board, "sha256", side_effect=concurrent_change),
+            self.assertRaisesRegex(RuntimeError, "changed during controlled cache verification"),
+        ):
+            board.require_verified_deployment(self.root, manifest)
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def test_cache_refresh_does_not_waive_other_metadata_or_replaced_inodes(self):
+        manifest, payload, caches, unlisted = self.verified_cache_deployment()
+        for path in (payload, unlisted, self.root / "model/verified-prefill-cache.txt"):
+            with self.subTest(path=path):
+                state = path.stat()
+                os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+                with self.assertRaisesRegex(RuntimeError, "deployment changed"):
+                    board.require_verified_deployment(self.root, manifest)
+                board.verify_deployment(self.root)
+        replacement = caches[0].with_suffix(".replacement")
+        replacement.write_bytes(caches[0].read_bytes())
+        replacement.replace(caches[0])
+        with self.assertRaisesRegex(RuntimeError, "deployment changed"):
+            board.require_verified_deployment(self.root, manifest)
+
     def test_bundle_and_remote_paths_cannot_escape_their_roots(self):
         for name in ("../weights.bin", "/tmp/weights.bin"):
             with self.assertRaises(ValueError):
@@ -431,7 +600,7 @@ class SocTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 remote.remote_path(name)
 
-    def supervise(self, source, timeout=1, monitor=lambda: None):
+    def supervise(self, source, timeout=1, monitor=lambda: None, preparation_timeout=None):
         return board.supervise(
             [sys.executable, "-c", source],
             self.root,
@@ -439,7 +608,64 @@ class SocTests(unittest.TestCase):
             self.root,
             timeout,
             monitor,
+            preparation_timeout=preparation_timeout,
         )
+
+    def test_preparation_and_inference_have_independent_deadlines(self):
+        result = self.supervise(
+            "import os,time; time.sleep(0.15); "
+            "os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.12,
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        self.assertGreater(result["preparation_seconds"], 0.12)
+        self.assertEqual(result["remaining_processes"], [])
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertGreaterEqual(fired - result["ready_monotonic_seconds"], 0.12)
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.35)
+
+    def test_ready_before_clean_exit_is_collected(self):
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode())",
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertIsNone(result["stop_reason"])
+        self.assertIn("ready_monotonic_seconds", result)
+
+    def test_preparation_timeout_does_not_grant_inference_time_before_readiness(self):
+        result = self.supervise("import time; time.sleep(60)", preparation_timeout=0.12)
+        self.assertEqual(result["stop_reason"], "preparation deadline expired")
+        self.assertNotIn("ready_monotonic_seconds", result)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_ready_pipe_and_inference_deadline_work_when_sampling_blocks(self):
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.12,
+            preparation_timeout=1,
+            monitor=lambda: time.sleep(0.4),
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.35)
+
+    def test_missing_or_invalid_readiness_cannot_pass_or_extend_preparation(self):
+        result = self.supervise("pass", preparation_timeout=1)
+        self.assertEqual(result["stop_reason"], "model readiness not reported")
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), b'NaN\\n'); "
+            "time.sleep(60)",
+            preparation_timeout=1,
+        )
+        self.assertIn("invalid model readiness", result["stop_reason"])
+        for limit in (0, 241):
+            with self.assertRaises(ValueError):
+                self.supervise("pass", preparation_timeout=limit)
 
     def test_deadline_stops_child_even_when_health_sampling_blocks(self):
         result = self.supervise(
@@ -448,6 +674,20 @@ class SocTests(unittest.TestCase):
         self.assertLess(result["exit"], 0)
         self.assertEqual(result["stop_reason"], "child deadline expired")
         self.assertEqual(result["remaining_processes"], [])
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["child_start_monotonic_seconds"], 0.35)
+
+    def test_deadline_is_armed_before_initial_record_write(self):
+        original = board.save
+
+        def slow_initial_write(path, value):
+            if path.name == "child.json" and "exit" not in value:
+                time.sleep(0.4)
+            original(path, value)
+
+        with patch.object(board, "save", side_effect=slow_initial_write):
+            result = self.supervise("import time; time.sleep(60)", timeout=0.12)
+        self.assertEqual(result["stop_reason"], "child deadline expired")
         fired = board.read_json(self.root / "watchdog.json")["expired_at"]
         self.assertLess(fired - result["child_start_monotonic_seconds"], 0.35)
 

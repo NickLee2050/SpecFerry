@@ -281,8 +281,8 @@ int main(int argc, char **argv) {
                                  ? PartitionedModel::KvTransfer::MappedSlot
                                  : PartitionedModel::KvTransfer::DeviceCopy;
     if (kv_transfer == PartitionedModel::KvTransfer::MappedSlot && config.decoder.capacity != 64 &&
-        config.decoder.capacity != 128) {
-      throw std::invalid_argument("mapped-slot KV requires the C64/C128 layout");
+        config.decoder.capacity != 128 && config.decoder.capacity != 256) {
+      throw std::invalid_argument("mapped-slot KV requires the C64/C128/C256 layout");
     }
     const auto cache_first = options.cache_first, cache_last = options.cache_last;
     if (cache_last > config.decoder.layers) {
@@ -307,7 +307,9 @@ int main(int argc, char **argv) {
                                      std::chrono::duration<double>(Clock::now() - start).count());
     };
     np101::WeightStore weights(argv[1]);
-    prepare("weights", [&] { weights.verify(); });
+    if (platform::verify_model_payloads()) {
+      prepare("weights", [&] { weights.verify(); });
+    }
     std::vector<models::opt::CompiledFfn> compiled_ffn, compiled_prefill_ffn;
     std::vector<models::opt::CompiledPrefillLayer> compiled_prefill_layers;
     models::opt::CompiledHead compiled_head;
@@ -467,6 +469,9 @@ int main(int argc, char **argv) {
         if (!initialized) {
           throw std::runtime_error("cannot save initialization observation");
         }
+      }
+      if (cycle == 0) {
+        platform::notify_model_ready();
       }
       bool tokens_match = true;
       bool cache_suffix_matches = true;

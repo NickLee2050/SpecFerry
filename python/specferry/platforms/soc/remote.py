@@ -168,7 +168,7 @@ def collect(bundle, output):
     session = read_json(output / "session.json")
     if session["bundle_sha256"] != sha256(bundle / "bundle.json"):
         raise ValueError("collection bundle differs from the launched run")
-    verify_bundle(bundle, check_sdk=False)
+    verify_bundle(bundle, check_sdk=False, verify_payload=False)
     marker = RECOVERY_ROOT / "np101-recovery-required.json"
     with device_lock(RECOVERY_ROOT, recovery_control=True):
         if read_json(marker).get("evidence") != str(output.resolve()):
@@ -251,12 +251,14 @@ def collect(bundle, output):
         return summary
 
 
-def run(bundle, host, destination, output, timeout, diagnostic=None):
+def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparation_timeout=240):
     if not 0 < timeout <= 300:
-        raise ValueError("child deadline must be in (0, 300] seconds")
+        raise ValueError("inference deadline must be in (0, 300] seconds")
+    if not 0 < preparation_timeout <= 240:
+        raise ValueError("preparation deadline must be in (0, 240] seconds")
     bundle, output = bundle.resolve(), output.resolve()
     destination = remote_path(destination)
-    verify_bundle(bundle, check_sdk=False)
+    verify_bundle(bundle, check_sdk=False, verify_payload=False)
     with device_lock(RECOVERY_ROOT, recovery_control=diagnostic is not None):
         marker = RECOVERY_ROOT / "np101-recovery-required.json"
         if diagnostic is not None and (
@@ -264,6 +266,7 @@ def run(bundle, host, destination, output, timeout, diagnostic=None):
             or sha256(bundle / "bundle.json") != diagnostic["bundle_sha256"]
             or not diagnostic["authorization"]
             or diagnostic["timeout"] != timeout
+            or diagnostic.get("preparation_timeout") != preparation_timeout
         ):
             raise RuntimeError("diagnostic authorization does not match the retained gate/bundle")
         output.mkdir(parents=True, exist_ok=False)
@@ -275,6 +278,8 @@ def run(bundle, host, destination, output, timeout, diagnostic=None):
             remote_output=remote_output,
             bundle_sha256=sha256(bundle / "bundle.json"),
             diagnostic=diagnostic,
+            preparation_timeout=preparation_timeout,
+            inference_timeout=timeout,
         )
         save(output / "session.json", session)
         if diagnostic is not None:
@@ -296,8 +301,7 @@ def run(bundle, host, destination, output, timeout, diagnostic=None):
         script = str(PurePosixPath(destination) / "board_runner.py")
         # The detached process owns its watchdog. Losing this SSH does not kill the monitor.
         command = ["python3", script, "run", destination, remote_output, str(timeout)]
-        if diagnostic is not None:
-            command.append(json.dumps(diagnostic))
+        command.extend([json.dumps(diagnostic), str(preparation_timeout)])
         launch = (
             "import subprocess,hashlib,pathlib; "
             f"assert hashlib.sha256(pathlib.Path({script!r}).read_bytes()).hexdigest()=={sha256(bundle / 'board_runner.py')!r}; "
@@ -314,8 +318,9 @@ def run(bundle, host, destination, output, timeout, diagnostic=None):
             except (subprocess.SubprocessError, OSError) as error:
                 # Submission may have reached the board. Discover this run; never resubmit.
                 save(output / "launch-transport-error.json", {"error": str(error)})
-            # File/SDK hashing happens before the native child. Its SDK deadline stays <=300s.
-            deadline = time.monotonic() + 300 + timeout + 60
+            # Separate preparation and post-ready execution budgets. SDK identity
+            # checks, release observation and transport have their own outer margin.
+            deadline = time.monotonic() + 60 + preparation_timeout + timeout + 60
             while time.monotonic() < deadline:
                 code = f"from pathlib import Path; print(int(Path({remote_output + '/result.json'!r}).is_file()))"
                 try:

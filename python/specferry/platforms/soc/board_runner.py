@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -17,9 +18,15 @@ from pathlib import Path
 
 STATE = Path("/root/specferry-soc")
 SDK = Path("/np101_driver/build/sdk/drivers")
-DELAY_SECONDS = 45
+DELAY_SECONDS = 10
 RESERVE_KIB = 192 * 1024
 HANG_FAILURE_LIMIT = 3
+# Old bundles carry their original fault expression. Keep this minimum independent
+# of that manifest so a stale expression cannot hide a storage failure.
+STORAGE_FAULT_PATTERN = (
+    r"mmc\d+:.*Timeout waiting for hardware(?: (?:cmd|data))? interrupt|"
+    r"EXT4-fs error|Buffer I/O error|(?:blk_update_request|end_request):.*I/O error"
+)
 
 
 def read_json(path):
@@ -51,7 +58,7 @@ def bundle_file(root, name):
     return target
 
 
-def verify_bundle(root, check_sdk=True):
+def verify_bundle(root, check_sdk=True, *, verify_payload=True):
     manifest = read_json(root / "bundle.json")
     if (manifest.get("schema_version"), manifest.get("target")) != (1, "np101-soc-riscv64"):
         raise ValueError("unsupported SoC bundle")
@@ -62,7 +69,8 @@ def verify_bundle(root, check_sdk=True):
             raise ValueError("bundle identity differs: " + name)
         if expected["executable"] and not os.access(path, os.X_OK):
             raise ValueError("missing executable permission: " + name)
-        checks.append((path, expected["bytes"], expected["sha256"], "bundle", name))
+        if verify_payload:
+            checks.append((path, expected["bytes"], expected["sha256"], "bundle", name))
     if check_sdk:
         for name, digest in manifest["sdk"].items():
             if Path(name).name != name:
@@ -86,6 +94,102 @@ def verify_bundle(root, check_sdk=True):
     if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 243:
         raise ValueError("SoC executable must be ELF64 little-endian RISC-V")
     return manifest
+
+
+def deployment_files(root, manifest):
+    result = {}
+    for name in manifest["files"]:
+        state = bundle_file(root, name).stat()
+        result[name] = [
+            state.st_dev,
+            state.st_ino,
+            state.st_size,
+            state.st_mtime_ns,
+            state.st_ctime_ns,
+        ]
+    return result
+
+
+def verify_deployment(root):
+    """Hash a deployment once, rejecting files changed during that verification."""
+    digest = sha256(root / "bundle.json")
+    before = deployment_files(root, read_json(root / "bundle.json"))
+    manifest = verify_bundle(root)
+    if sha256(root / "bundle.json") != digest or deployment_files(root, manifest) != before:
+        raise RuntimeError("deployment changed during checksum verification")
+    save(root / ".deployment-verified.json", {"bundle_sha256": digest, "files": before})
+    return manifest
+
+
+def controlled_cache_files(root, manifest):
+    """Limit timestamp refreshes to the exact native recipe's checked cache files."""
+    name = "model/verified-prefill-cache.txt"
+    if name not in manifest["files"]:
+        return set()
+    path = bundle_file(root, name)
+    if sha256(path) != manifest["files"][name]["sha256"]:
+        raise RuntimeError("controlled cache manifest identity differs")
+    lines = path.read_text().splitlines()
+    header = lines[0].split()
+    if (
+        len(header) != 8
+        or header[:3] != ["specferry-opt-verify-cache", "1", "batch-pointwise-f16-fp32-norm-v1"]
+        or header[3] not in ("12", "19")
+        or header[4:7] != ["1024", "4096", "16"]
+        or header[7] not in ("128", "256")
+    ):
+        raise RuntimeError("controlled cache recipe differs")
+    profile, libraries = lines[2].split()
+    start = 3 + int(libraries)
+    count = int(header[3])
+    if profile != "np101-soc-riscv64" or len(lines) != start + count * 7:
+        raise RuntimeError("controlled cache manifest layout differs")
+    result = set()
+    for layer in range(count):
+        index, filename, size, digest = shlex.split(lines[start + layer * 7])
+        name = f"model/verify-cache/layer-{layer}/{filename}"
+        if (
+            index != str(layer)
+            or Path(filename).name != filename
+            or not filename.endswith(".nb")
+            or not 0 < int(size) <= 64 * 1024**2
+            or manifest["files"].get(name)
+            != {"bytes": int(size), "sha256": digest, "executable": False}
+        ):
+            raise RuntimeError("controlled cache file identity differs")
+        result.add(name)
+    return result
+
+
+def require_verified_deployment(root, manifest):
+    receipt = root / ".deployment-verified.json"
+    if not receipt.is_file():
+        raise RuntimeError("deployment verification required before execution")
+    record = read_json(receipt)
+    current = deployment_files(root, manifest)
+    digest = sha256(root / "bundle.json")
+    if record.get("bundle_sha256") != digest or record.get("files", {}).keys() != current.keys():
+        raise RuntimeError("deployment changed; repeat deployment verification")
+    changed = {name for name, state in current.items() if state != record["files"][name]}
+    if not changed:
+        return
+    caches = controlled_cache_files(root, manifest)
+    if not changed <= caches or any(
+        current[name][:3] != record["files"][name][:3] for name in changed
+    ):
+        raise RuntimeError("deployment changed; repeat deployment verification")
+    # Cached Verify may touch mtime/ctime without changing the accepted binary.
+    # Rehash only those files, never waive content integrity or refresh other files.
+    for name in sorted(changed):
+        if sha256(bundle_file(root, name)) != manifest["files"][name]["sha256"]:
+            raise RuntimeError("controlled cache identity differs: " + name)
+    if sha256(root / "bundle.json") != digest or deployment_files(root, manifest) != current:
+        raise RuntimeError("deployment changed during controlled cache verification")
+    save(receipt, {"bundle_sha256": digest, "files": current})
+
+
+def fault_pattern(manifest):
+    return manifest["fault_pattern"] + "|" + STORAGE_FAULT_PATTERN
 
 
 def owners():
@@ -163,9 +267,11 @@ def group_members(group):
     return members
 
 
-def supervise(command, cwd, environment, output, timeout, monitor):
+def supervise(command, cwd, environment, output, timeout, monitor, *, preparation_timeout=None):
     if not 0 < timeout <= 300:
-        raise ValueError("child deadline must be in (0, 300] seconds")
+        raise ValueError("execution deadline must be in (0, 300] seconds")
+    if preparation_timeout is not None and not 0 < preparation_timeout <= 240:
+        raise ValueError("preparation deadline must be in (0, 240] seconds")
     started = time.monotonic()
     result = {
         "child_start_monotonic_seconds": started,
@@ -175,18 +281,63 @@ def supervise(command, cwd, environment, output, timeout, monitor):
         "actions": [],
         "stop_reason": None,
     }
-    child = None
-    watchdog = None
+    phased = preparation_timeout is not None
+    if phased:
+        result.update(
+            preparation_limit_seconds=preparation_timeout, inference_limit_seconds=timeout
+        )
+    child = watchdog = None
+    stopped = threading.Event()
+    read_fd = write_fd = None
+    ready_bytes = b""
+    deadline = started + (preparation_timeout if phased else timeout)
+    phase = "preparation" if phased else "child"
 
-    def expire():
-        if child.poll() is None:
-            result["stop_reason"] = "child deadline expired"
-            expired_at = time.monotonic()
-            terminate(child, result["actions"])
-            # Storage trouble must not delay the signal itself.
-            save(output / "watchdog.json", {"expired_at": expired_at, "child_pid": child.pid})
+    def observe_readiness():
+        nonlocal ready_bytes, deadline, phase
+        if not phased or phase != "preparation":
+            return
+        try:
+            ready_bytes += os.read(read_fd, 128)
+        except BlockingIOError:
+            return
+        if len(ready_bytes) > 64:
+            raise ValueError("invalid model readiness notification")
+        if b"\n" not in ready_bytes:
+            return
+        ready = float(ready_bytes.decode("ascii").strip())
+        if not started <= ready <= min(time.monotonic(), started + preparation_timeout):
+            raise ValueError("model readiness outside preparation budget")
+        result.update(ready_monotonic_seconds=ready, preparation_seconds=ready - started)
+        deadline = ready + timeout
+        phase = "inference"
+
+    def watch_deadline():
+        # The private nonblocking pipe avoids SDK/debugfs and SD reads. Sampling
+        # may block without delaying readiness detection or deadline enforcement.
+        while not stopped.is_set() and child.poll() is None:
+            try:
+                observe_readiness()
+                reason = phase + " deadline expired" if time.monotonic() >= deadline else None
+            except (ValueError, UnicodeError, OSError) as error:
+                reason = "invalid model readiness notification: " + str(error)
+            if reason:
+                result["stop_reason"] = reason
+                expired_at = time.monotonic()
+                terminate(child, result["actions"])
+                save(
+                    output / "watchdog.json",
+                    {"expired_at": expired_at, "child_pid": child.pid, "phase": phase},
+                )
+                return
+            stopped.wait(0.02)
 
     try:
+        environment = dict(environment)
+        if phased:
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+            environment["SPECFERRY_READY_FD"] = str(write_fd)
         with (output / "native.log").open("w") as log:
             child = subprocess.Popen(
                 command,
@@ -195,29 +346,48 @@ def supervise(command, cwd, environment, output, timeout, monitor):
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                pass_fds=(write_fd,) if phased else (),
             )
+            if write_fd is not None:
+                os.close(write_fd)
+                write_fd = None
             result["child_started"] = True
             result["child_pid"] = child.pid
-            save(output / "child.json", result)
-            # A driver debugfs read can itself block. The deadline must not depend
-            # on that monitor returning; this thread performs no device reads.
-            watchdog = threading.Timer(max(0, timeout - (time.monotonic() - started)), expire)
+            watchdog = threading.Thread(target=watch_deadline, daemon=True)
             watchdog.start()
+            save(output / "child.json", result)
             while child.poll() is None:
+                if result["stop_reason"]:
+                    break
                 reason = monitor()
-                if reason or time.monotonic() - started >= timeout:
-                    result["stop_reason"] = reason or "child deadline expired"
+                if reason:
+                    result["stop_reason"] = reason
                     break
                 time.sleep(0.05)
     finally:
+        stopped.set()
         if watchdog is not None:
-            watchdog.cancel()
             watchdog.join()
         if child is not None:
+            # A successful child can notify and exit before the watcher is scheduled.
+            if phased and phase == "preparation" and not result["stop_reason"]:
+                try:
+                    observe_readiness()
+                except (ValueError, UnicodeError, OSError) as error:
+                    result["stop_reason"] = "invalid model readiness notification: " + str(error)
             terminate(child, result["actions"])
             result["exit"] = child.poll()
+            if phased and phase == "preparation" and result["exit"] == 0:
+                result["stop_reason"] = result["stop_reason"] or "model readiness not reported"
             result["remaining_processes"] = group_members(child.pid)
+        for descriptor in (read_fd, write_fd):
+            if descriptor is not None:
+                os.close(descriptor)
         result["child_seconds"] = time.monotonic() - started
+        if "ready_monotonic_seconds" in result:
+            result["post_ready_child_seconds"] = max(
+                0, started + result["child_seconds"] - result["ready_monotonic_seconds"]
+            )
         save(output / "child.json", result)
     return result
 
@@ -337,7 +507,7 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
         or previous.get("pool_released") is not True
         or previous.get("gfp_released") is not True
         or type(delayed) not in (int, float)
-        or not 45 <= delayed < float("inf")
+        or not DELAY_SECONDS <= delayed < float("inf")
         or previous.get("monitor_error")
         or previous.get("final_check_error")
     ):
@@ -350,15 +520,19 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
     return result
 
 
-def run(root, output, timeout, diagnostic=None):
+def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
     if not 0 < timeout <= 300:
-        raise ValueError("child deadline must be in (0, 300] seconds")
+        raise ValueError("inference deadline must be in (0, 300] seconds")
+    if not 0 < preparation_timeout <= 240:
+        raise ValueError("preparation deadline must be in (0, 240] seconds")
     output.mkdir(parents=True, exist_ok=False)
     result = {
         "clean": False,
         "board_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "bundle_sha256": sha256(root / "bundle.json"),
-        "child_deadline_seconds": timeout,
+        "preparation_limit_seconds": preparation_timeout,
+        "inference_limit_seconds": timeout,
+        "child_deadline_seconds": preparation_timeout + timeout,
         "faults": [],
         "child_started": False,
     }
@@ -373,15 +547,16 @@ def run(root, output, timeout, diagnostic=None):
         if marker.exists() and diagnostic is None:
             raise RuntimeError("board recovery marker remains; follow the incident ledger")
         # Installed libraries are checked before native loading. This does not load the driver.
-        manifest = verify_bundle(root)
-        fault = re.compile(manifest["fault_pattern"], re.I)
-        result["fault_pattern"] = manifest["fault_pattern"]
+        manifest = verify_bundle(root, verify_payload=False)
+        result["fault_pattern"] = fault_pattern(manifest)
+        fault = re.compile(result["fault_pattern"], re.I)
         if diagnostic is not None:
             if (
                 diagnostic["board_boot_id"] != result["board_boot_id"]
                 or diagnostic["bundle_sha256"] != result["bundle_sha256"]
                 or not diagnostic["authorization"]
                 or diagnostic["timeout"] != timeout
+                or diagnostic.get("preparation_timeout") != preparation_timeout
             ):
                 raise RuntimeError("diagnostic authorization does not match this run")
             acknowledged = diagnostic["kernel_faults"]
@@ -395,6 +570,8 @@ def run(root, output, timeout, diagnostic=None):
             result["retained_prior_board_marker"] = retained
         if new_faults(kernel(output, "kernel-before.log"), fault, acknowledged) or owners():
             raise RuntimeError("kernel fault or existing galcore owner")
+        require_verified_deployment(root, manifest)
+        result["payload_verification"] = "deployment-checksums-and-current-file-metadata"
         parameters = {
             name: int((Path("/sys/module/galcore/parameters") / name).read_text(), 0)
             for name in manifest["driver_parameters"]
@@ -476,6 +653,7 @@ def run(root, output, timeout, diagnostic=None):
                 output,
                 timeout,
                 monitor,
+                preparation_timeout=preparation_timeout,
             )
         )
         monitor()
@@ -522,7 +700,7 @@ def run(root, output, timeout, diagnostic=None):
                 and not result["owners_delayed"]
                 and result["pool_released"]
                 and result["gfp_released"]
-                and result.get("delayed_seconds", 0) >= 45
+                and result.get("delayed_seconds", 0) >= DELAY_SECONDS
                 and native_complete(output)
             )
         except Exception as error:
@@ -574,7 +752,7 @@ def accept(output, expected_digest):
     # Reject new records even if they appeared after the delayed check.
     if new_faults(
         kernel(output, "kernel-accepted.log"),
-        re.compile(result["fault_pattern"], re.I),
+        re.compile(fault_pattern(result), re.I),
         result.get("diagnostic", {}).get("kernel_faults", []),
     ):
         raise RuntimeError("kernel fault after delayed check; retain recovery marker")
@@ -607,7 +785,7 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     command, root = sys.argv[1], Path(sys.argv[2]).resolve()
     if command == "verify":
-        manifest = verify_bundle(root)
+        manifest = verify_deployment(root)
         print(
             json.dumps(
                 {
@@ -627,6 +805,7 @@ def main():
                 Path(sys.argv[3]).resolve(),
                 float(sys.argv[4]),
                 json.loads(sys.argv[5]) if len(sys.argv) > 5 else None,
+                preparation_timeout=float(sys.argv[6]) if len(sys.argv) > 6 else 240,
             )
         elif command == "accept":
             accept(root, sys.argv[3])
