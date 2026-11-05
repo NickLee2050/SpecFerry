@@ -359,13 +359,8 @@ int main(int argc, char **argv) {
       const auto load_prefill = [&] {
         if (block == 16) {
           prepare("prefill", [&] {
-            if (fs::exists(resolved / "compiled-block-prefill.txt")) {
-              compiled_prefill_layers =
-                  models::opt::load_compiled_block_prefill(resolved, argv[1], config, weights);
-            } else {
-              compiled_prefill_ffn =
-                  models::opt::load_compiled_prefill(resolved, argv[1], config, weights);
-            }
+            compiled_prefill_layers =
+                models::opt::load_compiled_block_prefill(resolved, argv[1], config, weights);
           });
         }
       };
@@ -396,9 +391,9 @@ int main(int argc, char **argv) {
         : variant == PartitionedModel::Variant::CompiledDecoder   ? "nbg-decoder"
         : variant == PartitionedModel::Variant::CompiledFullModel ? "nbg-fullgraph"
                                                                   : "matmul";
-    const auto cached_prefill_ffns =
-        std::count_if(compiled_prefill_layers.begin(), compiled_prefill_layers.end(),
-                      [](const auto &layer) { return layer.verify_cache.has_value(); });
+    const auto prefill_backend = !compiled_prefill_layers.empty() ? "compiled-attention"
+                                 : block == 1                     ? "disabled"
+                                                                  : "handwritten-attention";
     const auto preparation =
         std::chrono::duration<double>(Clock::now() - preparation_started).count();
     fs::create_directories(directory);
@@ -437,6 +432,7 @@ int main(int argc, char **argv) {
       // Rebuild cycles reuse file validation; report one preparation plus this construction.
       const auto ready = preparation + initialize;
       const auto weight_bytes = model.weight_bytes();
+      const auto cache_dtype = np101::dtype_name(model.cache_spec().type);
       const auto kv_reset_uploads_per_request = model.cache_reset_uploads_per_request();
       const auto prefill_cache_policy =
           model.shares_prefill_cache() ? "shared-input" : "independent";
@@ -450,16 +446,12 @@ int main(int argc, char **argv) {
                     << ",\"readback_transport\":\"" << options.readback_transport << "\""
                     << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
                     << ",\"prefill_cache_policy\":\"" << prefill_cache_policy << "\""
-                    << ",\"prefill_backend\":\""
-                    << (compiled_prefill_layers.empty() ? "handwritten-attention"
-                                                        : "compiled-attention")
-                    << "\""
+                    << ",\"cache_dtype\":\"" << cache_dtype << "\""
+                    << ",\"prefill_backend\":\"" << prefill_backend << "\""
                     << ",\"token_readback_transport\":\"mapped\""
                     << ",\"head_backend\":\"" << head_backend << "\""
                     << ",\"attention_projection_backend\":\"" << projection_backend << "\""
                     << ",\"prefill_block\":" << block << ",\"launches\":" << model.launches()
-                    << ",\"verified_prefill_cache_layers\":" << cached_prefill_ffns
-                    << ",\"initialization_ffn_warmups\":" << cached_prefill_ffns
                     << ",\"decode_steps\":" << model.decode_steps()
                     << ",\"prefill_steps\":" << model.prefill_steps()
                     << ",\"head_runs\":" << model.head_runs()
@@ -615,9 +607,8 @@ int main(int argc, char **argv) {
           << ",\"history_mode\":\"" << options.history_mode << "\""
           << ",\"kv_transfer\":\"" << options.kv_transfer << "\""
           << ",\"prefill_cache_policy\":\"" << prefill_cache_policy << "\""
-          << ",\"prefill_backend\":\""
-          << (compiled_prefill_layers.empty() ? "handwritten-attention" : "compiled-attention")
-          << "\""
+          << ",\"cache_dtype\":\"" << cache_dtype << "\""
+          << ",\"prefill_backend\":\"" << prefill_backend << "\""
           << ",\"weight_payload_bytes\":" << weight_bytes
           << ",\"kv_reset_uploads_per_request\":" << kv_reset_uploads_per_request
           << ",\"initialize_seconds\":" << initialize << ",\"preparation_seconds\":" << preparation

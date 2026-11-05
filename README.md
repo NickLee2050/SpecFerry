@@ -81,49 +81,18 @@ python scripts/np101_soc.py collect .cache/deploy/opt-soc --output .cache/runs/o
 ```
 
 `prepare` is offline; `deploy` transfers files and checks hashes without opening the NPU.
-Deployment records the verified manifest and file identities. Subsequent `run`/`collect` calls do
-not rescan model payloads; execution checks the deployment record, file metadata and SDK identity.
-The SoC OPT loader also skips repeated weight/NBG payload hashes, retaining structural, port,
-source-identity and budget checks. Controlled FFN cache checks remain. If only timestamps of the
-exact native-manifest cache files change, the supervisor rehashes those files before refreshing
-their receipt metadata. Changed content, inode, size or other payload metadata still requires repair
-or full deployment verification. Copied deployments must be verified again.
-This does not detect silent payload corruption with unchanged file metadata
-on each launch. EP retains startup payload checks. Run `python3 board_runner.py verify BUNDLE` on
-the board after manual deployment; it checks the full bundle without opening the NPU.
-`run` accepts fullgraph C64/C128/C256, mapped-slot KV, independent reset requests and no Context
-rebuild. Optional block16 prefill uses `prepare --prefill-package` and request options
-`block 16`, `prefill_head last-token`. The original handwritten-attention/MLP-NBG candidate failed
-Linux memory acceptance. The compiled-attention path uses nineteen shared ordinary-weight FFNs
-and five full decoder NBGs. SoC packages use batch-axis convolution for the first four FFNs;
-an optional verified cache package extends that prefix to twelve or all nineteen
-(`package_np101_opt_verify_cache.py --layers 19`), with FCL for any remainder.
-The cache packager, pinned identities and lifecycle boundary are described in
-[validation](tests/README.md#soc-formal-generation); EP selection is unchanged.
-FCL also replaces the M16 input
-projection, avoiding numerical errors observed in the original MatMul path. SoC compiled-attention
-prefill uses 8192-row embedding chunks (at most 8MiB); head configuration and EP remain unchanged.
-Native `preparation.json` separates weight, prefill and M1 package validation costs. SoC validates
-M1 last before construction while preserving every integrity check. Three reset requests
-with 17/49/17 input tokens and 16 outputs each passed the original C64 independent-cache checks.
-Compiled-attention prefill retains M1's FP32 input KV. On SoC, all decoder NBGs share one fixed
-output K/V pair; each layer commits its current block before the next producer runs. Canonical
-inputs remain separate, and EP keeps independent outputs. C128 passed 97/17 input tokens and
-16 outputs each with both independent and shared input KV;
-the shared change has not been separately accepted on C64. Shared inputs remove the final prefix
-handoff and duplicate reset. Shared SoC outputs first passed two 17-input/two-output reset requests,
-reducing sampled SYSTEM peak by 23.03MiB. With the 8192-row embedding policy, the latest combination
-also passed 97/17-input reset requests with 16 outputs each and final-layer KV/unused-slot checks.
-Initialization and request-specific performance are reported separately in the status document.
-The accepted C128 entry also passed full-capacity 113/17/113/17-input reset requests with 16 outputs
-each, repeated token/KV equality and rejection after the final slot. C256 export/packaging support is
-experimental: offline artifacts are ready, but SDHCI faults interrupted deployment before any NPU
-run. Keep the accepted C128 package; storage recovery and full C256 acceptance are still required.
-Handwritten attention retains its independent FP16 cache and widening
-handoff. The implementation is `native/models/opt/block_prefill.*`, without platform macros.
-M1 consumes the remaining 1–16 prompt tokens and all generated tokens.
-M1's embedded head still executes on every M1 step. This path does not support continuation or the
-resident benchmark entry. Acceptance scopes and measurements are recorded in the status document.
+Deployment records the verified manifest and file identities. Later runs check the receipt, file
+metadata and SDK identity. Changed files require full deployment verification. EP also checks payload
+hashes at startup. Run `python3 board_runner.py verify BUNDLE` after a manual deployment.
+
+SoC accepts fullgraph C64/C128/C256 with mapped-slot KV and independent reset requests. Use
+`prepare --prefill-package` with compiled attention, `block 16` and `prefill_head last-token` for
+batch prefill. The default SoC build uses four convolution FFNs, then shared FCL and five full
+decoder NBGs. Compiled prefill shares M1's KV inputs and reuses a scratch output pair, committing
+each layer before reuse. FP16 KV packages require matching prefill and decode ports. M1 processes
+the final prompt token and all generated tokens. Current performance and acceptance scopes are in
+[status](docs/np101-status.md#soc部署与内存).
+
 It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
 host EP isolation. The detached supervisor allows at most 240 seconds for model preparation and
 300 seconds for the complete post-ready workload, configured by `--prepare-timeout` and `--timeout`.

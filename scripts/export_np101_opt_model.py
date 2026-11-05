@@ -22,6 +22,7 @@ from specferry.models.opt.export import verify_export
 from specferry.models.opt.onnx import (
     decoder_model,
     full_model,
+    half_precision_cache,
     narrow_cache_selection,
     select_cache_updates,
 )
@@ -180,6 +181,7 @@ def main():
         default="scatter",
         help="select requires head-ordered indices; narrow-select publishes FP32 current slots",
     )
+    parser.add_argument("--cache-dtype", choices=("F32", "F16"), default="F32")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--package-output", type=Path, help="write a portable source-bound runtime package"
@@ -187,6 +189,10 @@ def main():
     args = parser.parse_args()
     if args.kv_update == "narrow-select" and args.scope != "fullgraph":
         parser.error("narrow-select requires --scope fullgraph")
+    if args.cache_dtype == "F16" and (
+        args.scope != "fullgraph" or args.kv_update != "narrow-select"
+    ):
+        parser.error("FP16 KV requires --scope fullgraph --kv-update narrow-select")
     verify_export(args.deployment)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -205,6 +211,8 @@ def main():
             select_cache_updates(model)
         if args.kv_update == "narrow-select":
             narrow_cache_selection(model)
+        if args.cache_dtype == "F16":
+            half_precision_cache(model)
         onnx.save(model, directory / "model.onnx")
         write_json(
             directory / "source.json",
@@ -213,6 +221,7 @@ def main():
                 layer=layer,
                 capacity=args.capacity,
                 kv_update=args.kv_update,
+                cache_dtype=args.cache_dtype,
                 cache_output="current" if args.kv_update == "narrow-select" else "full",
                 weight_sha256=graph.identities,
                 onnx_sha256=sha256(directory / "model.onnx"),

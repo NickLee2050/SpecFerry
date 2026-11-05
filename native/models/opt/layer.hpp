@@ -2,12 +2,10 @@
 
 #include "models/opt/config.hpp"
 #include "np101/ops/graph_builder.hpp"
-#include "np101/ops/graph_cache.hpp"
 
 #include <array>
 #include <filesystem>
 #include <map>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,13 +46,12 @@ struct CompiledDecoder {
   std::array<unsigned, 3> output_order{0, 1, 2};
 };
 
-// M16 NBG: attention plus normalization, or a complete decoder. FP32 cache
+// M16 NBG: attention plus normalization, or a complete decoder. KV cache
 // ports use [width,capacity,heads]; ordinary FFNs retain their original weights.
 struct CompiledPrefillLayer {
   np101::ops::CompiledGraphSpec graph;
   unsigned layer = 0;
   bool full_decoder = false;
-  std::optional<np101::ops::VerifiedGraphCache> verify_cache;
 };
 
 std::vector<CompiledPrefillLayer>
@@ -70,6 +67,7 @@ struct CompiledFullModel {
 
   // The package validates every cache output against this fixed port contract.
   bool current_cache_outputs() const;
+  np101::DataType cache_type() const;
 };
 
 struct CompiledModelPackage {

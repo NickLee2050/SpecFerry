@@ -10,11 +10,15 @@ from .compiled import DRIVER, SDK_FILES
 from .export import verify_export
 
 
-def expected_ports(kind, capacity, cache_output="full"):
+def expected_ports(kind, capacity, cache_output="full", cache_dtype="F32"):
     if cache_output not in ("full", "current"):
         raise ValueError("unknown compiled OPT cache output layout")
     if kind == "decoders" and cache_output == "current":
         raise ValueError("current-slot OPT packages require the fullgraph runtime")
+    if cache_dtype not in ("F16", "F32") or (
+        cache_dtype == "F16" and (kind != "fullgraph" or cache_output != "current")
+    ):
+        raise ValueError("FP16 compiled OPT state requires fullgraph current-slot ports")
     cache = [64, capacity, 16]
     output_cache = cache if cache_output == "full" else [64, 1, 16]
     output_prefix = "present_" if cache_output == "full" else "current_"
@@ -39,8 +43,8 @@ def expected_ports(kind, capacity, cache_output="full"):
     outputs = [("logits", "F16", [50272, 1]), ("selected", "I32", [1])]
     for index in range(24):
         for part in ("key", "value"):
-            inputs.append((f"layer{index}.past_{part}", "F32", cache))
-            outputs.append((f"layer{index}.{output_prefix}{part}", "F32", output_cache))
+            inputs.append((f"layer{index}.past_{part}", cache_dtype, cache))
+            outputs.append((f"layer{index}.{output_prefix}{part}", cache_dtype, output_cache))
     return inputs, outputs
 
 
@@ -48,7 +52,9 @@ def _validate_ports(entry, kind, capacity):
     layout = entry.get("cache_output", "full")
     if (entry.get("kv_update") == "narrow-select") != (layout == "current"):
         raise ValueError("compiled OPT narrow selection requires current-slot outputs")
-    for direction, expected in zip(("input", "output"), expected_ports(kind, capacity, layout)):
+    for direction, expected in zip(
+        ("input", "output"), expected_ports(kind, capacity, layout, entry.get("cache_dtype", "F32"))
+    ):
         ports, order = entry[direction + "s"], entry[direction + "_order"]
         if sorted(order) != list(range(len(expected))) or len(ports) != len(expected):
             raise ValueError("compiled OPT ports require a complete permutation")
@@ -111,6 +117,7 @@ def package_model_exports(artifacts, deployment, output):
             raise ValueError("compiled OPT model constant bound is insufficient")
         entry["kv_update"] = source.get("kv_update", "scatter")
         entry["cache_output"] = source.get("cache_output", "full")
+        entry["cache_dtype"] = source.get("cache_dtype", "F32")
         _validate_ports(entry, kind, capacity)
         entry.update(
             path=f"decoder{index:02d}.nb" if kind == "decoders" else "model.nb",

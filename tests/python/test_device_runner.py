@@ -51,15 +51,6 @@ class DeviceRecoveryTests(unittest.TestCase):
                         library, root, root, {"LD_PRELOAD": "/unrelated.so"}
                     )
                 record = device.verify_trace_environment(library, root, root, environment)
-                environment["SPECFERRY_VERIFY_EXECUTION_TRACE"] = "summary"
-                summary = device.verify_trace_environment(
-                    library,
-                    root,
-                    root,
-                    {key: value for key, value in environment.items() if key != "LD_PRELOAD"},
-                )
-                self.assertEqual(summary["execution_mode"], "summary")
-                self.assertTrue(summary["execution_output"].endswith("-execution-summary.tsv"))
             self.assertEqual(environment["LD_PRELOAD"], str(library))
             self.assertEqual(environment["SPECFERRY_VERIFY_TRACE"], record["output"])
 
@@ -215,7 +206,6 @@ class DeviceRecoveryTests(unittest.TestCase):
             result, process, _, _ = self.run_fixture([0], [], profiler_output=output)
             self.assertEqual(process.spawn_environment["VIV_VX_PROFILE"], "1")
             self.assertEqual(process.spawn_environment["VP_OUTPUT"], str(output))
-            self.assertEqual(process.spawn_environment["SPECFERRY_VERIFY_EXECUTION_TRACE"], "0")
             self.assertEqual(result["profiler"]["output"], str(output))
             for option in ("recovery_control", "sdk_timing", "sdk_summary", "trace_driver"):
                 with self.subTest(option=option), self.assertRaisesRegex(ValueError, "separate"):

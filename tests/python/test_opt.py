@@ -91,6 +91,25 @@ class CacheSelectionTests(unittest.TestCase):
                 )
                 feed["past_" + part] = cache
 
+    def test_half_cache_package_rejects_implicit_or_mixed_precision(self):
+        inputs, outputs = expected_ports("fullgraph", 128, "current", "F16")
+        entry = {"kv_update": "narrow-select", "cache_output": "current", "cache_dtype": "F16"}
+        for direction, ports in (("input", inputs), ("output", outputs)):
+            entry[direction + "s"] = [
+                {"name": name, "dtype": dtype, "shape": shape} for name, dtype, shape in ports
+            ]
+            entry[direction + "_order"] = list(range(len(ports)))
+        _validate_ports(entry, "fullgraph", 128)
+        del entry["cache_dtype"]
+        with self.assertRaisesRegex(ValueError, "port contract"):
+            _validate_ports(entry, "fullgraph", 128)
+        entry["cache_dtype"] = "F16"
+        entry["outputs"][2]["dtype"] = "F32"
+        with self.assertRaisesRegex(ValueError, "port contract"):
+            _validate_ports(entry, "fullgraph", 128)
+        with self.assertRaises(ValueError):
+            expected_ports("fullgraph", 128, "full", "F16")
+
     def test_current_cache_package_requires_explicit_matching_contract(self):
         with self.assertRaisesRegex(ValueError, "fullgraph"):
             expected_ports("decoders", 128, "current")

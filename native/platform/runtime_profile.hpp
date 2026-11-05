@@ -14,16 +14,15 @@ struct RuntimeProfile {
 const RuntimeProfile &runtime_profile();
 void verify_driver();
 
-// The optional validated cache package selects the larger SoC fast prefix.
-// Without it, preserve the accepted bounded-construction baseline; EP stays disabled.
-unsigned pointwise_prefill_layers(unsigned verified_cache_layers = 0);
+// Number of leading FFNs that use convolution in compiled-attention prefill.
+unsigned pointwise_prefill_layers();
 
 // Only the compiled-attention prefill table uses this platform policy; model/head
 // configuration and the 8 MiB tensor/read limit remain independent.
 unsigned prefill_embedding_block_rows(unsigned configured_rows);
 
 // SoC deployment verifies model payloads before execution; EP retains startup hashes.
-// SDK identity and controlled graph-cache checks are independent of this policy.
+// SDK identity checks are independent of this policy.
 bool verify_model_payloads();
 
 // Parse the M1 artifact after prefill preparation on SoC.

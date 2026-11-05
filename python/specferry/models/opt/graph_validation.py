@@ -152,9 +152,19 @@ def _mapped_slot_enabled(metadata, variant, block, kv_transfer):
     return mapped
 
 
+def _cache_storage_dtype(metadata, variant="compiled-fullgraph"):
+    default = "F32" if variant in ("compiled-decoder", "compiled-fullgraph") else "F16"
+    dtype = metadata.get("cache_dtype", default)
+    if dtype not in ("F16", "F32"):
+        raise ValueError("unsupported OPT cache precision")
+    return np.dtype("<f2" if dtype == "F16" else "<f4")
+
+
 def _mapped_slot_transfers(metadata, launches, predictions, reset):
     caches = 2 * metadata["layers"]
-    slot_bytes = caches * metadata["heads"] * metadata["width"] * 4
+    slot_bytes = (
+        caches * metadata["heads"] * metadata["width"] * _cache_storage_dtype(metadata).itemsize
+    )
     control_bytes = 8 + metadata["heads"] * 8 + metadata["capacity"] * 4
     return {
         "uploads": launches * (4 + caches) + (caches if reset else 0),
@@ -186,15 +196,17 @@ def _mapped_prefill_transfers(metadata, counts, predictions, reset):
     transfers["upload_bytes"] += blocks * (2 * 16 + 1) * 4
     if compiled:
         # Index/mask updates and mapped FP32 block commits are unchanged by sharing.
-        commit_bytes = caches * hidden * blocks * 16 * 4
+        commit_bytes = caches * hidden * blocks * 16 * _cache_storage_dtype(metadata).itemsize
         transfers["uploads"] += blocks * (2 + caches)
         transfers["upload_bytes"] += blocks * (4 + metadata["capacity"] * 16 * 4) + commit_bytes
         transfers["reads"] += blocks * caches
         transfers["read_bytes"] += commit_bytes
     if not shared:
-        item_bytes = 4 if compiled else 2
+        item_bytes = _cache_storage_dtype(metadata).itemsize if compiled else 2
         transfers["uploads"] += (caches if blocks else 0) + (caches if reset else 0)
-        transfers["upload_bytes"] += caches * hidden * blocks * 16 * 4
+        transfers["upload_bytes"] += (
+            caches * hidden * blocks * 16 * _cache_storage_dtype(metadata).itemsize
+        )
         transfers["reads"] += caches if blocks else 0
         transfers["read_bytes"] += caches * hidden * blocks * 16 * item_bytes
         if reset:
@@ -254,6 +266,11 @@ def evaluate(
             checks["prefill_backend"] = (
                 native_run.get("prefill_backend") == metadata["prefill_backend"]
             )
+    expected_cache_dtype = _cache_storage_dtype(metadata, variant)
+    legacy_dtype = "F32" if variant in ("compiled-decoder", "compiled-fullgraph") else "F16"
+    checks["cache_dtype"] = native_run.get("cache_dtype", legacy_dtype) == (
+        "F16" if expected_cache_dtype.itemsize == 2 else "F32"
+    )
     checks["cache_readback"] = native_run.get("cache_readback") == cache_readback
     if cache_readback == "none":
         for field in ("diagnostic_reads", "diagnostic_read_bytes"):
@@ -266,7 +283,7 @@ def evaluate(
             * metadata["heads"]
             * metadata["capacity"]
             * metadata["width"]
-            * (4 if variant in ("compiled-decoder", "compiled-fullgraph") else 2)
+            * expected_cache_dtype.itemsize
         )
         if read_logits:
             # The head exposes one tensor per vocabulary block, including a short last block.
@@ -498,7 +515,7 @@ def evaluate(
                 )
                 actual = np.fromfile(
                     device / f"{key}.bin",
-                    dtype="<f4" if variant in ("compiled-decoder", "compiled-fullgraph") else "<f2",
+                    dtype=_cache_storage_dtype(metadata, variant),
                 )
                 # Ignore unconsumed slots while checking every head in the valid prefix.
                 actual = actual.reshape(metadata["heads"], metadata["capacity"], metadata["width"])
@@ -510,9 +527,7 @@ def evaluate(
                     previous = (
                         np.fromfile(
                             device / f"measured.{repeat_of}.layer.{layer}.{name}.bin",
-                            dtype="<f4"
-                            if variant in ("compiled-decoder", "compiled-fullgraph")
-                            else "<f2",
+                            dtype=_cache_storage_dtype(metadata, variant),
                         )
                         .reshape(metadata["heads"], metadata["capacity"], metadata["width"])[
                             :, :prefix

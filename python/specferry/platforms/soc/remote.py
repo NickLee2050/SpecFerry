@@ -321,16 +321,42 @@ def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparat
             # Separate preparation and post-ready execution budgets. SDK identity
             # checks, release observation and transport have their own outer margin.
             deadline = time.monotonic() + 60 + preparation_timeout + timeout + 60
+            result_path = remote_output + "/result.json"
+            supervisor = output / "supervisor.json"
+            if supervisor.is_file():
+                process = f"/proc/{read_json(supervisor)['remote_pid']}/cmdline"
+                # Check the command before the result: the process can publish a
+                # result and exit between reads. Recycled PIDs must not count as alive.
+                code = f"""from pathlib import Path
+try:
+    command = Path({process!r}).read_bytes().split(bytes([0]))
+except (FileNotFoundError, ProcessLookupError):
+    command = ()
+ready = Path({result_path!r}).is_file()
+print('1' if ready else '0' if {remote_output.encode()!r} in command else 'exited')
+"""
+            else:
+                # An uncertain submission is discovered by its result, never resubmitted.
+                code = f"from pathlib import Path; print(int(Path({result_path!r}).is_file()))"
             while time.monotonic() < deadline:
-                code = f"from pathlib import Path; print(int(Path({remote_output + '/result.json'!r}).is_file()))"
                 try:
-                    if (
-                        ssh(
-                            host, python_command(code), capture_output=True, text=True
-                        ).stdout.strip()
-                        == "1"
-                    ):
+                    status = ssh(
+                        host, python_command(code), capture_output=True, text=True
+                    ).stdout.strip()
+                    if status == "1":
                         break
+                    if status == "exited":
+                        save(
+                            output / "supervisor-exited.json",
+                            {
+                                "remote_output": remote_output,
+                                "remote_log": remote_output + ".supervisor.log",
+                            },
+                        )
+                        raise RuntimeError(
+                            "board supervisor exited without a result; "
+                            "preserve marker and inspect its supervisor log"
+                        )
                 except (subprocess.SubprocessError, OSError) as error:
                     save(
                         output / "transport-error.json",

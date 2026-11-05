@@ -9,6 +9,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from specferry.models.opt.graph_validation import (
+    _mapped_prefill_transfers,
+    _mapped_slot_transfers,
     evaluate,
 )
 from tests.python.validation_fixtures import GraphEvidenceFixture
@@ -135,6 +137,60 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
                     document[field] = original
         self.save_metadata()
 
+    def test_compiled_half_cache_readback_uses_actual_storage_bytes(self):
+        self.metadata["cache_dtype"] = "F16"
+        self.native_run.update(
+            variant="compiled-fullgraph",
+            cache_dtype="F16",
+            cache_readback="kv",
+            cache_first_layer=1,
+            cache_last_layer=1,
+            diagnostic_reads=6,
+            diagnostic_read_bytes=96,
+        )
+        self.initialized["variant"] = "compiled-fullgraph"
+        self.save_metadata()
+        for index, request in enumerate(self.metadata["requests"]):
+            for name in ("keys", "values"):
+                np.zeros(8, "<f2").tofile(self.device / f"measured.{index}.layer.0.{name}.bin")
+                np.zeros(request["consumed"] * 2, "<f2").tofile(
+                    self.fixture / f"expected.{index}.0.{name}.bin"
+                )
+        options = self.options | {
+            "variant": "compiled-fullgraph",
+            "cache_readback": "kv",
+            "cache_layer_range": (1, 1),
+        }
+        self.assertTrue(self.evaluate(**options)["diagnostic_read_bytes"])
+        self.native_run["diagnostic_read_bytes"] = 192
+        self.save_metadata()
+        self.assertFalse(self.evaluate(**options)["diagnostic_read_bytes"])
+
+    def test_half_cache_transfer_contract_preserves_control_bytes_and_call_counts(self):
+        metadata = dict(
+            capacity=128,
+            layers=24,
+            heads=16,
+            width=64,
+            prefill_backend="compiled-attention",
+            prefill_cache_policy="shared-input",
+        )
+        for calculate in (
+            lambda m: _mapped_slot_transfers(m, 3, 2, True),
+            lambda m: _mapped_prefill_transfers(
+                m, {"decode_steps": 3, "prefill_steps": 2}, 2, True
+            ),
+        ):
+            full = calculate(metadata)
+            half = calculate(metadata | {"cache_dtype": "F16"})
+            self.assertEqual(full["uploads"], half["uploads"])
+            self.assertEqual(full["reads"], half["reads"])
+            # Token selection stays INT32: only KV bytes shrink.
+            self.assertEqual(full["read_bytes"] - 8, 2 * (half["read_bytes"] - 8))
+            self.assertLess(half["upload_bytes"], full["upload_bytes"])
+        with self.assertRaises(ValueError):
+            _mapped_slot_transfers(metadata | {"cache_dtype": "I8"}, 3, 2, True)
+
     def test_mapped_slot_counts_bytes_and_request_reset_are_required(self):
         self.metadata.update(capacity=64, layers=24, heads=16, width=64)
         options = self.options | {
@@ -172,7 +228,7 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
         self.native_run["kv_transfer"] = "device-copy"
         self.save_metadata()
         self.assertFalse(self.evaluate(**options)["run.kv_transfer"])
-        self.metadata["capacity"] = 128
+        self.metadata["capacity"] = 512
         with self.assertRaises(ValueError):
             self.evaluate(**options)
 

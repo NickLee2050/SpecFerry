@@ -5,7 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from specferry.models.opt.compiled import SDK_FILES, validate_prefill_package
+from specferry.models.opt.compiled import SDK_FILES
 from specferry.models.opt.compiled_model import load_model_package
 from specferry.validation.recovery_controls import FAULT
 
@@ -75,67 +75,14 @@ def request_options(request):
 
 
 def package_block_prefill(source, output, model, deployment):
-    """Reuse pinned M16 FFNs with six ordinary layers to preserve the const budget.
-
-    NBG internals cannot share weights with the M1 graph. Ordinary prefill weights
-    keep their existing WeightBank ownership/classification; no const reclassification.
-    """
+    """Package source-bound attention and decoder artifacts for shared M16 KV."""
     source = Path(source).resolve()
     original = read_json(source / "manifest.json")
     records = {
         row["name"]: row for row in read_json(deployment / "deployment-manifest.json")["tensors"]
     }
-    if original.get("kind") == "opt-compiled-block-prefill":
-        return package_compiled_prefill(source, output, model, original, records)
-    if (
-        model["capacity"] != 64
-        or original["deployment_sha256"] != model["deployment_sha256"]
-        or sha256(source / "compiled-ffn.txt") != original["native_manifest_sha256"]
-    ):
-        raise ValueError("prefill source package/deployment differs")
-    validate_prefill_package(source, original, records)
-    layers = original["prefill"]["layers"][2:]
-    bound = model["graphs"][0]["constant_bytes"] + sum(row["constant_bytes"] for row in layers)
-    # Leave room for small operator constants. The runtime budget counts actual
-    # allocations too; this bound alone is not physical-pool acceptance.
-    if bound > 2**30 - 8 * 1024**2:
-        raise ValueError("fullgraph and prefill leave insufficient constant headroom")
-    lines = [
-        "specferry-opt-prefill 2 "
-        + sha256(output / "compiled-model.txt")
-        + " "
-        + " ".join(
-            model["deployment_sha256"][name]
-            for name in ("weights.index", "deployment-manifest.json")
-        )
-        + " 16 18"
-    ]
-    for item in layers:
-        shutil.copyfile(source / item["path"], output / item["path"])
-        prefix = f"decoder.layers.{item['layer']}."
-        identities = [
-            item["weight_sha256"][prefix + part]
-            for part in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias")
-        ]
-        lines.append(
-            f"{item['layer']} {json.dumps(item['path'])} {item['nbg_sha256']} "
-            f"{item['constant_bytes']} 1 1 34 " + " ".join(identities)
-        )
-    native = output / "compiled-prefill.txt"
-    native.write_text("\n".join(lines) + "\n")
-    return {
-        "tokens": 16,
-        "ordinary_layers": list(range(6)),
-        "layers": layers,
-        "native_manifest_sha256": sha256(native),
-        "combined_nbg_constant_bytes": bound,
-        "cache_handoff": "mapped-fp16-slot-major-to-fp32-head-major-prefix",
-        "final_prompt_token": "m1",
-    }
-
-
-def package_compiled_prefill(source, output, model, original, records):
-    """Bind public M16 NBG ports and source identities before any SDK calls."""
+    if original.get("kind") != "opt-compiled-block-prefill":
+        raise ValueError("SoC M16 requires a compiled attention prefill package")
     layers = original["layers"]
     capacity = model["capacity"]
     if (
@@ -149,8 +96,12 @@ def package_compiled_prefill(source, output, model, original, records):
     bound = model["graphs"][0]["constant_bytes"] + sum(x["constant_bytes"] for x in layers)
     if bound > 2**30 - 8 * 1024**2:
         raise ValueError("compiled prefill leaves insufficient constant headroom")
+    cache_dtype = model["graphs"][0].get("cache_dtype", "F32")
+    if cache_dtype not in ("F16", "F32") or original.get("cache_dtype", "F32") != cache_dtype:
+        raise ValueError("prefill and decode KV precision differs")
+    version = 2 if cache_dtype == "F16" else 1
     lines = [
-        "specferry-opt-compiled-block-prefill 1 "
+        f"specferry-opt-compiled-block-prefill {version} "
         + sha256(output / "compiled-model.txt")
         + " "
         + " ".join(
@@ -158,11 +109,12 @@ def package_compiled_prefill(source, output, model, original, records):
             for name in ("weights.index", "deployment-manifest.json")
         )
         + f" {capacity} 16 24"
+        + (f" {cache_dtype}" if version == 2 else "")
     ]
     inputs = [
         ("hidden", "F16", [1024, 16]),
-        ("past_key", "F32", [64, capacity, 16]),
-        ("past_value", "F32", [64, capacity, 16]),
+        ("past_key", cache_dtype, [64, capacity, 16]),
+        ("past_value", cache_dtype, [64, capacity, 16]),
         ("block_index", "I32", [1]),
         ("attention_mask", "F32", [capacity, 16]),
     ]
@@ -179,8 +131,8 @@ def package_compiled_prefill(source, output, model, original, records):
         path = (source / item["path"]).resolve(strict=True)
         outputs = [
             ("hidden_out" if full else "attention_norm_output", "F16", [1024, 16]),
-            ("present_key", "F32", [64, capacity, 16]),
-            ("present_value", "F32", [64, capacity, 16]),
+            ("present_key", cache_dtype, [64, capacity, 16]),
+            ("present_value", cache_dtype, [64, capacity, 16]),
         ]
 
         def ports(direction):
@@ -214,7 +166,7 @@ def package_compiled_prefill(source, output, model, original, records):
         layers=layers,
         native_manifest_sha256=sha256(native),
         combined_nbg_constant_bytes=bound,
-        cache_handoff="shared-fp32-input",
+        cache_handoff=f"shared-{cache_dtype.lower()}-input",
         final_prompt_token="m1",
     )
 
@@ -287,6 +239,9 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
                 if path.is_file() and not path.is_symlink():
                     shutil.copyfile(path, root / "request" / path.name)
         (root / "request/compiled-model-package.txt").write_text('"../model"\n')
+        reference = read_json(root / "request/reference.json")
+        reference["cache_dtype"] = model["graphs"][0].get("cache_dtype", "F32")
+        save(root / "request/reference.json", reference)
         if model.get("prefill", {}).get("backend") == "compiled-attention":
             reference = read_json(root / "request/reference.json")
             reference["prefill_backend"] = "compiled-attention"

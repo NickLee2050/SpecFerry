@@ -224,14 +224,12 @@ struct PartitionedGraphModel::Impl {
       if (prefill_block == 16) {
         const SdkScope timing_role("role", "block16.storage");
         std::vector<TensorBinding> shared_cache;
-        if (!compiled_prefill_layers.empty()) {
-          for (const auto &tensor : cache_tensors) {
-            shared_cache.push_back({decode->head->graph, tensor.id});
-          }
+        shared_cache.reserve(cache_tensors.size());
+        for (const auto &tensor : cache_tensors) {
+          shared_cache.push_back({decode->head->graph, tensor.id});
         }
-        full_model_prefill =
-            std::make_unique<BlockPrefill>(context, weights, config, compiled_prefill_ffn, phase,
-                                           compiled_prefill_layers, shared_cache);
+        full_model_prefill = std::make_unique<BlockPrefill>(
+            context, weights, config, compiled_prefill_layers, phase, shared_cache);
       }
       latest = decode.get();
       return;
@@ -833,16 +831,6 @@ struct PartitionedGraphModel::Impl {
         ++completed_steps;
         ++completed_prefill_steps;
       }
-      if (prefix && !full_model_prefill->shares_decode_cache()) {
-        const SdkScope timing_role("role", "block16.kv-handoff");
-        const Shape start{0, 0, 0};
-        const Shape end{config.decoder.kv_spec().head_dim, static_cast<unsigned>(prefix),
-                        config.decoder.heads};
-        for (unsigned index = 0; index < cache_tensors.size(); ++index) {
-          const auto bytes = full_model_prefill->read_cache(index / 2, index % 2);
-          upload_tensor_region(cache_storage(), cache_tensors[index].id, start, end, bytes);
-        }
-      }
       position = prefix;
       failed = false;
       for (std::size_t index = prefix; index < tokens.size(); ++index) {
@@ -1000,8 +988,8 @@ PartitionedGraphModel::PartitionedGraphModel(
     const bool block_prefill = prefill_block == 16 && kv_transfer == KvTransfer::MappedSlot &&
                                prefill_head == PrefillHeadPolicy::LastToken;
     if ((!block_prefill && (prefill_block != 1 || prefill_head != PrefillHeadPolicy::EveryToken)) ||
-        !compiled_head.graph.path.empty() ||
-        (block_prefill != (!compiled_prefill_ffn.empty() || !compiled_prefill_layers.empty()))) {
+        !compiled_head.graph.path.empty() || !compiled_prefill_ffn.empty() ||
+        block_prefill != !compiled_prefill_layers.empty()) {
       throw std::invalid_argument(
           "compiled full OPT requires its embedded head and explicit prefill");
     }
@@ -1010,18 +998,9 @@ PartitionedGraphModel::PartitionedGraphModel(
       throw std::invalid_argument("current-slot OPT outputs require mapped-slot KV commits");
     }
     std::size_t constants = compiled_full_model.graph.constant_bytes;
-    if (!compiled_prefill_layers.empty() && !compiled_prefill_ffn.empty()) {
-      throw std::invalid_argument("select one full-model prefill artifact contract");
-    }
     for (const auto &artifact : compiled_prefill_layers) {
       if (artifact.graph.constant_bytes > segment_payload_limit - constants) {
         throw std::invalid_argument("compiled prefill chain exceeds constant budget");
-      }
-      constants += artifact.graph.constant_bytes;
-    }
-    for (const auto &artifact : compiled_prefill_ffn) {
-      if (artifact.graph.constant_bytes > segment_payload_limit - constants) {
-        throw std::invalid_argument("full-model and prefill NBGs exceed constant budget");
       }
       constants += artifact.graph.constant_bytes;
     }
@@ -1112,8 +1091,7 @@ PartitionedGraphModel::PartitionedGraphModel(
     if (projection_constants > segment_payload_limit - constants) {
       throw std::invalid_argument("compiled FFN and FCL projections exceed the constant budget");
     }
-  } else if (!compiled_ffn.empty() ||
-             (!compiled_prefill_ffn.empty() && variant != Variant::CompiledFullModel) ||
+  } else if (!compiled_ffn.empty() || !compiled_prefill_ffn.empty() ||
              !compiled_projections.empty()) {
     throw std::invalid_argument("compiled OPT FFN artifacts require the compiled variant");
   }
@@ -1249,10 +1227,11 @@ std::vector<std::uint8_t> PartitionedGraphModel::read_cache(unsigned layer, bool
 TensorSpec PartitionedGraphModel::cache_spec() const {
   const auto &impl = require_impl();
   const auto &decoder = impl.config.decoder;
-  return {impl.variant == Variant::CompiledDecoder || impl.variant == Variant::CompiledFullModel
-              ? DataType::Float32
-              : f16,
-          {decoder.kv_spec().head_dim, decoder.capacity, decoder.heads}};
+  const auto type = impl.variant == Variant::CompiledFullModel
+                        ? impl.compiled_full_model.cache_type()
+                    : impl.variant == Variant::CompiledDecoder ? DataType::Float32
+                                                               : f16;
+  return {type, {decoder.kv_spec().head_dim, decoder.capacity, decoder.heads}};
 }
 
 std::vector<std::uint8_t> PartitionedGraphModel::read_output(const std::string &name,
@@ -1299,14 +1278,12 @@ std::size_t PartitionedGraphModel::head_runs() const {
 
 std::size_t PartitionedGraphModel::cache_reset_uploads_per_request() const {
   const auto &impl = require_impl();
-  const bool independent_prefill =
-      impl.full_model_prefill && !impl.full_model_prefill->shares_decode_cache();
-  return impl.cache_reset ? 0 : impl.cache_tensors.size() * (independent_prefill ? 2 : 1);
+  return impl.cache_reset ? 0 : impl.cache_tensors.size();
 }
 
 bool PartitionedGraphModel::shares_prefill_cache() const {
   const auto &impl = require_impl();
-  return impl.full_model_prefill && impl.full_model_prefill->shares_decode_cache();
+  return static_cast<bool>(impl.full_model_prefill);
 }
 
 std::size_t PartitionedGraphModel::weight_bytes() const {

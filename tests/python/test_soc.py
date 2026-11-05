@@ -419,6 +419,11 @@ class SocTests(unittest.TestCase):
         }
         board.save(self.root / "bundle.json", manifest)
         board.verify_bundle(self.root, check_sdk=False)
+        manifest["files"]["model/verified-prefill-cache.txt"] = record
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(ValueError, "FFN Verify cache package is retired"):
+            board.verify_bundle(self.root, check_sdk=False)
+        del manifest["files"]["model/verified-prefill-cache.txt"]
         sdk = self.root / "libexample.so"
         sdk.write_bytes(b"test SDK")
         manifest["sdk"] = {sdk.name: board.sha256(sdk)}
@@ -482,112 +487,6 @@ class SocTests(unittest.TestCase):
             board.require_verified_deployment(self.root, manifest)
         with self.assertRaisesRegex(ValueError, "identity differs"):
             board.verify_deployment(self.root)
-
-    def verified_cache_deployment(self):
-        binary = self.root / "bin/specferry_opt_graph_generate"
-        binary.parent.mkdir()
-        header = bytearray(20)
-        header[:6] = b"\x7fELF\x02\x01"
-        struct.pack_into("<H", header, 18, 243)
-        binary.write_bytes(header)
-        binary.chmod(0o755)
-        payload = self.root / "model/model.nb"
-        payload.parent.mkdir()
-        payload.write_bytes(b"immutable model")
-        caches = []
-        lines = [
-            "specferry-opt-verify-cache 1 batch-pointwise-f16-fp32-norm-v1 12 1024 4096 16 256",
-            f'{board.sha256(binary)} "cache-producer.bin" {board.sha256(binary)}',
-            "np101-soc-riscv64 0",
-        ]
-        for layer in range(12):
-            path = self.root / f"model/verify-cache/layer-{layer}/accepted.nb"
-            path.parent.mkdir(parents=True)
-            path.write_bytes(f"cache {layer}".encode())
-            caches.append(path)
-            digest = board.sha256(path)
-            lines.append(f'{layer} "accepted.nb" {path.stat().st_size} {digest}')
-            lines.extend([digest] * 6)
-        (payload.parent / "verified-prefill-cache.txt").write_text("\n".join(lines) + "\n")
-        unlisted = self.root / "model/verify-cache/unlisted.nb"
-        unlisted.write_bytes(b"not a controlled native cache")
-        manifest = {
-            "schema_version": 1,
-            "target": "np101-soc-riscv64",
-            "sdk": {},
-            "files": {
-                path.relative_to(self.root).as_posix(): {
-                    "bytes": path.stat().st_size,
-                    "sha256": board.sha256(path),
-                    "executable": path == binary,
-                }
-                for path in self.root.rglob("*")
-                if path.is_file()
-            },
-        }
-        board.save(self.root / "bundle.json", manifest)
-        board.verify_deployment(self.root)
-        return manifest, payload, caches, unlisted
-
-    def test_cache_timestamp_refresh_hashes_only_changed_controlled_files(self):
-        manifest, payload, caches, _ = self.verified_cache_deployment()
-        state = caches[0].stat()
-        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
-        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
-            board.require_verified_deployment(self.root, manifest)
-            self.assertIn(unittest.mock.call(caches[0]), hashes.call_args_list)
-            for path in (payload, *caches[1:]):
-                self.assertNotIn(unittest.mock.call(path), hashes.call_args_list)
-        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
-            board.require_verified_deployment(self.root, manifest)
-            self.assertNotIn(unittest.mock.call(caches[0]), hashes.call_args_list)
-
-    def test_cache_refresh_rejects_corruption_and_keeps_the_prior_receipt(self):
-        manifest, _, caches, _ = self.verified_cache_deployment()
-        receipt = self.root / ".deployment-verified.json"
-        original = receipt.read_bytes()
-        state = caches[0].stat()
-        caches[0].write_bytes(b"damaged")
-        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns))
-        with self.assertRaisesRegex(RuntimeError, "cache identity differs"):
-            board.require_verified_deployment(self.root, manifest)
-        self.assertEqual(receipt.read_bytes(), original)
-
-    def test_cache_refresh_rejects_files_changed_during_hashing(self):
-        manifest, payload, caches, _ = self.verified_cache_deployment()
-        receipt = self.root / ".deployment-verified.json"
-        original = receipt.read_bytes()
-        state = caches[0].stat()
-        os.utime(caches[0], ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
-        checksum = board.sha256
-
-        def concurrent_change(path):
-            digest = checksum(path)
-            if path == caches[0]:
-                payload.write_bytes(b"changed model!!")
-            return digest
-
-        with (
-            patch.object(board, "sha256", side_effect=concurrent_change),
-            self.assertRaisesRegex(RuntimeError, "changed during controlled cache verification"),
-        ):
-            board.require_verified_deployment(self.root, manifest)
-        self.assertEqual(receipt.read_bytes(), original)
-
-    def test_cache_refresh_does_not_waive_other_metadata_or_replaced_inodes(self):
-        manifest, payload, caches, unlisted = self.verified_cache_deployment()
-        for path in (payload, unlisted, self.root / "model/verified-prefill-cache.txt"):
-            with self.subTest(path=path):
-                state = path.stat()
-                os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
-                with self.assertRaisesRegex(RuntimeError, "deployment changed"):
-                    board.require_verified_deployment(self.root, manifest)
-                board.verify_deployment(self.root)
-        replacement = caches[0].with_suffix(".replacement")
-        replacement.write_bytes(caches[0].read_bytes())
-        replacement.replace(caches[0])
-        with self.assertRaisesRegex(RuntimeError, "deployment changed"):
-            board.require_verified_deployment(self.root, manifest)
 
     def test_bundle_and_remote_paths_cannot_escape_their_roots(self):
         for name in ("../weights.bin", "/tmp/weights.bin"):
@@ -839,3 +738,29 @@ class SocTests(unittest.TestCase):
         commands = [call.args[1] for call in transport.call_args_list]
         self.assertEqual(sum("subprocess.Popen" in command for command in commands), 1)
         self.assertEqual(sum("result.json" in command for command in commands), 2)
+
+    def test_supervisor_exit_without_result_stops_polling_and_preserves_gate(self):
+        (self.root / "bundle.json").write_text("{}")
+        (self.root / "board_runner.py").write_text("# fixture")
+        output = self.root / "run"
+        responses = [
+            subprocess.CompletedProcess([], 0, stdout="123\n"),
+            subprocess.CompletedProcess([], 0, stdout="exited\n"),
+        ]
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "collect") as collect,
+            patch.object(remote.time, "sleep") as sleep,
+            patch.object(remote, "ssh", side_effect=responses) as transport,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "supervisor exited without a result"):
+                remote.run(self.root, "np101", "/root/specferry-soc/bundles/test", output, 180)
+        self.assertEqual(transport.call_count, 2)
+        collect.assert_not_called()
+        sleep.assert_not_called()
+        gate = board.read_json(self.root / "np101-recovery-required.json")
+        self.assertEqual(gate["evidence"], str(output.resolve()))
+        self.assertTrue((output / "supervisor-exited.json").is_file())
+        self.assertTrue((output / "interrupted.json").is_file())

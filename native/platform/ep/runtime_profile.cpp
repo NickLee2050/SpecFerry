@@ -13,7 +13,7 @@ bool verify_primary_model_last() { return false; }
 
 bool verify_model_payloads() { return true; }
 
-unsigned pointwise_prefill_layers(unsigned) { return 0; }
+unsigned pointwise_prefill_layers() { return 0; }
 
 const RuntimeProfile &runtime_profile() {
   static const RuntimeProfile profile{"ep", "x86_64", "F53A3E6EFBB7D0FD7D4617C",

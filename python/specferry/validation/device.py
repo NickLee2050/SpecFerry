@@ -30,22 +30,18 @@ def verify_trace_environment(library: Path, sdk_lib: Path, output: Path, environ
     if sha256(sdk_lib / "libOpenVX.so") != VERIFY_TRACE_OPENVX_SHA256:
         raise ValueError("Verify tracing requires the pinned v105 libOpenVX binary")
     if sha256(sdk_lib / "libGAL.so") != VERIFY_TRACE_GAL_SHA256:
-        raise ValueError("Execution tracing requires the pinned v105 libGAL binary")
+        raise ValueError("Verify auditing requires the pinned v105 libGAL binary")
     if environment.get("LD_PRELOAD"):
         raise ValueError("Verify tracing cannot be combined with another LD_PRELOAD")
     trace_path = output / "verify-internals.tsv"
     environment.update(LD_PRELOAD=str(library), SPECFERRY_VERIFY_TRACE=str(trace_path))
-    execution_mode = environment.get("SPECFERRY_VERIFY_EXECUTION_TRACE", "calls")
-    execution_suffix = "-execution-summary.tsv" if execution_mode == "summary" else "-execution.tsv"
     return {
         "library": str(library),
         "library_sha256": sha256(library),
         "output": str(trace_path),
         "node_snapshots_output": str(trace_path) + "-nodes.tsv",
-        "execution_mode": execution_mode,
-        "execution_output": str(trace_path) + execution_suffix if execution_mode != "0" else None,
         "private_layout_openvx_sha256": VERIFY_TRACE_OPENVX_SHA256,
-        "execution_gal_sha256": VERIFY_TRACE_GAL_SHA256,
+        "sdk_gal_sha256": VERIFY_TRACE_GAL_SHA256,
     }
 
 
@@ -183,7 +179,7 @@ def run_device(
         "LD_LIBRARY_PATH": str(sdk_lib.resolve(strict=True)),
         "VIV_VX_ENABLE_PRINT_TARGET": "0",
         "VIV_VX_PROFILE": "0",
-        "VIV_MEMORY_PROFILE": "1" if binary.name == "np101_memory_accounting_check" else "0",
+        "VIV_MEMORY_PROFILE": "0",
         "SPECFERRY_SDK_TIMING": "calls" if sdk_timing else ("summary" if sdk_summary else "off"),
     }
     if env.get("LD_PRELOAD"):
@@ -201,7 +197,6 @@ def run_device(
             raise ValueError("Profiler output must not overwrite existing evidence")
         profiler_output.parent.mkdir(parents=True, exist_ok=True)
         env.update(VIV_VX_PROFILE="1", VP_OUTPUT=str(profiler_output))
-        env["SPECFERRY_VERIFY_EXECUTION_TRACE"] = "0"
     if require_compiled_operations:
         env["SPECFERRY_VERIFY_REQUIRE_OPERATIONS"] = "1"
     verify_trace_record = (

@@ -69,21 +69,9 @@ resets, repeated final-layer KV equality and unused slots. Original SDHCI/hang i
 this bounded acceptance does not establish a driver fix. Do not treat storage faults as isolated
 NP hangs.
 
-An optional SoC cache package selects twelve or nineteen batch-convolution FFNs; an ordinary package keeps
-the accepted four-layer prefix. After preparing a bundle, attach existing accepted caches with
-`package_np101_opt_verify_cache.py --source SOURCE --deployment BUNDLE/weights
---package BUNDLE/model --consumer BUNDLE/bin/specferry_opt_graph_generate`, then deploy it.
-The default remains twelve; append `--layers 19` for the accepted full prefix. Both use the
-complete 24-layer model; this number selects only the ordinary M16 FFN implementation.
-The source manifest pins successful numerical/health evidence, the producer, all six FFN weights,
-the recipe and SDK. Runtime also pins the consumer and rejects cache misses or changed files.
-The supervisor permits timestamp-only changes solely for files named in this native manifest,
-rehashing those files before updating their deployment receipt. Inode, size, payload or unrelated
-metadata changes are rejected; native cache checks before and after SDK access remain mandatory.
-Cached Verify is serial, after all bindings and ordinary compilation; a prepared ordinary graph
-refreshes the SDK's retained cache policy before model execution/release. This uses no private
-Context writes or weight reclassification. Cache generation is separate from warm-cache startup;
-neither belongs in inference throughput. The CPU layout test checks file/size/symlink isolation.
+SoC prefill compiles the ordinary FFNs in the running process. Historical FFN Verify-cache
+bundles are archived with their original runner and executable. FP16 KV regressions cover port
+precision, the shared prefill state and byte accounting.
 
 The retired standalone KV transfer experiment is archived outside the source tree. Its maintained
 replacement is the formal OPT entry: one resident Context processes long/short/repeated-long reset
@@ -197,6 +185,14 @@ Exclude preparation, reset, diagnostics and file output; include required token 
 Verify. Input processing and operator replay are not generation throughput. CPU time overlaps wall.
 `--sdk-summary` aggregates in memory; `--sdk-timing` records calls. New instrumentation needs the same
 workload off/on/off; VPD collection has substantial measured perturbation and no operator timeline.
+
+For SoC hang localization, retain both abnormally long completed calls and unmatched begins;
+the final graph entered can follow an earlier stalled call. Formal supervision forces SDK timing
+off; enable the existing calls mode only in an explicit diagnostic deployment, never by silently
+changing the benchmark default. A sysfs `stuckDump=1` readback is not proof of effective dumping:
+the current driver copies options during construction and keeps internal dumping disabled when
+automatic recovery is enabled. Disabling recovery can stop the driver to preserve the scene;
+follow the incident ledger before changing that policy.
 
 Completed allocation stress/integrity/accounting/growth, packed-cache matrices, Qwen layer-slice and
 handwritten recurrent diagnostics, vocabulary-prefix NBG and vendor diagnostic commands are retired.

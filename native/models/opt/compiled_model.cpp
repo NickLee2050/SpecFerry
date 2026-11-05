@@ -60,6 +60,20 @@ bool CompiledFullModel::current_cache_outputs() const {
          output_names[output_order[2]] == "layer0.current_key";
 }
 
+DataType CompiledFullModel::cache_type() const {
+  if (input_order.size() <= 4 || input_order[4] >= graph.inputs.size()) {
+    throw std::invalid_argument("compiled OPT cache input contract is missing");
+  }
+  const auto type = graph.inputs[input_order[4]].type;
+  if (type != DataType::Float16 && type != DataType::Float32) {
+    throw std::invalid_argument("compiled OPT cache precision differs");
+  }
+  if (type == DataType::Float16 && !current_cache_outputs()) {
+    throw std::invalid_argument("FP16 OPT cache requires current-slot outputs");
+  }
+  return type;
+}
+
 void validate_compiled_full_model(const CompiledFullModel &compiled, const WeightStore &weights,
                                   const ModelConfig &config) {
   const auto &decoder = config.decoder;
@@ -77,9 +91,10 @@ void validate_compiled_full_model(const CompiledFullModel &compiled, const Weigh
       {"attention_mask", {DataType::Float32, {decoder.capacity, 1}}}};
   std::vector<std::pair<std::string, TensorSpec>> outputs{
       {"logits", {DataType::Float16, {50272, 1}}}, {"selected", {DataType::Int32, {1}}}};
-  const TensorSpec cache{DataType::Float32, {64, decoder.capacity, 16}};
+  const auto cache_type = compiled.cache_type();
+  const TensorSpec cache{cache_type, {64, decoder.capacity, 16}};
   const bool current = compiled.current_cache_outputs();
-  const TensorSpec output_cache{DataType::Float32, {64, current ? 1u : decoder.capacity, 16}};
+  const TensorSpec output_cache{cache_type, {64, current ? 1u : decoder.capacity, 16}};
   for (unsigned layer = 0; layer < 24; ++layer) {
     for (const std::string part : {"key", "value"}) {
       const auto prefix = "layer" + std::to_string(layer) + ".";

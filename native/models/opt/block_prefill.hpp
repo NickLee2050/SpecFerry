@@ -11,36 +11,21 @@
 #include <vector>
 
 namespace specferry::models::opt {
-// Convert packed FP16 [slot,head,width] into FP32 [head,slot,width]. The exact
-// widening preserves half subnormals and signed zero without SDK conversion.
-std::vector<std::uint8_t> widen_prefill_cache(const std::vector<std::uint8_t> &packed,
-                                              unsigned positions, unsigned heads, unsigned width);
-
-// Resident, headless M16 execution for an initial prompt. Compiled attention may
-// retain M1's FP32 input cache; its owner must outlive this chain. Independent
-// caches hand their prefix to M1 once. This chain never consumes decode state.
+// Headless M16 execution shares the M1 KV inputs.
 class BlockPrefill {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
   BlockPrefill(np101::Context &context, const np101::WeightStore &weights,
-               const ModelConfig &config, std::vector<CompiledFfn> compiled_ffn,
-               PhaseObserver phase = {}, std::vector<CompiledPrefillLayer> compiled_layers = {},
-               const std::vector<np101::TensorBinding> &shared_cache = {});
+               const ModelConfig &config, const std::vector<CompiledPrefillLayer> &compiled_layers,
+               PhaseObserver phase, const std::vector<np101::TensorBinding> &shared_cache);
   ~BlockPrefill();
   BlockPrefill(const BlockPrefill &) = delete;
   BlockPrefill &operator=(const BlockPrefill &) = delete;
 
   // Exactly sixteen tokens per call; callers retain at least one prompt token for M1.
   void consume(const std::vector<std::int32_t> &tokens);
-  // Shared-input mode resets position only; the caller must clear its cache owner
-  // before the next consume(). Independent mode clears its own cache as well.
   void reset();
-  unsigned position() const;
-  bool shares_decode_cache() const;
-  // Packed FP32 [head,position,width], containing only the populated prefix.
-  std::vector<std::uint8_t> read_cache(unsigned layer, bool values);
-  std::size_t constant_weight_bytes() const;
   std::size_t weight_bytes() const;
   void close();
 

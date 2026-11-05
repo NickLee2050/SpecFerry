@@ -326,7 +326,6 @@ def run_case(
                 reason="Compiled validation and delayed checks are incomplete",
             ),
         )
-        os.environ["SPECFERRY_VERIFY_EXECUTION_TRACE"] = "0"
         report = dict(passed=False)
         try:
             evidence = run_device(

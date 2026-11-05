@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import signal
 import struct
 import subprocess
@@ -62,6 +61,12 @@ def verify_bundle(root, check_sdk=True, *, verify_payload=True):
     manifest = read_json(root / "bundle.json")
     if (manifest.get("schema_version"), manifest.get("target")) != (1, "np101-soc-riscv64"):
         raise ValueError("unsupported SoC bundle")
+    if "verified_prefill_cache" in manifest or any(
+        name in {"model/verified-prefill-cache.txt", "model/cache-producer.bin"}
+        or name.startswith("model/verify-cache/")
+        for name in manifest["files"]
+    ):
+        raise ValueError("FFN Verify cache package is retired")
     checks = []
     for name, expected in manifest["files"].items():
         path = bundle_file(root, name)
@@ -121,46 +126,6 @@ def verify_deployment(root):
     return manifest
 
 
-def controlled_cache_files(root, manifest):
-    """Limit timestamp refreshes to the exact native recipe's checked cache files."""
-    name = "model/verified-prefill-cache.txt"
-    if name not in manifest["files"]:
-        return set()
-    path = bundle_file(root, name)
-    if sha256(path) != manifest["files"][name]["sha256"]:
-        raise RuntimeError("controlled cache manifest identity differs")
-    lines = path.read_text().splitlines()
-    header = lines[0].split()
-    if (
-        len(header) != 8
-        or header[:3] != ["specferry-opt-verify-cache", "1", "batch-pointwise-f16-fp32-norm-v1"]
-        or header[3] not in ("12", "19")
-        or header[4:7] != ["1024", "4096", "16"]
-        or header[7] not in ("128", "256")
-    ):
-        raise RuntimeError("controlled cache recipe differs")
-    profile, libraries = lines[2].split()
-    start = 3 + int(libraries)
-    count = int(header[3])
-    if profile != "np101-soc-riscv64" or len(lines) != start + count * 7:
-        raise RuntimeError("controlled cache manifest layout differs")
-    result = set()
-    for layer in range(count):
-        index, filename, size, digest = shlex.split(lines[start + layer * 7])
-        name = f"model/verify-cache/layer-{layer}/{filename}"
-        if (
-            index != str(layer)
-            or Path(filename).name != filename
-            or not filename.endswith(".nb")
-            or not 0 < int(size) <= 64 * 1024**2
-            or manifest["files"].get(name)
-            != {"bytes": int(size), "sha256": digest, "executable": False}
-        ):
-            raise RuntimeError("controlled cache file identity differs")
-        result.add(name)
-    return result
-
-
 def require_verified_deployment(root, manifest):
     receipt = root / ".deployment-verified.json"
     if not receipt.is_file():
@@ -168,24 +133,8 @@ def require_verified_deployment(root, manifest):
     record = read_json(receipt)
     current = deployment_files(root, manifest)
     digest = sha256(root / "bundle.json")
-    if record.get("bundle_sha256") != digest or record.get("files", {}).keys() != current.keys():
+    if record.get("bundle_sha256") != digest or record.get("files") != current:
         raise RuntimeError("deployment changed; repeat deployment verification")
-    changed = {name for name, state in current.items() if state != record["files"][name]}
-    if not changed:
-        return
-    caches = controlled_cache_files(root, manifest)
-    if not changed <= caches or any(
-        current[name][:3] != record["files"][name][:3] for name in changed
-    ):
-        raise RuntimeError("deployment changed; repeat deployment verification")
-    # Cached Verify may touch mtime/ctime without changing the accepted binary.
-    # Rehash only those files, never waive content integrity or refresh other files.
-    for name in sorted(changed):
-        if sha256(bundle_file(root, name)) != manifest["files"][name]["sha256"]:
-            raise RuntimeError("controlled cache identity differs: " + name)
-    if sha256(root / "bundle.json") != digest or deployment_files(root, manifest) != current:
-        raise RuntimeError("deployment changed during controlled cache verification")
-    save(receipt, {"bundle_sha256": digest, "files": current})
 
 
 def fault_pattern(manifest):

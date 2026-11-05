@@ -151,6 +151,87 @@ def narrow_cache_selection(model):
     return model
 
 
+def half_precision_cache(model, *, prefill=False):
+    """Use FP16 public KV and storage, preserving norm, mask and Softmax precision.
+
+    Decode requires the validated current-slot Select graph. Prefill requires the
+    aligned block-selection graph; its public outputs remain full-cache tensors.
+    This declares a new input contract, not lossless conversion of arbitrary FP32 state.
+    """
+    full = not prefill
+
+    names = [p.name for p in model.graph.output]
+    suffixes = ("present_key", "present_value") if prefill else ("current_key", "current_value")
+    if not any(name.endswith(suffixes) for name in names):
+        raise ValueError("half cache requires current-slot decode or block-prefill outputs")
+    producers = {o: n for n in model.graph.node for o in n.output}
+    alias = {}
+    for port in model.graph.input:
+        if port.name.endswith(("past_key", "past_value")):
+            if port.type.tensor_type.elem_type != TensorProto.FLOAT:
+                raise ValueError("half cache expects original FP32 KV ports")
+            port.type.tensor_type.elem_type = TensorProto.FLOAT16
+            for node in model.graph.node:
+                if node.op_type == "Cast" and list(node.input) == [port.name]:
+                    if not any(
+                        a.name == "to" and a.i == TensorProto.FLOAT16 for a in node.attribute
+                    ):
+                        raise ValueError("unexpected public KV conversion")
+                    alias[node.output[0]] = port.name
+    for port in model.graph.output:
+        if full and port.name.endswith(("current_key", "current_value")):
+            identity = producers[port.name]
+            expanded = producers[identity.input[0]]
+            wide = producers[expanded.input[0]]
+            if (
+                identity.op_type != "Identity"
+                or expanded.op_type != "Unsqueeze"
+                or wide.op_type != "Cast"
+            ):
+                raise ValueError("half decode cache requires current-slot selection")
+            columns = [
+                n
+                for n in model.graph.node
+                if n.op_type == "Unsqueeze" and list(n.input) == [wide.input[0]]
+            ]
+            if len(columns) != 1:
+                raise ValueError("half cache requires one FP16 current column")
+            identity.input[0] = columns[0].output[0]
+            port.type.tensor_type.elem_type = TensorProto.FLOAT16
+        elif not full and port.name in ("present_key", "present_value"):
+            port.type.tensor_type.elem_type = TensorProto.FLOAT16
+            # The accepted M16 graph only widens the new block before selection.
+            wide = next(
+                n
+                for n in model.graph.node
+                if n.output[0] == port.name.removeprefix("present_") + "_update_fp32"
+            )
+            if wide.op_type != "Cast" or not any(
+                a.name == "to" and a.i == TensorProto.FLOAT for a in wide.attribute
+            ):
+                raise ValueError("half prefill cache requires FP16 block projections")
+            wide.op_type = "Identity"
+            del wide.attribute[:]
+            attention = next(
+                n for n in model.graph.node if n.op_type == "Cast" and list(n.input) == [port.name]
+            )
+            alias[attention.output[0]] = port.name
+    for node in model.graph.node:
+        for i, value in enumerate(node.input):
+            node.input[i] = alias.get(value, value)
+    required = {p.name for p in model.graph.output}
+    kept = []
+    for node in reversed(model.graph.node):
+        if required.intersection(node.output):
+            kept.append(node)
+            required.update(node.input)
+    del model.graph.node[:]
+    model.graph.node.extend(reversed(kept))
+    del model.graph.value_info[:]
+    onnx.checker.check_model(model, full_check=True)
+    return model
+
+
 class Graph(OnnxGraph):
     def __init__(self, weights, capacity):
         if capacity not in (64, 128, 256):

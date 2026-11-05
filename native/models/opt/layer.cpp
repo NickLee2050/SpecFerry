@@ -1,5 +1,4 @@
 #include "models/opt/layer.hpp"
-#include "models/opt/prefill_graph_cache.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/sdk_identity.hpp"
 #include "platform/runtime_profile.hpp"
@@ -182,12 +181,10 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
   std::string magic, m1_digest, index_digest, deployment_digest, name, digest, extra;
   unsigned version = 0, tokens = 0, count = 0;
   file >> magic >> version >> m1_digest >> index_digest >> deployment_digest >> tokens >> count;
-  const bool full_model = version == 2;
-  if (!file || magic != "specferry-opt-prefill" || (version != 1 && version != 2) || tokens != 16 ||
-      count != (full_model ? 18u : 20u) || config.decoder.layers != 24 ||
+  if (!file || magic != "specferry-opt-prefill" || version != 1 || tokens != 16 || count != 20 ||
+      config.decoder.layers != 24 ||
       (config.decoder.capacity != 64 && config.decoder.capacity != 256) ||
-      (full_model && config.decoder.capacity != 64) ||
-      file_sha256(root / (full_model ? "compiled-model.txt" : "compiled-ffn.txt")) != m1_digest ||
+      file_sha256(root / "compiled-ffn.txt") != m1_digest ||
       file_sha256(deployment / "weights.index") != index_digest ||
       file_sha256(deployment / "deployment-manifest.json") != deployment_digest) {
     throw std::invalid_argument("M16 FFN package source/M1/geometry differs");
@@ -197,7 +194,7 @@ std::vector<CompiledFfn> load_compiled_prefill(const std::filesystem::path &pack
     result[layer].layer = layer;
   }
   std::size_t total = 0;
-  for (unsigned layer = full_model ? 6u : 4u; layer < result.size(); ++layer) {
+  for (unsigned layer = 4; layer < result.size(); ++layer) {
     auto &artifact = result[layer];
     file >> artifact.layer >> std::quoted(name) >> digest >> artifact.graph.constant_bytes;
     for (auto &part : artifact.graph.graph_version) {
@@ -231,12 +228,22 @@ load_compiled_block_prefill(const std::filesystem::path &package,
                             const std::filesystem::path &deployment, const ModelConfig &config,
                             const WeightStore &weights) {
   const auto root = std::filesystem::canonical(package);
+  if (std::filesystem::exists(root / "verified-prefill-cache.txt")) {
+    throw std::invalid_argument("FFN Verify cache package is retired");
+  }
   std::ifstream stream(root / "compiled-block-prefill.txt");
   std::string magic, model_digest, index_digest, deployment_digest, extra;
   unsigned version = 0, capacity = 0, tokens = 0, count = 0;
   stream >> magic >> version >> model_digest >> index_digest >> deployment_digest >> capacity >>
       tokens >> count;
-  if (!stream || magic != "specferry-opt-compiled-block-prefill" || version != 1 ||
+  // Schema 1 preserves the accepted FP32 contract. Schema 2 declares KV precision.
+  std::string cache_dtype = "F32";
+  if (version == 2) {
+    stream >> cache_dtype;
+  }
+  const auto cache_type = cache_dtype == "F16" ? f16 : DataType::Float32;
+  if (!stream || magic != "specferry-opt-compiled-block-prefill" ||
+      (version != 1 && version != 2) || (cache_dtype != "F16" && cache_dtype != "F32") ||
       (capacity != 64 && capacity != 128 && capacity != 256) || tokens != 16 || count != 24 ||
       config.decoder.capacity != capacity || config.decoder.layers != count ||
       config.decoder.hidden != 1024 || config.decoder.heads != 16 ||
@@ -299,7 +306,7 @@ load_compiled_block_prefill(const std::filesystem::path &package,
     }
     item.graph.path = binary.string();
     checksums.push_back({binary, digest});
-    const TensorSpec hidden{f16, {1024, 16}}, state{DataType::Float32, {64, capacity, 16}};
+    const TensorSpec hidden{f16, {1024, 16}}, state{cache_type, {64, capacity, 16}};
     item.graph.inputs = {
         hidden, state, state, {DataType::Int32, {1}}, {DataType::Float32, {capacity, 16}}};
     item.graph.outputs = {hidden, state, state};
@@ -312,7 +319,6 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   if (platform::verify_model_payloads()) {
     verify_files(checksums);
   }
-  attach_prefill_graph_caches(root, config, weights, result);
   return result;
 }
 
