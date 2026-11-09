@@ -1,6 +1,5 @@
 #include "models/qwen3_5/attention.hpp"
 #include "np101/diagnostics.hpp"
-#include "np101/kv_cache.hpp"
 #include "np101/ops/graph_builder.hpp"
 #include "np101/ops/mixers.hpp"
 #include "np101/tensor_spec.hpp"
@@ -34,11 +33,12 @@ public:
   Config config;
   unsigned layer;
   WeightBank *bank;
+  bool shared_fcl_projections;
 
-  AttentionGraph(Context &context, const Config &configuration, unsigned index,
-                 WeightBank *weights = nullptr)
-      : GraphBuilder(context, 100, 80, weights), config(configuration), layer(index),
-        bank(weights) {}
+  AttentionGraph(Context &context, const Config &configuration, unsigned index, WeightBank *weights,
+                 bool use_shared_fcl)
+      : GraphBuilder(context, 100, 80, weights), config(configuration), layer(index), bank(weights),
+        shared_fcl_projections(use_shared_fcl) {}
 
   Tensor weight(const WeightStore &weights, const std::string &name, Shape shape) {
     return GraphBuilder::weight(weights,
@@ -47,8 +47,11 @@ public:
   }
 
   Tensor project(const WeightStore &weights, Tensor input, const std::string &name, unsigned rows) {
-    return matmul(input, weight(weights, name + ".weight", {input.spec.shape[0], rows}), {rows, 1},
-                  false, true);
+    const auto matrix = weight(weights, name + ".weight", {input.spec.shape[0], rows});
+    if (shared_fcl_projections) {
+      return fully_connected(input, matrix, true);
+    }
+    return matmul(input, matrix, {rows, 1}, false, true);
   }
 
   Tensor rms_norm(const WeightStore &weights, Tensor input, const std::string &name) {
@@ -62,8 +65,9 @@ public:
   Tensor hidden, position, query, key, value, gate;
 
   ProjectionGraph(Context &context, const WeightStore &weights, const Config &configuration,
-                  unsigned layer, std::optional<TensorBinding> input, WeightBank *bank = nullptr)
-      : AttentionGraph(context, configuration, layer, bank) {
+                  unsigned layer, std::optional<TensorBinding> input, WeightBank *bank,
+                  bool use_shared_fcl)
+      : AttentionGraph(context, configuration, layer, bank, use_shared_fcl) {
     const auto d = config.kv.head_dim, qh = config.query_heads, kh = config.kv.heads;
     hidden = input ? bind(*input, config.hidden_spec()) : tensor(config.hidden_spec());
     position = tensor({i32, {1}});
@@ -120,7 +124,8 @@ public:
 
   ReaderGraph(Context &context, const WeightStore &weights, ProjectionGraph &producer,
               KvCache &cache, std::optional<TensorBinding> destination)
-      : AttentionGraph(context, producer.config, producer.layer, producer.bank) {
+      : AttentionGraph(context, producer.config, producer.layer, producer.bank,
+                       producer.shared_fcl_projections) {
     auto query = share(producer, producer.query);
     auto gate = share(producer, producer.gate);
     Tensor keys{cache.retain_keys(graph), cache.spec().tensor()};
@@ -134,9 +139,14 @@ public:
     output = destination ? bind(*destination, config.hidden_spec()) : tensor(config.hidden_spec());
     const auto width = config.kv.head_dim * config.query_heads;
     auto matrix = weight(weights, "o_proj.weight", {width, config.hidden});
-    auto *projection = node(VSI_NN_OP_MATRIXMUL, {reshape(gated, {width, 1}), matrix}, output);
-    projection->nn_param.matrixmul.transpose[0] = false;
-    projection->nn_param.matrixmul.transpose[1] = true;
+    const auto projection_input = reshape(gated, {width, 1});
+    if (shared_fcl_projections) {
+      fully_connected(projection_input, matrix, true, output);
+    } else {
+      auto *projection = node(VSI_NN_OP_MATRIXMUL, {projection_input, matrix}, output);
+      projection->nn_param.matrixmul.transpose[0] = false;
+      projection->nn_param.matrixmul.transpose[1] = true;
+    }
     compile({query, gate, keys, values, valid_length}, {output, probabilities});
   }
 };
@@ -152,9 +162,11 @@ struct Attention::Impl {
 
   Impl(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
        std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {},
-       WeightBank *bank = nullptr)
-      : producer(context, weights, config, layer, input, bank),
-        cache(context, producer.graph, producer.key.id, producer.value.id, config.kv),
+       WeightBank *bank = nullptr, bool shared_fcl_projections = false,
+       KvWriteMode kv_write_mode = KvWriteMode::CopyGraph)
+      : producer(context, weights, config, layer, input, bank, shared_fcl_projections),
+        cache(context, producer.graph, producer.key.id, producer.value.id, config.kv,
+              kv_write_mode),
         reader(context, weights, producer, cache, output) {}
 };
 
@@ -168,13 +180,18 @@ Attention::Attention(Context &context, const WeightStore &weights, const Config 
 }
 
 Attention::Attention(Context &context, const WeightStore &weights, const Config &config,
-                     unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank)
+                     unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank,
+                     bool shared_fcl_projections, KvWriteMode kv_write_mode)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, false);
   if (config.mixer(layer) != MixerKind::Attention) {
     throw std::invalid_argument("layer is not Attention");
   }
-  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank);
+  if (shared_fcl_projections && !bank) {
+    throw std::invalid_argument("Qwen shared FCL projections require a weight bank");
+  }
+  impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank,
+                                 shared_fcl_projections, kv_write_mode);
 }
 
 Attention::~Attention() = default;
@@ -240,6 +257,8 @@ void Attention::truncate(unsigned length) {
 }
 
 unsigned Attention::length() const { return impl_ ? impl_->length : 0; }
+
+std::size_t Attention::kv_revalidations() const { return impl_ ? impl_->cache.revalidations() : 0; }
 
 std::vector<std::uint8_t> Attention::read(const std::string &name, TensorReadback method) {
   if (!impl_ || impl_->failed || !impl_->has_output) {

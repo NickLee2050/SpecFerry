@@ -8,10 +8,12 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 namespace fs = std::filesystem;
@@ -93,10 +95,11 @@ int main(int argc, char **argv) {
     const auto token_readback = token_readback_name == "mapped" ? np101::TensorReadback::MappedHost
                                                                 : np101::TensorReadback::SdkCopy;
     const auto head_backend_name = read_option(request, "head-backend.txt", "matmul");
-    if (head_backend_name != "matmul" && head_backend_name != "shared-fcl") {
+    if (head_backend_name != "matmul" && head_backend_name != "shared-fcl" &&
+        head_backend_name != "shared-fcl-split") {
       throw std::invalid_argument("unsupported Qwen head projection");
     }
-    const auto head_backend = head_backend_name == "shared-fcl"
+    const auto head_backend = head_backend_name != "matmul"
                                   ? np101::ops::LinearBackend::FullyConnected
                                   : np101::ops::LinearBackend::MatMul;
     const auto state_commit = read_option(request, "state-commit.txt", "per-layer");
@@ -120,8 +123,31 @@ int main(int argc, char **argv) {
     if (matmul_layer >= config.layer_types.size()) {
       throw std::invalid_argument("Qwen MatMul feed-forward layer exceeds model depth");
     }
+    const auto projections = read_option(request, "projections.txt", "matmul");
+    const bool shared_fcl = projections == "shared-fcl";
+    if (projections != "matmul" && !shared_fcl) {
+      throw std::invalid_argument("unsupported Qwen projection backend");
+    }
+    if (shared_fcl && (std::string_view(platform::runtime_profile().target) != "soc" ||
+                       (policy.capacity != 64 && policy.capacity != 128) || matmul_layer != 9 ||
+                       head_backend_name != "shared-fcl-split" || state_commit != "combined" ||
+                       lookup_name != "gather-nd" || token_readback_name != "mapped")) {
+      throw std::invalid_argument("Qwen shared FCL requires the validated SoC M1 composition");
+    }
+    const auto kv_write_name = read_option(request, "kv-write-mode.txt", "copy-graph");
+    if (kv_write_name != "copy-graph" && kv_write_name != "mapped") {
+      throw std::invalid_argument("unsupported Qwen KV write mode");
+    }
+    if (kv_write_name == "mapped" &&
+        (std::string_view(platform::runtime_profile().target) != "soc" || !shared_fcl)) {
+      throw std::invalid_argument("mapped Qwen KV requires the shared FCL SoC composition");
+    }
+    const auto kv_write_mode =
+        kv_write_name == "mapped" ? np101::KvWriteMode::MappedHost : np101::KvWriteMode::CopyGraph;
     np101::WeightStore weights(argv[1]);
-    weights.verify();
+    if (platform::verify_model_payloads()) {
+      weights.verify();
+    }
     const auto artifacts = models::qwen3_5::load_compiled_mixers(argv[2], weights, config);
     auto feed_forward = models::qwen3_5::load_compiled_feed_forward(argv[2], weights, config);
     // Validate the complete package before selecting the existing device MatMul FFN.
@@ -137,7 +163,11 @@ int main(int argc, char **argv) {
         [&](const std::string &name) {
           phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
         },
-        lookup, head_backend, state_commit == "combined");
+        lookup, head_backend, state_commit == "combined",
+        head_backend_name == "shared-fcl-split" ? 8 : 0,
+        shared_fcl ? np101::ops::LinearBackend::SharedFullyConnected
+                   : np101::ops::LinearBackend::MatMul,
+        kv_write_mode);
     const auto initialize =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     {
@@ -149,19 +179,22 @@ int main(int argc, char **argv) {
       }
       std::ofstream initialized(output / "initialization.json");
       initialized << std::setprecision(17) << "{\"initialize_seconds\":" << initialize
+                  << ",\"capacity\":" << policy.capacity
                   << ",\"const_peak_bytes\":" << memory.peak(true)
                   << ",\"nonconst_peak_bytes\":" << memory.peak(false)
                   << ",\"compiled_mixers\":" << artifacts.size() << ",\"embedding_lookup\":\""
                   << lookup_name << '"' << ",\"matmul_feed_forward_layer\":" << matmul_layer
                   << ",\"token_readback\":\"" << token_readback_name << '"'
                   << ",\"head_backend\":\"" << head_backend_name << '"' << ",\"state_commit\":\""
-                  << state_commit << '"'
+                  << state_commit << '"' << ",\"projections\":\"" << projections << '"'
+                  << ",\"kv_write_mode\":\"" << kv_write_name << '"'
                   << ",\"compiled_input_norm_layers\":" << compiled_input_norm_layers
                   << ",\"compiled_feed_forward\":" << feed_forward.size() << "}\n";
       if (!initialized) {
         throw std::runtime_error("cannot save Qwen initialization evidence");
       }
     }
+    platform::notify_model_ready();
     for (unsigned repeat = 0; repeat < repeats; ++repeat) {
       phase(output, "request." + std::to_string(repeat));
       const auto result = model.generate(prompt, maximum, token_readback);
@@ -182,18 +215,28 @@ int main(int argc, char **argv) {
            model.read(23, "values"));
     }
     phase(output, "release");
+    const auto kv_revalidations = model.kv_revalidations();
     model.close();
     const auto &memory = context.memory();
     if (memory.live(true) || memory.live(false)) {
       throw std::runtime_error("Qwen retains tensor payload after release");
     }
-    std::ofstream file(output / "execution.json");
-    file << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"initialize_"
-            "seconds\":"
-         << initialize << ",\"const_live_bytes\":0,\"nonconst_live_bytes\":0,\"const_peak_bytes\":"
-         << memory.peak(true) << ",\"nonconst_peak_bytes\":" << memory.peak(false) << "}\n";
     context.close();
-    return file ? 0 : 1;
+    // Publish completion only after model storage and its Context are released.
+    // Both platforms use the same record; the SoC supervisor also requires run.json.
+    for (const auto *name : {"execution.json", "run.json"}) {
+      std::ofstream file(output / name);
+      file << std::setprecision(17)
+           << "{\"status\":\"executed\",\"phase\":\"complete\",\"released\":true,\"initialize_"
+              "seconds\":"
+           << initialize << ",\"kv_revalidations\":" << kv_revalidations
+           << ",\"const_live_bytes\":0,\"nonconst_live_bytes\":0,\"const_peak_bytes\":"
+           << memory.peak(true) << ",\"nonconst_peak_bytes\":" << memory.peak(false) << "}\n";
+      if (!file) {
+        throw std::runtime_error("cannot save Qwen release evidence");
+      }
+    }
+    return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

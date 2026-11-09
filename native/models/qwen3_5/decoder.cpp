@@ -56,7 +56,8 @@ struct DecoderLayer::Impl {
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
        TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
-       const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit)
+       const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
+       KvWriteMode kv_write_mode)
       : config(configuration), storage(context, 1, 0),
         mixed(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
@@ -79,8 +80,9 @@ struct DecoderLayer::Impl {
       if (compiled) {
         throw std::invalid_argument("DeltaNet compiled mixer cannot replace attention");
       }
-      attention = std::make_unique<Attention>(context, weights, config, layer, mixer_input,
-                                              mixer_output, bank);
+      attention = std::make_unique<Attention>(
+          context, weights, config, layer, mixer_input, mixer_output, bank,
+          backend == LinearBackend::SharedFullyConnected, kv_write_mode);
     } else {
       if (!compiled) {
         throw std::invalid_argument("Qwen DeltaNet requires its compiled mixer");
@@ -121,14 +123,19 @@ struct DecoderLayer::Impl {
 DecoderLayer::DecoderLayer(Context &context, const WeightStore &weights, const Config &config,
                            unsigned layer, TensorBinding input, WeightBank *bank,
                            LinearBackend backend, const CompiledBlock *compiled,
-                           const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit)
+                           const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
+                           KvWriteMode kv_write_mode)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, true);
   impl_ = std::make_unique<Impl>(context, weights, config, layer, input, bank, backend, compiled,
-                                 compiled_feed_forward, deferred_delta_commit);
+                                 compiled_feed_forward, deferred_delta_commit, kv_write_mode);
 }
 
 DecoderLayer::~DecoderLayer() = default;
+
+std::size_t DecoderLayer::kv_revalidations() const {
+  return impl_ && impl_->attention ? impl_->attention->kv_revalidations() : 0;
+}
 
 void DecoderLayer::step() {
   if (!impl_ || impl_->failed) {

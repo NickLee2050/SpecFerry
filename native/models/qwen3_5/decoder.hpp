@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/compiled.hpp"
 #include "np101/context.hpp"
+#include "np101/kv_cache.hpp"
 #include "np101/ops/linear_backend.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
@@ -30,7 +31,8 @@ public:
                np101::ops::LinearBackend feed_forward = np101::ops::LinearBackend::MatMul,
                const CompiledBlock *compiled_mixer = nullptr,
                const CompiledBlock *compiled_feed_forward = nullptr,
-               bool deferred_delta_commit = false);
+               bool deferred_delta_commit = false,
+               np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph);
   ~DecoderLayer();
   DecoderLayer(const DecoderLayer &) = delete;
   DecoderLayer &operator=(const DecoderLayer &) = delete;
@@ -38,6 +40,7 @@ public:
   void step();
   void reset();
   std::size_t length() const;
+  std::size_t kv_revalidations() const;
   TensorBinding output();
   std::vector<np101::TensorCopyBinding> state_copies();
   void confirm_state_commit();

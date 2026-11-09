@@ -1,5 +1,5 @@
 #pragma once
 
 namespace specferry::np101::ops {
-enum class LinearBackend { MatMul, FullyConnected };
+enum class LinearBackend { MatMul, FullyConnected, SharedFullyConnected };
 }

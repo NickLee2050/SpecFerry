@@ -57,10 +57,40 @@ def bundle_file(root, name):
     return target
 
 
+def memory_reserve_kib(manifest):
+    """Allow an explicit smaller reserve for the constrained 512MiB Linux layout."""
+    reserve = manifest.get("linux_memory_reserve_mib", RESERVE_KIB // 1024)
+    if type(reserve) is not int or not 32 <= reserve <= 512:
+        raise ValueError("Linux memory reserve must be an integer in [32, 512] MiB")
+    return reserve * 1024
+
+
+def native_command(root, manifest, output):
+    """Keep model argument ordering explicit; never execute a manifest-provided command."""
+    family = manifest.get("model_family", "opt")
+    if family == "opt":
+        return [
+            str(root / "bin/specferry_opt_graph_generate"),
+            str(root / "weights"),
+            str(root / "request"),
+            str(output / "native"),
+        ]
+    if family == "qwen3_5":
+        return [
+            str(root / "bin/specferry_qwen_generate"),
+            str(root / "weights"),
+            str(root / "model"),
+            str(root / "request"),
+            str(output / "native"),
+        ]
+    raise ValueError("unsupported SoC model family")
+
+
 def verify_bundle(root, check_sdk=True, *, verify_payload=True):
     manifest = read_json(root / "bundle.json")
     if (manifest.get("schema_version"), manifest.get("target")) != (1, "np101-soc-riscv64"):
         raise ValueError("unsupported SoC bundle")
+    memory_reserve_kib(manifest)
     if "verified_prefill_cache" in manifest or any(
         name in {"model/verified-prefill-cache.txt", "model/cache-producer.bin"}
         or name.startswith("model/verify-cache/")
@@ -94,7 +124,11 @@ def verify_bundle(root, check_sdk=True, *, verify_payload=True):
     with futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as workers:
         for _ in workers.map(verify_file, checks):
             pass
-    with (root / "bin/specferry_opt_graph_generate").open("rb") as binary:
+    executable = Path(native_command(root, manifest, root)[0])
+    name = executable.relative_to(root).as_posix()
+    if manifest["files"].get(name, {}).get("executable") is not True:
+        raise ValueError("SoC executable must be included in the verified file inventory")
+    with executable.open("rb") as binary:
         header = binary.read(20)
     if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 243:
         raise ValueError("SoC executable must be ELF64 little-endian RISC-V")
@@ -216,9 +250,28 @@ def group_members(group):
     return members
 
 
-def supervise(command, cwd, environment, output, timeout, monitor, *, preparation_timeout=None):
-    if not 0 < timeout <= 300:
-        raise ValueError("execution deadline must be in (0, 300] seconds")
+def inference_timeout_limit(manifest):
+    # Qwen's first SoC acceptance has an explicitly authorized ten-minute budget.
+    return 600 if manifest.get("model_family", "opt") == "qwen3_5" else 300
+
+
+def supervise(
+    command,
+    cwd,
+    environment,
+    output,
+    timeout,
+    monitor,
+    *,
+    preparation_timeout=None,
+    execution_limit=300,
+):
+    if execution_limit not in (300, 600) or (
+        execution_limit == 600 and preparation_timeout is None
+    ):
+        raise ValueError("extended execution requires a phased model workload")
+    if not 0 < timeout <= execution_limit:
+        raise ValueError(f"execution deadline must be in (0, {execution_limit}] seconds")
     if preparation_timeout is not None and not 0 < preparation_timeout <= 240:
         raise ValueError("preparation deadline must be in (0, 240] seconds")
     started = time.monotonic()
@@ -470,8 +523,9 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
 
 
 def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
-    if not 0 < timeout <= 300:
-        raise ValueError("inference deadline must be in (0, 300] seconds")
+    execution_limit = inference_timeout_limit(read_json(root / "bundle.json"))
+    if not 0 < timeout <= execution_limit:
+        raise ValueError(f"inference deadline must be in (0, {execution_limit}] seconds")
     if not 0 < preparation_timeout <= 240:
         raise ValueError("preparation deadline must be in (0, 240] seconds")
     output.mkdir(parents=True, exist_ok=False)
@@ -497,6 +551,8 @@ def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
             raise RuntimeError("board recovery marker remains; follow the incident ledger")
         # Installed libraries are checked before native loading. This does not load the driver.
         manifest = verify_bundle(root, verify_payload=False)
+        reserve_kib = memory_reserve_kib(manifest)
+        result["linux_memory_reserve_mib"] = reserve_kib // 1024
         result["fault_pattern"] = fault_pattern(manifest)
         fault = re.compile(result["fault_pattern"], re.I)
         if diagnostic is not None:
@@ -532,7 +588,7 @@ def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
         before = snapshot()
         result["before"] = before
         if (
-            before["mem_available_kib"] < RESERVE_KIB
+            before["mem_available_kib"] < reserve_kib
             or int(re.search(r"POOL SYSTEM:.*?Total\s*:\s*(\d+)", before["pool"], re.S)[1])
             != manifest["driver_parameters"]["contiguousSize"]
         ):
@@ -568,7 +624,7 @@ def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
                 state = snapshot()
                 samples.append(state)
                 next_sample = time.monotonic() + 0.5
-                if state["mem_available_kib"] < RESERVE_KIB:
+                if state["mem_available_kib"] < reserve_kib:
                     return "Linux memory reserve breached"
             return None
 
@@ -591,18 +647,14 @@ def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
         result["child_started"] = True
         result.update(
             supervise(
-                [
-                    str(root / "bin/specferry_opt_graph_generate"),
-                    str(root / "weights"),
-                    str(root / "request"),
-                    str(output / "native"),
-                ],
+                native_command(root, manifest, output),
                 root / "runtime",
                 environment,
                 output,
                 timeout,
                 monitor,
                 preparation_timeout=preparation_timeout,
+                execution_limit=execution_limit,
             )
         )
         monitor()

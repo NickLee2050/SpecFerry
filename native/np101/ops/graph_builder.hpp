@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -76,7 +77,8 @@ public:
                 bool transpose_right = false);
   // Static FP16 [K,N] weights, no fused bias/activation. Shared ordinary weights
   // require explicit opt-in and must remain unchanged for the graph's lifetime.
-  Tensor fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights = false);
+  Tensor fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights = false,
+                         std::optional<Tensor> destination = std::nullopt);
   // M16 FP16 [K,16] projection through 1x1 convolution, with ordinary read-only
   // shared backing in [1,1,K,N]. Bias remains a separate FP16 operation.
   Tensor batch_pointwise_projection(Tensor input, Tensor weights);

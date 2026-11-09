@@ -19,6 +19,72 @@ SUPPORTED_DRIVER_SHA256 = {
 }
 
 
+def sdk_identity(sdk):
+    """Resolve the pinned board SDK without contacting or loading a device."""
+    driver_digest = sha256(sdk / "drivers/galcore.ko")
+    if driver_digest not in SUPPORTED_DRIVER_SHA256:
+        raise ValueError("SDK snapshot is not the pinned SoC module")
+    hashes = {path.name: sha256(path) for path in sorted((sdk / "drivers").glob("*.so"))}
+    hashes["galcore.ko"] = driver_digest
+    if not all(name in hashes for name in SDK_FILES):
+        raise ValueError("incomplete SDK snapshot")
+    if not (sdk / "include/CL/cl_viv_vx_ext.h").is_file():
+        raise ValueError("SDK CL headers are missing")
+    return hashes
+
+
+def stage_runtime(root, binary, deployment, sdk, executable):
+    """Stage shared transport, source weights and shader headers for either model."""
+    for name in ("bin", "weights", "model", "request", "runtime"):
+        (root / name).mkdir()
+    shutil.copy2(binary, root / "bin" / executable)
+    (root / "bin" / executable).chmod(0o755)
+    shutil.copyfile(board_runner.__file__, root / "board_runner.py")
+    for name in ("weights.bin", "weights.index", "deployment-manifest.json"):
+        shutil.copyfile(deployment / name, root / "weights" / name)
+    shutil.copytree(sdk / "include/CL", root / "runtime/include/CL")
+    # The validated vendor shader compiler also resolves these headers from cwd.
+    for path in (sdk / "include/CL").glob("*.h"):
+        shutil.copyfile(path, root / "runtime" / path.name)
+
+
+def finish_bundle(root, sdk_hashes, options, *, model_family="opt", **provenance):
+    """Bind every staged file to the shared board supervisor and recovery policy."""
+    executable = (
+        "specferry_qwen_generate" if model_family == "qwen3_5" else "specferry_opt_graph_generate"
+    )
+    files = {
+        path.relative_to(root).as_posix(): {
+            "bytes": path.stat().st_size,
+            "sha256": sha256(path),
+            "executable": path == root / "bin" / executable,
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+    manifest = {
+        "schema_version": 1,
+        "target": "np101-soc-riscv64",
+        "model_family": model_family,
+        "files": files,
+        "payload_bytes": sum(item["bytes"] for item in files.values()),
+        "sdk": sdk_hashes,
+        "request_options": options,
+        # Match the validated 512MiB Linux layout; older bundles keep their pinned policy.
+        "linux_memory_reserve_mib": 64,
+        "driver_parameters": {
+            "contiguousBase": 0x60000000,
+            "contiguousSize": 0x90000000,
+            "stuckDump": 1,
+        },
+        "fault_pattern": FAULT.pattern + r"|Out of memory|I/O error|kernel panic",
+        **provenance,
+    }
+    save(root / "bundle.json", manifest)
+    verify_bundle(root, check_sdk=False)
+    return manifest
+
+
 def request_options(request):
     options = {}
     for line in (request / "run-options.txt").read_text().splitlines():
@@ -188,25 +254,11 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
     records = read_json(deployment / "deployment-manifest.json")["tensors"]
     if graph["weight_sha256"] != {row["name"]: row["sha256"] for row in records}:
         raise ValueError("NBG source weight identities differ")
-    driver_digest = sha256(sdk / "drivers/galcore.ko")
-    if driver_digest not in SUPPORTED_DRIVER_SHA256:
-        raise ValueError("SDK snapshot is not the pinned SoC module")
-    sdk_hashes = {path.name: sha256(path) for path in sorted((sdk / "drivers").glob("*.so"))}
-    sdk_hashes["galcore.ko"] = driver_digest
-    if not all(name in sdk_hashes for name in SDK_FILES):
-        raise ValueError("incomplete SDK snapshot")
-    if not (sdk / "include/CL/cl_viv_vx_ext.h").is_file():
-        raise ValueError("SDK CL headers are missing")
+    sdk_hashes = sdk_identity(sdk)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".soc-bundle-", dir=output.parent) as temporary:
         root = Path(temporary)
-        for name in ("bin", "weights", "model", "request", "runtime"):
-            (root / name).mkdir()
-        shutil.copy2(binary, root / "bin/specferry_opt_graph_generate")
-        (root / "bin/specferry_opt_graph_generate").chmod(0o755)
-        shutil.copyfile(board_runner.__file__, root / "board_runner.py")
-        for name in ("weights.bin", "weights.index", "deployment-manifest.json"):
-            shutil.copyfile(deployment / name, root / "weights" / name)
+        stage_runtime(root, binary, deployment, sdk, "specferry_opt_graph_generate")
         shutil.copyfile(package / graph["path"], root / "model" / graph["path"])
         # Only the platform identity changes. The original graph, weights and ports stay pinned.
         native = (package / "compiled-model.txt").read_text().splitlines()
@@ -247,35 +299,11 @@ def prepare_bundle(binary, deployment, package, request, sdk, output, *, prefill
             reference["prefill_backend"] = "compiled-attention"
             reference["prefill_cache_policy"] = "shared-input"
             save(root / "request/reference.json", reference)
-        shutil.copytree(sdk / "include/CL", root / "runtime/include/CL")
-        # The validated vendor shader compiler also resolves these headers from cwd.
-        for path in (sdk / "include/CL").glob("*.h"):
-            shutil.copyfile(path, root / "runtime" / path.name)
-        files = {
-            path.relative_to(root).as_posix(): {
-                "bytes": path.stat().st_size,
-                "sha256": sha256(path),
-                "executable": path == root / "bin/specferry_opt_graph_generate",
-            }
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-        }
-        manifest = {
-            "schema_version": 1,
-            "target": "np101-soc-riscv64",
-            "files": files,
-            "payload_bytes": sum(item["bytes"] for item in files.values()),
-            "sdk": sdk_hashes,
-            "request_options": options,
-            "source_native_manifest_sha256": sha256(package / "compiled-model.txt"),
-            "driver_parameters": {
-                "contiguousBase": 0x80000000,
-                "contiguousSize": 0x70000000,
-                "stuckDump": 1,
-            },
-            "fault_pattern": FAULT.pattern + r"|Out of memory|I/O error|kernel panic",
-        }
-        save(root / "bundle.json", manifest)
-        verify_bundle(root, check_sdk=False)
+        manifest = finish_bundle(
+            root,
+            sdk_hashes,
+            options,
+            source_native_manifest_sha256=sha256(package / "compiled-model.txt"),
+        )
         root.rename(output)
     return manifest

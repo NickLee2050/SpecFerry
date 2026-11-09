@@ -260,7 +260,8 @@ Tensor GraphBuilder::matmul(Tensor left, Tensor right, Shape shape, bool transpo
   return output;
 }
 
-Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights) {
+Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights,
+                                     std::optional<Tensor> destination) {
   const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
   if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
       weights.spec.shape.size() != 2 || input.spec.shape[0] != weights.spec.shape[0] ||
@@ -268,7 +269,12 @@ Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutabl
       (!weight_tensor->attr.is_const && !immutable_shared_weights)) {
     throw std::invalid_argument("FCL candidate requires FP16 [K,M] and static [K,N] weights");
   }
-  auto output = tensor({f16, {weights.spec.shape[1], input.spec.shape[1]}});
+  const TensorSpec spec{f16, {weights.spec.shape[1], input.spec.shape[1]}};
+  if (destination &&
+      (destination->spec.type != spec.type || destination->spec.shape != spec.shape)) {
+    throw std::invalid_argument("FCL destination must match its FP16 projection output");
+  }
+  auto output = destination ? *destination : tensor(spec);
   auto *operation = node(VSI_NN_OP_FCL, {input, weights}, output);
   operation->nn_param.fcl.weights = weights.spec.shape[1];
   operation->vx_param.overflow_policy = VX_CONVERT_POLICY_SATURATE;
@@ -330,6 +336,9 @@ Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const Weigh
   const auto columns = input.spec.shape[0], rows = record.spec.shape[1];
   if (backend == LinearBackend::FullyConnected) {
     return fully_connected(input, constant_weight(store, record));
+  }
+  if (backend == LinearBackend::SharedFullyConnected && weights_) {
+    return fully_connected(input, weight(store, record, record.spec), true);
   }
   if (backend != LinearBackend::MatMul) {
     throw std::invalid_argument("unknown projection backend");

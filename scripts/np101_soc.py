@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, deploy and supervise the explicit OPT fullgraph SoC configuration."""
+"""Prepare, deploy and supervise explicit OPT or Qwen SoC deployments."""
 
 import argparse
 import json
@@ -17,14 +17,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="offline: assemble a relocatable bundle")
+    prepare.add_argument("--model", choices=("opt", "qwen"), default="opt")
     prepare.add_argument(
-        "--binary", type=Path, default=ROOT / "build/soc/bin/specferry_opt_graph_generate"
+        "--qwen-projections",
+        choices=("shared-fcl", "matmul"),
+        help="Qwen projection backend, defaults to shared-fcl; matmul is the M1 fallback",
     )
-    prepare.add_argument("--deployment", type=Path, default=ROOT / ".cache/np101/opt-350m")
+    prepare.add_argument(
+        "--qwen-kv-write-mode",
+        choices=("copy-graph", "mapped"),
+        help="Qwen KV append backend; mapped avoids runtime copy-graph revalidation",
+    )
+    prepare.add_argument("--binary", type=Path)
+    prepare.add_argument("--deployment", type=Path)
     for name in ("package", "request", "sdk", "output"):
         prepare.add_argument("--" + name, type=Path, required=True)
     prepare.add_argument(
-        "--prefill-package", type=Path, help="pinned EP M16 FFN package for block16 prefill"
+        "--prefill-package",
+        type=Path,
+        help="source-bound compiled attention package for M16 prefill",
     )
     for name in ("deploy", "run", "collect"):
         command = commands.add_parser(name)
@@ -41,7 +52,10 @@ def main():
                 help="explicit authorization and exact old fault/boot/gate/bundle identities",
             )
             command.add_argument(
-                "--timeout", type=int, default=300, help="post-ready execution seconds, maximum 300"
+                "--timeout",
+                type=int,
+                default=300,
+                help="post-ready execution seconds: maximum 600 for Qwen, 300 for OPT",
             )
             command.add_argument(
                 "--prepare-timeout",
@@ -51,15 +65,33 @@ def main():
             )
     args = parser.parse_args()
     if args.command == "prepare":
-        result = prepare_bundle(
-            args.binary,
-            args.deployment,
-            args.package,
-            args.request,
-            args.sdk,
-            args.output,
-            prefill_package=args.prefill_package,
-        )
+        if args.model == "qwen":
+            from specferry.platforms.soc.qwen_deployment import prepare_bundle as prepare_qwen
+
+            if args.prefill_package is not None:
+                parser.error("Qwen currently uses the existing single-token chain")
+            result = prepare_qwen(
+                args.binary or ROOT / "build/soc/bin/specferry_qwen_generate",
+                args.deployment or ROOT / ".cache/np101/Qwen3.5-0.8B",
+                args.package,
+                args.request,
+                args.sdk,
+                args.output,
+                projections=args.qwen_projections or "shared-fcl",
+                kv_write_mode=args.qwen_kv_write_mode or "copy-graph",
+            )
+        else:
+            if args.qwen_projections is not None or args.qwen_kv_write_mode is not None:
+                parser.error("Qwen execution options require --model qwen")
+            result = prepare_bundle(
+                args.binary or ROOT / "build/soc/bin/specferry_opt_graph_generate",
+                args.deployment or ROOT / ".cache/np101/opt-350m",
+                args.package,
+                args.request,
+                args.sdk,
+                args.output,
+                prefill_package=args.prefill_package,
+            )
         print(
             json.dumps(
                 {

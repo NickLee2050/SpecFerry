@@ -34,7 +34,8 @@ struct Model::Impl {
        const std::map<unsigned, CompiledBlock> &compiled,
        const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
        const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-       LinearBackend head_backend, bool combined_state_commit)
+       LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
+       LinearBackend projection_backend, KvWriteMode kv_write_mode)
       : config(spec), policy(selection), bank(context), progress(phase) {
     const auto *timing = std::getenv("SPECFERRY_SDK_TIMING");
     trace_steps = timing && std::string_view(timing) == "calls";
@@ -52,10 +53,10 @@ struct Model::Impl {
         const auto feed_forward = compiled_feed_forward.find(layer);
         const auto input = layers.empty() ? vocabulary->embedding() : layers.back()->output();
         layers.push_back(std::make_unique<DecoderLayer>(
-            context, weights, config, layer, input, &bank, LinearBackend::MatMul,
+            context, weights, config, layer, input, &bank, projection_backend,
             artifact == compiled.end() ? nullptr : &artifact->second,
             feed_forward == compiled_feed_forward.end() ? nullptr : &feed_forward->second,
-            combined_state_commit));
+            combined_state_commit, kv_write_mode));
       }
       if (combined_state_commit) {
         if (phase) {
@@ -91,9 +92,9 @@ struct Model::Impl {
       if (phase) {
         phase("lm-head");
       }
-      head = std::make_unique<VocabularyHead>(context, *vocabulary,
-                                              TensorBinding{normalization->graph, normalized.id},
-                                              SamplingOptions{}, head_backend);
+      head = std::make_unique<VocabularyHead>(
+          context, *vocabulary, TensorBinding{normalization->graph, normalized.id},
+          SamplingOptions{}, head_backend, head_blocks_per_graph);
     } catch (...) {
       close();
       throw;
@@ -183,7 +184,7 @@ struct Model::Impl {
     failed = true;
     prediction_ready = false;
     if (head) {
-      head->graph.close();
+      head->close();
       head.reset();
     }
 
@@ -212,7 +213,8 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
              const std::map<unsigned, CompiledBlock> &compiled,
              const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
              const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-             LinearBackend head_backend, bool combined_state_commit) {
+             LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
+             LinearBackend projection_backend, KvWriteMode kv_write_mode) {
   config.validate();
   const auto &table = weights.find("model.embed_tokens.weight");
   if (config.hidden != 1024 || config.intermediate != 3584 || config.layer_types.size() != 24 ||
@@ -223,6 +225,11 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   }
   if (head_backend != LinearBackend::MatMul && head_backend != LinearBackend::FullyConnected) {
     throw std::invalid_argument("Qwen head requires one explicit projection implementation");
+  }
+  if (projection_backend != LinearBackend::MatMul &&
+      (projection_backend != LinearBackend::SharedFullyConnected ||
+       compiled_feed_forward.size() != 23 || compiled_feed_forward.count(9))) {
+    throw std::invalid_argument("Qwen shared FCL requires the fixed layer-10 FFN fallback");
   }
   std::size_t constants = 0, ordinary_weights = table.bytes;
   for (const auto &entry : compiled_feed_forward) {
@@ -274,7 +281,8 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   try {
     impl_ =
         std::make_unique<Impl>(context, weights, config, policy, compiled, compiled_feed_forward,
-                               phase, lookup, head_backend, combined_state_commit);
+                               phase, lookup, head_backend, combined_state_commit,
+                               head_blocks_per_graph, projection_backend, kv_write_mode);
   } catch (const std::exception &error) {
     const auto &memory = context.memory();
     throw std::runtime_error(
@@ -309,6 +317,16 @@ std::vector<std::uint8_t> Model::read(unsigned layer, const std::string &field) 
   }
   impl_->require_live();
   return impl_->layers.at(layer)->read(field, TensorReadback::MappedHost);
+}
+
+std::size_t Model::kv_revalidations() const {
+  std::size_t count = 0;
+  if (impl_) {
+    for (const auto &layer : impl_->layers) {
+      count += layer->kv_revalidations();
+    }
+  }
+  return count;
 }
 
 void Model::close() {

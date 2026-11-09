@@ -8,15 +8,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-import numpy as np
-
 from specferry.data.checkpoint import sha256
 from specferry.models.qwen3_5.generation import prepare_reference, prepare_request
-from specferry.models.qwen3_5.precision import TOLERANCES
-from specferry.validation.arrays import compare_arrays
+from specferry.models.qwen3_5.validation import evaluate_generation
 from specferry.validation.compiled import run_case
 from specferry.validation.device import write_json
-from specferry.validation.generation_metrics import summarize
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -104,54 +100,12 @@ def main():
         return 0
 
     def accept(case, device):
-        generations, checks = [], {}
-        for index in range(args.repeats):
-            run = json.loads((device / f"measured.{index}.json").read_text())
-            generations.append(run)
-            checks[f"request.{index}"] = (
-                run["tokens"] == reference["tokens"]
-                and run["consumed"] == reference["consumed"]
-                and run["stop_reason"] == reference["stop_reason"]
-            )
-            for name, contract in reference["snapshots"].items():
-                expected = np.fromfile(
-                    fixture / f"expected.{name}.bin", dtype=contract["dtype"]
-                ).reshape(contract["shape"])
-                actual = np.fromfile(
-                    device / f"measured.{index}.{name}.bin", dtype=contract["dtype"]
-                )
-                if name in ("keys", "values"):
-                    full = actual.reshape(1, 2, args.capacity, 256)
-                    checks[f"request.{index}.{name}.unwritten_bit_zero"] = not np.any(
-                        full[:, :, reference["consumed"] :].copy().view("u1")
-                    ).item()
-                    actual = full[:, :, : reference["consumed"]]
-                else:
-                    actual = actual.reshape(expected.shape)
-                tolerance = TOLERANCES[
-                    "fp32_state_from_fp16_pipeline" if name == "recurrent" else "fp16_pipeline"
-                ]
-                checks[f"request.{index}.{name}"] = compare_arrays(actual, expected, **tolerance)[
-                    "passed"
-                ]
-                if index:
-                    checks[f"request.{index}.{name}.reset"] = (
-                        device / f"measured.{index}.{name}.bin"
-                    ).read_bytes() == (device / f"measured.0.{name}.bin").read_bytes()
-        native = json.loads((device / "execution.json").read_text())
-        checks["release"] = (
-            native["released"]
-            and native["const_live_bytes"] == native["nonconst_live_bytes"] == 0
-            and max(native["const_peak_bytes"], native["nonconst_peak_bytes"]) <= 2**30
-        )
-        return dict(
-            passed=all(checks.values()),
-            checks=checks,
-            performance=summarize(generations) if all(checks.values()) else None,
-            generated_text=[
-                tokenizer.decode(run["tokens"], skip_special_tokens=True) for run in generations
-            ],
-        )
+        result = evaluate_generation(fixture, device)
+        result["generated_text"] = [
+            tokenizer.decode(run["tokens"], skip_special_tokens=True)
+            for run in result.pop("generations")
+        ]
+        return result
 
     result = run_case(
         dict(

@@ -85,16 +85,22 @@ Deployment records the verified manifest and file identities. Later runs check t
 metadata and SDK identity. Changed files require full deployment verification. EP also checks payload
 hashes at startup. Run `python3 board_runner.py verify BUNDLE` after a manual deployment.
 
-SoC accepts fullgraph C64/C128/C256 with mapped-slot KV and independent reset requests. Use
+SoC accepts fixed fullgraph C64/C128/C256/C512 with mapped-slot KV and independent reset requests.
+C512 hardware acceptance is tracked in the status document. Use
 `prepare --prefill-package` with compiled attention, `block 16` and `prefill_head last-token` for
-batch prefill. The default SoC build uses four convolution FFNs, then shared FCL and five full
-decoder NBGs. Compiled prefill shares M1's KV inputs and reuses a scratch output pair, committing
+batch prefill. The current SoC candidate uses four convolution FFNs, then shared FCL and five full
+decoder NBGs. Continuous-request acceptance is still open. Compiled prefill shares M1's KV inputs
+and reuses a scratch output pair, committing
 each layer before reuse. FP16 KV packages require matching prefill and decode ports. M1 processes
 the final prompt token and all generated tokens. Current performance and acceptance scopes are in
 [status](docs/np101-status.md#soc部署与内存).
 
-It requires the documented 1792MiB pool, stuckDump=1, board Python 3.9+, a matching SDK and
-host EP isolation. The detached supervisor allows at most 240 seconds for model preparation and
+New bundles pin the documented 2304 MiB pool at `0x60000000`, with 512 MiB Linux,
+stuckDump=1, board Python 3.9+, a matching SDK and host EP isolation. They explicitly use a
+64 MiB Linux available-memory stop threshold; legacy bundles retain their pinned pool and the
+192 MiB default when the reserve is unspecified. These thresholds do not guarantee against OOM.
+The expanded layout passes the recorded short requests; C512 long-request regression remains
+blocked after three consecutive NP hangs, with incident markers retained. The detached supervisor allows at most 240 seconds for model preparation and
 300 seconds for the complete post-ready workload, configured by `--prepare-timeout` and `--timeout`.
 The native entry reports readiness once through a private pipe; requests never restart the budget,
 and blocked SDK/debugfs sampling cannot delay the watchdog. Kernel monitoring, Linux memory reserve
@@ -105,11 +111,36 @@ retry discovery of the same run; `collect` performs host numerical acceptance. E
 markers block ordinary runs. `--diagnostic-baseline` is only for explicitly authorized diagnostics:
 it binds exact boot, old timestamped fault occurrences, marker/bundle hashes and deadline; success
 retains the old marker. Diagnostic authorization does not automatically enable per-SDK-call tracing.
-Neither command loads or resets the driver. Qwen on SoC, whole-pool
-integrity and long-term stability remain unvalidated.
+Neither command loads or resets the driver. Whole-pool integrity and long-term stability remain
+unvalidated.
 See [status](docs/np101-status.md#soc部署与内存) for deployment evidence and acceptance boundaries.
 SoC runs require board-side deadlines, kernel monitoring and release/delayed checks; retain host EP
 isolation. Driver autoload remains disabled.
+
+Qwen's existing single-token hybrid implementation can also be cross-built and packaged offline:
+
+```sh
+cmake --build build/soc --target specferry_qwen_generate -j 4
+python scripts/np101_soc.py prepare --model qwen \
+  --deployment .cache/np101/Qwen3.5-0.8B --package /absolute/path/to/qwen-package \
+  --request /absolute/path/to/qwen-request --sdk /absolute/path/to/board-sdk \
+  --output .cache/runs/qwen-soc-bundle
+```
+
+New Qwen SoC bundles default to shared FP16 FCL for attention Q/K/V, attention output and the three
+projections in the handwritten tenth-layer FFN. Pass `--qwen-projections matmul` during
+preparation for the original single-token projection path. Both configurations reuse the split
+FCL vocabulary head, eighteen normalized DeltaNet NBGs, twenty-three FFN NBGs, combined state
+commit and mapped token readback. Existing bundles without a projection option keep their recorded
+configuration. The Qwen bundle uses the validated 768 MiB Linux / 2048 MiB NPU pool layout,
+C64 or C128 capacity and greedy single-EOS. Supply the matching CPU request and reference.
+Use `--qwen-kv-write-mode mapped` with shared FCL to append only the current K/V slot through
+reused host buffers, without rebinding or reverifying a copy graph. The default `copy-graph`
+retains the previous path. Run records identify the selected mode and cumulative KV revalidations.
+
+The bundle uses the same deployment receipt, supervisor, release checks and `deploy/run/collect`
+workflow as OPT. Qwen accepts an explicit `--timeout 600` for inference after readiness.
+Preparation remains limited to 240 seconds.
 
 ### Source and platform boundaries
 

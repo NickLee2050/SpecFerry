@@ -1,6 +1,7 @@
 #include "models/qwen3_5/compiled.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/sdk_identity.hpp"
+#include "platform/runtime_profile.hpp"
 
 #include <array>
 #include <fstream>
@@ -87,7 +88,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
   unsigned version = 0, count = 0;
   file >> magic >> version >> driver >> count;
   if (!file || magic != std::string("specferry-qwen-") + label ||
-      (version != 1 && !(mixer && version == 2)) || driver != "F53A3E6EFBB7D0FD7D4617C") {
+      (version != 1 && !(mixer && version == 2))) {
     throw std::invalid_argument("compiled Qwen block package/driver differs");
   }
   verify_compiled_sdk(file, driver, count);
@@ -106,9 +107,10 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
     }
     const auto binary = std::filesystem::canonical(root / name);
     if (!file || binary.parent_path() != root || !std::filesystem::file_size(binary) ||
+        digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos ||
         std::filesystem::file_size(binary) > artifact.graph.constant_bytes ||
         artifact.graph.constant_bytes > segment_payload_limit - total ||
-        file_sha256(binary) != digest) {
+        (platform::verify_model_payloads() && file_sha256(binary) != digest)) {
       throw std::invalid_argument("compiled Qwen block NBG identity/budget differs");
     }
     total += artifact.graph.constant_bytes;

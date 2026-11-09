@@ -49,6 +49,12 @@ the request is unchanged. Host numerical checks share the OPT validation code wi
 `python -m unittest tests.python.test_soc` checks packaging integrity, architecture/path rejection,
 watchdog termination despite blocked sampling, fault handling and retained recovery gates without
 opening a device. SSH failure alone never authorizes another model submission.
+Qwen SoC packaging is selected with `np101_soc.py prepare --model qwen`; its C64 or C128 single-token
+request reuses the source-bound EP weight/NBG package and complete CPU oracle. The shared supervisor
+has explicit model argument ordering and requires the selected executable in the verified inventory.
+`python -m unittest tests.python.test_qwen_soc` covers model routing, policy/precision rejection,
+unwritten KV and nonfinite state rejection, and required SoC identity/composition. EP and SoC share
+Qwen's numerical acceptance function; packaging and cross-compilation alone are not device evidence.
 Shared prefill acceptance additionally checks the declared input-cache policy and reduced transfer
 counts; older records retain independent-cache accounting. Current shared-input hardware evidence
 covers C128 long/short reset requests; capacity and stability limits remain in the status document.

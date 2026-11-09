@@ -11,13 +11,16 @@
 #include <vector>
 
 namespace specferry::np101 {
+// MappedHost requires a completed synchronous producer and ordinary mappable tensors.
+enum class KvWriteMode { CopyGraph, MappedHost };
+
 // Fixed layer storage: one FP16 K and V parent tensor using the supplied KvSpec.
 // The caller manages the valid prefix and executes the producer before write().
-// Context and the two producer tensors must outlive this cache.
+// Context, producer graph and both producer tensors must outlive this cache.
 class KvCache {
 public:
   KvCache(Context &context, Graph &producer, vsi_nn_tensor_id_t key, vsi_nn_tensor_id_t value,
-          KvSpec spec);
+          KvSpec spec, KvWriteMode mode = KvWriteMode::CopyGraph);
   ~KvCache();
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;

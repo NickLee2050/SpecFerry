@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/config.hpp"
 #include "np101/context.hpp"
+#include "np101/kv_cache.hpp"
 #include "np101/tensor.hpp"
 #include "np101/weights.hpp"
 
@@ -28,7 +29,9 @@ class Attention {
 public:
   Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer);
   Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
-            TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr);
+            TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr,
+            bool shared_fcl_projections = false,
+            np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph);
   ~Attention();
   Attention(const Attention &) = delete;
   Attention &operator=(const Attention &) = delete;
@@ -38,6 +41,7 @@ public:
   void reset();
   void truncate(unsigned length);
   unsigned length() const;
+  std::size_t kv_revalidations() const;
   std::vector<std::uint8_t> read(const std::string &name,
                                  np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   void close();

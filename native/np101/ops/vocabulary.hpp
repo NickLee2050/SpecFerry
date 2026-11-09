@@ -48,12 +48,17 @@ private:
 class VocabularyHead : public GraphBuilder {
 public:
   VocabularyHead(Context &context, Vocabulary &table, TensorBinding input,
-                 SamplingOptions sampling = {}, LinearBackend backend = LinearBackend::MatMul);
+                 SamplingOptions sampling = {}, LinearBackend backend = LinearBackend::MatMul,
+                 unsigned blocks_per_graph = 0);
+  ~VocabularyHead();
+  void close();
   std::int32_t select(TensorReadback readback = TensorReadback::SdkCopy);
   void reset();
   std::vector<std::uint8_t> read_logits(); // Diagnostic only.
 
 private:
+  struct ProjectionGroup;
+  std::vector<std::unique_ptr<ProjectionGroup>> groups_;
   unsigned vocabulary_size_;
   SamplingOptions sampling_;
   std::uint32_t draws_ = 0;

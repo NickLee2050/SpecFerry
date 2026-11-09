@@ -25,6 +25,14 @@ class SocTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
+    def test_explicit_memory_reserve_for_smaller_linux_layout(self):
+        self.assertEqual(board.memory_reserve_kib({}), 192 * 1024)
+        self.assertEqual(board.memory_reserve_kib({"linux_memory_reserve_mib": 64}), 64 * 1024)
+        self.assertEqual(board.memory_reserve_kib({"linux_memory_reserve_mib": 32}), 32 * 1024)
+        for reserve in (True, "32", 31, 513, None):
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                board.memory_reserve_kib({"linux_memory_reserve_mib": reserve})
+
     def test_request_capacity_limits_long_prompt_and_rejects_unsupported_geometry(self):
         (self.root / "run-options.txt").write_text(
             "variant compiled-fullgraph\nkv_transfer mapped-slot\n"
@@ -504,7 +512,9 @@ class SocTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 remote.remote_path(name)
 
-    def supervise(self, source, timeout=1, monitor=lambda: None, preparation_timeout=None):
+    def supervise(
+        self, source, timeout=1, monitor=lambda: None, preparation_timeout=None, execution_limit=300
+    ):
         return board.supervise(
             [sys.executable, "-c", source],
             self.root,
@@ -513,6 +523,7 @@ class SocTests(unittest.TestCase):
             timeout,
             monitor,
             preparation_timeout=preparation_timeout,
+            execution_limit=execution_limit,
         )
 
     def test_preparation_and_inference_have_independent_deadlines(self):
@@ -626,6 +637,25 @@ class SocTests(unittest.TestCase):
         for limit in (0, 301):
             with self.assertRaises(ValueError):
                 self.supervise("pass", timeout=limit)
+
+    def test_extended_qwen_budget_preserves_readiness_and_other_model_limits(self):
+        self.assertEqual(board.inference_timeout_limit({"model_family": "qwen3_5"}), 600)
+        self.assertEqual(board.inference_timeout_limit({}), 300)
+        self.assertEqual(board.inference_timeout_limit({"model_family": "opt"}), 300)
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode())",
+            timeout=600,
+            preparation_timeout=1,
+            execution_limit=600,
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertEqual(result["inference_limit_seconds"], 600)
+        self.assertIn("ready_monotonic_seconds", result)
+        with self.assertRaises(ValueError):
+            self.supervise("pass", timeout=601, preparation_timeout=1, execution_limit=600)
+        with self.assertRaises(ValueError):
+            self.supervise("pass", timeout=600, execution_limit=600)
 
     def test_sdk_success_does_not_replace_release_and_budget_checks(self):
         native = self.root / "native"

@@ -50,15 +50,23 @@ struct KvCache::Impl {
   // Destruction order: copy graph, views, then parent storage.
   std::vector<std::unique_ptr<TensorView>> key_views;
   std::vector<std::unique_ptr<TensorView>> value_views;
-  Graph copy;
+  std::unique_ptr<Graph> copy;
+  KvWriteMode mode;
+  Graph &producer;
+  vsi_nn_tensor_id_t source_key_id, source_value_id;
+  std::vector<std::uint8_t> key_buffer, value_buffer;
   std::optional<unsigned> selected_position = 0;
   std::size_t completed_writes = 0;
   std::size_t revalidations = 0;
 
   Impl(Context &context, Graph &producer, vsi_nn_tensor_id_t key, vsi_nn_tensor_id_t value,
-       KvSpec requested_spec)
-      : spec(requested_spec), capacity(spec.capacity), storage(context, 2, 0), copy(context, 0, 0) {
+       KvSpec requested_spec, KvWriteMode write_mode)
+      : spec(requested_spec), capacity(spec.capacity), storage(context, 2, 0), mode(write_mode),
+        producer(producer), source_key_id(key), source_value_id(value) {
     spec.validate();
+    if (mode != KvWriteMode::CopyGraph && mode != KvWriteMode::MappedHost) {
+      throw std::invalid_argument("unknown KV write mode");
+    }
     if (producer.get()->ctx != context.get()) {
       throw std::invalid_argument("KV cache requires one context");
     }
@@ -68,6 +76,12 @@ struct KvCache::Impl {
     const std::vector<std::uint8_t> zeros(tensor_spec.bytes());
     keys = add_tensor(storage, tensor_spec, false, zeros);
     values = add_tensor(storage, tensor_spec, false, zeros);
+    if (mode == KvWriteMode::MappedHost) {
+      key_buffer.resize(spec.slot().bytes());
+      value_buffer.resize(spec.slot().bytes());
+      return;
+    }
+    copy = std::make_unique<Graph>(context, 0, 0);
     for (unsigned position = 0; position < capacity; ++position) {
       key_views.push_back(view(keys, position));
       value_views.push_back(view(values, position));
@@ -75,18 +89,18 @@ struct KvCache::Impl {
 
     // Only the new token is copied. Views alias the parent allocation; this
     // intentionally bypasses whole-cache SCATTER_ND_UPDATE outputs.
-    auto key_copy = vxTensorCopyNode(copy.get()->g, source_key, key_views[0]->tensor);
+    auto key_copy = vxTensorCopyNode(copy->get()->g, source_key, key_views[0]->tensor);
     if (!key_copy) {
       throw std::runtime_error("cannot create key-to-slot copy node");
     }
-    auto value_copy = vxTensorCopyNode(copy.get()->g, source_value, value_views[0]->tensor);
+    auto value_copy = vxTensorCopyNode(copy->get()->g, source_value, value_views[0]->tensor);
     if (!value_copy) {
       vxReleaseNode(&key_copy);
       throw std::runtime_error("cannot create value-to-slot copy node");
     }
     try {
-      expose_output(copy, key_copy);
-      expose_output(copy, value_copy);
+      expose_output(*copy, key_copy);
+      expose_output(*copy, value_copy);
     } catch (...) {
       vxReleaseNode(&value_copy);
       vxReleaseNode(&key_copy);
@@ -94,7 +108,7 @@ struct KvCache::Impl {
     }
     vxReleaseNode(&value_copy);
     vxReleaseNode(&key_copy);
-    check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(copy.get()->g); }),
+    check(sdk_call("vxVerifyGraph", [&] { return vxVerifyGraph(copy->get()->g); }),
           "verify KV slot-copy graph");
   }
 
@@ -110,8 +124,8 @@ struct KvCache::Impl {
 };
 
 KvCache::KvCache(Context &context, Graph &producer, vsi_nn_tensor_id_t key,
-                 vsi_nn_tensor_id_t value, KvSpec spec)
-    : impl_(std::make_unique<Impl>(context, producer, key, value, spec)) {}
+                 vsi_nn_tensor_id_t value, KvSpec spec, KvWriteMode mode)
+    : impl_(std::make_unique<Impl>(context, producer, key, value, spec, mode)) {}
 
 KvCache::~KvCache() = default;
 
@@ -119,7 +133,22 @@ void KvCache::write(unsigned position) {
   if (!impl_ || position >= impl_->capacity) {
     throw std::out_of_range("KV write position exceeds capacity or cache is closed");
   }
-  auto graph = impl_->copy.get()->g;
+  if (impl_->mode == KvWriteMode::MappedHost) {
+    // The synchronous producer has completed. Mapping/unmapping is the host
+    // access boundary; readers retain the same parent tensors for their lifetime.
+    const auto &spec = impl_->spec;
+    const std::vector<std::uint32_t> start{0, 0, 0}, end{spec.head_dim, 1, spec.heads};
+    const std::vector<std::uint32_t> slot_start{0, position, 0};
+    const std::vector<std::uint32_t> slot_end{spec.head_dim, position + 1, spec.heads};
+    read_tensor_region_into(impl_->producer, impl_->source_key_id, start, end, impl_->key_buffer);
+    read_tensor_region_into(impl_->producer, impl_->source_value_id, start, end,
+                            impl_->value_buffer);
+    upload_tensor_region(impl_->storage, impl_->keys, slot_start, slot_end, impl_->key_buffer);
+    upload_tensor_region(impl_->storage, impl_->values, slot_start, slot_end, impl_->value_buffer);
+    ++impl_->completed_writes;
+    return;
+  }
+  auto graph = impl_->copy->get()->g;
   // Construction already binds slot zero. Rebinding identical destinations can
   // invalidate the verified graph before the first token, without changing data.
   if (impl_->selected_position != position) {
@@ -192,7 +221,10 @@ std::size_t KvCache::revalidations() const { return impl_ ? impl_->revalidations
 
 void KvCache::close() {
   if (impl_) {
-    impl_->copy.close();
+    if (impl_->copy) {
+      impl_->copy->close();
+      impl_->copy.reset();
+    }
     impl_->key_views.clear();
     impl_->value_views.clear();
     impl_->storage.close();

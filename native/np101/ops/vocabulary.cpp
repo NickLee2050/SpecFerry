@@ -70,7 +70,13 @@ Tensor lookup_blocks(GraphBuilder &g, const std::vector<Tensor> &blocks, Tensor 
   return result;
 }
 
-Tensor greedy_token(GraphBuilder &g, const std::vector<Tensor> &logits, unsigned block_rows) {
+namespace {
+struct GreedyReduction {
+  Tensor scores, tokens;
+};
+
+GreedyReduction reduce_blocks(GraphBuilder &g, const std::vector<Tensor> &logits,
+                              unsigned block_rows, unsigned first_block = 0) {
   if (logits.empty() || !block_rows) {
     throw std::invalid_argument("greedy selection requires nonempty ordered logit blocks");
   }
@@ -78,14 +84,20 @@ Tensor greedy_token(GraphBuilder &g, const std::vector<Tensor> &logits, unsigned
   for (unsigned index = 0; index < logits.size(); ++index) {
     auto local = g.argmax(logits[index], 0);
     scores.push_back(g.reshape(g.gather(logits[index], local, 0), {1}));
-    tokens.push_back(g.binary(VSI_NN_OP_ADD, local, g.integer(index * block_rows)));
+    tokens.push_back(g.binary(VSI_NN_OP_ADD, local, g.integer((first_block + index) * block_rows)));
   }
   auto best_scores = scores.front(), best_tokens = tokens.front();
   for (unsigned index = 1; index < scores.size(); ++index) {
     best_scores = g.concat(best_scores, scores[index]);
     best_tokens = g.concat(best_tokens, tokens[index]);
   }
-  return g.gather(best_tokens, g.argmax(best_scores, 0), 0);
+  return {best_scores, best_tokens};
+}
+} // namespace
+
+Tensor greedy_token(GraphBuilder &g, const std::vector<Tensor> &logits, unsigned block_rows) {
+  const auto reduced = reduce_blocks(g, logits, block_rows);
+  return g.gather(reduced.tokens, g.argmax(reduced.scores, 0), 0);
 }
 
 struct Vocabulary::Impl {
@@ -181,13 +193,74 @@ void Vocabulary::close() {
   }
 }
 
+struct VocabularyHead::ProjectionGroup : GraphBuilder {
+  std::vector<Tensor> logits;
+  Tensor score, token;
+
+  ProjectionGroup(Context &context, Vocabulary &table, TensorBinding source, unsigned first,
+                  unsigned count)
+      : GraphBuilder(context, count * 16 + 16, count * 12 + 8) {
+    const auto input = bind(source, {f16, {table.width(), 1}});
+    std::vector<Tensor> inputs{input};
+    for (unsigned index = first; index < first + count; ++index) {
+      const auto weights = bind(table.block(index), table.block_spec(index));
+      inputs.push_back(weights);
+      logits.push_back(fully_connected(input, weights, true));
+    }
+    const auto reduced = reduce_blocks(*this, logits, table.block_rows(), first);
+    const auto best = argmax(reduced.scores, 0);
+    score = gather(reduced.scores, best, 0);
+    token = gather(reduced.tokens, best, 0);
+    auto outputs = logits;
+    outputs.push_back(score);
+    outputs.push_back(token);
+    compile(inputs, outputs);
+  }
+};
+
 VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBinding source,
-                               SamplingOptions sampling, LinearBackend backend)
-    : GraphBuilder(context, table.blocks() * 16 + 8, table.blocks() * 12 + 4),
+                               SamplingOptions sampling, LinearBackend backend,
+                               unsigned blocks_per_graph)
+    : GraphBuilder(context, blocks_per_graph ? 64 : table.blocks() * 16 + 8,
+                   blocks_per_graph ? 32 : table.blocks() * 12 + 4),
       vocabulary_size_(table.rows()), sampling_(sampling) {
   if (!table.blocks() ||
       (backend != LinearBackend::MatMul && backend != LinearBackend::FullyConnected)) {
     throw std::invalid_argument("head requires a live vocabulary");
+  }
+  if (blocks_per_graph) {
+    if (sampling.enabled || backend != LinearBackend::FullyConnected || blocks_per_graph != 8) {
+      throw std::invalid_argument(
+          "split head requires greedy shared FCL in groups of eight blocks");
+    }
+    try {
+      for (unsigned first = 0; first < table.blocks(); first += blocks_per_graph) {
+        groups_.push_back(std::make_unique<ProjectionGroup>(
+            context, table, source, first, std::min(blocks_per_graph, table.blocks() - first)));
+      }
+      std::vector<Tensor> inputs, scores, tokens;
+      for (const auto &group : groups_) {
+        auto score = bind({group->graph, group->score.id}, group->score.spec);
+        auto token = bind({group->graph, group->token.id}, group->token.spec);
+        inputs.push_back(score);
+        inputs.push_back(token);
+        scores.push_back(reshape(score, {1}));
+        tokens.push_back(reshape(token, {1}));
+      }
+      auto best_scores = scores.front(), best_tokens = tokens.front();
+      for (unsigned index = 1; index < scores.size(); ++index) {
+        best_scores = concat(best_scores, scores[index]);
+        best_tokens = concat(best_tokens, tokens[index]);
+      }
+      // Ordered groups preserve the original first-index tie policy. Scores are
+      // gathered FP16 values, with no additional arithmetic or CPU selection.
+      token_ = gather(best_tokens, argmax(best_scores, 0), 0);
+      compile(inputs, {token_});
+    } catch (...) {
+      close();
+      throw;
+    }
+    return;
   }
   auto input = bind(source, {f16, {table.width(), 1}});
   std::vector<Tensor> inputs{input};
@@ -223,6 +296,23 @@ VocabularyHead::VocabularyHead(Context &context, Vocabulary &table, TensorBindin
   compile(inputs, outputs);
 }
 
+VocabularyHead::~VocabularyHead() {
+  try {
+    close();
+  } catch (...) {
+    // Explicit model close reports errors; graph destructors provide fallback release.
+  }
+}
+
+void VocabularyHead::close() {
+  // Selection borrows group outputs: release the consumer before its producers.
+  graph.close();
+  while (!groups_.empty()) {
+    groups_.back()->graph.close();
+    groups_.pop_back();
+  }
+}
+
 std::int32_t VocabularyHead::select(TensorReadback readback) {
   const SdkScope timing_role("role", "lm-head-selection");
   if (sampling_.enabled) {
@@ -235,6 +325,10 @@ std::int32_t VocabularyHead::select(TensorReadback readback) {
     std::vector<std::uint8_t> bytes(sizeof(words));
     std::memcpy(bytes.data(), words.data(), bytes.size());
     upload_tensor(graph, seed_.id, bytes);
+  }
+  for (const auto &group : groups_) {
+    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(group->graph.get()); }),
+          "vocabulary shared FCL projection group");
   }
   check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(graph.get()); }),
         "vocabulary projection and token selection");
@@ -255,6 +349,12 @@ void VocabularyHead::reset() { draws_ = 0; }
 std::vector<std::uint8_t> VocabularyHead::read_logits() {
   std::vector<std::uint8_t> bytes;
   bytes.reserve(std::size_t(vocabulary_size_) * 2);
+  for (const auto &group : groups_) {
+    for (auto logits : group->logits) {
+      auto part = read_tensor(group->graph, logits.id);
+      bytes.insert(bytes.end(), part.begin(), part.end());
+    }
+  }
   for (auto logits : logits_) {
     auto part = read_tensor(graph, logits.id);
     bytes.insert(bytes.end(), part.begin(), part.end());

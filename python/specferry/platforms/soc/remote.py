@@ -16,7 +16,7 @@ from specferry.validation.device import RECOVERY_ROOT, device_lock, host_boot_id
 from specferry.validation.generation_metrics import summarize
 from specferry.validation.recovery_controls import FAULT
 
-from .board_runner import read_json, save, sha256, verify_bundle
+from .board_runner import inference_timeout_limit, read_json, save, sha256, verify_bundle
 
 
 def ssh(host, command, **kwargs):
@@ -120,7 +120,51 @@ def host_health(output, name):
 
 
 def numerical_acceptance(bundle, board):
-    options = read_json(bundle / "bundle.json")["request_options"]
+    manifest = read_json(bundle / "bundle.json")
+    if manifest.get("model_family", "opt") == "qwen3_5":
+        from specferry.models.qwen3_5.validation import evaluate_generation
+
+        result = evaluate_generation(bundle / "request", board / "native")
+        profile = read_json(board / "native/platform.json")
+        result["checks"]["platform"] = (
+            profile.get("target") == "soc"
+            and profile.get("architecture") == "riscv64"
+            and profile.get("sdk_identity") == "np101-soc-riscv64"
+        )
+        initialized = read_json(board / "native/initialization.json")
+        options = manifest["request_options"]
+        result["checks"]["composition"] = (
+            initialized.get("compiled_mixers") == 18
+            and initialized.get("compiled_feed_forward") == 23
+            and initialized.get("compiled_input_norm_layers") == 18
+            and initialized.get("embedding_lookup") == "gather-nd"
+            and initialized.get("capacity", 64) == options.get("capacity", 64)
+            and (
+                all(
+                    initialized.get(name) == options[name]
+                    for name in ("projections", "kv_write_mode")
+                    if name in options
+                )
+            )
+            and all(
+                initialized.get(name) == options[name]
+                for name in (
+                    "head_backend",
+                    "state_commit",
+                    "matmul_feed_forward_layer",
+                    "token_readback",
+                )
+            )
+        )
+        if options.get("kv_write_mode") == "mapped":
+            execution = read_json(board / "native/execution.json")
+            count = execution.get("kv_revalidations")
+            result["checks"]["kv_revalidations"] = type(count) is int and count == 0
+        result["passed"] = all(result["checks"].values())
+        if not result["passed"]:
+            result["performance"] = None
+        return result
+    options = manifest["request_options"]
     metadata = read_json(bundle / "request/reference.json")
     block = int(options["block"])
     common = dict(
@@ -194,13 +238,20 @@ def collect(bundle, output):
         )
         numerical = numerical_acceptance(bundle, output / "board") if passed else {"passed": False}
         host_health(output, "host-kernel-after.log")
+        manifest = read_json(bundle / "bundle.json")
+        capacity = manifest.get("request_options", {}).get("capacity")
+        qwen_scope = f"Qwen C{capacity}" if capacity is not None else "Qwen"
         summary = {
             "passed": False,
             "checks_passed": passed and numerical["passed"],
             "board": board,
             "numerical": numerical,
             "host_boot_id": host_boot_id(),
-            "scope": "formal OPT fullgraph mapped-slot with explicit prefill policy",
+            "scope": (
+                f"{qwen_scope} single-token hybrid with shared vocabulary and FP32 recurrent state"
+                if manifest.get("model_family", "opt") == "qwen3_5"
+                else "formal OPT fullgraph mapped-slot with explicit prefill policy"
+            ),
         }
         save(output / "summary.json", summary)
         if summary["checks_passed"]:
@@ -252,14 +303,17 @@ def collect(bundle, output):
 
 
 def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparation_timeout=240):
-    if not 0 < timeout <= 300:
-        raise ValueError("inference deadline must be in (0, 300] seconds")
+    bundle, output = bundle.resolve(), output.resolve()
+    if not 0 < timeout <= 600:
+        raise ValueError("inference deadline must be in (0, 600] seconds")
     if not 0 < preparation_timeout <= 240:
         raise ValueError("preparation deadline must be in (0, 240] seconds")
-    bundle, output = bundle.resolve(), output.resolve()
     destination = remote_path(destination)
-    verify_bundle(bundle, check_sdk=False, verify_payload=False)
+    manifest = verify_bundle(bundle, check_sdk=False, verify_payload=False)
     with device_lock(RECOVERY_ROOT, recovery_control=diagnostic is not None):
+        execution_limit = inference_timeout_limit(manifest)
+        if timeout > execution_limit:
+            raise ValueError(f"inference deadline must be in (0, {execution_limit}] seconds")
         marker = RECOVERY_ROOT / "np101-recovery-required.json"
         if diagnostic is not None and (
             sha256(marker) != diagnostic["host_marker_sha256"]
