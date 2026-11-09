@@ -59,6 +59,8 @@ void run_options_contracts() {
   const auto benchmark = parse("block 4\nbenchmark 1\nwarmups 1\nrepeats 3\n");
   require(benchmark.block == 4 && benchmark.benchmark && benchmark.warmups == 1 &&
           benchmark.repeats == 3);
+  require(parse("max_new_tokens 64\n").maximum == 64);
+  rejects([&] { parse("max_new_tokens 0\n"); });
   const auto head_skip = parse("block 4\nprefill_head last-token\n");
   require(head_skip.block == 4 && head_skip.prefill_head == "last-token");
   for (unsigned block : {8, 16}) {

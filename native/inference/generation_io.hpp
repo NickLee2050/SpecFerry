@@ -84,8 +84,9 @@ private:
 inline RunOptions read_run_options(const std::filesystem::path &directory, bool graph) {
   RunSettings settings(directory);
   RunOptions result;
-  result.maximum = settings.number("max_new_tokens", 8, graph ? 1 : 0,
-                                   graph ? 32 : std::numeric_limits<unsigned>::max());
+  // Context capacity and the external workload deadline bound graph generation.
+  result.maximum =
+      settings.number("max_new_tokens", 8, graph ? 1 : 0, std::numeric_limits<unsigned>::max());
   result.warmups = settings.number("warmups", 0, 0, 5);
   result.repeats = settings.number("repeats", 1, 1, 20);
   result.sampling = settings.contains("seed");

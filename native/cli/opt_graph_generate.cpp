@@ -281,8 +281,9 @@ int main(int argc, char **argv) {
                                  ? PartitionedModel::KvTransfer::MappedSlot
                                  : PartitionedModel::KvTransfer::DeviceCopy;
     if (kv_transfer == PartitionedModel::KvTransfer::MappedSlot && config.decoder.capacity != 64 &&
-        config.decoder.capacity != 128 && config.decoder.capacity != 256) {
-      throw std::invalid_argument("mapped-slot KV requires the C64/C128/C256 layout");
+        config.decoder.capacity != 128 && config.decoder.capacity != 256 &&
+        config.decoder.capacity != 512) {
+      throw std::invalid_argument("mapped-slot KV requires the C64/C128/C256/C512 layout");
     }
     const auto cache_first = options.cache_first, cache_last = options.cache_last;
     if (cache_last > config.decoder.layers) {

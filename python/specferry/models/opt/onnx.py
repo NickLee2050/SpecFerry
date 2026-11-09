@@ -234,8 +234,8 @@ def half_precision_cache(model, *, prefill=False):
 
 class Graph(OnnxGraph):
     def __init__(self, weights, capacity):
-        if capacity not in (64, 128, 256):
-            raise ValueError("compiled OPT export supports fixed C64/C128/C256")
+        if capacity not in (64, 128, 256, 512):
+            raise ValueError("compiled OPT export supports fixed C64/C128/C256/C512")
         super().__init__(weights)
         self.capacity = capacity
 

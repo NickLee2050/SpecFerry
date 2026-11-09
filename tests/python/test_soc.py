@@ -41,7 +41,7 @@ class SocTests(unittest.TestCase):
         )
         board.save(self.root / "reference.json", metadata)
         self.assertEqual(request_options(self.root)["block"], "16")
-        for capacity in (64, 96, 512):
+        for capacity in (64, 96, 1024):
             board.save(self.root / "reference.json", metadata | {"capacity": capacity})
             with self.subTest(capacity=capacity), self.assertRaises(ValueError):
                 request_options(self.root)
@@ -51,7 +51,12 @@ class SocTests(unittest.TestCase):
         (self.root / "requests.txt").write_text(" ".join(["7"] * 241) + "\n")
         board.save(self.root / "reference.json", metadata)
         self.assertEqual(request_options(self.root)["block"], "16")
-        metadata["requests"][0]["consumed"] = 257
+        metadata.update(capacity=512)
+        metadata["requests"][0].update(prompt_length=497, consumed=512)
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 497) + "\n")
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        metadata["requests"][0]["consumed"] = 513
         board.save(self.root / "reference.json", metadata)
         with self.assertRaises(ValueError):
             request_options(self.root)

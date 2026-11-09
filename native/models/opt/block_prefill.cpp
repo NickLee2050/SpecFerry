@@ -254,7 +254,8 @@ BlockPrefill::BlockPrefill(Context &context, const WeightStore &weights, const M
   const auto &decoder = config.decoder;
   if (decoder.layers != 24 || decoder.hidden != 1024 || decoder.heads != 16 ||
       decoder.intermediate != 4096 ||
-      (decoder.capacity != 64 && decoder.capacity != 128 && decoder.capacity != 256) ||
+      (decoder.capacity != 64 && decoder.capacity != 128 && decoder.capacity != 256 &&
+       decoder.capacity != 512) ||
       decoder.epsilon != 1e-5f || config.embedding != 512 || config.vocabulary != 50272 ||
       config.position_offset != 2 || compiled_layers.size() != decoder.layers ||
       shared_cache.size() != 2 * decoder.layers) {

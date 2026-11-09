@@ -244,8 +244,8 @@ load_compiled_block_prefill(const std::filesystem::path &package,
   const auto cache_type = cache_dtype == "F16" ? f16 : DataType::Float32;
   if (!stream || magic != "specferry-opt-compiled-block-prefill" ||
       (version != 1 && version != 2) || (cache_dtype != "F16" && cache_dtype != "F32") ||
-      (capacity != 64 && capacity != 128 && capacity != 256) || tokens != 16 || count != 24 ||
-      config.decoder.capacity != capacity || config.decoder.layers != count ||
+      (capacity != 64 && capacity != 128 && capacity != 256 && capacity != 512) || tokens != 16 ||
+      count != 24 || config.decoder.capacity != capacity || config.decoder.layers != count ||
       config.decoder.hidden != 1024 || config.decoder.heads != 16 ||
       config.decoder.intermediate != 4096 || config.decoder.epsilon != 1e-5f ||
       file_sha256(root / "compiled-model.txt") != model_digest ||

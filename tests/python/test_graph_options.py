@@ -228,7 +228,7 @@ class GraphExecutionOptionsTests(GraphEvidenceFixture):
         self.native_run["kv_transfer"] = "device-copy"
         self.save_metadata()
         self.assertFalse(self.evaluate(**options)["run.kv_transfer"])
-        self.metadata["capacity"] = 512
+        self.metadata["capacity"] = 1024
         with self.assertRaises(ValueError):
             self.evaluate(**options)
 
