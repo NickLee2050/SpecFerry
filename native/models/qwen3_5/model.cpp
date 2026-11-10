@@ -3,11 +3,14 @@
 #include "np101/diagnostics.hpp"
 #include "np101/memory_budget.hpp"
 #include "np101/ops/graph_builder.hpp"
+#include "np101/tensor.hpp"
 #include "np101/weight_bank.hpp"
 #include "vsi_nn_pub.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -24,10 +27,11 @@ struct Model::Impl {
   std::unique_ptr<GraphBuilder> state_commit;
   std::unique_ptr<GraphBuilder> normalization;
   std::unique_ptr<VocabularyHead> head;
-  unsigned position = 0;
+  unsigned position = 0, batch_tokens = 1;
   bool failed = false, prediction_ready = false;
   std::function<void(const std::string &)> progress;
   bool trace_steps = false;
+  bool share_residual_blocks;
 
   Impl(Context &context, const WeightStore &weights, const Config &spec,
        const inference::GenerationPolicy &selection,
@@ -35,8 +39,10 @@ struct Model::Impl {
        const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
        const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
        LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
-       LinearBackend projection_backend, KvWriteMode kv_write_mode)
-      : config(spec), policy(selection), bank(context), progress(phase) {
+       LinearBackend projection_backend, KvWriteMode kv_write_mode, DecoderLayout layout,
+       bool commit_state_in_ffn)
+      : config(spec), policy(selection), bank(context), progress(phase),
+        share_residual_blocks(layout == DecoderLayout::SharedResidual) {
     const auto *timing = std::getenv("SPECFERRY_SDK_TIMING");
     trace_steps = timing && std::string_view(timing) == "calls";
     try {
@@ -56,9 +62,19 @@ struct Model::Impl {
             context, weights, config, layer, input, &bank, projection_backend,
             artifact == compiled.end() ? nullptr : &artifact->second,
             feed_forward == compiled_feed_forward.end() ? nullptr : &feed_forward->second,
-            combined_state_commit, kv_write_mode));
+            combined_state_commit, kv_write_mode, layout != DecoderLayout::Separate,
+            share_residual_blocks && !layers.empty()
+                ? std::optional<TensorBinding>(layers.back()->batch_output())
+                : std::nullopt,
+            commit_state_in_ffn));
       }
-      if (combined_state_commit) {
+      batch_tokens = layers.front()->feed_forward_batch_tokens();
+      for (const auto &layer : layers) {
+        if (layer->feed_forward_batch_tokens() != batch_tokens) {
+          throw std::invalid_argument("Qwen prefill requires one common FFN batch width");
+        }
+      }
+      if (combined_state_commit && !commit_state_in_ffn) {
         if (phase) {
           phase("combined-state-commit");
         }
@@ -152,6 +168,56 @@ struct Model::Impl {
     failed = false;
   }
 
+  void prefill(const std::vector<std::int32_t> &tokens) {
+    require_live();
+    if (tokens.size() > policy.capacity - position) {
+      throw std::out_of_range("Qwen prompt exceeds remaining capacity");
+    }
+    for (auto token : tokens) {
+      if (token < 0 || unsigned(token) >= policy.vocabulary) {
+        throw std::invalid_argument("Qwen prompt token exceeds vocabulary");
+      }
+    }
+    failed = true;
+    prediction_ready = false;
+    const auto bytes_per_row = config.hidden_spec().bytes();
+    for (std::size_t offset = 0; offset < tokens.size(); offset += batch_tokens) {
+      const auto count = unsigned(std::min<std::size_t>(batch_tokens, tokens.size() - offset));
+      for (const auto &layer : layers) {
+        if (layer->length() != position) {
+          throw std::logic_error("Qwen prefill layer positions disagree");
+        }
+      }
+      std::vector<std::uint8_t> rows;
+      rows.reserve(count * bytes_per_row);
+      for (unsigned row = 0; row < count; ++row) {
+        vocabulary->lookup(tokens[offset + row]);
+        const auto binding = vocabulary->embedding();
+        const auto embedding = read_tensor(binding.owner, binding.id, TensorReadback::MappedHost);
+        rows.insert(rows.end(), embedding.begin(), embedding.end());
+      }
+      for (unsigned layer = 0; layer < layers.size(); ++layer) {
+        if (trace_steps && progress) {
+          progress("token." + std::to_string(position) + ".prefill.decoder." +
+                   std::to_string(layer));
+        }
+        // Every mixer consumes real tokens in order and commits only its own
+        // recurrence. Padding exists solely inside the independent FFN rows.
+        // Intermediate public rows are populated by the next layer's input writes.
+        // Only the final block's final layer is consumed directly by the LM head.
+        const bool publish = !share_residual_blocks ||
+                             (layer + 1 == layers.size() && offset + count == tokens.size());
+        rows = layers[layer]->prefill_block(rows, count, publish);
+        if (rows.size() != count * bytes_per_row || layers[layer]->length() != position + count) {
+          throw std::logic_error("Qwen prefill returned an incomplete layer block");
+        }
+      }
+      position += count;
+    }
+    prediction_ready = !tokens.empty();
+    failed = false;
+  }
+
   std::int32_t predict(TensorReadback token_readback) {
     require_live();
     if (!prediction_ready) {
@@ -214,8 +280,13 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
              const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
              const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
              LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
-             LinearBackend projection_backend, KvWriteMode kv_write_mode) {
+             LinearBackend projection_backend, KvWriteMode kv_write_mode, DecoderLayout layout,
+             bool commit_state_in_ffn) {
   config.validate();
+  if (layout != DecoderLayout::Separate && layout != DecoderLayout::FusedAttentionNorm &&
+      layout != DecoderLayout::SharedResidual) {
+    throw std::invalid_argument("unsupported Qwen decoder layout");
+  }
   const auto &table = weights.find("model.embed_tokens.weight");
   if (config.hidden != 1024 || config.intermediate != 3584 || config.layer_types.size() != 24 ||
       policy.vocabulary != 248320 || policy.capacity != config.kv.capacity ||
@@ -226,12 +297,16 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   if (head_backend != LinearBackend::MatMul && head_backend != LinearBackend::FullyConnected) {
     throw std::invalid_argument("Qwen head requires one explicit projection implementation");
   }
+  const bool complete_feed_forward = compiled_feed_forward.size() == 24;
   if (projection_backend != LinearBackend::MatMul &&
       (projection_backend != LinearBackend::SharedFullyConnected ||
-       compiled_feed_forward.size() != 23 || compiled_feed_forward.count(9))) {
-    throw std::invalid_argument("Qwen shared FCL requires the fixed layer-10 FFN fallback");
+       (!complete_feed_forward &&
+        (compiled_feed_forward.size() != 23 || compiled_feed_forward.count(9))))) {
+    throw std::invalid_argument(
+        "Qwen shared FCL requires the fixed fallback or complete FFN package");
   }
   std::size_t constants = 0, ordinary_weights = table.bytes;
+  unsigned common_batch = 0;
   for (const auto &entry : compiled_feed_forward) {
     if (entry.first >= 24) {
       throw std::invalid_argument("compiled Qwen feed-forward layer exceeds model bounds");
@@ -245,6 +320,11 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
       validate_compiled_feed_forward(feed_forward->second, weights, config, layer);
       constants += feed_forward->second.graph.constant_bytes;
     }
+    const auto batch = handwritten ? 1 : compiled_feed_forward_batch_tokens(feed_forward->second);
+    if (common_batch && batch != common_batch) {
+      throw std::invalid_argument("Qwen FFN package contains mixed batch widths");
+    }
+    common_batch = batch;
     if (config.mixer(layer) == MixerKind::DeltaNet) {
       const auto artifact = compiled.find(layer);
       if (artifact == compiled.end()) {
@@ -270,6 +350,22 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
       }
     }
   }
+  if (common_batch > 1) {
+    if (!complete_feed_forward || (common_batch != 8 && common_batch != 16) ||
+        !combined_state_commit) {
+      throw std::invalid_argument("Qwen block prefill requires M8/M16 and combined decode commits");
+    }
+  }
+  if (layout != DecoderLayout::Separate &&
+      (common_batch == 1 || projection_backend != LinearBackend::SharedFullyConnected ||
+       kv_write_mode != KvWriteMode::MappedHost)) {
+    throw std::invalid_argument("optimized Qwen decoder layout requires mapped batched FFN");
+  }
+  if (commit_state_in_ffn && (!combined_state_commit || common_batch == 1 ||
+                              projection_backend != LinearBackend::SharedFullyConnected ||
+                              kv_write_mode != KvWriteMode::MappedHost)) {
+    throw std::invalid_argument("FFN state commit requires deferred mapped batched execution");
+  }
   // The exact budget is charged during construction. Reject an impossible lower
   // bound before any tensor allocation; each bank remains independently capped.
   if (compiled.size() != 18 || constants > segment_payload_limit ||
@@ -279,10 +375,10 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
     throw std::invalid_argument("complete Qwen exceeds its separate resident payload budgets");
   }
   try {
-    impl_ =
-        std::make_unique<Impl>(context, weights, config, policy, compiled, compiled_feed_forward,
-                               phase, lookup, head_backend, combined_state_commit,
-                               head_blocks_per_graph, projection_backend, kv_write_mode);
+    impl_ = std::make_unique<Impl>(context, weights, config, policy, compiled,
+                                   compiled_feed_forward, phase, lookup, head_backend,
+                                   combined_state_commit, head_blocks_per_graph, projection_backend,
+                                   kv_write_mode, layout, commit_state_in_ffn);
   } catch (const std::exception &error) {
     const auto &memory = context.memory();
     throw std::runtime_error(
@@ -304,11 +400,13 @@ inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, u
     throw std::invalid_argument(
         "Qwen generation requires a live model and a nonempty rendered prompt");
   }
-  return inference::generate_tokens(impl_->policy,
-                                    {[&] { impl_->reset(); },
-                                     [&](std::int32_t token) { impl_->consume(token); },
-                                     [&] { return impl_->predict(token_readback); }},
-                                    prompt, maximum);
+  inference::GenerationExecutor executor{[&] { impl_->reset(); },
+                                         [&](std::int32_t token) { impl_->consume(token); },
+                                         [&] { return impl_->predict(token_readback); }};
+  if (impl_->batch_tokens > 1) {
+    executor.prefill = [&](const auto &tokens) { impl_->prefill(tokens); };
+  }
+  return inference::generate_tokens(impl_->policy, executor, prompt, maximum);
 }
 
 std::vector<std::uint8_t> Model::read(unsigned layer, const std::string &field) {

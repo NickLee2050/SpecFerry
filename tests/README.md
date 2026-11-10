@@ -55,6 +55,33 @@ has explicit model argument ordering and requires the selected executable in the
 `python -m unittest tests.python.test_qwen_soc` covers model routing, policy/precision rejection,
 unwritten KV and nonfinite state rejection, and required SoC identity/composition. EP and SoC share
 Qwen's numerical acceptance function; packaging and cross-compilation alone are not device evidence.
+Qwen C128 may explicitly select `--qwen-ffn-batch 8|16` with mapped KV and shared-FCL
+projections. These packages contain all 24 fixed-weight FFNs at one common width: prefill processes
+real rows in blocks, while decode pads a single row into the same graph. They do not retain a second
+M1 FFN package. The default remains M1. Acceptance checks the declared composition, exact output
+tokens, final hidden/representative state and KV, unwritten slots and release; a divisible prompt does
+not cover a partial prefill block or repeated reset. See the status document for measured scope.
+`--qwen-decoder-layout fused-attention-norm` merges input RMSNorm into attention QKV;
+`shared-residual` additionally binds preceding FFN output blocks as residual inputs and omits
+unconsumed scalar publications. Both require the same mapped/shared-FCL batch composition;
+`separate` remains the default. Request, bundle and initialization layout records must agree.
+`--qwen-state-commit ffn` is an experimental M8/M16 candidate: fixed state copies run in
+the FFN wrapper on the final real prefill row and every decode step; intermediate rows retain
+their local commit graph. `combined` remains the default. Contract tests reject M1 and
+policy/metadata mismatches. Keep the imported FFN wrapper's original graph IO: promoting
+state copies to extra graph ports corrupted FFN output on the pinned SoC SDK. Ordinary retained
+copy tensors preserve the bindings. The repaired M8 96-input/16-output run matched baseline tokens
+and captured hidden/state/KV bitwise, with clean release/kernel checks and about 3.9% higher actual
+output throughput. The latest M8 combination also passed the frozen two-turn reset/replay conversation
+(28/66 inputs, 20/49 outputs, both EOS), covering partial prefill blocks. M16 has a single-request
+comparison only; its tail/reset behavior and long-term stability are not established.
+Independent shared-state DeltaNet candidates bind M4/M8 outputs to the original M1 next-state
+buffers, keeping canonical inputs distinct and the FFN graph IO unchanged. Both selected layers
+passed 96 rows, M1 continuation, reset, 8+8+2 rows and M1 again; before/after controls were bitwise
+identical. Two-layer whole-model candidates passed the frozen 96-input/16-output CPU oracle and
+health/release gates. Existing pipeline tolerances pass; strict recurrence differences remain recorded.
+These are archived candidates, not default deployment options. Their full-model multi-turn/reset
+acceptance and 18-layer capacity are not established; do not substitute the baseline's conversation.
 Shared prefill acceptance additionally checks the declared input-cache policy and reduced transfer
 counts; older records retain independent-cache accounting. Current shared-input hardware evidence
 covers C128 long/short reset requests; capacity and stability limits remain in the status document.
@@ -177,7 +204,11 @@ partial-block replay, selected using measured headless M1/M16 costs including co
 `replayed_prompt_tokens` records recomputation. The old six-turn `compare` mode is retired;
 use independent `reuse` and `reset` runs, under the respective platform's deadline policy.
 
-Qwen mixer export accepts `--outer-product multiply` and `--fuse-input-norm`. OPT's
+Qwen feed-forward export accepts `--batch-tokens 1|4|8|16`; package contracts bind every layer's
+original weights, port shapes and common width. Qwen mixer export accepts `--outer-product multiply`,
+`--fuse-input-norm`, and the opt-in
+`--joint-state-reads` (shared FP32 K/Q state product with an algebraic rank-one output update).
+The latter preserves state precision and public ports; the default recurrence remains unchanged. OPT's
 `--projection-backend fcl|nbg-qkv|nbg-output|nbg` selects explicit implementations. Packages with
 QKV/out artifacts default to NBG; older head-only packages retain FCL. Direct FCL experiments are
 stopped. Python/native loaders reject changed identities before Context creation. Generated

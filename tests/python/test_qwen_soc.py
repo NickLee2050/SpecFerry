@@ -97,6 +97,72 @@ class QwenSocTests(unittest.TestCase):
         self.assertEqual(self.validate()["head_backend"], "shared-fcl-split")
         self.assertEqual(self.validate()["maximum"], 2)
 
+    def test_batched_ffn_requires_complete_mapped_c128_composition(self):
+        self.assertEqual(self.validate()["ffn_batch_tokens"], 1)
+        self.assertEqual(self.validate()["decoder_layout"], "separate")
+        commit_file = self.request / "state-commit.txt"
+        commit_file.write_text("ffn\n")
+        with self.assertRaisesRegex(ValueError, "FFN state commit requires batched"):
+            self.validate()
+        commit_file.write_text("combined\n")
+        layout_file = self.request / "decoder-layout.txt"
+        layout_file.write_text("fused-attention-norm\n")
+        self.metadata["decoder_layout"] = "fused-attention-norm"
+        board.save(self.request / "request.json", self.metadata)
+        with self.assertRaisesRegex(ValueError, "requires batched FFN"):
+            self.validate()
+        layout_file.unlink()
+        del self.metadata["decoder_layout"]
+        self.metadata["capacity"] = 128
+        board.save(self.request / "request.json", self.metadata)
+        Components.from_text_config(self.config, capacity=128).write(self.request)
+        (self.request / "policy.txt").write_text("248320 128 0 248044 2 1\n")
+        for name, value in {
+            "head-backend": "shared-fcl-split",
+            "projections": "shared-fcl",
+            "kv-write-mode": "mapped",
+            "matmul-feed-forward-layer": "-1",
+        }.items():
+            (self.request / (name + ".txt")).write_text(value + "\n")
+        for width in (8, 16):
+            (self.request / "ffn-batch-tokens.txt").write_text(str(width) + "\n")
+            self.assertEqual(self.validate()["ffn_batch_tokens"], width)
+            self.assertEqual(self.validate()["matmul_feed_forward_layer"], -1)
+            for layout in ("separate", "fused-attention-norm", "shared-residual"):
+                layout_file.write_text(layout + "\n")
+                self.metadata["decoder_layout"] = layout
+                board.save(self.request / "request.json", self.metadata)
+                self.assertEqual(self.validate()["decoder_layout"], layout)
+            commit_file.write_text("ffn\n")
+            with self.assertRaisesRegex(ValueError, "state commit metadata/option"):
+                self.validate()
+            self.metadata["state_commit"] = "ffn"
+            board.save(self.request / "request.json", self.metadata)
+            self.assertEqual(self.validate()["state_commit"], "ffn")
+            commit_file.write_text("unknown\n")
+            with self.assertRaisesRegex(ValueError, "unsupported Qwen state commit"):
+                self.validate()
+            commit_file.write_text("combined\n")
+            del self.metadata["state_commit"]
+            board.save(self.request / "request.json", self.metadata)
+        layout_file.write_text("unknown\n")
+        with self.assertRaisesRegex(ValueError, "layout metadata/option"):
+            self.validate()
+        layout_file.write_text("separate\n")
+        with self.assertRaisesRegex(ValueError, "layout metadata/option"):
+            self.validate()
+        layout_file.write_text("shared-residual\n")
+        (self.request / "matmul-feed-forward-layer.txt").write_text("9\n")
+        with self.assertRaisesRegex(ValueError, "execution option differs"):
+            self.validate()
+        (self.request / "matmul-feed-forward-layer.txt").write_text("-1\n")
+        (self.request / "kv-write-mode.txt").write_text("copy-graph\n")
+        with self.assertRaisesRegex(ValueError, "C128 mapped"):
+            self.validate()
+        (self.request / "ffn-batch-tokens.txt").write_text("4\n")
+        with self.assertRaisesRegex(ValueError, "batch width"):
+            self.validate()
+
     def test_request_rejects_mismatched_tokens_precision_and_unsupported_eos(self):
         self.assertEqual(self.validate()["capacity"], 64)
         (self.request / "tokens.txt").write_text("7 11\n")
@@ -237,6 +303,74 @@ class QwenSocTests(unittest.TestCase):
         self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
         board.save(device / "execution.json", execution | {"kv_revalidations": 0})
         self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        options = manifest["request_options"]
+        options.update(
+            ffn_batch_tokens=8,
+            matmul_feed_forward_layer=-1,
+            capacity=128,
+            head_backend="shared-fcl-split",
+        )
+        board.save(self.root / "bundle.json", manifest)
+        self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        initialized = board.read_json(device / "initialization.json")
+        initialized.update(
+            ffn_batch_tokens=8,
+            matmul_feed_forward_layer=-1,
+            compiled_feed_forward=24,
+            capacity=128,
+            head_backend="shared-fcl-split",
+        )
+        board.save(device / "initialization.json", initialized)
+        self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        initialized["ffn_batch_tokens"] = 16
+        board.save(device / "initialization.json", initialized)
+        self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        initialized["ffn_batch_tokens"] = 8
+        board.save(device / "initialization.json", initialized)
+        options["state_commit"] = "ffn"
+        board.save(self.root / "bundle.json", manifest)
+        self.metadata["state_commit"] = "ffn"
+        board.save(self.request / "request.json", self.metadata)
+        (self.request / "state-commit.txt").write_text("ffn\n")
+        self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        initialized["state_commit"] = "ffn"
+        board.save(device / "initialization.json", initialized)
+        self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        (self.request / "state-commit.txt").write_text("combined\n")
+        self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        options["state_commit"] = initialized["state_commit"] = "combined"
+        del self.metadata["state_commit"]
+        board.save(self.request / "request.json", self.metadata)
+        board.save(self.root / "bundle.json", manifest)
+        board.save(device / "initialization.json", initialized)
+        layout_file = self.request / "decoder-layout.txt"
+        for layout in ("fused-attention-norm", "shared-residual"):
+            options["decoder_layout"] = layout
+            board.save(self.root / "bundle.json", manifest)
+            self.metadata["decoder_layout"] = layout
+            board.save(self.request / "request.json", self.metadata)
+            layout_file.write_text(layout + "\n")
+            self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+            initialized["decoder_layout"] = layout
+            board.save(device / "initialization.json", initialized)
+            self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+            layout_file.write_text("separate\n")
+            self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+            layout_file.write_text(layout + "\n")
+        options["decoder_layout"] = "unknown"
+        board.save(self.root / "bundle.json", manifest)
+        initialized["decoder_layout"] = "unknown"
+        board.save(device / "initialization.json", initialized)
+        self.metadata["decoder_layout"] = "unknown"
+        board.save(self.request / "request.json", self.metadata)
+        layout_file.write_text("unknown\n")
+        self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        options["decoder_layout"] = initialized["decoder_layout"] = "shared-residual"
+        self.metadata["decoder_layout"] = "shared-residual"
+        board.save(self.root / "bundle.json", manifest)
+        board.save(device / "initialization.json", initialized)
+        board.save(self.request / "request.json", self.metadata)
+        layout_file.write_text("shared-residual\n")
         board.save(device / "platform.json", profile | {"target": "ep"})
         result = remote.numerical_acceptance(self.root, device.parent)
         self.assertFalse(result["passed"])

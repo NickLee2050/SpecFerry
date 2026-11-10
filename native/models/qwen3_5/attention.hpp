@@ -17,7 +17,8 @@ class WeightBank;
 }
 
 namespace specferry::models::qwen3_5 {
-// Configured Qwen attention mixer, excluding decoder input norm/residual.
+// Configured Qwen attention mixer, excluding the decoder residual. Input norm may
+// be fused into the projection graph; otherwise the caller supplies normalized input.
 // A single sequence owns one fixed-capacity KV allocation. Context outlives it.
 // Calls are synchronous; reset/truncate change the valid prefix without clearing
 // storage. A failed SDK step invalidates the instance, which must be recreated.
@@ -31,7 +32,8 @@ public:
   Attention(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
             TensorBinding input, TensorBinding output, np101::WeightBank *shared_weights = nullptr,
             bool shared_fcl_projections = false,
-            np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph);
+            np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph,
+            bool fuse_input_norm = false);
   ~Attention();
   Attention(const Attention &) = delete;
   Attention &operator=(const Attention &) = delete;

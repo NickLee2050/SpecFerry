@@ -28,7 +28,23 @@ def main():
         choices=("copy-graph", "mapped"),
         help="Qwen KV append backend; mapped avoids runtime copy-graph revalidation",
     )
+    prepare.add_argument(
+        "--qwen-ffn-batch",
+        type=int,
+        choices=(1, 8, 16),
+        help="Qwen compiled FFN batch width; defaults to the validated M1 chain",
+    )
+    prepare.add_argument(
+        "--qwen-decoder-layout",
+        choices=("separate", "fused-attention-norm", "shared-residual"),
+        help="Qwen M8/M16 graph layout; shared-residual also fuses norm and avoids redundant publication",
+    )
     prepare.add_argument("--binary", type=Path)
+    prepare.add_argument(
+        "--qwen-state-commit",
+        choices=("combined", "ffn"),
+        help="Qwen state copies: combined decode graph (default) or batched FFN graph",
+    )
     prepare.add_argument("--deployment", type=Path)
     for name in ("package", "request", "sdk", "output"):
         prepare.add_argument("--" + name, type=Path, required=True)
@@ -79,9 +95,21 @@ def main():
                 args.output,
                 projections=args.qwen_projections or "shared-fcl",
                 kv_write_mode=args.qwen_kv_write_mode or "copy-graph",
+                ffn_batch_tokens=args.qwen_ffn_batch or 1,
+                decoder_layout=args.qwen_decoder_layout or "separate",
+                state_commit=args.qwen_state_commit or "combined",
             )
         else:
-            if args.qwen_projections is not None or args.qwen_kv_write_mode is not None:
+            if any(
+                value is not None
+                for value in (
+                    args.qwen_projections,
+                    args.qwen_kv_write_mode,
+                    args.qwen_ffn_batch,
+                    args.qwen_decoder_layout,
+                    args.qwen_state_commit,
+                )
+            ):
                 parser.error("Qwen execution options require --model qwen")
             result = prepare_bundle(
                 args.binary or ROOT / "build/soc/bin/specferry_opt_graph_generate",

@@ -36,9 +36,10 @@ public:
   bool shared_fcl_projections;
 
   AttentionGraph(Context &context, const Config &configuration, unsigned index, WeightBank *weights,
-                 bool use_shared_fcl)
-      : GraphBuilder(context, 100, 80, weights), config(configuration), layer(index), bank(weights),
-        shared_fcl_projections(use_shared_fcl) {}
+                 bool use_shared_fcl, bool fuse_input_norm = false)
+      : GraphBuilder(context, fuse_input_norm ? 116 : 100, fuse_input_norm ? 92 : 80, weights),
+        config(configuration), layer(index), bank(weights), shared_fcl_projections(use_shared_fcl) {
+  }
 
   Tensor weight(const WeightStore &weights, const std::string &name, Shape shape) {
     return GraphBuilder::weight(weights,
@@ -66,16 +67,26 @@ public:
 
   ProjectionGraph(Context &context, const WeightStore &weights, const Config &configuration,
                   unsigned layer, std::optional<TensorBinding> input, WeightBank *bank,
-                  bool use_shared_fcl)
-      : AttentionGraph(context, configuration, layer, bank, use_shared_fcl) {
+                  bool use_shared_fcl, bool fuse_input_norm)
+      : AttentionGraph(context, configuration, layer, bank, use_shared_fcl, fuse_input_norm) {
     const auto d = config.kv.head_dim, qh = config.query_heads, kh = config.kv.heads;
     hidden = input ? bind(*input, config.hidden_spec()) : tensor(config.hidden_spec());
     position = tensor({i32, {1}});
-    auto packed = reshape(project(weights, hidden, "q_proj", 2 * d * qh), {2 * d, qh});
+    auto projection_input = hidden;
+    if (fuse_input_norm) {
+      const auto scale = GraphBuilder::weight(
+          weights, weights.find(config.layer_prefix(layer) + "input_layernorm.weight"),
+          {f16, {config.hidden}});
+      // Preserve the separate decoder norm's FP32 arithmetic and final FP16
+      // conversion. Only its graph boundary is removed; QKV still consumes FP16.
+      projection_input = GraphBuilder::rms_norm(hidden, scale, config.epsilon, 1.0f, f16);
+    }
+    auto packed = reshape(project(weights, projection_input, "q_proj", 2 * d * qh), {2 * d, qh});
     query = rms_norm(weights, slice(packed, {0, 0}, {d, qh}), "q_norm");
     gate = slice(packed, {d, 0}, {d, qh});
-    key = rms_norm(weights, reshape(project(weights, hidden, "k_proj", d * kh), {d, kh}), "k_norm");
-    value = reshape(project(weights, hidden, "v_proj", d * kh), {d, 1, kh});
+    key = rms_norm(weights, reshape(project(weights, projection_input, "k_proj", d * kh), {d, kh}),
+                   "k_norm");
+    value = reshape(project(weights, projection_input, "v_proj", d * kh), {d, 1, kh});
     auto cosine = rope_table(false);
     auto sine = rope_table(true);
     query = reshape(rotate(query, cosine, sine), {d, qh / kh, kh});
@@ -163,8 +174,9 @@ struct Attention::Impl {
   Impl(Context &context, const WeightStore &weights, const Config &config, unsigned layer,
        std::optional<TensorBinding> input = {}, std::optional<TensorBinding> output = {},
        WeightBank *bank = nullptr, bool shared_fcl_projections = false,
-       KvWriteMode kv_write_mode = KvWriteMode::CopyGraph)
-      : producer(context, weights, config, layer, input, bank, shared_fcl_projections),
+       KvWriteMode kv_write_mode = KvWriteMode::CopyGraph, bool fuse_input_norm = false)
+      : producer(context, weights, config, layer, input, bank, shared_fcl_projections,
+                 fuse_input_norm),
         cache(context, producer.graph, producer.key.id, producer.value.id, config.kv,
               kv_write_mode),
         reader(context, weights, producer, cache, output) {}
@@ -181,7 +193,7 @@ Attention::Attention(Context &context, const WeightStore &weights, const Config 
 
 Attention::Attention(Context &context, const WeightStore &weights, const Config &config,
                      unsigned layer, TensorBinding input, TensorBinding output, WeightBank *bank,
-                     bool shared_fcl_projections, KvWriteMode kv_write_mode)
+                     bool shared_fcl_projections, KvWriteMode kv_write_mode, bool fuse_input_norm)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, false);
   if (config.mixer(layer) != MixerKind::Attention) {
@@ -191,7 +203,7 @@ Attention::Attention(Context &context, const WeightStore &weights, const Config 
     throw std::invalid_argument("Qwen shared FCL projections require a weight bank");
   }
   impl_ = std::make_unique<Impl>(context, weights, config, layer, input, output, bank,
-                                 shared_fcl_projections, kv_write_mode);
+                                 shared_fcl_projections, kv_write_mode, fuse_input_norm);
 }
 
 Attention::~Attention() = default;

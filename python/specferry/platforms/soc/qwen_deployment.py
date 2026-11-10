@@ -14,6 +14,8 @@ from specferry.models.qwen3_5.export import verify_export
 from .board_runner import bundle_file, read_json, save
 from .deployment import finish_bundle, sdk_identity, stage_runtime
 
+DECODER_LAYOUTS = ("separate", "fused-attention-norm", "shared-residual")
+
 
 def native_manifest(graphs, *, mixer, sdk):
     """Reconstruct the public port/source contract, preserving graph and parameter bytes."""
@@ -43,7 +45,7 @@ def native_manifest(graphs, *, mixer, sdk):
     return "\n".join(lines) + "\n"
 
 
-def validate_package(package, deployment):
+def validate_package(package, deployment, *, ffn_batch_tokens=1):
     """Verify the original EP package once while assembling a new deployment."""
     verify_export(deployment)
     weights = read_json(deployment / "deployment-manifest.json")
@@ -102,7 +104,7 @@ def validate_package(package, deployment):
             ):
                 raise ValueError("Qwen NBG source/path/hash/constant contract differs")
             if not mixer:
-                validate_feed_forward_ports(graph)
+                validate_feed_forward_ports(graph, batch_tokens=ffn_batch_tokens)
             else:
                 expected = [("F16", [1024, 1]), ("F32", [128, 128, 16]), ("F16", [4, 6144])]
                 for direction in ("input", "output"):
@@ -221,11 +223,33 @@ def validate_request(request, weights, deployment_digest):
             Path(temporary) / "components.txt"
         ).read_text():
             raise ValueError("Qwen native component geometry differs")
+    batch_file = request / "ffn-batch-tokens.txt"
+    batch_name = batch_file.read_text().strip() if batch_file.exists() else "1"
+    if batch_name not in ("1", "8", "16"):
+        raise ValueError("unsupported Qwen FFN batch width")
+    ffn_batch_tokens = int(batch_name)
+    layout_file = request / "decoder-layout.txt"
+    decoder_layout = layout_file.read_text().strip() if layout_file.exists() else "separate"
+    if (
+        decoder_layout not in DECODER_LAYOUTS
+        or metadata.get("decoder_layout", "separate") != decoder_layout
+    ):
+        raise ValueError("Qwen decoder layout metadata/option differs")
+    if decoder_layout != "separate" and ffn_batch_tokens == 1:
+        raise ValueError("optimized Qwen decoder layout requires batched FFN")
+    state_commit = (request / "state-commit.txt").read_text().strip()
+    if state_commit not in ("combined", "ffn"):
+        raise ValueError("unsupported Qwen state commit policy")
+    if state_commit == "ffn" and ffn_batch_tokens == 1:
+        raise ValueError("FFN state commit requires batched FFN")
+    if metadata.get("state_commit", "combined") != state_commit:
+        raise ValueError("Qwen state commit metadata/option differs")
+    fallback_layer = 9 if ffn_batch_tokens == 1 else -1
     options = {
         "embedding-lookup.txt": "gather-nd",
-        "matmul-feed-forward-layer.txt": "9",
+        "matmul-feed-forward-layer.txt": str(fallback_layer),
         "token-readback.txt": "mapped",
-        "state-commit.txt": "combined",
+        "state-commit.txt": state_commit,
     }
     for name, value in options.items():
         if (request / name).read_text().strip() != value:
@@ -233,13 +257,22 @@ def validate_request(request, weights, deployment_digest):
     head = (request / "head-backend.txt").read_text().strip()
     if head not in ("matmul", "shared-fcl", "shared-fcl-split"):
         raise ValueError("Qwen head must reuse the existing shared vocabulary")
+    if ffn_batch_tokens > 1 and (
+        capacity != 128
+        or head != "shared-fcl-split"
+        or (request / "projections.txt").read_text().strip() != "shared-fcl"
+        or (request / "kv-write-mode.txt").read_text().strip() != "mapped"
+    ):
+        raise ValueError("batched Qwen FFN requires the C128 mapped shared FCL chain")
     return dict(
         capacity=capacity,
         maximum=maximum,
         repeats=repeats,
         head_backend=head,
-        state_commit="combined",
-        matmul_feed_forward_layer=9,
+        state_commit=state_commit,
+        matmul_feed_forward_layer=fallback_layer,
+        ffn_batch_tokens=ffn_batch_tokens,
+        decoder_layout=decoder_layout,
         token_readback="mapped",
     )
 
@@ -254,6 +287,9 @@ def prepare_bundle(
     *,
     projections="shared-fcl",
     kv_write_mode="copy-graph",
+    ffn_batch_tokens=1,
+    decoder_layout="separate",
+    state_commit="combined",
 ):
     binary, deployment, package, request, sdk, output = map(
         lambda p: Path(p).resolve(), (binary, deployment, package, request, sdk, output)
@@ -262,15 +298,35 @@ def prepare_bundle(
         raise ValueError("use a new bundle directory")
     if projections not in ("shared-fcl", "matmul"):
         raise ValueError("unsupported Qwen projection backend")
+    if state_commit not in ("combined", "ffn"):
+        raise ValueError("unsupported Qwen state commit policy")
+    if state_commit == "ffn" and ffn_batch_tokens == 1:
+        raise ValueError("FFN state commit requires batched FFN")
     if kv_write_mode not in ("copy-graph", "mapped"):
         raise ValueError("unsupported Qwen KV write mode")
     if kv_write_mode == "mapped" and projections != "shared-fcl":
         raise ValueError("mapped Qwen KV requires shared FCL projections")
+    if type(ffn_batch_tokens) is not int or ffn_batch_tokens not in (1, 8, 16):
+        raise ValueError("unsupported Qwen FFN batch width")
+    if decoder_layout not in DECODER_LAYOUTS:
+        raise ValueError("unsupported Qwen decoder layout")
+    if decoder_layout != "separate" and ffn_batch_tokens == 1:
+        raise ValueError("optimized Qwen decoder layout requires batched FFN")
+    if ffn_batch_tokens > 1 and (projections != "shared-fcl" or kv_write_mode != "mapped"):
+        raise ValueError("batched Qwen FFN requires mapped shared FCL projections")
     hashes = sdk_identity(sdk)
-    manifest, weights = validate_package(package, deployment)
+    manifest, weights = validate_package(package, deployment, ffn_batch_tokens=ffn_batch_tokens)
     options = validate_request(request, weights, manifest["deployment_sha256"])
+    if ffn_batch_tokens > 1 and options["capacity"] != 128:
+        raise ValueError("batched Qwen FFN requires C128")
     options.update(
-        head_backend="shared-fcl-split", projections=projections, kv_write_mode=kv_write_mode
+        head_backend="shared-fcl-split",
+        state_commit=state_commit,
+        projections=projections,
+        kv_write_mode=kv_write_mode,
+        ffn_batch_tokens=ffn_batch_tokens,
+        decoder_layout=decoder_layout,
+        matmul_feed_forward_layer=9 if ffn_batch_tokens == 1 else -1,
     )
     source_sdk = manifest["sdk"]
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -307,11 +363,20 @@ def prepare_bundle(
         (request_dir / "head-backend.txt").write_text(options["head_backend"] + "\n")
         (request_dir / "projections.txt").write_text(projections + "\n")
         (request_dir / "kv-write-mode.txt").write_text(kv_write_mode + "\n")
+        (request_dir / "ffn-batch-tokens.txt").write_text(str(ffn_batch_tokens) + "\n")
+        (request_dir / "decoder-layout.txt").write_text(decoder_layout + "\n")
+        (request_dir / "state-commit.txt").write_text(state_commit + "\n")
+        (request_dir / "matmul-feed-forward-layer.txt").write_text(
+            str(options["matmul_feed_forward_layer"]) + "\n"
+        )
         metadata = read_json(request_dir / "request.json")
         metadata.update(
             head_backend=options["head_backend"],
+            state_commit=state_commit,
             projections=projections,
             kv_write_mode=kv_write_mode,
+            ffn_batch_tokens=ffn_batch_tokens,
+            decoder_layout=decoder_layout,
         )
         save(request_dir / "request.json", metadata)
         result = finish_bundle(

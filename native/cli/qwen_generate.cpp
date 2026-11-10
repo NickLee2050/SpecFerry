@@ -103,25 +103,47 @@ int main(int argc, char **argv) {
                                   ? np101::ops::LinearBackend::FullyConnected
                                   : np101::ops::LinearBackend::MatMul;
     const auto state_commit = read_option(request, "state-commit.txt", "per-layer");
-    if (state_commit != "per-layer" && state_commit != "combined") {
+    if (state_commit != "per-layer" && state_commit != "combined" && state_commit != "ffn") {
       throw std::invalid_argument("unsupported Qwen state commit policy");
     }
     if (fs::exists(request / "compiled-head-package.txt")) {
       throw std::invalid_argument(
           "compiled vocabulary-prefix requests are retired; use shared-fcl");
     }
-    unsigned matmul_layer = 9;
+    const auto batch_name = read_option(request, "ffn-batch-tokens.txt", "1");
+    if (batch_name != "1" && batch_name != "8" && batch_name != "16") {
+      throw std::invalid_argument("unsupported Qwen FFN batch width");
+    }
+    const unsigned ffn_batch_tokens = std::stoul(batch_name);
+    if (state_commit == "ffn" && ffn_batch_tokens == 1) {
+      throw std::invalid_argument("FFN state commit requires batched FFN");
+    }
+    const auto layout_name = read_option(request, "decoder-layout.txt", "separate");
+    using DecoderLayout = models::qwen3_5::DecoderLayout;
+    DecoderLayout layout;
+    if (layout_name == "separate") {
+      layout = DecoderLayout::Separate;
+    } else if (layout_name == "fused-attention-norm") {
+      layout = DecoderLayout::FusedAttentionNorm;
+    } else if (layout_name == "shared-residual") {
+      layout = DecoderLayout::SharedResidual;
+    } else {
+      throw std::invalid_argument("unsupported Qwen decoder layout");
+    }
+    if (layout != DecoderLayout::Separate && ffn_batch_tokens == 1) {
+      throw std::invalid_argument("optimized Qwen decoder layout requires batched FFN");
+    }
+    int matmul_layer = ffn_batch_tokens == 1 ? 9 : -1;
     if (fs::exists(request / "matmul-feed-forward-layer.txt")) {
       std::ifstream fallback(request / "matmul-feed-forward-layer.txt");
-      unsigned layer = 0;
-      fallback >> layer;
-      if (!fallback || fallback >> extra) {
+      if (!(fallback >> matmul_layer) || fallback >> extra) {
         throw std::invalid_argument("invalid Qwen MatMul feed-forward layer");
       }
-      matmul_layer = layer;
     }
-    if (matmul_layer >= config.layer_types.size()) {
-      throw std::invalid_argument("Qwen MatMul feed-forward layer exceeds model depth");
+    if ((ffn_batch_tokens == 1 &&
+         (matmul_layer < 0 || unsigned(matmul_layer) >= config.layer_types.size())) ||
+        (ffn_batch_tokens > 1 && matmul_layer != -1)) {
+      throw std::invalid_argument("Qwen FFN batch/fallback layer contract differs");
     }
     const auto projections = read_option(request, "projections.txt", "matmul");
     const bool shared_fcl = projections == "shared-fcl";
@@ -129,8 +151,9 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("unsupported Qwen projection backend");
     }
     if (shared_fcl && (std::string_view(platform::runtime_profile().target) != "soc" ||
-                       (policy.capacity != 64 && policy.capacity != 128) || matmul_layer != 9 ||
-                       head_backend_name != "shared-fcl-split" || state_commit != "combined" ||
+                       (policy.capacity != 64 && policy.capacity != 128) ||
+                       matmul_layer != (ffn_batch_tokens == 1 ? 9 : -1) ||
+                       head_backend_name != "shared-fcl-split" || state_commit == "per-layer" ||
                        lookup_name != "gather-nd" || token_readback_name != "mapped")) {
       throw std::invalid_argument("Qwen shared FCL requires the validated SoC M1 composition");
     }
@@ -144,14 +167,28 @@ int main(int argc, char **argv) {
     }
     const auto kv_write_mode =
         kv_write_name == "mapped" ? np101::KvWriteMode::MappedHost : np101::KvWriteMode::CopyGraph;
+    if (ffn_batch_tokens > 1 &&
+        (!shared_fcl || policy.capacity != 128 || kv_write_name != "mapped")) {
+      throw std::invalid_argument("batched Qwen FFN requires the C128 mapped shared FCL chain");
+    }
     np101::WeightStore weights(argv[1]);
     if (platform::verify_model_payloads()) {
       weights.verify();
     }
     const auto artifacts = models::qwen3_5::load_compiled_mixers(argv[2], weights, config);
     auto feed_forward = models::qwen3_5::load_compiled_feed_forward(argv[2], weights, config);
-    // Validate the complete package before selecting the existing device MatMul FFN.
-    feed_forward.erase(matmul_layer);
+    for (const auto &entry : feed_forward) {
+      if (models::qwen3_5::compiled_feed_forward_batch_tokens(entry.second) != ffn_batch_tokens) {
+        throw std::invalid_argument("Qwen FFN package does not match selected batch width");
+      }
+    }
+    if (ffn_batch_tokens > 1 && feed_forward.size() != config.layer_types.size()) {
+      throw std::invalid_argument("batched Qwen FFN requires all decoder artifacts");
+    }
+    // The default M1 chain retains its validated shared FCL replacement at layer 9.
+    if (matmul_layer >= 0) {
+      feed_forward.erase(unsigned(matmul_layer));
+    }
     fs::create_directories(output);
     platform::write_runtime_profile(output);
     np101::SdkTimings timings(output);
@@ -163,11 +200,11 @@ int main(int argc, char **argv) {
         [&](const std::string &name) {
           phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
         },
-        lookup, head_backend, state_commit == "combined",
+        lookup, head_backend, state_commit != "per-layer",
         head_backend_name == "shared-fcl-split" ? 8 : 0,
         shared_fcl ? np101::ops::LinearBackend::SharedFullyConnected
                    : np101::ops::LinearBackend::MatMul,
-        kv_write_mode);
+        kv_write_mode, layout, state_commit == "ffn");
     const auto initialize =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     {
@@ -189,7 +226,9 @@ int main(int argc, char **argv) {
                   << state_commit << '"' << ",\"projections\":\"" << projections << '"'
                   << ",\"kv_write_mode\":\"" << kv_write_name << '"'
                   << ",\"compiled_input_norm_layers\":" << compiled_input_norm_layers
-                  << ",\"compiled_feed_forward\":" << feed_forward.size() << "}\n";
+                  << ",\"ffn_batch_tokens\":" << ffn_batch_tokens << ",\"decoder_layout\":\""
+                  << layout_name << '"' << ",\"compiled_feed_forward\":" << feed_forward.size()
+                  << "}\n";
       if (!initialized) {
         throw std::runtime_error("cannot save Qwen initialization evidence");
       }

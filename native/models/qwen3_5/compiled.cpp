@@ -12,6 +12,18 @@
 namespace specferry::models::qwen3_5 {
 using namespace np101;
 
+unsigned compiled_feed_forward_batch_tokens(const CompiledBlock &artifact) {
+  if (artifact.kind != CompiledBlockKind::FeedForward || artifact.graph.inputs.size() != 2) {
+    throw std::invalid_argument("compiled FFN requires two input ports");
+  }
+  const auto &shape = artifact.graph.inputs.front().shape;
+  if (shape.size() != 2 || shape[0] != 1024 ||
+      (shape[1] != 1 && shape[1] != 4 && shape[1] != 8 && shape[1] != 16)) {
+    throw std::invalid_argument("compiled FFN requires a supported fixed token batch");
+  }
+  return shape[1];
+}
+
 namespace {
 void validate_block(const CompiledBlock &artifact, const WeightStore &weights, const Config &config,
                     unsigned layer, CompiledBlockKind kind) {
@@ -34,9 +46,12 @@ void validate_block(const CompiledBlock &artifact, const WeightStore &weights, c
     const auto &ports = output ? artifact.graph.outputs : artifact.graph.inputs;
     const auto &order = output ? artifact.output_order : artifact.input_order;
     const std::vector<TensorSpec> expected =
-        mixer ? std::vector<TensorSpec>{config.hidden_spec(), config.delta.recurrent(),
-                                        config.delta.convolution()}
-              : std::vector<TensorSpec>(output ? 1 : 2, config.hidden_spec());
+        mixer
+            ? std::vector<TensorSpec>{config.hidden_spec(), config.delta.recurrent(),
+                                      config.delta.convolution()}
+            : std::vector<TensorSpec>(
+                  output ? 1 : 2, {DataType::Float16,
+                                   {config.hidden, compiled_feed_forward_batch_tokens(artifact)}});
     std::set<unsigned> permutation;
     for (unsigned index = 0; index < expected.size(); ++index) {
       permutation.insert(index);

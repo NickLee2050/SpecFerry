@@ -58,6 +58,131 @@
 或出现BUG/Oops等非NP hang故障时立即停止；3次连续失败后转离线分析，不无限重试。
 该约定仅适用于SoC，不修改EP门禁；“偶发/概率性”是操作策略，尚未证明故障根因。
 
+## 11-10 容量候选部署后、启动前SDHCI命令超时
+
+板卡boot `ad5d4749-c7c0-4e6b-a6e2-79c4f96636ce`。同96输入/16输出的低开销整模归因和
+随后关闭插桩的原包均通过数值、释放、全内核及10秒检查。接着部署共享投影Delta容量候选，
+部署前完整内核无此错误；部署校验返回成功，bundle SHA
+`f172885457e63284efa6e5a23309c86eb4a635a149101bbe8244a628b868dd24`。
+启动前复读全内核发现`14803.479017 mmc0: Timeout waiting for hardware cmd interrupt.`；
+`Cmd=0x00000d1a`、`Argument=0xaaaa0000`、`Int stat=0x00000001`、`ADMA Err=0`。
+没有启动候选child，未执行其Setup/Verify/RunGraph，不能归因于候选算子。
+
+14814.914401检查owner为空，SYSTEM122976 B、VIRTUAL0、GFP5808页均为空闲基线，
+EXT4错误计数0，无新增NP hang/Oops。这不消除SDHCI故障；停止所有板卡实验，不按孤立
+NP hang例外继续。保留完整内核、原数值失败标记及新的主机恢复门禁；不额外写板端SD或
+扫描全卡。命令特征与历史相同，但尚未确定是控制器、时序、介质或其它根因；部署在时间
+上相邻不证明因果。下次先确认存储恢复，再重新核验受影响候选部署；原健康归因结果保留。
+证据`qwen-performance-capacity-20261110/{storage-incident.json,storage-kernel.log,partition-test/}`，
+旧主机标记留于`retained-pre-storage-host-marker.json`；两个候选均不得记为已上板通过。
+
+恢复续记：用户确认再次断电后，boot `1e21c890-d53a-49e5-a531-3e28415f0e6c`。
+原768 MiB Linux/2048 MiB NPU池、原六张量IO及三输入decoder通过数值、资源、完整内核和
+10秒检查；旧主机/板端标记按身份归档，历史事故不删除。恢复证据
+`qwen-shared-projection-resume-20261110/recovery/`。后续共享投影夹具两次Verify返回−1及
+head后控制准备超时均无新增内核故障，正常退出/释放；精确软件失败记录保留，修订后
+对应对照单独验收，不能把原失败改记通过。
+
+## 11-10 固定行view复制诊断数值不一致，无设备故障
+
+同恢复后boot `ad5d4749-c7c0-4e6b-a6e2-79c4f96636ce`，完整layer0的96输入接一次M1，
+原版→固定行模板→原版。候选第0行输出一致，第1行起小幅偏离；FFN/递归态/卷积历史
+最大差分别0.0004883/0.0008545/0.015625，前后原版逐位一致。退出0，原生完成、
+应用/池/GFP、owner、完整内核及10秒观察通过，无NP hang/SDHCI/Oops。保留数值失败标记；
+后续只在已批准的诊断范围和完整健康检查下继续，不清除旧事故。此候选仅快0.124%，不采用。
+已证实不是换了不同copy API；SDK图构成、端口与view语义的具体影响未定位，不继续无收益排查。
+完整身份和日志：`qwen-block-progress-20261110/fixed-rows-test/run-1/`；分析见状态文档。
+
+## 11-10 FFN内状态提交数值失败，无新增设备故障
+
+确认断电恢复后的boot `ad5d4749-c7c0-4e6b-a6e2-79c4f96636ce`，原norm合图/M8基线
+同96输入/16输出完整通过；候选bundle SHA
+`91fd77f87f3c915c6e442ffea5d5f61d6b5e2c1d9f05c518cbfcdeec2b2f16d1`
+仅把Delta块末和decode状态复制移入FFN包装图，复用原NBG、binary及参考。
+候选Setup/Verify及推理均返回，800.430887进入请求、886.906632进入释放，退出0，
+原生完成记录及应用/池/GFP释放、10秒观察通过，无NP hang/SDHCI/Oops或残留owner。
+
+16个输出token全为0；hidden含1个Inf，其余有限值也异常大；递归态及有效K/V超出原
+容差。第24层K/V位置0已偏离基线，111个有效槽中60个槽K/V全零，17个未写槽仍为零。
+不把86.437 s计时算优化收益。这里只定位到整模数值失败，未定位首个错误层/SDK调用；
+不能证明状态复制错误、NBG混合图端口/布局错误或硬件根因。
+保留数值失败门禁和完整证据，候选非默认。随后单层固定输入证明：新状态和提交后的状态
+与基线逐位一致，但FFN输出最大差0.918335；显式reset不改变错误。取消额外状态图端口，
+保留两个DATACONVERT及固定外部缓冲区后，8+8输入及下一步M1的输出、两类状态均与
+基线逐位一致。已定位到扩展FFN包装图输入/输出声明触发错误，SDK内部原因尚未证实。
+此事件不等同板卡hang，不据此宣称必须再次断电。原始证据`qwen-ffn-state-commit-20261110/candidate-test/run-1/`
+及`candidate-failure-analysis.json`；已验基线见同目录`baseline-test/run-1/`。
+
+单层首轮临时夹具另有软件记录缺陷：逐Context释放记录和最终`execution.json`齐全，
+但漏写汇总`run.json`，监督器据此拒绝完成。remote run
+`8d76ab938bab4a78a12735eec8129e08`退出0，池/GFP、owner、全内核及10秒观察通过，
+无新增设备故障。修正夹具后，仅对该精确缺失文件及原标记哈希建立诊断例外，复核真实
+释放记录，保留原标记和原始失败证据；没有修改公共门禁或豁免硬件故障。修复后的单层
+完成记录、执行及释放全部通过。证据`qwen-ffn-state-diagnosis-20261110/`下
+`probe-test/`、`fixed-boundary-test/`、`reviewed_fixture.py`；不将单层通过等同整模验收。
+
+修复后整模bundle `d160efe804cc4ba873af13763f596295639e483f0c734ec46b584cbb21fa6d6a`，
+remote run `c6bde7c27e674d9eb7dd5487fc5a5071`：1959.386463进入同96输入/16输出请求，
+2046.029959进入释放；token及采集hidden/递归态/K/V与原基线逐位一致，原容差验收通过。
+退出0，应用/池/GFP及owner释放、全内核和10秒观察通过，无新硬件故障；原数值失败和
+夹具缺记录标记均保留，不改写旧记录。性能及范围见状态文档，未覆盖M16/尾块/reset。
+
+## 11-10 Qwen共享残差整模推理完成，释放期SDHCI命令超时
+
+板卡boot `a6c83b66-ccc8-49b5-a36b-7bf34926f46e`，主机boot
+`317cf691-2086-4138-9dc3-6ad90a186647`，child PID575，bundle SHA
+`19ca8b38831d98e4e630c3399c9262d05d772a9435f350e5e90c5381bb911242`。
+本boot无旧恢复标记；原配置加载2048 MiB池后，同一M8基线和仅attention输入norm合图
+均完整通过。第三轮在合图基础上共享FFN残差块、略去中间末行发布，仍复用96输入/16输出。
+
+child于5077.431325启动，5223.338235就绪；推理完成并写齐token及四份数值快照，
+5312.077982进入`release`。5325.330935出现`mmc0: Timeout waiting for hardware cmd
+interrupt.`，5325.455405发送SIGTERM，退出−15；5325.765411内核记录`release galcore`。
+没有逐SDK追踪，不能定位到某个析构/释放API。`Cmd=0x00000d1a`、
+`Argument=0xaaaa0000`、`Int stat=0x00000001`、`ADMA Err=0`，与11-09事件相同；
+这只支持同类SDHCI命令超时，不证明共享残差、NPU计算或SD卡介质是根因。
+
+owner清空，SYSTEM/VIRTUAL及GFP归位，退出后10秒无新增故障，无NP hang/Oops。
+原生`execution.json`未写出，完整验收失败；恢复标记保留，停止上板，不按NP hang例外重试。
+离线回收的16个token符合CPU，hidden/递归态/K/V逐位等同本boot已验基线；
+88.697秒计时仅作诊断，不作为新增已验性能。后续先确认存储恢复，再决定是否复测；
+当前不做大文件扫描或改变时钟/驱动。证据`qwen-block-layout-20261110/shared-test/run-1/`
+及`shared-fault-analysis.json`，SDK身份/完整内核/内存轨迹与门禁均保留。
+
+11-10用户确认再次断电上电后，新boot为`ad5d4749-c7c0-4e6b-a6e2-79c4f96636ce`。
+768 MiB Linux/2048 MiB池配置未变，完整内核、EXT4错误计数及owner正常；复用六tensor
+读写和三输入decoder控制，数值、应用/池/GFP释放及各10秒观察通过，旧标记归档。
+证据`qwen-ffn-state-commit-20261110/recovery/`；只恢复后续有界实验条件，不宣称SDHCI根因修复。
+
+## 11-09 DeltaNet归约对照退出后SDHCI命令超时
+
+板卡boot `5d436758-f7d8-4ed2-8cdb-ecac5ac8de9c`，主机boot
+`c5709490-69ba-455b-b5e1-38f96a9c15f1`，child PID5018，bundle SHA
+`1adbd68c9ebbbe7433766ed9f224ebe3ad456a4993743257cdf721fa2b4741c6`。
+此前固定NBG和共享FCL两份M4 gate对照各自数值、释放、10秒观察及随后全内核通过。
+本轮仅比较原M1→FP32乘法归约DeltaNet→原M1，各96输入并接回下一步，不跑整模。
+
+child于193713.844239启动，193714.628628就绪；12.100秒后退出0，原生完成记录已写齐。
+内核193725.779864记录`release galcore`；193735.959044报告
+`mmc0: Timeout waiting for hardware cmd interrupt.`，即驱动释放后约10.179秒，
+被10.072秒退出观察捕获。寄存器`Cmd=0x00000d1a`、`Argument=0xaaaa0000`、
+`Int stat=0x00000001`、`ADMA Err=0x00000000`。无新增NP hang/Oops；owner为空，
+SYSTEM/VIRTUAL恢复122976/0 B，GFP恢复5808页。**释放成功不能豁免新增存储故障**。
+
+已证实是退出观察期间报告的SDHCI命令中断超时，不能归因于某个RunGraph或归约算子，
+也不能据报告时间断言命令恰在退出后发出。根因仍可能涉及控制器/中断/时序，尚未定位。
+离线复核已回收输出可通过原数值阈值，但整轮健康验收失败，原始计时仅作待复测线索。
+保留本次及全部旧标记，停止后续上板；不按孤立NP hang自动重试，不改时钟/驱动或
+再次读写大模型排障。先解决存储完整性/恢复条件，再复用本轮产物做最小复测。
+证据`qwen-delta-prefill-progress-20261109/run-1/`及`faulted-run-analysis.json`；
+总调度阻塞记录`qwen-prefill-progress-20261109/board-blocked.json`。
+
+11-09用户确认板卡断电重启后，新boot为`f463e76d-0e3a-48aa-a54d-0941884351dc`。
+完整内核、EXT4状态及owner正常；按原配置加载2048 MiB池，复用六tensor读写和三输入
+完整decoder控制，数值、执行、释放及各10秒观察通过，旧标记归档保留。归约原包复测
+及完整FFN、另外两种DeltaNet对照均健康通过，仅恢复这些已测负载范围，不证明SDHCI根因
+已修复。证据`qwen-prefill-resume-20261109/recovery/`及各候选`run-1/`。
+
 ## 11-08 Qwen四步DeltaNet对照完成，夹具完成记录缺失
 
 同boot `5d436758-f7d8-4ed2-8cdb-ecac5ac8de9c`，PID3826。单层96个真实输入和

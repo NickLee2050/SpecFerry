@@ -8,6 +8,7 @@
 #include "np101/weight_bank.hpp"
 #include "vsi_nn_pub.h"
 
+#include <algorithm>
 #include <map>
 #include <stdexcept>
 
@@ -45,26 +46,42 @@ public:
 struct DecoderLayer::Impl {
   // Destruction reverses this order: consumers, mixers, then their storage owners.
   Config config;
+  TensorBinding incoming;
+  unsigned batch_tokens;
+  bool shared_residual;
+  bool commit_state_in_ffn;
   Graph storage;
   vsi_nn_tensor_id_t mixed;
+  vsi_nn_tensor_id_t public_output = VSI_NN_TENSOR_ID_NA;
   std::unique_ptr<DecoderGraph> normalization;
   std::unique_ptr<DeltaNet> delta;
   std::unique_ptr<Attention> attention;
   DecoderGraph feed_forward;
+  std::unique_ptr<GraphBuilder> local_commit;
+  vsi_nn_tensor_id_t residual_row = VSI_NN_TENSOR_ID_NA, mixer_row = VSI_NN_TENSOR_ID_NA;
+  vsi_nn_tensor_id_t residual_batch = VSI_NN_TENSOR_ID_NA, mixer_batch = VSI_NN_TENSOR_ID_NA;
+  std::vector<std::uint8_t> residual_bytes, mixer_bytes, row_bytes;
   std::size_t completed = 0;
   bool failed = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
        TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
        const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
-       KvWriteMode kv_write_mode)
-      : config(configuration), storage(context, 1, 0),
+       KvWriteMode kv_write_mode, bool fuse_attention_input_norm,
+       std::optional<TensorBinding> residual_block, bool commit_in_ffn)
+      : config(configuration), incoming(input),
+        batch_tokens(
+            compiled_feed_forward ? compiled_feed_forward_batch_tokens(*compiled_feed_forward) : 1),
+        shared_residual(residual_block.has_value()), commit_state_in_ffn(commit_in_ffn),
+        storage(context, batch_tokens > 1 ? 2 : 1, 0),
         mixed(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
         feed_forward(context, config, bank) {
     const auto prefix = config.layer_prefix(layer);
     TensorBinding mixer_output{storage, mixed};
-    if (!compiled || !compiled->includes_input_norm) {
+    const bool fused_attention_norm =
+        fuse_attention_input_norm && config.mixer(layer) == MixerKind::Attention;
+    if ((!compiled || !compiled->includes_input_norm) && !fused_attention_norm) {
       normalization = std::make_unique<DecoderGraph>(context, config, bank);
       const auto incoming = normalization->bind(input, config.hidden_spec());
       const auto normalized =
@@ -82,7 +99,7 @@ struct DecoderLayer::Impl {
       }
       attention = std::make_unique<Attention>(
           context, weights, config, layer, mixer_input, mixer_output, bank,
-          backend == LinearBackend::SharedFullyConnected, kv_write_mode);
+          backend == LinearBackend::SharedFullyConnected, kv_write_mode, fused_attention_norm);
     } else {
       if (!compiled) {
         throw std::invalid_argument("Qwen DeltaNet requires its compiled mixer");
@@ -96,17 +113,62 @@ struct DecoderLayer::Impl {
     const auto residual = feed_forward.bind(input, config.hidden_spec());
     const auto mixer = feed_forward.bind(
         deferred_delta_commit && delta ? delta->output() : mixer_output, config.hidden_spec());
+    residual_row = residual.id;
+    mixer_row = mixer.id;
     auto &tail = feed_forward;
     if (compiled_feed_forward) {
       validate_compiled_feed_forward(*compiled_feed_forward, weights, config, layer);
-      const std::vector<Tensor> semantic{residual, mixer};
+      std::vector<Tensor> semantic{residual, mixer};
+      if (batch_tokens > 1) {
+        const TensorSpec batch_spec{f16, {config.hidden, batch_tokens}};
+        // A preceding FFN owns this immutable-for-the-step block. Keep its
+        // binding fixed; only the mixer still uses the separate scalar input.
+        const auto batch_residual =
+            residual_block ? tail.bind(*residual_block, batch_spec) : tail.tensor(batch_spec);
+        semantic = {batch_residual, tail.tensor(batch_spec)};
+        residual_batch = semantic[0].id;
+        mixer_batch = semantic[1].id;
+        if (!shared_residual) {
+          residual_bytes.resize(batch_spec.bytes());
+        }
+        mixer_bytes.resize(batch_spec.bytes());
+        row_bytes.resize(config.hidden_spec().bytes());
+        public_output = add_tensor(storage, config.hidden_spec(), false, row_bytes);
+      }
       auto inputs = semantic;
       for (unsigned index = 0; index < semantic.size(); ++index) {
         inputs[compiled_feed_forward->input_order[index]] = semantic[index];
       }
       const auto outputs = tail.compiled(compiled_feed_forward->graph, inputs);
       tail.outputs = {{"output", outputs.at(compiled_feed_forward->output_order.at(0))}};
-      tail.compile_outputs({residual, mixer});
+      if (commit_state_in_ffn && delta) {
+        // FFN never reads the old recurrent state. Copying here has no feedback
+        // edge into DeltaNet, which already finished before this graph runs.
+        // Preserve the NBG wrapper's original graph IO. Promoting the state
+        // copies to extra graph ports corrupted FFN output on the pinned SoC
+        // SDK, despite correct copied states. Ordinary retained tensors keep
+        // these fixed copy bindings alive without changing that boundary.
+        for (const auto &copy : delta->state_copies()) {
+          const auto source = tail.bind(copy.source, copy.spec);
+          const auto destination = tail.bind(copy.destination, copy.spec);
+          tail.node(VSI_NN_OP_DATACONVERT, {source}, destination);
+        }
+      }
+      tail.compile_outputs(semantic);
+      if (batch_tokens > 1 && delta && deferred_delta_commit) {
+        // Layer-major prefill must commit this layer before its next token. The
+        // global decode commit would also overwrite states of inactive layers.
+        local_commit = std::make_unique<GraphBuilder>(context, 4, 2);
+        std::vector<Tensor> sources, destinations;
+        for (const auto &copy : delta->state_copies()) {
+          const auto source = local_commit->bind(copy.source, copy.spec);
+          const auto destination = local_commit->bind(copy.destination, copy.spec);
+          local_commit->node(VSI_NN_OP_DATACONVERT, {source}, destination);
+          sources.push_back(source);
+          destinations.push_back(destination);
+        }
+        local_commit->compile(sources, destinations);
+      }
       return;
     }
     const auto sum = tail.binary(VSI_NN_OP_ADD, residual, mixer);
@@ -118,17 +180,69 @@ struct DecoderLayer::Impl {
     tail.outputs = {{"residual", sum}, {"post_norm", norm}, {"mlp", mlp}, {"output", output}};
     tail.compile_outputs({residual, mixer});
   }
+
+  void run_mixer() {
+    if (normalization) {
+      check(
+          sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(normalization->graph.get()); }),
+          "decoder input normalization");
+    }
+    if (delta) {
+      delta->step();
+    } else {
+      attention->step();
+    }
+  }
+
+  void require_position() {
+    if ((delta && delta->steps() != completed) || (attention && attention->length() != completed)) {
+      failed = true;
+      throw std::logic_error("decoder mixer position is inconsistent");
+    }
+  }
+
+  std::vector<std::uint8_t> run_batch_ffn(unsigned count, bool publish_output) {
+    const std::vector<std::uint32_t> start{0, 0}, end{config.hidden, batch_tokens};
+    if (!shared_residual) {
+      upload_tensor_region(feed_forward.graph, residual_batch, start, end, residual_bytes);
+    }
+    upload_tensor_region(feed_forward.graph, mixer_batch, start, end, mixer_bytes);
+    check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(feed_forward.graph.get()); }),
+          "decoder batched residual and MLP");
+    if (commit_state_in_ffn && delta) {
+      // A failed RunGraph must leave the pending state unconfirmed and the
+      // decoder failed; no subsequent token may consume a partial state update.
+      delta->confirm_state_commit();
+    }
+    auto output = read_tensor_region(feed_forward.graph, feed_forward.outputs.at("output").id,
+                                     start, {config.hidden, count});
+    if (publish_output) {
+      std::copy(output.end() - row_bytes.size(), output.end(), row_bytes.begin());
+      upload_tensor_region(storage, public_output, start, {config.hidden, 1}, row_bytes);
+    }
+    return output;
+  }
 };
 
 DecoderLayer::DecoderLayer(Context &context, const WeightStore &weights, const Config &config,
                            unsigned layer, TensorBinding input, WeightBank *bank,
                            LinearBackend backend, const CompiledBlock *compiled,
                            const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
-                           KvWriteMode kv_write_mode)
+                           KvWriteMode kv_write_mode, bool fuse_attention_input_norm,
+                           std::optional<TensorBinding> residual_block, bool commit_state_in_ffn)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, true);
+  if (residual_block &&
+      (!compiled_feed_forward || compiled_feed_forward_batch_tokens(*compiled_feed_forward) == 1)) {
+    throw std::invalid_argument("shared residual block requires a batched compiled FFN");
+  }
+  if (commit_state_in_ffn && (!deferred_delta_commit || !compiled_feed_forward ||
+                              compiled_feed_forward_batch_tokens(*compiled_feed_forward) == 1)) {
+    throw std::invalid_argument("FFN state commit requires deferred batched execution");
+  }
   impl_ = std::make_unique<Impl>(context, weights, config, layer, input, bank, backend, compiled,
-                                 compiled_feed_forward, deferred_delta_commit, kv_write_mode);
+                                 compiled_feed_forward, deferred_delta_commit, kv_write_mode,
+                                 fuse_attention_input_norm, residual_block, commit_state_in_ffn);
 }
 
 DecoderLayer::~DecoderLayer() = default;
@@ -145,27 +259,79 @@ void DecoderLayer::step() {
     throw std::out_of_range("decoder capacity exhausted");
   }
   auto &state = *impl_;
-  if ((state.delta && state.delta->steps() != state.completed) ||
-      (state.attention && state.attention->length() != state.completed)) {
-    state.failed = true;
-    throw std::logic_error("decoder mixer position is inconsistent");
-  }
+  state.require_position();
   state.failed = true;
-  if (state.normalization) {
-    check(sdk_call("vsi_nn_RunGraph",
-                   [&] { return vsi_nn_RunGraph(state.normalization->graph.get()); }),
-          "decoder input normalization");
-  }
-  if (state.delta) {
-    state.delta->step();
+  state.run_mixer();
+  if (state.batch_tokens > 1) {
+    if (!state.shared_residual) {
+      std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
+      read_tensor_region_into(state.feed_forward.graph, state.residual_row, {0, 0},
+                              {state.config.hidden, 1}, state.row_bytes);
+      std::copy(state.row_bytes.begin(), state.row_bytes.end(), state.residual_bytes.begin());
+    }
+    std::fill(state.mixer_bytes.begin(), state.mixer_bytes.end(), 0);
+    read_tensor_region_into(state.feed_forward.graph, state.mixer_row, {0, 0},
+                            {state.config.hidden, 1}, state.row_bytes);
+    std::copy(state.row_bytes.begin(), state.row_bytes.end(), state.mixer_bytes.begin());
+    state.run_batch_ffn(1, true);
   } else {
-    state.attention->step();
+    check(sdk_call("vsi_nn_RunGraph",
+                   [&] { return vsi_nn_RunGraph(state.feed_forward.graph.get()); }),
+          "decoder residual and MLP");
   }
-  check(
-      sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(state.feed_forward.graph.get()); }),
-      "decoder residual and MLP");
   ++state.completed;
   state.failed = false;
+}
+
+unsigned DecoderLayer::feed_forward_batch_tokens() const {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("closed or failed decoder layer must be recreated");
+  }
+  return impl_->batch_tokens;
+}
+
+std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uint8_t> &packed_rows,
+                                                      unsigned count, bool publish_output) {
+  if (!impl_ || impl_->failed) {
+    throw std::logic_error("closed or failed decoder layer must be recreated");
+  }
+  auto &state = *impl_;
+  const auto row_size = state.config.hidden_spec().bytes();
+  if (state.batch_tokens == 1 || !count || count > state.batch_tokens ||
+      packed_rows.size() != count * row_size) {
+    throw std::invalid_argument("prefill requires a valid fixed-batch FFN block");
+  }
+  if (state.completed > state.config.kv.capacity ||
+      count > state.config.kv.capacity - state.completed) {
+    throw std::out_of_range("decoder capacity exhausted by prefill block");
+  }
+  state.require_position();
+  state.failed = true;
+  if (!state.shared_residual) {
+    std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
+    std::copy(packed_rows.begin(), packed_rows.end(), state.residual_bytes.begin());
+  }
+  std::fill(state.mixer_bytes.begin(), state.mixer_bytes.end(), 0);
+  for (unsigned row = 0; row < count; ++row) {
+    std::copy_n(packed_rows.begin() + row * row_size, row_size, state.row_bytes.begin());
+    upload_tensor_region(state.incoming.owner, state.incoming.id, {0, 0}, {state.config.hidden, 1},
+                         state.row_bytes);
+    state.run_mixer();
+    read_tensor_region_into(state.feed_forward.graph, state.mixer_row, {0, 0},
+                            {state.config.hidden, 1}, state.row_bytes);
+    std::copy(state.row_bytes.begin(), state.row_bytes.end(),
+              state.mixer_bytes.begin() + row * row_size);
+    if (state.local_commit && (!state.commit_state_in_ffn || row + 1 < count)) {
+      check(sdk_call("vsi_nn_RunGraph",
+                     [&] { return vsi_nn_RunGraph(state.local_commit->graph.get()); }),
+            "prefill layer DeltaNet state commit");
+      state.delta->confirm_state_commit();
+    }
+    ++state.completed;
+  }
+  auto output = state.run_batch_ffn(count, publish_output);
+  state.failed = false;
+  return output;
 }
 
 void DecoderLayer::reset() {
@@ -187,6 +353,16 @@ std::size_t DecoderLayer::length() const { return impl_ ? impl_->completed : 0; 
 TensorBinding DecoderLayer::output() {
   if (!impl_ || impl_->failed) {
     throw std::logic_error("invalid decoder output binding");
+  }
+  if (impl_->batch_tokens > 1) {
+    return {impl_->storage, impl_->public_output};
+  }
+  return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
+}
+
+TensorBinding DecoderLayer::batch_output() {
+  if (!impl_ || impl_->failed || impl_->batch_tokens == 1) {
+    throw std::logic_error("full FFN output requires a live batched decoder");
   }
   return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
 }
@@ -213,7 +389,7 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorRead
   }
   if (name == "normalized") {
     if (!impl_->normalization) {
-      throw std::invalid_argument("compiled input normalization has no public diagnostic output");
+      throw std::invalid_argument("fused input normalization has no separate diagnostic output");
     }
     return read_tensor(impl_->normalization->graph, impl_->normalization->outputs.at(name).id,
                        method);
@@ -224,6 +400,9 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorRead
     }
     return read_tensor(impl_->storage, impl_->mixed, method);
   }
+  if (name == "output" && impl_->batch_tokens > 1) {
+    return read_tensor(impl_->storage, impl_->public_output, method);
+  }
   const auto &outputs = impl_->feed_forward.outputs;
   if (outputs.count(name)) {
     return read_tensor(impl_->feed_forward.graph, outputs.at(name).id, method);
@@ -233,6 +412,10 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorRead
 
 void DecoderLayer::close() {
   if (impl_) {
+    if (impl_->local_commit) {
+      impl_->local_commit->graph.close();
+      impl_->local_commit.reset();
+    }
     impl_->feed_forward.graph.close();
     if (impl_->attention) {
       impl_->attention->close();

@@ -124,6 +124,8 @@ def numerical_acceptance(bundle, board):
     if manifest.get("model_family", "opt") == "qwen3_5":
         from specferry.models.qwen3_5.validation import evaluate_generation
 
+        from .qwen_deployment import DECODER_LAYOUTS
+
         result = evaluate_generation(bundle / "request", board / "native")
         profile = read_json(board / "native/platform.json")
         result["checks"]["platform"] = (
@@ -133,9 +135,36 @@ def numerical_acceptance(bundle, board):
         )
         initialized = read_json(board / "native/initialization.json")
         options = manifest["request_options"]
+        ffn_batch_tokens = options.get("ffn_batch_tokens", 1)
+        decoder_layout = options.get("decoder_layout", "separate")
+        layout_file = bundle / "request/decoder-layout.txt"
+        requested_layout = layout_file.read_text().strip() if layout_file.exists() else "separate"
+        request_metadata = read_json(bundle / "request/request.json")
+        state_commit = options["state_commit"]
         result["checks"]["composition"] = (
             initialized.get("compiled_mixers") == 18
-            and initialized.get("compiled_feed_forward") == 23
+            and ffn_batch_tokens in (1, 8, 16)
+            and initialized.get("ffn_batch_tokens", 1) == ffn_batch_tokens
+            and decoder_layout in DECODER_LAYOUTS
+            and initialized.get("decoder_layout", "separate") == decoder_layout
+            and requested_layout == decoder_layout
+            and request_metadata.get("decoder_layout", "separate") == decoder_layout
+            and (decoder_layout == "separate" or ffn_batch_tokens in (8, 16))
+            and state_commit in ("combined", "ffn")
+            and (state_commit == "combined" or ffn_batch_tokens in (8, 16))
+            and (bundle / "request/state-commit.txt").read_text().strip() == state_commit
+            and request_metadata.get("state_commit", "combined") == state_commit
+            and (
+                ffn_batch_tokens == 1
+                or (
+                    options.get("capacity") == 128
+                    and options.get("head_backend") == "shared-fcl-split"
+                    and options.get("projections") == "shared-fcl"
+                    and options.get("kv_write_mode") == "mapped"
+                )
+            )
+            and initialized.get("compiled_feed_forward") == (23 if ffn_batch_tokens == 1 else 24)
+            and initialized.get("matmul_feed_forward_layer") == (9 if ffn_batch_tokens == 1 else -1)
             and initialized.get("compiled_input_norm_layers") == 18
             and initialized.get("embedding_lookup") == "gather-nd"
             and initialized.get("capacity", 64) == options.get("capacity", 64)
@@ -241,6 +270,7 @@ def collect(bundle, output):
         manifest = read_json(bundle / "bundle.json")
         capacity = manifest.get("request_options", {}).get("capacity")
         qwen_scope = f"Qwen C{capacity}" if capacity is not None else "Qwen"
+        ffn_batch = manifest.get("request_options", {}).get("ffn_batch_tokens", 1)
         summary = {
             "passed": False,
             "checks_passed": passed and numerical["passed"],
@@ -248,7 +278,7 @@ def collect(bundle, output):
             "numerical": numerical,
             "host_boot_id": host_boot_id(),
             "scope": (
-                f"{qwen_scope} single-token hybrid with shared vocabulary and FP32 recurrent state"
+                f"{qwen_scope} hybrid, FFN batch {ffn_batch}, shared vocabulary and FP32 recurrent state"
                 if manifest.get("model_family", "opt") == "qwen3_5"
                 else "formal OPT fullgraph mapped-slot with explicit prefill policy"
             ),

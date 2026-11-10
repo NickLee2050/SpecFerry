@@ -16,9 +16,14 @@
 #include <vector>
 
 namespace specferry::models::qwen3_5 {
+// SharedResidual also fuses attention normalization and omits unconsumed scalar publications.
+enum class DecoderLayout { Separate, FusedAttentionNorm, SharedResidual };
+
 // Complete text-only model: shared tied vocabulary, 18 compiled DeltaNet mixers,
 // six handwritten gated-attention layers, SwiGLU and device greedy selection.
 // Missing compiled FFN entries use device projections from the shared weight bank.
+// commit_state_in_ffn replaces the combined decode commit and each block's final
+// local commit; it requires deferred (combined_state_commit) batched execution.
 class Model {
 public:
   Model(np101::Context &context, const np101::WeightStore &weights, const Config &config,
@@ -30,7 +35,8 @@ public:
         np101::ops::LinearBackend head_backend = np101::ops::LinearBackend::MatMul,
         bool combined_state_commit = false, unsigned head_blocks_per_graph = 0,
         np101::ops::LinearBackend projection_backend = np101::ops::LinearBackend::MatMul,
-        np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph);
+        np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph,
+        DecoderLayout layout = DecoderLayout::Separate, bool commit_state_in_ffn = false);
   ~Model();
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;

@@ -26,8 +26,10 @@ def main():
     parser.add_argument("--rootfs", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--part", choices=("mixer", "feed-forward"), default="mixer")
+    parser.add_argument("--batch-tokens", type=int, choices=(1, 4, 8, 16), default=1)
     parser.add_argument("--outer-product", choices=("matmul", "multiply"), default="matmul")
     parser.add_argument("--fuse-input-norm", action="store_true")
+    parser.add_argument("--joint-state-reads", action="store_true")
     parser.add_argument("--all-layers", action="store_true")
     parser.add_argument(
         "--reuse-first-layer", type=Path, help="validated layer-zero compiler evidence"
@@ -36,9 +38,12 @@ def main():
     parser.add_argument("--mixers-package", type=Path, help="combine accepted mixers with all FFNs")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.part != "mixer" and (args.outer_product != "matmul" or args.fuse_input_norm):
-        parser.error("outer product and input normalization options require --part mixer")
-    if args.reuse_first_layer and (args.outer_product != "matmul" or args.fuse_input_norm):
+    changed_mixer = args.outer_product != "matmul" or args.fuse_input_norm or args.joint_state_reads
+    if args.batch_tokens != 1 and args.part != "feed-forward":
+        parser.error("--batch-tokens requires --part feed-forward")
+    if args.part != "mixer" and changed_mixer:
+        parser.error("mixer implementation options require --part mixer")
+    if args.reuse_first_layer and changed_mixer:
         parser.error("changed mixer contracts cannot reuse an unchecked layer-zero export")
     if args.mixers_package and (
         args.part != "feed-forward" or not args.all_layers or not args.package_output
@@ -93,10 +98,16 @@ def main():
                 manifest["text_config"],
                 outer_product=args.outer_product,
                 fuse_input_norm=args.fuse_input_norm,
+                joint_state_reads=args.joint_state_reads,
             )
         else:
-            graph = feed_forward_model(weights, layer, manifest["text_config"])
-        model = graph.model("Qwen single-step " + args.part)
+            graph = feed_forward_model(
+                weights, layer, manifest["text_config"], batch_tokens=args.batch_tokens
+            )
+        title = (
+            "Qwen single-step " if args.batch_tokens == 1 else f"Qwen {args.batch_tokens}-token "
+        )
+        model = graph.model(title + args.part)
         onnx.save(model, target / "model.onnx")
         write_json(
             target / "source.json",
@@ -109,6 +120,8 @@ def main():
                 constant_bytes=sum(len(t.raw_data) for t in graph.constants),
                 outer_product=args.outer_product if args.part == "mixer" else None,
                 includes_input_norm=args.fuse_input_norm,
+                joint_state_reads=args.joint_state_reads,
+                batch_tokens=args.batch_tokens,
             ),
         )
         compile_model(args.rootfs.resolve(), target, precision="float32")

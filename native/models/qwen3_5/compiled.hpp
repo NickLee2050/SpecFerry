@@ -25,6 +25,7 @@ void validate_compiled_mixer(const CompiledBlock &artifact, const np101::WeightS
 void validate_compiled_feed_forward(const CompiledBlock &artifact,
                                     const np101::WeightStore &weights, const Config &config,
                                     unsigned layer);
+unsigned compiled_feed_forward_batch_tokens(const CompiledBlock &artifact);
 std::map<unsigned, CompiledBlock> load_compiled_feed_forward(const std::filesystem::path &package,
                                                              const np101::WeightStore &weights,
                                                              const Config &config);

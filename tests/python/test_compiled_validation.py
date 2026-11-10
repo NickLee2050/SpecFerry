@@ -23,6 +23,38 @@ from specferry.validation.generation_metrics import summarize
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_qwen_ffn_batch_contract_preserves_ports_and_selected_width(self):
+        from specferry.models.qwen3_5.compiled import validate_feed_forward_ports
+
+        for width in (1, 4, 8, 16):
+            # Public residual/mixer order can differ from the imported node's order.
+            artifact = {
+                "inputs": [
+                    {"name": name, "dtype": "F16", "shape": [1024, width]}
+                    for name in ("mixer", "residual")
+                ],
+                "input_order": [1, 0],
+                "outputs": [{"name": "output", "dtype": "F16", "shape": [1024, width]}],
+                "output_order": [0],
+                "batch_tokens": width,
+            }
+            self.assertEqual(validate_feed_forward_ports(artifact, batch_tokens=width), width)
+            if width != 1:
+                with self.assertRaisesRegex(ValueError, "selected configuration"):
+                    validate_feed_forward_ports(artifact, batch_tokens=1)
+            for change in ("shape", "metadata", "dtype", "order"):
+                bad = json.loads(json.dumps(artifact))
+                if change == "shape":
+                    bad["outputs"][0]["shape"][1] = 2
+                elif change == "metadata":
+                    bad["batch_tokens"] = True
+                elif change == "dtype":
+                    bad["inputs"][0]["dtype"] = "F32"
+                else:
+                    bad["input_order"] = [0, 0]
+                with self.subTest(width=width, change=change), self.assertRaises(ValueError):
+                    validate_feed_forward_ports(bad)
+
     def test_mapped_slot_capacity_contract_rejects_unbounded_layouts(self):
         from specferry.models.opt.graph_validation import _mapped_slot_enabled
 

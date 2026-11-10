@@ -1,7 +1,7 @@
 """Single-step DeltaNet export retaining the accepted FP32 recurrence contract."""
 
 import numpy as np
-from onnx import TensorProto
+from onnx import TensorProto, helper
 
 from specferry.export.onnx import OnnxGraph
 
@@ -43,7 +43,15 @@ class DeltaGraph(OnnxGraph):
         return self.node("Mul", [value, sigmoid], prefix + "_swish")
 
 
-def delta_model(weights, layer, config, *, outer_product="matmul", fuse_input_norm=False):
+def delta_model(
+    weights,
+    layer,
+    config,
+    *,
+    outer_product="matmul",
+    fuse_input_norm=False,
+    joint_state_reads=False,
+):
     if config["layer_types"][layer] != "linear_attention":
         raise ValueError("compiled mixer export requires a DeltaNet layer")
     hidden = config["hidden_size"]
@@ -163,7 +171,22 @@ def delta_model(weights, layer, config, *, outer_product="matmul", fuse_input_no
     beta = graph.cast(graph.node("Sigmoid", [b], "beta_fp16"), "beta_fp32", TensorProto.FLOAT)
     beta = graph.reshape(beta, "beta_heads", [heads, 1, 1])
     decayed = graph.node("Mul", [state, decay], "decayed_state_fp32")
-    prediction = graph.node("MatMul", [key, decayed], "prediction_fp32")
+    if joint_state_reads:
+        joint_queries = graph.node("Concat", [key, query], "joint_queries_fp32", axis=1)
+        predictions = graph.node("MatMul", [joint_queries, decayed], "joint_predictions_fp32")
+        prediction, prior_core = "prediction_fp32", "prior_core_fp32"
+        graph.nodes.append(
+            helper.make_node(
+                "Split",
+                [predictions],
+                [prediction, prior_core],
+                name="separate_predictions_fp32",
+                axis=1,
+                split=[1, 1],
+            )
+        )
+    else:
+        prediction = graph.node("MatMul", [key, decayed], "prediction_fp32")
     error = graph.node("Sub", [value, prediction], "error_fp32")
     correction = graph.node("Mul", [error, beta], "correction_fp32")
     transposed_key = graph.node("Transpose", [key], "transposed_key", perm=[0, 2, 1])
@@ -173,7 +196,16 @@ def delta_model(weights, layer, config, *, outer_product="matmul", fuse_input_no
         "update_fp32",
     )
     updated_state = graph.node("Add", [decayed, update], "present_recurrent")
-    core = graph.node("MatMul", [query, updated_state], "core_fp32")
+    if joint_state_reads:
+        # q(S + k^T correction) = qS + (q k^T) correction. Read S with K/Q
+        # together, while retaining the FP32 state update and public state ports.
+        # Reassociation can change rounding; this opt-in needs sequence-level validation.
+        products = graph.node("Mul", [query, key], "query_key_products_fp32")
+        dot = graph.node("ReduceSum", [products], "query_key_dot_fp32", axes=[2], keepdims=1)
+        contribution = graph.node("Mul", [dot, correction], "core_correction_fp32")
+        core = graph.node("Add", [prior_core, contribution], "core_fp32")
+    else:
+        core = graph.node("MatMul", [query, updated_state], "core_fp32")
     core = graph.reshape(core, "flat_core", [heads, value_dim])
     normalized = graph.normalize(core, "output_norm", config["rms_norm_eps"])
     scale = graph.weight("output_norm_weight", prefix + "norm.weight")
@@ -192,13 +224,15 @@ def delta_model(weights, layer, config, *, outer_product="matmul", fuse_input_no
     return graph
 
 
-def feed_forward_model(weights, layer, config):
+def feed_forward_model(weights, layer, config, *, batch_tokens=1):
     """Post-attention residual, FP32 RMSNorm and FP16 SwiGLU without runtime FCL packing."""
+    if type(batch_tokens) is not int or batch_tokens not in (1, 4, 8, 16):
+        raise ValueError("compiled FFN token batch must be 1, 4, 8 or 16")
     graph = DeltaGraph(weights)
     hidden = config["hidden_size"]
     prefix = f"model.layers.{layer}."
-    residual = graph.port("residual", TensorProto.FLOAT16, [1, hidden])
-    mixer = graph.port("mixer", TensorProto.FLOAT16, [1, hidden])
+    residual = graph.port("residual", TensorProto.FLOAT16, [batch_tokens, hidden])
+    mixer = graph.port("mixer", TensorProto.FLOAT16, [batch_tokens, hidden])
     summed = graph.node("Add", [residual, mixer], "residual_sum")
     wide = graph.cast(summed, "residual_fp32", TensorProto.FLOAT)
     squares = graph.node("Mul", [wide, wide], "squares_fp32")
@@ -228,5 +262,5 @@ def feed_forward_model(weights, layer, config):
     product = graph.node("Mul", [activated, up], "gated")
     projected = graph.project(product, "down", prefix + "mlp.down_proj", False)
     output = graph.node("Add", [summed, projected], "output")
-    graph.port(output, TensorProto.FLOAT16, [1, hidden], True)
+    graph.port(output, TensorProto.FLOAT16, [batch_tokens, hidden], True)
     return graph
