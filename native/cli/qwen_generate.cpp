@@ -71,17 +71,7 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("invalid Qwen generation policy");
     }
     std::ifstream input(request / "tokens.txt");
-    std::vector<std::int32_t> prompt;
-    std::int32_t token;
-    while (input >> token) {
-      if (token < 0 || unsigned(token) >= policy.vocabulary) {
-        throw std::invalid_argument("Qwen prompt token exceeds vocabulary");
-      }
-      prompt.push_back(token);
-    }
-    if (!input.eof() || prompt.empty() || prompt.size() > policy.capacity) {
-      throw std::invalid_argument("invalid Qwen rendered prompt");
-    }
+    const auto prompt = inference::read_prompt(input, policy.vocabulary, policy.capacity);
     const auto lookup_name = read_option(request, "embedding-lookup.txt", "gather-nd");
     if (lookup_name != "gather" && lookup_name != "gather-nd") {
       throw std::invalid_argument("unsupported Qwen embedding lookup operator");
@@ -125,8 +115,6 @@ int main(int argc, char **argv) {
       layout = DecoderLayout::Separate;
     } else if (layout_name == "fused-attention-norm") {
       layout = DecoderLayout::FusedAttentionNorm;
-    } else if (layout_name == "shared-residual") {
-      layout = DecoderLayout::SharedResidual;
     } else {
       throw std::invalid_argument("unsupported Qwen decoder layout");
     }
@@ -150,11 +138,12 @@ int main(int argc, char **argv) {
     if (projections != "matmul" && !shared_fcl) {
       throw std::invalid_argument("unsupported Qwen projection backend");
     }
-    if (shared_fcl && (std::string_view(platform::runtime_profile().target) != "soc" ||
-                       (policy.capacity != 64 && policy.capacity != 128) ||
-                       matmul_layer != (ffn_batch_tokens == 1 ? 9 : -1) ||
-                       head_backend_name != "shared-fcl-split" || state_commit == "per-layer" ||
-                       lookup_name != "gather-nd" || token_readback_name != "mapped")) {
+    if (shared_fcl &&
+        (std::string_view(platform::runtime_profile().target) != "soc" ||
+         (policy.capacity != 64 && policy.capacity != 128 && policy.capacity != 512) ||
+         matmul_layer != (ffn_batch_tokens == 1 ? 9 : -1) ||
+         head_backend_name != "shared-fcl-split" || state_commit == "per-layer" ||
+         lookup_name != "gather-nd" || token_readback_name != "mapped")) {
       throw std::invalid_argument("Qwen shared FCL requires the validated SoC M1 composition");
     }
     const auto kv_write_name = read_option(request, "kv-write-mode.txt", "copy-graph");
@@ -168,8 +157,9 @@ int main(int argc, char **argv) {
     const auto kv_write_mode =
         kv_write_name == "mapped" ? np101::KvWriteMode::MappedHost : np101::KvWriteMode::CopyGraph;
     if (ffn_batch_tokens > 1 &&
-        (!shared_fcl || policy.capacity != 128 || kv_write_name != "mapped")) {
-      throw std::invalid_argument("batched Qwen FFN requires the C128 mapped shared FCL chain");
+        (!shared_fcl || (policy.capacity != 128 && policy.capacity != 512) ||
+         kv_write_name != "mapped")) {
+      throw std::invalid_argument("batched Qwen FFN requires a C128/C512 mapped shared FCL chain");
     }
     np101::WeightStore weights(argv[1]);
     if (platform::verify_model_payloads()) {
@@ -195,16 +185,23 @@ int main(int argc, char **argv) {
     phase(output, "initialize");
     const auto start = std::chrono::steady_clock::now();
     np101::Context context;
+    models::qwen3_5::ModelOptions model_options;
+    model_options.lookup = lookup;
+    model_options.head = head_backend;
+    model_options.head_blocks_per_graph = head_backend_name == "shared-fcl-split" ? 8 : 0;
+    model_options.projections = shared_fcl ? np101::ops::LinearBackend::SharedFullyConnected
+                                           : np101::ops::LinearBackend::MatMul;
+    model_options.kv_write = kv_write_mode;
+    model_options.layout = layout;
+    using StateCommit = models::qwen3_5::StateCommit;
+    model_options.state_commit = state_commit == "ffn"        ? StateCommit::FeedForward
+                                 : state_commit == "combined" ? StateCommit::Combined
+                                                              : StateCommit::PerLayer;
     models::qwen3_5::Model model(
-        context, weights, config, policy, artifacts, feed_forward,
+        context, weights, config, policy, artifacts, feed_forward, model_options,
         [&](const std::string &name) {
           phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
-        },
-        lookup, head_backend, state_commit != "per-layer",
-        head_backend_name == "shared-fcl-split" ? 8 : 0,
-        shared_fcl ? np101::ops::LinearBackend::SharedFullyConnected
-                   : np101::ops::LinearBackend::MatMul,
-        kv_write_mode, layout, state_commit == "ffn");
+        });
     const auto initialize =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     {

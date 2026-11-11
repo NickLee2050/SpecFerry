@@ -1,48 +1,24 @@
 """Offline SoC adaptation of the existing single-token Qwen hybrid package."""
 
-import json
 import math
 import shutil
 import tempfile
 from pathlib import Path
 
 from specferry.data.checkpoint import sha256
-from specferry.models.qwen3_5.compiled import DRIVER, SDK_FILES, validate_feed_forward_ports
+from specferry.models.qwen3_5.compiled import (
+    DRIVER,
+    SDK_FILES,
+    native_manifest,
+    validate_feed_forward_ports,
+)
 from specferry.models.qwen3_5.components import Components
 from specferry.models.qwen3_5.export import verify_export
 
 from .board_runner import bundle_file, read_json, save
 from .deployment import finish_bundle, sdk_identity, stage_runtime
 
-DECODER_LAYOUTS = ("separate", "fused-attention-norm", "shared-residual")
-
-
-def native_manifest(graphs, *, mixer, sdk):
-    """Reconstruct the public port/source contract, preserving graph and parameter bytes."""
-    version = 2 if mixer and any(g.get("includes_input_norm") for g in graphs) else 1
-    kind = "delta" if mixer else "feed-forward"
-    profile = sdk.get("profile", sdk.get("module_srcversion"))
-    lines = [f"specferry-qwen-{kind} {version} {profile} 5"]
-    lines.extend(f"{name} {sdk['sha256'][name]}" for name in SDK_FILES)
-    lines.append(str(len(graphs)))
-    for graph in graphs:
-        lines.append(
-            f"{graph['layer']} {json.dumps(graph['path'])} {graph['nbg_sha256']} "
-            f"{graph['constant_bytes']} " + " ".join(map(str, graph["graph_version"]))
-        )
-        if mixer and version == 2:
-            lines.append(str(int(graph["includes_input_norm"])))
-        for direction in ("input", "output"):
-            lines.append(" ".join(map(str, graph[direction + "_order"])))
-            lines.extend(
-                f"{port['dtype']} {len(port['shape'])} " + " ".join(map(str, port["shape"]))
-                for port in graph[direction + "s"]
-            )
-        lines.extend(
-            f"{json.dumps(name)} {digest}"
-            for name, digest in sorted(graph["weight_sha256"].items())
-        )
-    return "\n".join(lines) + "\n"
+DECODER_LAYOUTS = ("separate", "fused-attention-norm")
 
 
 def validate_package(package, deployment, *, ffn_batch_tokens=1):
@@ -160,7 +136,7 @@ def validate_request(request, weights, deployment_digest):
         raise ValueError("unsupported Qwen generation policy")
     if (
         vocabulary != 248320
-        or capacity not in (64, 128)
+        or capacity not in (64, 128, 512)
         or not 0 <= bos < vocabulary
         or type(effective.get("eos_token_id")) is not int
         or eos != effective["eos_token_id"]
@@ -258,12 +234,12 @@ def validate_request(request, weights, deployment_digest):
     if head not in ("matmul", "shared-fcl", "shared-fcl-split"):
         raise ValueError("Qwen head must reuse the existing shared vocabulary")
     if ffn_batch_tokens > 1 and (
-        capacity != 128
+        capacity not in (128, 512)
         or head != "shared-fcl-split"
         or (request / "projections.txt").read_text().strip() != "shared-fcl"
         or (request / "kv-write-mode.txt").read_text().strip() != "mapped"
     ):
-        raise ValueError("batched Qwen FFN requires the C128 mapped shared FCL chain")
+        raise ValueError("batched Qwen FFN requires a C128/C512 mapped shared FCL chain")
     return dict(
         capacity=capacity,
         maximum=maximum,
@@ -317,8 +293,8 @@ def prepare_bundle(
     hashes = sdk_identity(sdk)
     manifest, weights = validate_package(package, deployment, ffn_batch_tokens=ffn_batch_tokens)
     options = validate_request(request, weights, manifest["deployment_sha256"])
-    if ffn_batch_tokens > 1 and options["capacity"] != 128:
-        raise ValueError("batched Qwen FFN requires C128")
+    if ffn_batch_tokens > 1 and options["capacity"] not in (128, 512):
+        raise ValueError("batched Qwen FFN requires C128 or C512")
     options.update(
         head_backend="shared-fcl-split",
         state_commit=state_commit,

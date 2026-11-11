@@ -16,27 +16,35 @@
 #include <vector>
 
 namespace specferry::models::qwen3_5 {
-// SharedResidual also fuses attention normalization and omits unconsumed scalar publications.
-enum class DecoderLayout { Separate, FusedAttentionNorm, SharedResidual };
+enum class DecoderLayout { Separate, FusedAttentionNorm };
+
+// Graph construction choices are explicit and fixed for the model lifetime.
+// Batch width and tensor contracts come from the source-bound NBG package.
+enum class StateCommit { PerLayer, Combined, FeedForward };
+
+struct ModelOptions {
+  np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather;
+  np101::ops::LinearBackend head = np101::ops::LinearBackend::MatMul;
+  unsigned head_blocks_per_graph = 0;
+  np101::ops::LinearBackend projections = np101::ops::LinearBackend::MatMul;
+  np101::KvWriteMode kv_write = np101::KvWriteMode::CopyGraph;
+  DecoderLayout layout = DecoderLayout::Separate;
+  StateCommit state_commit = StateCommit::PerLayer;
+};
 
 // Complete text-only model: shared tied vocabulary, 18 compiled DeltaNet mixers,
 // six handwritten gated-attention layers, SwiGLU and device greedy selection.
 // Missing compiled FFN entries use device projections from the shared weight bank.
-// commit_state_in_ffn replaces the combined decode commit and each block's final
-// local commit; it requires deferred (combined_state_commit) batched execution.
+// FeedForward state commit replaces combined decode and block-final local copies;
+// it requires a batched FFN package. Graph storage outlives all consumers.
 class Model {
 public:
   Model(np101::Context &context, const np101::WeightStore &weights, const Config &config,
         const inference::GenerationPolicy &policy,
         const std::map<unsigned, CompiledBlock> &compiled,
         const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
-        const std::function<void(const std::string &)> &phase = {},
-        np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather,
-        np101::ops::LinearBackend head_backend = np101::ops::LinearBackend::MatMul,
-        bool combined_state_commit = false, unsigned head_blocks_per_graph = 0,
-        np101::ops::LinearBackend projection_backend = np101::ops::LinearBackend::MatMul,
-        np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph,
-        DecoderLayout layout = DecoderLayout::Separate, bool commit_state_in_ffn = false);
+        const ModelOptions &options = {},
+        const std::function<void(const std::string &)> &phase = {});
   ~Model();
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;

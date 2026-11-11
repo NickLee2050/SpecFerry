@@ -36,8 +36,8 @@ def main():
     )
     prepare.add_argument(
         "--qwen-decoder-layout",
-        choices=("separate", "fused-attention-norm", "shared-residual"),
-        help="Qwen M8/M16 graph layout; shared-residual also fuses norm and avoids redundant publication",
+        choices=("separate", "fused-attention-norm"),
+        help="Qwen batched FFN layout; optionally fuse attention input normalization",
     )
     prepare.add_argument("--binary", type=Path)
     prepare.add_argument(

@@ -13,6 +13,34 @@ SDK_FILES = ("libovxlib.so", "libOpenVX.so", "libGAL.so", "libArchModelSw.so", "
 DRIVER = "F53A3E6EFBB7D0FD7D4617C"
 
 
+def native_manifest(graphs, *, mixer, sdk):
+    """Reconstruct the public port/source contract, preserving graph and parameter bytes."""
+    version = 2 if mixer and any(g.get("includes_input_norm") for g in graphs) else 1
+    kind = "delta" if mixer else "feed-forward"
+    profile = sdk.get("profile", sdk.get("module_srcversion"))
+    lines = [f"specferry-qwen-{kind} {version} {profile} 5"]
+    lines.extend(f"{name} {sdk['sha256'][name]}" for name in SDK_FILES)
+    lines.append(str(len(graphs)))
+    for graph in graphs:
+        lines.append(
+            f"{graph['layer']} {json.dumps(graph['path'])} {graph['nbg_sha256']} "
+            f"{graph['constant_bytes']} " + " ".join(map(str, graph["graph_version"]))
+        )
+        if mixer and version == 2:
+            lines.append(str(int(graph["includes_input_norm"])))
+        for direction in ("input", "output"):
+            lines.append(" ".join(map(str, graph[direction + "_order"])))
+            lines.extend(
+                f"{port['dtype']} {len(port['shape'])} " + " ".join(map(str, port["shape"]))
+                for port in graph[direction + "s"]
+            )
+        lines.extend(
+            f"{json.dumps(name)} {digest}"
+            for name, digest in sorted(graph["weight_sha256"].items())
+        )
+    return "\n".join(lines) + "\n"
+
+
 def graph_version(directory):
     header = (directory / "export_model/vnn_network.h").read_text()
     return [
@@ -159,33 +187,13 @@ def package_blocks(directories, deployment, output, sdk, *, part="mixer"):
         module_srcversion=DRIVER,
         sha256={name: sha256(sdk / name) for name in SDK_FILES},
     )
-    kind = "delta" if mixer else "feed-forward"
-    version = 2 if any(entry["includes_input_norm"] for entry in graphs) else 1
-    lines = [f"specferry-qwen-{kind} {version} {DRIVER} 5"]
-    lines.extend(f"{name} {identity['sha256'][name]}" for name in SDK_FILES)
-    lines.append(str(len(graphs)))
     for entry, directory in zip(graphs, directories):
         shutil.copyfile(
             directory / "export_model_nbg_unify/network_binary.nb", output / entry["path"]
         )
-        lines.append(
-            f"{entry['layer']} {json.dumps(entry['path'])} {entry['nbg_sha256']} {entry['constant_bytes']} "
-            + " ".join(map(str, entry["graph_version"]))
-        )
-        if mixer and version == 2:
-            lines.append(str(int(entry["includes_input_norm"])))
-        for direction in ("input", "output"):
-            lines.append(" ".join(map(str, entry[direction + "_order"])))
-            lines.extend(
-                f"{port['dtype']} {len(port['shape'])} " + " ".join(map(str, port["shape"]))
-                for port in entry[direction + "s"]
-            )
-        lines.extend(
-            f"{json.dumps(name)} {digest}"
-            for name, digest in sorted(entry["weight_sha256"].items())
-        )
+    kind = "delta" if mixer else "feed-forward"
     native = "compiled-mixers.txt" if mixer else "compiled-feed-forward.txt"
-    (output / native).write_text("\n".join(lines) + "\n")
+    (output / native).write_text(native_manifest(graphs, mixer=mixer, sdk=identity))
     manifest = dict(
         schema_version=1,
         kind="qwen-" + kind,
@@ -198,10 +206,6 @@ def package_blocks(directories, deployment, output, sdk, *, part="mixer"):
         manifest["batch_tokens"] = graphs[0]["batch_tokens"]
     write_json(output / "manifest.json", manifest)
     return manifest
-
-
-def package_mixers(directories, deployment, output, sdk):
-    return package_blocks(directories, deployment, output, sdk)
 
 
 def combine_packages(mixers, feed_forward, output):

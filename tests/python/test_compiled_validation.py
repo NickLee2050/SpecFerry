@@ -335,11 +335,20 @@ class CompiledValidationTests(unittest.TestCase):
                     remaining_processes=[],
                 ),
             )
-            for problem in (None, "kernel", "live_budget", "compilation", "non_numerical"):
+            for problem in (
+                None,
+                "no_private_audit",
+                "kernel",
+                "live_budget",
+                "compilation",
+                "non_numerical",
+            ):
                 with self.subTest(problem=problem):
                     execution_record = native | {"const_live_bytes": int(problem == "live_budget")}
                     comparison = dict(result)
                     marker = dict(previous)
+                    if problem == "no_private_audit":
+                        comparison.pop("compilation")
                     if problem == "kernel":
                         marker["kernel_gate"] = dict(faults=["EDMA timeout"], owners="")
                     if problem == "compilation":
@@ -348,7 +357,7 @@ class CompiledValidationTests(unittest.TestCase):
                         comparison["checks"] = {"request.0.tokens": False, "release_budget": False}
                     (root / "device/execution.json").write_text(json.dumps(execution_record))
                     (root / "result.json").write_text(json.dumps(comparison))
-                    if problem:
+                    if problem not in (None, "no_private_audit"):
                         with self.assertRaisesRegex(ValueError, "healthy numerical failure"):
                             compiled.validate_numerical_failure(marker)
                     else:

@@ -29,15 +29,8 @@ int main(int argc, char **argv) {
     const auto options = specferry::inference::read_run_options(argv[2], false);
     const auto config = specferry::models::opt::read_model_config(argv[2]);
     std::ifstream input(std::filesystem::path(argv[2]) / "tokens.txt");
-    std::vector<std::int32_t> prompt;
-    std::int32_t token;
-    while (input >> token) {
-      config.validate_token(token);
-      prompt.push_back(token);
-    }
-    if (!input.eof() || prompt.empty() || prompt.size() > config.decoder.capacity) {
-      throw std::invalid_argument("invalid prompt tokens or capacity");
-    }
+    const auto prompt =
+        specferry::inference::read_prompt(input, config.vocabulary, config.decoder.capacity);
     specferry::np101::WeightStore weights(argv[1]);
     weights.verify();
     specferry::np101::SdkTimings timings(output);

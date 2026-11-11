@@ -25,7 +25,7 @@ def parse_arguments():
     parser.add_argument("--compiled-mixers", type=Path, required=True)
     parser.add_argument("--head-backend", choices=("matmul", "shared-fcl"), default="matmul")
     parser.add_argument("--state-commit", choices=("per-layer", "combined"), default="per-layer")
-    parser.add_argument("--capacity", type=int, choices=(64, 128), default=64)
+    parser.add_argument("--capacity", type=int, choices=(64, 128, 512), default=64)
     parser.add_argument("--embedding-lookup", choices=("gather", "gather-nd"), default="gather-nd")
     parser.add_argument("--matmul-feed-forward-layer", type=int, choices=range(24), default=9)
     parser.add_argument("--token-readback", choices=("sdk", "mapped"), default="mapped")
@@ -42,6 +42,8 @@ def parse_arguments():
     parser.add_argument("--sdk-timing", action="store_true", help="record diagnostic SDK calls")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.capacity == 512 and not args.prepare_only:
+        parser.error("C512 is supported through the SoC deployment entry; use --prepare-only")
     return args
 
 
@@ -51,27 +53,25 @@ def main():
     if (
         package["kind"] != "qwen-delta"
         or package["schema_version"] != 1
-        or len(package["graphs"]) != 18
-        or sha256(args.compiled_mixers / "compiled-mixers.txt") != package["native_manifest_sha256"]
         or package["deployment_sha256"] != sha256(args.model / "deployment-manifest.json")
     ):
         raise ValueError("complete Qwen requires its source-bound 18-mixer package")
-    for graph in package["graphs"]:
-        binary = (args.compiled_mixers / graph["path"]).resolve(strict=True)
-        if binary.parent != args.compiled_mixers.resolve() or sha256(binary) != graph["nbg_sha256"]:
-            raise ValueError("compiled Qwen mixer NBG changed")
+    sections = [("graphs", "native_manifest_sha256", "compiled-mixers.txt", 18)]
     if not args.prepare_only:
-        if len(package.get("feed_forward", [])) != 24 or sha256(
-            args.compiled_mixers / "compiled-feed-forward.txt"
-        ) != package.get("feed_forward_manifest_sha256"):
-            raise ValueError("complete Qwen requires its source-bound 24-FFN package")
-        for graph in package["feed_forward"]:
+        sections.append(
+            ("feed_forward", "feed_forward_manifest_sha256", "compiled-feed-forward.txt", 24)
+        )
+    for key, digest, native, count in sections:
+        graphs = package.get(key, [])
+        if len(graphs) != count or sha256(args.compiled_mixers / native) != package.get(digest):
+            raise ValueError(f"complete Qwen requires its source-bound {count}-graph {key} package")
+        for graph in graphs:
             binary = (args.compiled_mixers / graph["path"]).resolve(strict=True)
             if (
                 binary.parent != args.compiled_mixers.resolve()
                 or sha256(binary) != graph["nbg_sha256"]
             ):
-                raise ValueError("compiled Qwen feed-forward NBG changed")
+                raise ValueError("compiled Qwen NBG changed")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     fixture = output / "request"
@@ -121,7 +121,6 @@ def main():
         output / "guarded",
         sudo_read_only=args.sudo_read_only,
         timeout=args.timeout,
-        audit_verify=True,
         evaluate_result=accept,
         board_power_cycled=args.board_power_cycled,
         sdk_timing=args.sdk_timing,

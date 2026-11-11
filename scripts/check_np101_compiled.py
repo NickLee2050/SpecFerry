@@ -18,7 +18,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--sudo-read-only", action="store_true")
-    parser.add_argument("--audit-verify", action="store_true", help="pinned v105 Verify-only audit")
     parser.add_argument("--timeout", type=int, default=300)
     options = parser.parse_args()
     if options.timeout <= 0:
@@ -33,7 +32,6 @@ def main():
         options.output.resolve(),
         sudo_read_only=options.sudo_read_only,
         timeout=options.timeout,
-        audit_verify=options.audit_verify,
     )
     print(json.dumps({k: report.get(k) for k in ("passed", "performance", "error")}, indent=2))
     return 0 if report["passed"] else 1

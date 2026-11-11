@@ -423,10 +423,6 @@ def main():
                 args.timeout,
                 sdk_timing=args.sdk_timing,
                 sdk_summary=args.sdk_summary,
-                verify_trace=ROOT / "build/ep/tests/libnp101_verify_trace.so"
-                if args.lifecycle_check
-                else None,
-                require_compiled_operations=args.lifecycle_check,
             )
     execution = (
         json.loads((device / "execution.json").read_text())

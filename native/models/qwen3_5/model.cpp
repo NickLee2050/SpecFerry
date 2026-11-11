@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
-#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -31,18 +30,16 @@ struct Model::Impl {
   bool failed = false, prediction_ready = false;
   std::function<void(const std::string &)> progress;
   bool trace_steps = false;
-  bool share_residual_blocks;
 
   Impl(Context &context, const WeightStore &weights, const Config &spec,
        const inference::GenerationPolicy &selection,
        const std::map<unsigned, CompiledBlock> &compiled,
-       const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
-       const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-       LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
-       LinearBackend projection_backend, KvWriteMode kv_write_mode, DecoderLayout layout,
-       bool commit_state_in_ffn)
-      : config(spec), policy(selection), bank(context), progress(phase),
-        share_residual_blocks(layout == DecoderLayout::SharedResidual) {
+       const std::map<unsigned, CompiledBlock> &compiled_feed_forward, const ModelOptions &options,
+       const std::function<void(const std::string &)> &phase)
+      : config(spec), policy(selection), bank(context), progress(phase) {
+    const auto lookup = options.lookup;
+    const bool combined_state_commit = options.state_commit != StateCommit::PerLayer;
+    const bool commit_state_in_ffn = options.state_commit == StateCommit::FeedForward;
     const auto *timing = std::getenv("SPECFERRY_SDK_TIMING");
     trace_steps = timing && std::string_view(timing) == "calls";
     try {
@@ -59,13 +56,10 @@ struct Model::Impl {
         const auto feed_forward = compiled_feed_forward.find(layer);
         const auto input = layers.empty() ? vocabulary->embedding() : layers.back()->output();
         layers.push_back(std::make_unique<DecoderLayer>(
-            context, weights, config, layer, input, &bank, projection_backend,
+            context, weights, config, layer, input, &bank, options.projections,
             artifact == compiled.end() ? nullptr : &artifact->second,
             feed_forward == compiled_feed_forward.end() ? nullptr : &feed_forward->second,
-            combined_state_commit, kv_write_mode, layout != DecoderLayout::Separate,
-            share_residual_blocks && !layers.empty()
-                ? std::optional<TensorBinding>(layers.back()->batch_output())
-                : std::nullopt,
+            combined_state_commit, options.kv_write, options.layout != DecoderLayout::Separate,
             commit_state_in_ffn));
       }
       batch_tokens = layers.front()->feed_forward_batch_tokens();
@@ -110,7 +104,7 @@ struct Model::Impl {
       }
       head = std::make_unique<VocabularyHead>(
           context, *vocabulary, TensorBinding{normalization->graph, normalized.id},
-          SamplingOptions{}, head_backend, head_blocks_per_graph);
+          SamplingOptions{}, options.head, options.head_blocks_per_graph);
     } catch (...) {
       close();
       throw;
@@ -203,11 +197,7 @@ struct Model::Impl {
         }
         // Every mixer consumes real tokens in order and commits only its own
         // recurrence. Padding exists solely inside the independent FFN rows.
-        // Intermediate public rows are populated by the next layer's input writes.
-        // Only the final block's final layer is consumed directly by the LM head.
-        const bool publish = !share_residual_blocks ||
-                             (layer + 1 == layers.size() && offset + count == tokens.size());
-        rows = layers[layer]->prefill_block(rows, count, publish);
+        rows = layers[layer]->prefill_block(rows, count);
         if (rows.size() != count * bytes_per_row || layers[layer]->length() != position + count) {
           throw std::logic_error("Qwen prefill returned an incomplete layer block");
         }
@@ -278,13 +268,20 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
              const inference::GenerationPolicy &policy,
              const std::map<unsigned, CompiledBlock> &compiled,
              const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
-             const std::function<void(const std::string &)> &phase, VocabularyLookup lookup,
-             LinearBackend head_backend, bool combined_state_commit, unsigned head_blocks_per_graph,
-             LinearBackend projection_backend, KvWriteMode kv_write_mode, DecoderLayout layout,
-             bool commit_state_in_ffn) {
+             const ModelOptions &options, const std::function<void(const std::string &)> &phase) {
+  const auto head_backend = options.head;
+  const auto projection_backend = options.projections;
+  const auto kv_write_mode = options.kv_write;
+  const auto layout = options.layout;
+  const bool combined_state_commit = options.state_commit != StateCommit::PerLayer;
+  const bool commit_state_in_ffn = options.state_commit == StateCommit::FeedForward;
+  if (options.state_commit != StateCommit::PerLayer &&
+      options.state_commit != StateCommit::Combined &&
+      options.state_commit != StateCommit::FeedForward) {
+    throw std::invalid_argument("unsupported Qwen state commit policy");
+  }
   config.validate();
-  if (layout != DecoderLayout::Separate && layout != DecoderLayout::FusedAttentionNorm &&
-      layout != DecoderLayout::SharedResidual) {
+  if (layout != DecoderLayout::Separate && layout != DecoderLayout::FusedAttentionNorm) {
     throw std::invalid_argument("unsupported Qwen decoder layout");
   }
   const auto &table = weights.find("model.embed_tokens.weight");
@@ -376,9 +373,7 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   }
   try {
     impl_ = std::make_unique<Impl>(context, weights, config, policy, compiled,
-                                   compiled_feed_forward, phase, lookup, head_backend,
-                                   combined_state_commit, head_blocks_per_graph, projection_backend,
-                                   kv_write_mode, layout, commit_state_in_ffn);
+                                   compiled_feed_forward, options, phase);
   } catch (const std::exception &error) {
     const auto &memory = context.memory();
     throw std::runtime_error(

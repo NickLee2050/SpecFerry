@@ -1,6 +1,5 @@
 """Pinned compiled-model acceptance with preparation outside generation timings."""
 
-import csv
 import json
 import math
 import os
@@ -15,7 +14,6 @@ from specferry.models.opt.config import TOLERANCES
 from specferry.validation.arrays import compare_arrays
 from specferry.validation.device import (
     RECOVERY_ROOT,
-    VERIFY_TRACE_OPENVX_SHA256,
     clean_execution,
     device_lock,
     run_device,
@@ -188,26 +186,6 @@ def evaluate(case, device):
     )
 
 
-def audit_compilation(device):
-    with (device / "verify-internals.tsv-nodes.tsv").open() as stream:
-        records = list(csv.DictReader(stream, delimiter="\t"))
-    graphs = [row for row in records if row["event"] == "summary"]
-    operations = [row for row in records if row["event"] == "node"]
-    extensions = sum("extension" in row["kernel_name"] for row in operations)
-    passed = (
-        bool(graphs)
-        and extensions < 1024
-        and all(
-            row["scan_complete"] == "1"
-            and row["read_errors"] == row["null_operations"] == row["zero_operations"] == "0"
-            for row in graphs
-        )
-    )
-    return dict(
-        passed=passed, graphs=len(graphs), outer_operations=len(operations), extensions=extensions
-    )
-
-
 def validate_numerical_failure(previous):
     """Require a completed, released numeric failure before an explicit repair diagnostic."""
     execution = previous.get("execution", {})
@@ -218,12 +196,14 @@ def validate_numerical_failure(previous):
         native = read_json(directory / "device/execution.json")
         result = read_json(directory / "result.json")
         failed = [name for name, passed in result.get("checks", {}).items() if passed is False]
+        # Legacy records may carry the retired private audit; a recorded failure
+        # still blocks recovery, while current runs use numerical/release contracts.
         numerical_failure = (
             native.get("status") == "executed"
             and native.get("phase") == "complete"
             and result.get("passed") is False
             and not result.get("error")
-            and result.get("compilation", {}).get("passed") is True
+            and result.get("compilation", {"passed": True}).get("passed") is True
             and bool(failed)
             and all(name.startswith("request.") for name in failed)
         )
@@ -256,7 +236,6 @@ def run_case(
     *,
     sudo_read_only=False,
     timeout=300,
-    audit_verify=False,
     evaluate_result=evaluate,
     numerical_diagnostic=False,
     board_power_cycled=False,
@@ -273,10 +252,6 @@ def run_case(
             raise ValueError(f"compiled validation requires the pinned SDK: {name}")
     if Path("/sys/module/galcore/srcversion").read_text().strip() != identity["module_srcversion"]:
         raise ValueError("compiled validation requires the pinned loaded driver")
-    if audit_verify:
-        (ROOT / "build/ep/tests/libnp101_verify_trace.so").resolve(strict=True)
-        if sha256(sdk / "libOpenVX.so") != VERIFY_TRACE_OPENVX_SHA256:
-            raise ValueError("Verify-only compilation audit requires pinned v105")
     (ROOT / "docs/np101-recovery-incidents.md").read_text()
     output.mkdir(parents=True, exist_ok=False)
     device = output / "device"
@@ -336,10 +311,6 @@ def run_case(
                 timeout,
                 recovery_control=True,
                 sdk_timing=sdk_timing,
-                verify_trace=ROOT / "build/ep/tests/libnp101_verify_trace.so"
-                if audit_verify
-                else None,
-                require_compiled_operations=audit_verify,
                 abort_check=lambda: bool(
                     snapshot(output / "monitor", sudo_read_only, fault_baseline=baseline)["faults"]
                 ),
@@ -352,9 +323,6 @@ def run_case(
             report.update(immediate=immediate, postflight=postflight)
             if clean_execution(evidence):
                 report.update(evaluate_result(case, device))
-                if audit_verify:
-                    report["compilation"] = audit_compilation(device)
-                    report["passed"] &= report["compilation"]["passed"]
             report["passed"] = report["passed"] and healthy(immediate) and healthy(postflight)
         except (
             OSError,

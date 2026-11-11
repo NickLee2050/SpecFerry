@@ -97,7 +97,7 @@ class QwenSocTests(unittest.TestCase):
         self.assertEqual(self.validate()["head_backend"], "shared-fcl-split")
         self.assertEqual(self.validate()["maximum"], 2)
 
-    def test_batched_ffn_requires_complete_mapped_c128_composition(self):
+    def test_batched_ffn_requires_complete_mapped_composition(self):
         self.assertEqual(self.validate()["ffn_batch_tokens"], 1)
         self.assertEqual(self.validate()["decoder_layout"], "separate")
         commit_file = self.request / "state-commit.txt"
@@ -128,7 +128,7 @@ class QwenSocTests(unittest.TestCase):
             (self.request / "ffn-batch-tokens.txt").write_text(str(width) + "\n")
             self.assertEqual(self.validate()["ffn_batch_tokens"], width)
             self.assertEqual(self.validate()["matmul_feed_forward_layer"], -1)
-            for layout in ("separate", "fused-attention-norm", "shared-residual"):
+            for layout in ("separate", "fused-attention-norm"):
                 layout_file.write_text(layout + "\n")
                 self.metadata["decoder_layout"] = layout
                 board.save(self.request / "request.json", self.metadata)
@@ -145,19 +145,26 @@ class QwenSocTests(unittest.TestCase):
             commit_file.write_text("combined\n")
             del self.metadata["state_commit"]
             board.save(self.request / "request.json", self.metadata)
-        layout_file.write_text("unknown\n")
-        with self.assertRaisesRegex(ValueError, "layout metadata/option"):
-            self.validate()
+        for capacity in (512, 128):
+            self.metadata["capacity"] = capacity
+            board.save(self.request / "request.json", self.metadata)
+            Components.from_text_config(self.config, capacity=capacity).write(self.request)
+            (self.request / "policy.txt").write_text(f"248320 {capacity} 0 248044 2 1\n")
+            self.assertEqual(self.validate()["capacity"], capacity)
+        for retired in ("shared-residual", "unknown"):
+            layout_file.write_text(retired + "\n")
+            with self.assertRaisesRegex(ValueError, "layout metadata/option"):
+                self.validate()
         layout_file.write_text("separate\n")
         with self.assertRaisesRegex(ValueError, "layout metadata/option"):
             self.validate()
-        layout_file.write_text("shared-residual\n")
+        layout_file.write_text("fused-attention-norm\n")
         (self.request / "matmul-feed-forward-layer.txt").write_text("9\n")
         with self.assertRaisesRegex(ValueError, "execution option differs"):
             self.validate()
         (self.request / "matmul-feed-forward-layer.txt").write_text("-1\n")
         (self.request / "kv-write-mode.txt").write_text("copy-graph\n")
-        with self.assertRaisesRegex(ValueError, "C128 mapped"):
+        with self.assertRaisesRegex(ValueError, "C128/C512 mapped"):
             self.validate()
         (self.request / "ffn-batch-tokens.txt").write_text("4\n")
         with self.assertRaisesRegex(ValueError, "batch width"):
@@ -344,7 +351,7 @@ class QwenSocTests(unittest.TestCase):
         board.save(self.root / "bundle.json", manifest)
         board.save(device / "initialization.json", initialized)
         layout_file = self.request / "decoder-layout.txt"
-        for layout in ("fused-attention-norm", "shared-residual"):
+        for layout in ("fused-attention-norm",):
             options["decoder_layout"] = layout
             board.save(self.root / "bundle.json", manifest)
             self.metadata["decoder_layout"] = layout
@@ -365,12 +372,12 @@ class QwenSocTests(unittest.TestCase):
         board.save(self.request / "request.json", self.metadata)
         layout_file.write_text("unknown\n")
         self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
-        options["decoder_layout"] = initialized["decoder_layout"] = "shared-residual"
-        self.metadata["decoder_layout"] = "shared-residual"
+        options["decoder_layout"] = initialized["decoder_layout"] = "fused-attention-norm"
+        self.metadata["decoder_layout"] = "fused-attention-norm"
         board.save(self.root / "bundle.json", manifest)
         board.save(device / "initialization.json", initialized)
         board.save(self.request / "request.json", self.metadata)
-        layout_file.write_text("shared-residual\n")
+        layout_file.write_text("fused-attention-norm\n")
         board.save(device / "platform.json", profile | {"target": "ep"})
         result = remote.numerical_acceptance(self.root, device.parent)
         self.assertFalse(result["passed"])

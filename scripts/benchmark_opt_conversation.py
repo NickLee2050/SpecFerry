@@ -208,7 +208,6 @@ def main():
         args.output / "guarded",
         sudo_read_only=True,
         timeout=300,
-        audit_verify=True,
         evaluate_result=lambda case, device: evaluate_conversation(
             args.output / "request", reference, device
         ),

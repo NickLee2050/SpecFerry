@@ -23,11 +23,6 @@ def add_run_arguments(parser):
     parser.add_argument(
         "--trace-driver", action="store_true", help="record ioctl calls with strace"
     )
-    parser.add_argument(
-        "--trace-verify",
-        action="store_true",
-        help="trace internal Verify stages with the diagnostic library and pinned v105 SDK",
-    )
 
 
 def run_check(binary, arguments, output, options, *, evaluate=None, timeout=None):
@@ -42,9 +37,6 @@ def run_check(binary, arguments, output, options, *, evaluate=None, timeout=None
             else (120 if options.timeout is None else options.timeout),
             sdk_timing=options.sdk_timing,
             trace_driver=options.trace_driver,
-            verify_trace=RECOVERY_ROOT.parents[1] / "build/ep/tests/libnp101_verify_trace.so"
-            if options.trace_verify
-            else None,
         )
     report = {
         "status": "numerical_pass" if clean_execution(evidence) else "failed",

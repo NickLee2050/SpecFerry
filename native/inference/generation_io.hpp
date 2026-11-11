@@ -4,9 +4,11 @@
 
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <istream>
 #include <limits>
 #include <map>
 #include <ostream>
@@ -16,6 +18,22 @@
 #include <vector>
 
 namespace specferry::inference {
+inline std::vector<std::int32_t> read_prompt(std::istream &input, unsigned vocabulary,
+                                             unsigned capacity) {
+  std::vector<std::int32_t> tokens;
+  std::int32_t token;
+  while (input >> token) {
+    if (token < 0 || unsigned(token) >= vocabulary) {
+      throw std::invalid_argument("prompt token exceeds vocabulary");
+    }
+    tokens.push_back(token);
+  }
+  if (!input.eof() || tokens.empty() || tokens.size() > capacity) {
+    throw std::invalid_argument("invalid prompt tokens or capacity");
+  }
+  return tokens;
+}
+
 struct RunOptions {
   unsigned maximum = 8, warmups = 0, repeats = 1, seed = 0;
   unsigned block = 1, cache_first = 0, cache_last = 0;

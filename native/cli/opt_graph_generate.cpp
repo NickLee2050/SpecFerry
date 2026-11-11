@@ -179,16 +179,7 @@ std::vector<std::vector<std::int32_t>> read_requests(const fs::path &path,
   std::string line;
   while (std::getline(input, line)) {
     std::istringstream stream(line);
-    std::vector<std::int32_t> tokens;
-    std::int32_t token;
-    while (stream >> token) {
-      config.validate_token(token);
-      tokens.push_back(token);
-    }
-    if (!stream.eof() || tokens.empty() || tokens.size() > config.decoder.capacity) {
-      throw std::invalid_argument("invalid experimental request token list");
-    }
-    requests.push_back(tokens);
+    requests.push_back(inference::read_prompt(stream, config.vocabulary, config.decoder.capacity));
   }
   if (!input.eof() || requests.empty() || requests.size() > 64) {
     throw std::invalid_argument("expected one to 64 request lines");

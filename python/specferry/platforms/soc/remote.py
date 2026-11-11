@@ -157,7 +157,7 @@ def numerical_acceptance(bundle, board):
             and (
                 ffn_batch_tokens == 1
                 or (
-                    options.get("capacity") == 128
+                    options.get("capacity") in (128, 512)
                     and options.get("head_backend") == "shared-fcl-split"
                     and options.get("projections") == "shared-fcl"
                     and options.get("kv_write_mode") == "mapped"

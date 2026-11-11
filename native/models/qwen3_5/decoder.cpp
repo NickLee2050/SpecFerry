@@ -48,7 +48,6 @@ struct DecoderLayer::Impl {
   Config config;
   TensorBinding incoming;
   unsigned batch_tokens;
-  bool shared_residual;
   bool commit_state_in_ffn;
   Graph storage;
   vsi_nn_tensor_id_t mixed;
@@ -67,13 +66,11 @@ struct DecoderLayer::Impl {
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
        TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
        const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
-       KvWriteMode kv_write_mode, bool fuse_attention_input_norm,
-       std::optional<TensorBinding> residual_block, bool commit_in_ffn)
+       KvWriteMode kv_write_mode, bool fuse_attention_input_norm, bool commit_in_ffn)
       : config(configuration), incoming(input),
         batch_tokens(
             compiled_feed_forward ? compiled_feed_forward_batch_tokens(*compiled_feed_forward) : 1),
-        shared_residual(residual_block.has_value()), commit_state_in_ffn(commit_in_ffn),
-        storage(context, batch_tokens > 1 ? 2 : 1, 0),
+        commit_state_in_ffn(commit_in_ffn), storage(context, batch_tokens > 1 ? 2 : 1, 0),
         mixed(add_tensor(storage, config.hidden_spec(), false,
                          std::vector<std::uint8_t>(config.hidden_spec().bytes()))),
         feed_forward(context, config, bank) {
@@ -121,16 +118,10 @@ struct DecoderLayer::Impl {
       std::vector<Tensor> semantic{residual, mixer};
       if (batch_tokens > 1) {
         const TensorSpec batch_spec{f16, {config.hidden, batch_tokens}};
-        // A preceding FFN owns this immutable-for-the-step block. Keep its
-        // binding fixed; only the mixer still uses the separate scalar input.
-        const auto batch_residual =
-            residual_block ? tail.bind(*residual_block, batch_spec) : tail.tensor(batch_spec);
-        semantic = {batch_residual, tail.tensor(batch_spec)};
+        semantic = {tail.tensor(batch_spec), tail.tensor(batch_spec)};
         residual_batch = semantic[0].id;
         mixer_batch = semantic[1].id;
-        if (!shared_residual) {
-          residual_bytes.resize(batch_spec.bytes());
-        }
+        residual_bytes.resize(batch_spec.bytes());
         mixer_bytes.resize(batch_spec.bytes());
         row_bytes.resize(config.hidden_spec().bytes());
         public_output = add_tensor(storage, config.hidden_spec(), false, row_bytes);
@@ -201,11 +192,9 @@ struct DecoderLayer::Impl {
     }
   }
 
-  std::vector<std::uint8_t> run_batch_ffn(unsigned count, bool publish_output) {
+  std::vector<std::uint8_t> run_batch_ffn(unsigned count) {
     const std::vector<std::uint32_t> start{0, 0}, end{config.hidden, batch_tokens};
-    if (!shared_residual) {
-      upload_tensor_region(feed_forward.graph, residual_batch, start, end, residual_bytes);
-    }
+    upload_tensor_region(feed_forward.graph, residual_batch, start, end, residual_bytes);
     upload_tensor_region(feed_forward.graph, mixer_batch, start, end, mixer_bytes);
     check(sdk_call("vsi_nn_RunGraph", [&] { return vsi_nn_RunGraph(feed_forward.graph.get()); }),
           "decoder batched residual and MLP");
@@ -216,10 +205,8 @@ struct DecoderLayer::Impl {
     }
     auto output = read_tensor_region(feed_forward.graph, feed_forward.outputs.at("output").id,
                                      start, {config.hidden, count});
-    if (publish_output) {
-      std::copy(output.end() - row_bytes.size(), output.end(), row_bytes.begin());
-      upload_tensor_region(storage, public_output, start, {config.hidden, 1}, row_bytes);
-    }
+    std::copy(output.end() - row_bytes.size(), output.end(), row_bytes.begin());
+    upload_tensor_region(storage, public_output, start, {config.hidden, 1}, row_bytes);
     return output;
   }
 };
@@ -229,20 +216,16 @@ DecoderLayer::DecoderLayer(Context &context, const WeightStore &weights, const C
                            LinearBackend backend, const CompiledBlock *compiled,
                            const CompiledBlock *compiled_feed_forward, bool deferred_delta_commit,
                            KvWriteMode kv_write_mode, bool fuse_attention_input_norm,
-                           std::optional<TensorBinding> residual_block, bool commit_state_in_ffn)
+                           bool commit_state_in_ffn)
     : impl_(nullptr) {
   validate_layer_weights(weights, config, layer, true);
-  if (residual_block &&
-      (!compiled_feed_forward || compiled_feed_forward_batch_tokens(*compiled_feed_forward) == 1)) {
-    throw std::invalid_argument("shared residual block requires a batched compiled FFN");
-  }
   if (commit_state_in_ffn && (!deferred_delta_commit || !compiled_feed_forward ||
                               compiled_feed_forward_batch_tokens(*compiled_feed_forward) == 1)) {
     throw std::invalid_argument("FFN state commit requires deferred batched execution");
   }
   impl_ = std::make_unique<Impl>(context, weights, config, layer, input, bank, backend, compiled,
                                  compiled_feed_forward, deferred_delta_commit, kv_write_mode,
-                                 fuse_attention_input_norm, residual_block, commit_state_in_ffn);
+                                 fuse_attention_input_norm, commit_state_in_ffn);
 }
 
 DecoderLayer::~DecoderLayer() = default;
@@ -263,17 +246,15 @@ void DecoderLayer::step() {
   state.failed = true;
   state.run_mixer();
   if (state.batch_tokens > 1) {
-    if (!state.shared_residual) {
-      std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
-      read_tensor_region_into(state.feed_forward.graph, state.residual_row, {0, 0},
-                              {state.config.hidden, 1}, state.row_bytes);
-      std::copy(state.row_bytes.begin(), state.row_bytes.end(), state.residual_bytes.begin());
-    }
+    std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
+    read_tensor_region_into(state.feed_forward.graph, state.residual_row, {0, 0},
+                            {state.config.hidden, 1}, state.row_bytes);
+    std::copy(state.row_bytes.begin(), state.row_bytes.end(), state.residual_bytes.begin());
     std::fill(state.mixer_bytes.begin(), state.mixer_bytes.end(), 0);
     read_tensor_region_into(state.feed_forward.graph, state.mixer_row, {0, 0},
                             {state.config.hidden, 1}, state.row_bytes);
     std::copy(state.row_bytes.begin(), state.row_bytes.end(), state.mixer_bytes.begin());
-    state.run_batch_ffn(1, true);
+    state.run_batch_ffn(1);
   } else {
     check(sdk_call("vsi_nn_RunGraph",
                    [&] { return vsi_nn_RunGraph(state.feed_forward.graph.get()); }),
@@ -291,7 +272,7 @@ unsigned DecoderLayer::feed_forward_batch_tokens() const {
 }
 
 std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uint8_t> &packed_rows,
-                                                      unsigned count, bool publish_output) {
+                                                      unsigned count) {
   if (!impl_ || impl_->failed) {
     throw std::logic_error("closed or failed decoder layer must be recreated");
   }
@@ -307,10 +288,8 @@ std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uin
   }
   state.require_position();
   state.failed = true;
-  if (!state.shared_residual) {
-    std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
-    std::copy(packed_rows.begin(), packed_rows.end(), state.residual_bytes.begin());
-  }
+  std::fill(state.residual_bytes.begin(), state.residual_bytes.end(), 0);
+  std::copy(packed_rows.begin(), packed_rows.end(), state.residual_bytes.begin());
   std::fill(state.mixer_bytes.begin(), state.mixer_bytes.end(), 0);
   for (unsigned row = 0; row < count; ++row) {
     std::copy_n(packed_rows.begin() + row * row_size, row_size, state.row_bytes.begin());
@@ -329,7 +308,7 @@ std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uin
     }
     ++state.completed;
   }
-  auto output = state.run_batch_ffn(count, publish_output);
+  auto output = state.run_batch_ffn(count);
   state.failed = false;
   return output;
 }
@@ -356,13 +335,6 @@ TensorBinding DecoderLayer::output() {
   }
   if (impl_->batch_tokens > 1) {
     return {impl_->storage, impl_->public_output};
-  }
-  return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
-}
-
-TensorBinding DecoderLayer::batch_output() {
-  if (!impl_ || impl_->failed || impl_->batch_tokens == 1) {
-    throw std::logic_error("full FFN output requires a live batched decoder");
   }
   return {impl_->feed_forward.graph, impl_->feed_forward.outputs.at("output").id};
 }
