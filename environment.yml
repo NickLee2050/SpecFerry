@@ -3,6 +3,7 @@ channels:
   - defaults
 dependencies:
   - python=3.12
+  - ninja
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu

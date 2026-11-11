@@ -1,6 +1,6 @@
 target-version = "py312"
 line-length = 100
-src = ["python", "scripts"]
+src = ["."]
 extend-exclude = ["demo", "build", ".cache"]
 force-exclude = true
 

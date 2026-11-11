@@ -3,34 +3,46 @@
 ## Read the code in this order
 
 ```text
-Python command                     Native command
-scripts/np101_soc.py                native/cli/qwen_generate.cpp
-    │ package / deploy / run           │ parse package and request
-    ▼                                  ▼
-platforms/soc/{deployment,remote}   models/qwen3_5/Model
-    │                                  │ generation and layer ordering
-    ▼                                  ▼
-board_runner.py                    DecoderLayer → DeltaNet / Attention → FFN
-    │ bounded process supervision      │ fixed tensor bindings and state commits
-    └──────────────────────────────────▼
-                                  np101/ops → Graph / Context → vendor SDK
+tools/deploy/execute/np101/soc/cli.py
+    → tools/deploy/pack/np101/                 assemble the deployment
+    → tools/deploy/execute/np101/soc/remote.py transfer and collect
+    → board_runner.py                        bounded child supervision
+        → src/cli/qwen_generate.cpp          parse package and request
+        → src/models/qwen3_5/                order layers and advance state
+        → src/devices/np101/api/             graphs, tensors and vendor SDK
+
+src/inference/ supplies the shared token loop and generation timing.
 ```
 
 | Layer | Owns | Must not own |
 |---|---|---|
-| `native/inference/` | Token loop, EOS/capacity, generation timing and request semantics | Model tensor names, SDK operators |
-| `native/models/opt/`, `native/models/qwen3_5/` | Checkpoint names, layer ordering, model-specific precision/state | SSH, deployment, shell commands |
-| `native/np101/ops/` | Reusable graph construction and explicit tensor contracts | Model selection and conversational task codes |
-| `native/np101/` | SDK lifetime, tensors, shared weights, budgets, package integrity | Request scheduling |
-| `native/platform/{ep,soc}/` | Target SDK/runtime policy | A second implementation of model math |
-| `python/specferry/models/` | Checkpoint/export/reference and model acceptance | Device recovery exceptions |
-| `python/specferry/platforms/soc/` | Bundle construction, SSH and board supervision | Model arithmetic |
-| `python/specferry/validation/` | Common numerical, measurement and recovery contracts | Automatic policy waivers |
+| `src/inference/` | Token loop, EOS/capacity, generation timing and request semantics | Model tensor names, SDK operators |
+| `src/models/` | Checkpoint names, layer ordering, model-specific precision/state | SSH, deployment, shell commands |
+| `src/devices/np101/api/ops/` | Reusable graph construction and explicit tensor contracts | Model selection and conversational task codes |
+| `src/devices/np101/api/` | SDK lifetime, tensors, shared weights, budgets, package integrity | Request scheduling |
+| `src/devices/np101/api/{ep,soc}/` | Target SDK/runtime policy | A second implementation of model math |
+| `tools/deploy/export/`, `tools/deploy/pack/` | Checkpoints, compiled artifacts and deployment packages | Device execution |
+| `tools/deploy/execute/np101/` | Request preparation, SSH, bounded execution and recovery | Model arithmetic |
+| `tools/reference/` | Independent CPU reference | Device recovery exceptions |
+| `tools/validate/`, `tools/benchmark/` | Numerical acceptance and measurement | Automatic policy waivers |
 
-CMake selects a single platform implementation. `cmake/native-targets.cmake` lists shared targets
-and dependencies; `tests/native/CMakeLists.txt` separates CPU regressions from explicit device
+This is a directory migration, not a new device-independent model implementation. Model classes
+still call the NP101 graph builders, and API runtime profiles still contain accepted execution
+policies. Separating these responsibilities is a later change. No IR implementation or empty
+placeholder directory is provided.
+
+Run tool files with the SpecFerry Python interpreter from the repository root, or use their
+`python -m tools...` module entry. Commands retain their arguments; only their paths changed.
+There are no duplicate `scripts/` entry points or compatibility imports for the old Python package.
+Recovery markers and deployed `native/` output directories retain their existing names and semantics.
+
+CMake selects a single platform implementation. `cmake/targets.cmake` lists shared targets
+and dependencies; `tests/CMakeLists.txt` separates CPU regressions from explicit device
 checks. `cmake/toolchains/` only selects the cross compiler and sysroot. Keep platform differences
 at these boundaries rather than inserting preprocessor branches into model execution.
+The documented generator is Ninja. Keep `build/ep` and `build/soc` separate, and use a clean
+build directory when changing generators. ccache remains an optional compiler launcher;
+changing the build executor does not change the compiler, SDK or runtime graph verification.
 
 ## Model construction and execution
 

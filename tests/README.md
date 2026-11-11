@@ -3,13 +3,19 @@
 Start with the [build instructions](../README.md) and [architecture](../docs/development.md).
 Accepted hardware scopes and measurements live in [status](../docs/np101-status.md), not this guide.
 
+## Layout
+
+`unit/` contains local contracts; `integration/` covers command and mocked deployment flows.
+`device/np101/` contains explicit board checks, `support/` holds test-only helpers and
+`fixtures/` contains small inputs. Tests are grouped by scope and responsibility, not language.
+
 ## CPU checks
 
 ```sh
 python -m unittest discover -s tests -t .
 ctest --test-dir build/ep -L cpu --output-on-failure
-python scripts/format_python.py --check
-python scripts/format_cpp.py --check
+python tools/format/python.py --check
+python tools/format/cpp.py --check
 ```
 
 Python tests cover package/source/port integrity, generation policy and token counts, numerical
@@ -22,8 +28,8 @@ Cross-builds produce CPU test binaries but do not register them for execution on
 Device checks are excluded from the default build and never registered with CTest:
 
 ```sh
-cmake -S . -B build/ep -DSPECFERRY_TARGET=ep -DSPECFERRY_BUILD_DEVICE_TESTS=ON
-cmake --build build/ep --parallel 4
+cmake -G Ninja -S . -B build/ep -DSPECFERRY_TARGET=ep -DSPECFERRY_BUILD_DEVICE_TESTS=ON
+cmake --build build/ep
 ```
 
 Use the same option with an existing SoC cross-build if a specific device control is required.
@@ -33,13 +39,13 @@ Do not run a historical diagnostic merely because its executable is available.
 
 | Command | Maintained purpose |
 |---|---|
-| `scripts/generate_opt.py` | Complete OPT inference, component baseline or graph backend, request/lifecycle acceptance |
-| `scripts/generate_qwen.py` | Complete Qwen request preparation/CPU reference and local EP inference |
-| `scripts/np101_soc.py` | Offline prepare, deploy, bounded remote run and evidence collection |
-| `scripts/check_np101_compiled.py --plan PLAN --case CASE` | Source-bound compiled model acceptance |
-| `scripts/check_np101_model.py` | OPT decoder, selection and IO contract checks |
-| `scripts/check_np101.py` | Lookup, projections, sampling, KV append and FP16 preservation contracts |
-| `scripts/benchmark_opt_conversation.py` | Existing OPT reuse/reset conversation comparison, separate processes |
+| `tools/deploy/execute/np101/ep/opt.py` | Complete OPT inference, component baseline or graph backend, request/lifecycle acceptance |
+| `tools/deploy/execute/np101/ep/qwen.py` | Complete Qwen request preparation/CPU reference and local EP inference |
+| `tools/deploy/execute/np101/soc/cli.py` | Offline prepare, deploy, bounded remote run and evidence collection |
+| `tools/validate/np101/compiled.py --plan PLAN --case CASE` | Source-bound compiled model acceptance |
+| `tools/validate/np101/model.py` | OPT decoder, selection and IO contract checks |
+| `tools/validate/np101/operators.py` | Lookup, projections, sampling, KV append and FP16 preservation contracts |
+| `tools/benchmark/opt_conversation.py` | Existing OPT reuse/reset conversation comparison, separate processes |
 
 Use `--help` for supported inputs and `--prepare-only` where available. Diagnostics are not supported
 model configurations. Raw native checks require frozen fixtures and agreed recovery controls.
@@ -71,12 +77,12 @@ compiler ONNX, generated C and logs remain outside the runtime package.
 
 | Script | Output |
 |---|---|
-| `export_opt.py` | OPT packed weights and native index |
-| `export_np101_dlm.py` | Cached Qwen text weights, native index and capacity estimate |
-| `export_np101_opt_ffn.py` | Fused M1 FFN/final-normalization graphs and optional head/projections |
-| `export_np101_opt_projections.py` | QKV/output/head graphs with explicit public port permutations |
-| `export_np101_opt_model.py` | Decoder/full-model NBGs, fixed capacity and KV precision/update contracts |
-| `export_np101_qwen_blocks.py` | DeltaNet or FFN blocks and combined source-bound packages |
+| `tools/deploy/export/opt/cli.py` | OPT packed weights and native index |
+| `tools/deploy/export/qwen3_5/cli.py` | Cached Qwen text weights, native index and capacity estimate |
+| `tools/deploy/export/opt/ffn.py` | Fused M1 FFN/final-normalization graphs and optional head/projections |
+| `tools/deploy/export/opt/projections.py` | QKV/output/head graphs with explicit public port permutations |
+| `tools/deploy/export/opt/model.py` | Decoder/full-model NBGs, fixed capacity and KV precision/update contracts |
+| `tools/deploy/export/qwen3_5/blocks.py` | DeltaNet or FFN blocks and combined source-bound packages |
 
 For Qwen, export normalized DeltaNet mixers with `--outer-product multiply --fuse-input-norm`;
 `--joint-state-reads` selects the accepted combined FP32 state-read formulation. Export all FFNs

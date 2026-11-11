@@ -16,19 +16,19 @@ project(SpecFerry LANGUAGES CXX)
 # Export compiler flags and include paths for clangd.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(cmake/platforms/${SPECFERRY_TARGET}.cmake)
+include(cmake/devices/np101/${SPECFERRY_TARGET}.cmake)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-include(cmake/np101-sdk.cmake)
+include(cmake/devices/np101/api.cmake)
 message(STATUS "SpecFerry target: ${SPECFERRY_TARGET} (${CMAKE_SYSTEM_PROCESSOR})")
 message(STATUS "Platform implementation: ${SPECFERRY_PLATFORM_SOURCE}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "SDK headers: ${LJMICRO_SDK_INCLUDE_DIR}")
 message(STATUS "SDK libraries: ${LJMICRO_SDK_LIBRARY_DIR}")
 
-include(cmake/native-targets.cmake)
+include(cmake/targets.cmake)
 
 include(CTest)
 if(BUILD_TESTING)
-  add_subdirectory(tests/native)
+  add_subdirectory(tests)
 endif()

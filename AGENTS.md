@@ -2,9 +2,10 @@
 
 ## Implementation
 
+- Use Ninja's default build parallelism. Do not pass `--parallel`/`-j` or set a parallelism override by default; apply an explicit limit only for a concrete resource constraint.
 - Use descriptive names, focused functions, explicit ownership/errors and comments for non-obvious decisions. Separate logical blocks; never trade readability for fewer lines.
 - Reuse validated code, references and tools. Add or repeat checks only for an observed failure, decision-relevant uncertainty or required acceptance gate; avoid broad matrices and intermediate probes without a concrete gap.
-- C++: repository LLVM clang-format, 100 columns, braces on all control statements. Python: Conda `SpecFerry` (3.12), Ruff at 100 columns; run `scripts/format_python.py` for safe fixes/imports and `--check` before delivery. Declare dependencies in `environment.yml` and requirements files; no venvs.
+- C++: repository LLVM clang-format, 100 columns, braces on all control statements. Python: Conda `SpecFerry` (3.12), Ruff at 100 columns; run `tools/format/python.py` for safe fixes/imports and `--check` before delivery. Declare dependencies in `environment.yml` and requirements files; no venvs.
 - Headers own declaration/definition dependencies. `.cpp` includes its matching header and implementation dependencies, without repeating that header's direct includes. SDK callers include SDK headers unless their matching header does. Remove unused includes; sort quoted project/SDK/third-party/platform headers case-sensitively before a separate standard-header group, without prioritizing the matching header.
 
 ## Measurement
