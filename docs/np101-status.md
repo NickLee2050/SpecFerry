@@ -58,6 +58,13 @@ Evidence: `native-supervisor-20261111/acceptance.json`; prior comparison and run
 `runtime-contracts-20261111/acceptance.json`. Offline evidence lives under
 `.cache/maintenance/native-supervisor-20261111/` and `runtime-extraction-20261111/`.
 
+The subsequent PR review fixed rejection of an overflowing final prompt token and propagation of
+buffered binary-output close failures. Valid model requests, operators and tensor/state layouts are
+unchanged; hardware measurements above are reused, not rerun for these error-path fixes. Clean
+tracked-source EP/SoC builds, 154 Python tests, five native CPU tests and 18 command help entries
+passed; evidence is in `.cache/maintenance/pr-readiness-20261111/`. The checks use the installed
+Conda environment and explicitly supplied SDK/toolchain, not a newly provisioned machine.
+
 The earlier directory migration passed 142 Python tests, four C++ CPU tests, 18 tool entries and
 both builds including explicit device-check binaries. The subsequent clean Ninja rebuild retained
 compiler/SDK/flags and produced byte-identical tested SoC binaries; see

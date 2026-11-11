@@ -108,6 +108,15 @@ void binary_output() {
   std::ifstream input(directory.path / "state.bin", std::ios::binary);
   const std::vector<std::uint8_t> read((std::istreambuf_iterator<char>(input)), {});
   require(read == bytes);
+
+  // A small buffered write can succeed even when flushing/closing the file fails.
+  bool failed = false;
+  try {
+    specferry::io::write_bytes("/dev/full", bytes, "cannot save state");
+  } catch (const std::runtime_error &) {
+    failed = true;
+  }
+  require(failed);
 }
 } // namespace
 

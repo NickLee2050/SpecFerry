@@ -63,7 +63,8 @@ void report_contracts() {
   require(!generation_metrics(result).output_tokens_per_second);
   std::istringstream valid("2 7 1");
   require(read_prompt(valid, 8, 3) == std::vector<std::int32_t>({2, 7, 1}));
-  for (const auto *text : {"", "-1", "8", "2 3 4 5", "2 word"}) {
+  for (const auto *text :
+       {"", "-1", "8", "2 3 4 5", "2 word", "2 2147483648", "2 -2147483649", "2 +", "2 -"}) {
     std::istringstream invalid_prompt(text);
     rejects([&] { read_prompt(invalid_prompt, 8, 3); });
   }

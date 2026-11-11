@@ -141,8 +141,8 @@ in English; preserve vendor originals and immutable historical evidence in their
 | Credentials and local assistant/proxy state | Keep out of main; use precise ignores rather than ignoring all dotfiles. |
 
 `.cache`, `.ruff_cache`, `build` and `demo` are ignored; exact ignores were added for `.agents`,
-`.codex` and `.aws`. The unused `tests/repro` directory was removed. The three protected empty
-hidden directories were not forcibly deleted. Shared `.vscode` files remain tracked. Adding an
+`.codex`. The unused `tests/repro` directory was removed. The user removed the empty `.aws`
+directory; no ignore rule remains for it. Shared `.vscode` files remain tracked. Adding an
 ignore does not untrack files or remove secrets from history. No license or secrets audit is claimed;
 review personal paths, network details and vendor redistribution rights before external publication.
 

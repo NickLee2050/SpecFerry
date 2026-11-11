@@ -25,6 +25,13 @@ representation (IR) support starts independently, without a speculative common p
 | 3. Shared inference runtime | ✅ Scoped SoC acceptance | Shared scheduling/reporting and model execution sessions; graph construction separated from state/runtime. OPT 17→16 and Qwen 96→16 passed with unchanged token/state outputs and NPU pool peaks. |
 | 4. Independent supervisor | ✅ Scoped SoC acceptance | Native process groups/readiness/deadlines/termination and verified companion deployment; 54 Python tests, five C++ tests and both builds pass. OPT/Qwen tokens/state and pool peaks match the prior run. Deployment, health sampling and recovery policy remain Python. |
 
+PR review: tracked-source-only EP/SoC builds (including explicit device-check binaries), 154 Python
+tests, five C++ CPU tests and 18 command help entries passed. Fixed malformed final-token parsing
+and buffered output-close error reporting; no model/operator changes or new hardware runs.
+Before public release, the owner must choose a repository license and confirm third-party material
+redistribution rights. EP hardware regression remains deferred as above. Do not treat a targeted
+credential scan as a complete security or licensing audit.
+
 ## Recommended execution order
 
 | Order | Work | Acceptance and boundary |

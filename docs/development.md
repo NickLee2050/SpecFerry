@@ -182,5 +182,6 @@ experimental packages need their original binaries/runners, not compatibility br
 4. Keep temporary probes in ignored storage. Merge a candidate only after a useful whole-model result;
    leave stable conclusions in status and pending work in TODO. Device incidents go in their ledger.
 
-The repository does not ship model weights or vendor libraries. A source-only checkout can run CPU
-contract tests after installing Python dependencies; native builds also require a compatible SDK.
+The repository does not ship model weights or vendor libraries. Native builds require a compatible
+SDK. Before running the complete Python suite, build EP as described in the test guide: supervision
+integration tests execute its native guard with fake children. CPU checks require no board access.

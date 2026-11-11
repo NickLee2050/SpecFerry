@@ -10,9 +10,21 @@ namespace specferry::inference {
 std::vector<std::int32_t> read_prompt(std::istream &input, unsigned vocabulary, unsigned capacity) {
   std::vector<std::int32_t> tokens;
   std::int32_t token;
-  while (input >> token) {
+  while (true) {
+    input >> std::ws;
+    if (input.eof()) {
+      break;
+    }
+    // Numeric overflow at EOF sets both failbit and eofbit. Check extraction itself
+    // so a malformed final token cannot silently become a shorter valid prompt.
+    if (!(input >> token)) {
+      throw std::invalid_argument("invalid prompt token");
+    }
     if (token < 0 || unsigned(token) >= vocabulary) {
       throw std::invalid_argument("prompt token exceeds vocabulary");
+    }
+    if (tokens.size() == capacity) {
+      throw std::invalid_argument("prompt exceeds capacity");
     }
     tokens.push_back(token);
   }

@@ -33,6 +33,8 @@ conda activate SpecFerry
 
 Only OPT is enabled in the download script. Qwen commands require an existing checkpoint.
 Generated packages and measurements belong under ignored `.cache/`, not in the source tree.
+Offline NBG compilation additionally requires `bwrap` (Bubblewrap), enabled unprivileged user
+namespaces and the vendor compiler rootfs. It does not expose the board device to the compiler.
 
 ## Build
 
@@ -110,7 +112,10 @@ python tools/deploy/execute/np101/soc/cli.py run .cache/deploy/qwen --host np101
   --output .cache/runs/qwen-dinner --prepare-timeout 240 --timeout 300
 ```
 
-`np101` is an SSH alias configured by the operator. Read the
+`np101` is an SSH alias configured by the operator. The current SoC runner requires a root account
+on the board: it uses `/root/specferry-soc`, `/dev/kmsg` and the driver's debugfs memory counters.
+The host account also needs permission to run noninteractive, read-only `sudo -n journalctl`
+for kernel checks; the runner does not grant permissions or configure sudo. Read the
 [recovery ledger](np101-recovery-incidents.md) and ensure the board's loaded driver, memory layout
 and SDK match the bundle before running. The board still requires Python 3.9 standard-library
 support for deployment and recovery policy; deadlines and child-process control run in C++. Commands do not

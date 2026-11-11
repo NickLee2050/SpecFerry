@@ -8,6 +8,7 @@ void write_bytes(const std::filesystem::path &path, const std::vector<std::uint8
                  const char *error) {
   std::ofstream output(path, std::ios::binary);
   output.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+  output.close();
   if (!output) {
     throw std::runtime_error(error);
   }
