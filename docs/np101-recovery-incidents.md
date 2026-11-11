@@ -1,6 +1,6 @@
 # NP101 recovery gates and incident ledger
 
-Updated: 2026-11-11 (documentation only; no device check performed).
+Updated: 2026-11-11. Latest scoped checks: native-supervisor OPT/Qwen regressions.
 Read this page before every board run. See [status](np101-status.md) for accepted workload scopes
 and [SDK findings](np101-sdk-driver-validation-report.md) for interface failures.
 Historical plans, permissions and successful windows do not override current gates or prove that
@@ -79,7 +79,11 @@ power cycle to boot `1e21c890-d53a-49e5-a531-3e28415f0e6c`. On the unchanged 768
 2048 MiB NPU configuration, six-tensor IO and a three-input decoder passed numerics, release,
 complete kernel and 10 s observation; old markers were archived by identity. Evidence:
 `qwen-shared-projection-resume-20261110/recovery/` under `.cache/runs/`.
-The 11-11 OPT/Qwen migration regressions also passed their scoped checks; see status.
+The 11-11 OPT/Qwen migration, C++ runtime extraction and native-supervisor regressions also
+passed their scoped checks on this boot; see status and `native-supervisor-20261111/acceptance.json`.
+The latest run used unchanged model binaries, with bitwise tokens/state, released owners/pools/GFP
+and clean complete kernel/10 s observation. No new fault was recorded; exact historical
+software-failure markers remain retained. This does not validate intentional hardware-fault recovery.
 These are recorded windows, not a live health check or a storage-root-cause fix.
 
 Recent events that affect subsequent work:

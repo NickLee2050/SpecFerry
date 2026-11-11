@@ -31,28 +31,38 @@ board CPU. SDK refers to the vendor software development kit.
 
 ## Current delivery acceptance
 
-After the 11-11 directory migration, both rebuilt programs passed one SoC whole-model regression,
-reusing the original NBGs, requests and CPU references. Numerics, application/pool release, complete
-kernel checks and 10 s observation passed with no new device fault. Historical markers remain retained.
+The 11-11 C++ loading/runtime extraction and subsequent independent native supervision both passed
+one SoC whole-model request per model, reusing the original NBGs, requests and CPU references.
+The supervisor change leaves both model executables byte-identical. Output tokens and collected
+KV/hidden/recurrent snapshots match the previous run bitwise. Resource release, complete kernel
+checks and 10 s observation passed with no new fault; historical markers remain retained.
 
 | Configuration, input→output tokens | Preparation | TTFT | Actual output | Post-first-token decode | Sampled SYSTEM peak |
 |---|---:|---:|---:|---:|---:|
-| Qwen C128, M8 FFN + attention normalization fusion + FFN state commit, 96→16 | 145.756 s | 69.505 s | 0.185759 token/s | 0.902094 token/s | 1604.836 MiB |
-| OPT C256, four uncached convolution layers in M16 prefill, 17→16 | 147.597 s | 1.712 s | 2.956322 token/s | 4.054121 token/s | 1447.515 MiB |
+| Qwen C128, M8 FFN + attention normalization fusion + FFN state commit, 96→16 | 145.665 s | 70.025 s | 0.184338 token/s | 0.894348 token/s | 1604.836 MiB |
+| OPT C256, four uncached convolution layers in M16 prefill, 17→16 | 147.197 s | 1.701 s | 2.964564 token/s | 4.058360 token/s | 1447.515 MiB |
 
-Relative to the same requests on 11-10, actual output changed +0.27%/−0.47%, with identical sampled
-SYSTEM peaks. Minimum available Linux memory was 291.992/446.180 MiB. These are single regression
-samples, not performance improvements. Both target builds, including explicit device-check binaries,
-142 Python tests, four C++ CPU tests, 18 tool entries and formatting passed. Bodies of 83 C++ files
-were unchanged except includes/formatting. NBG inventories and final deployed binaries matched bytewise.
-Evidence: `directory-migration-20261111/acceptance.json`; prior comparison:
-`pr-cleanup-validation-20261110/acceptance.json`.
+Relative to the same requests before the supervisor change, actual output changed −0.56%/+0.06%
+and decode rate changed +0.09%/−0.11%; sampled SYSTEM peaks were identical. Minimum available
+Linux memory was 278.168/446.309 MiB. These are single regression samples, not evidence of a
+speedup or an established memory change. Both target builds, 54 Python compatibility/supervision
+tests, five C++ CPU tests and formatting passed. Native single-request rates agree with independent
+Python aggregation within floating-point rounding. Final SoC model and supervisor binaries match
+the tested deployments bytewise.
 
-EP migration acceptance is compilation-only by user instruction; hardware regression is pending.
-Afterward the entire build tree was cleaned and rebuilt with Ninja, retaining compiler, SDK, flags
-and ccache. Both default builds and four CPU tests passed; SoC binaries matched the already-tested
-files bytewise, so no board run was repeated. See `ninja-switch-20261111/acceptance.json`.
-Cache-hit build times do not establish clean-build speedup.
+The independent C++ guard owns process groups, readiness, fixed deadlines and termination. The
+Python policy adapter still owns deployment/SDK identity, health sampling and recovery/release
+acceptance. Tests cover blocked policy sampling/publication, deadline phases, failed exec, stopped
+children, descendants and lost control channels; no new tracing was inserted into model execution.
+Evidence: `native-supervisor-20261111/acceptance.json`; prior comparison and runtime extraction:
+`runtime-contracts-20261111/acceptance.json`. Offline evidence lives under
+`.cache/maintenance/native-supervisor-20261111/` and `runtime-extraction-20261111/`.
+
+The earlier directory migration passed 142 Python tests, four C++ CPU tests, 18 tool entries and
+both builds including explicit device-check binaries. The subsequent clean Ninja rebuild retained
+compiler/SDK/flags and produced byte-identical tested SoC binaries; see
+`ninja-switch-20261111/acceptance.json`. Cache-hit build times do not establish clean-build speedup.
+EP acceptance remains compilation-only by user instruction; hardware regression is pending.
 
 ## Closed EP exploration
 

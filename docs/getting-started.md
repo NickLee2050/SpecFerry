@@ -72,7 +72,9 @@ cmake --build build/soc
 ```
 
 Both builds produce `specferry_opt_generate`, `specferry_opt_graph_generate` and
-`specferry_qwen_generate` under `build/<target>/bin`. CPU tests are enabled by `BUILD_TESTING`;
+`specferry_qwen_generate`, plus the independent `specferry_supervise` companion, under
+`build/<target>/bin`. Keep the supervisor beside the model executable when packaging for SoC.
+CPU tests are enabled by `BUILD_TESTING`;
 device checks additionally require `SPECFERRY_BUILD_DEVICE_TESTS=ON` and never run through CTest.
 If ccache is installed, add `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache` to either configure command.
 Leave build parallelism to Ninja by default; do not add `--parallel` or `-j` unless an explicit
@@ -110,13 +112,55 @@ python tools/deploy/execute/np101/soc/cli.py run .cache/deploy/qwen --host np101
 
 `np101` is an SSH alias configured by the operator. Read the
 [recovery ledger](np101-recovery-incidents.md) and ensure the board's loaded driver, memory layout
-and SDK match the bundle before running. Commands do not
+and SDK match the bundle before running. The board still requires Python 3.9 standard-library
+support for deployment and recovery policy; deadlines and child-process control run in C++. Commands do not
 load/reset drivers or change board networking. Preparation and deployment do not open the NPU.
 If SSH disconnects, collect the **same run** instead of starting another inference:
 
 ```sh
 python tools/deploy/execute/np101/soc/cli.py collect .cache/deploy/qwen --output .cache/runs/qwen-dinner
 ```
+
+### Save preparation inputs as JSON
+
+To avoid repeating paths and Qwen options, `prepare` accepts an optional JSON file. It uses the
+existing `model_family` and `request_options` vocabulary; it is an input recipe, not a replacement
+for the generated, integrity-checked `bundle.json`. For example, save this as `prepare.json`:
+
+```json
+{
+  "schema_version": 1,
+  "model_family": "qwen3_5",
+  "deployment": "qwen-weights",
+  "package": "qwen-m8-package",
+  "request": "qwen-request",
+  "sdk": "board-sdk",
+  "request_options": {
+    "projections": "shared-fcl",
+    "kv_write_mode": "mapped",
+    "ffn_batch_tokens": 8,
+    "decoder_layout": "fused-attention-norm",
+    "state_commit": "ffn"
+  }
+}
+```
+
+```sh
+python tools/deploy/execute/np101/soc/cli.py prepare \
+  --config prepare.json --output .cache/deploy/qwen
+```
+
+Replace the paths with existing validated inputs. JSON paths are relative to the JSON file;
+explicit CLI paths remain relative to the working directory. CLI values override file values;
+omitted values keep the existing defaults. Both the file and resolved combination must be valid.
+Unknown/duplicate keys, invalid types, unsupported combinations and a conflicting `--model` fail
+before packaging. Keep `--output` explicit so each deployment uses a new directory.
+
+OPT accepts `model_family: "opt"` with the same paths and optional `prefill_package`; its execution
+options remain owned by the existing validated request, so `request_options` must be absent or empty.
+`binary` is optional for both models. Config files cannot override SDK hashes, artifact dimensions,
+driver parameters, deadlines or recovery gates. Existing commands and generated native request
+formats are unchanged; no YAML dependency or native JSON parser was added.
 
 SoC Qwen supports C64/C128; C512 has also passed bounded requests with the M8 FFN combination.
 With a complete M8 or M16 FFN package and a C128/C512 request, preparation

@@ -9,6 +9,7 @@ from tools.deploy.execute.np101.soc.board_runner import bundle_file, read_json, 
 from tools.deploy.export.checkpoint import sha256
 from tools.deploy.export.qwen3_5.components import Components
 from tools.deploy.export.qwen3_5.export import verify_export
+from tools.deploy.pack.np101.config import DECODER_LAYOUTS, QwenExecutionOptions
 from tools.deploy.pack.np101.soc import finish_bundle, sdk_identity, stage_runtime
 from tools.deploy.pack.qwen3_5.compiled import (
     DRIVER,
@@ -16,8 +17,6 @@ from tools.deploy.pack.qwen3_5.compiled import (
     native_manifest,
     validate_feed_forward_ports,
 )
-
-DECODER_LAYOUTS = ("separate", "fused-attention-norm")
 
 
 def validate_package(package, deployment, *, ffn_batch_tokens=1):
@@ -260,35 +259,25 @@ def prepare_bundle(
     sdk,
     output,
     *,
-    projections="shared-fcl",
-    kv_write_mode="copy-graph",
-    ffn_batch_tokens=1,
-    decoder_layout="separate",
-    state_commit="combined",
+    projections=QwenExecutionOptions.projections,
+    kv_write_mode=QwenExecutionOptions.kv_write_mode,
+    ffn_batch_tokens=QwenExecutionOptions.ffn_batch_tokens,
+    decoder_layout=QwenExecutionOptions.decoder_layout,
+    state_commit=QwenExecutionOptions.state_commit,
 ):
     binary, deployment, package, request, sdk, output = map(
         lambda p: Path(p).resolve(), (binary, deployment, package, request, sdk, output)
     )
     if output.exists():
         raise ValueError("use a new bundle directory")
-    if projections not in ("shared-fcl", "matmul"):
-        raise ValueError("unsupported Qwen projection backend")
-    if state_commit not in ("combined", "ffn"):
-        raise ValueError("unsupported Qwen state commit policy")
-    if state_commit == "ffn" and ffn_batch_tokens == 1:
-        raise ValueError("FFN state commit requires batched FFN")
-    if kv_write_mode not in ("copy-graph", "mapped"):
-        raise ValueError("unsupported Qwen KV write mode")
-    if kv_write_mode == "mapped" and projections != "shared-fcl":
-        raise ValueError("mapped Qwen KV requires shared FCL projections")
-    if type(ffn_batch_tokens) is not int or ffn_batch_tokens not in (1, 8, 16):
-        raise ValueError("unsupported Qwen FFN batch width")
-    if decoder_layout not in DECODER_LAYOUTS:
-        raise ValueError("unsupported Qwen decoder layout")
-    if decoder_layout != "separate" and ffn_batch_tokens == 1:
-        raise ValueError("optimized Qwen decoder layout requires batched FFN")
-    if ffn_batch_tokens > 1 and (projections != "shared-fcl" or kv_write_mode != "mapped"):
-        raise ValueError("batched Qwen FFN requires mapped shared FCL projections")
+    execution_options = QwenExecutionOptions(
+        projections=projections,
+        kv_write_mode=kv_write_mode,
+        ffn_batch_tokens=ffn_batch_tokens,
+        decoder_layout=decoder_layout,
+        state_commit=state_commit,
+    )
+    execution_options.validate()
     hashes = sdk_identity(sdk)
     manifest, weights = validate_package(package, deployment, ffn_batch_tokens=ffn_batch_tokens)
     options = validate_request(request, weights, manifest["deployment_sha256"])
@@ -296,11 +285,7 @@ def prepare_bundle(
         raise ValueError("batched Qwen FFN requires C128 or C512")
     options.update(
         head_backend="shared-fcl-split",
-        state_commit=state_commit,
-        projections=projections,
-        kv_write_mode=kv_write_mode,
-        ffn_batch_tokens=ffn_batch_tokens,
-        decoder_layout=decoder_layout,
+        **execution_options.as_mapping(),
         matmul_feed_forward_layer=9 if ffn_batch_tokens == 1 else -1,
     )
     source_sdk = manifest["sdk"]
@@ -347,11 +332,7 @@ def prepare_bundle(
         metadata = read_json(request_dir / "request.json")
         metadata.update(
             head_backend=options["head_backend"],
-            state_commit=state_commit,
-            projections=projections,
-            kv_write_mode=kv_write_mode,
-            ffn_batch_tokens=ffn_batch_tokens,
-            decoder_layout=decoder_layout,
+            **execution_options.as_mapping(),
         )
         save(request_dir / "request.json", metadata)
         result = finish_bundle(

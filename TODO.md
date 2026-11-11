@@ -9,19 +9,21 @@ dependencies and acceptance boundaries. Task IDs are planning references, not co
 
 ## Code organization
 
-The [runtime plan](docs/inference-runtime-plan.md) defines the remaining C++ configuration,
-loading, inference and supervision work. Directory migration is complete; responsibility
-refactoring is not. EP and SoC remain under `src/devices/np101/api/`; future vendor intermediate
+The [runtime plan](docs/inference-runtime-plan.md) records the C++ configuration,
+loading, inference and supervision work. Directory migration and C++ loading/runtime extraction
+are accepted for the scoped SoC regressions. Native process supervision is accepted for the same requests; the Python
+adapter retains deployment and recovery policy. EP and SoC remain under
+`src/devices/np101/api/`; future vendor intermediate
 representation (IR) support starts independently, without a speculative common platform layer.
 
 | Order | Status | Deliverable and acceptance |
 |---|---|---|
 | Directory migration | ✅ | Sources, tools, tests, imports, build and documentation paths migrated. Both targets compile; 142 Python tests, four C++ CPU tests, 18 command entries and one SoC full-model request per model passed. |
 | EP hardware regression | ⏸ | The user accepted compilation-only for the 2026-11-11 migration. Reuse accepted OPT/Qwen requests when hardware becomes available; do not reopen performance exploration. |
-| 1. Configuration and contracts | 🔜 | Named configurations, constants with clear ownership, package formats and shared IO; preserve rejection of unsupported combinations. |
-| 2. C++ loading and thin entry points | 🧩 | Move execution-side parsing and result logic into C++; preserve command behavior. |
-| 3. Shared inference runtime | 🧩 | Separate model semantics, orchestration and device execution; reuse one OPT and one Qwen whole-model regression at each meaningful batch boundary. |
-| 4. Independent supervisor | 🧩 | Preserve process isolation and recovery gates; test fake children before minimal hardware acceptance. |
+| 1. Configuration and contracts | ✅ Offline scope | OPT named execution/artifact objects, shared Qwen preparation validation, optional JSON inputs and documented ownership/default/override rules. Native formats, artifact checks and execution policy unchanged; standalone IO extraction stays with loader/supervisor work. |
+| 2. C++ loading and thin entry points | ✅ | Shared native request/report modules and typed model request loaders; thin commands retain existing arguments. Five CPU tests, 48 Python tests and both builds pass. |
+| 3. Shared inference runtime | ✅ Scoped SoC acceptance | Shared scheduling/reporting and model execution sessions; graph construction separated from state/runtime. OPT 17→16 and Qwen 96→16 passed with unchanged token/state outputs and NPU pool peaks. |
+| 4. Independent supervisor | ✅ Scoped SoC acceptance | Native process groups/readiness/deadlines/termination and verified companion deployment; 54 Python tests, five C++ tests and both builds pass. OPT/Qwen tokens/state and pool peaks match the prior run. Deployment, health sampling and recovery policy remain Python. |
 
 ## Recommended execution order
 

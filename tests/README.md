@@ -11,7 +11,10 @@ The build guide also defines graph, cache and batch terminology. Accepted hardwa
 
 ## CPU checks
 
+Build the EP targets first, including the SDK-independent native process guard:
+
 ```sh
+cmake --build build/ep
 python -m unittest discover -s tests -t .
 ctest --test-dir build/ep -L cpu --output-on-failure
 python tools/format/python.py --check
@@ -19,8 +22,11 @@ python tools/format/cpp.py --check
 ```
 
 Python tests cover package/source/port integrity, generation policy and token counts, numerical
-acceptance, memory budgets and mocked supervision/recovery. The four native CTest cases cover
-data contracts, generation, public SDK timing and memory budgets; they never open NP101.
+acceptance, memory budgets and recovery policy. Supervision tests run the built
+`build/ep/bin/specferry_supervise` against fake children: blocked sampling/publication, independent
+deadlines, invalid/repeated readiness, exec failure, stopped children, descendants and owner-channel
+closure. They do not access the board. The five native CTest cases cover data/request contracts,
+generation, public SDK timing and memory budgets; they never open NP101.
 Cross-builds produce CPU test binaries but do not register them for execution on the host.
 
 ## Explicit device checks

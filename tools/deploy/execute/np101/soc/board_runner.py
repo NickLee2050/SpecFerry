@@ -1,4 +1,4 @@
-"""Standalone Python 3.9 supervisor deployed to NP101; no SDK imports or dependencies."""
+"""Standalone deployment/health policy adapter for the independent C++ process supervisor."""
 
 import fcntl
 import hashlib
@@ -9,11 +9,12 @@ import signal
 import struct
 import subprocess
 import sys
-import threading
 import time
 from collections import Counter
 from concurrent import futures
 from pathlib import Path
+
+SUPERVISOR_BINARY = Path(__file__).resolve().parent / "bin/specferry_supervise"
 
 STATE = Path("/root/specferry-soc")
 SDK = Path("/np101_driver/build/sdk/drivers")
@@ -124,14 +125,21 @@ def verify_bundle(root, check_sdk=True, *, verify_payload=True):
     with futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as workers:
         for _ in workers.map(verify_file, checks):
             pass
-    executable = Path(native_command(root, manifest, root)[0])
-    name = executable.relative_to(root).as_posix()
-    if manifest["files"].get(name, {}).get("executable") is not True:
-        raise ValueError("SoC executable must be included in the verified file inventory")
-    with executable.open("rb") as binary:
-        header = binary.read(20)
-    if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 243:
-        raise ValueError("SoC executable must be ELF64 little-endian RISC-V")
+    executables = [Path(native_command(root, manifest, root)[0])]
+    implementation = manifest.get("supervisor_implementation")
+    if implementation is not None:
+        if implementation != "cpp-process-v1":
+            raise ValueError("unsupported SoC supervisor implementation")
+        executables.append(root / "bin/specferry_supervise")
+    for executable in executables:
+        name = executable.relative_to(root).as_posix()
+        if manifest["files"].get(name, {}).get("executable") is not True:
+            raise ValueError("SoC executable must be included in the verified file inventory")
+        with executable.open("rb") as binary:
+            header = binary.read(20)
+        if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != 243:
+            raise ValueError("SoC executable must be ELF64 little-endian RISC-V")
+
     return manifest
 
 
@@ -222,34 +230,6 @@ def new_faults(log, pattern, acknowledged=()):
     return faults
 
 
-def terminate(child, actions):
-    # Signal the whole group even if its leader has already exited.
-    for request in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(child.pid, request)
-            if request == signal.SIGTERM:
-                os.killpg(child.pid, signal.SIGCONT)
-            actions.append({"signal": request.name, "monotonic_seconds": time.monotonic()})
-        except ProcessLookupError:
-            break
-        try:
-            child.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            pass
-
-
-def group_members(group):
-    members = []
-    for process in Path("/proc").glob("[0-9]*"):
-        try:
-            fields = (process / "stat").read_text().rpartition(")")[2].split()
-            if int(fields[2]) == group and fields[0] != "Z":
-                members.append(int(process.name))
-        except FileNotFoundError:
-            pass
-    return members
-
-
 def inference_timeout_limit(manifest):
     # Qwen's first SoC acceptance has an explicitly authorized ten-minute budget.
     return 600 if manifest.get("model_family", "opt") == "qwen3_5" else 300
@@ -274,124 +254,88 @@ def supervise(
         raise ValueError(f"execution deadline must be in (0, {execution_limit}] seconds")
     if preparation_timeout is not None and not 0 < preparation_timeout <= 240:
         raise ValueError("preparation deadline must be in (0, 240] seconds")
+    # The native process owns fork/exec, process groups, the private ready pipe and deadlines.
+    # Python owns deployment/recovery policy; blocking this callback cannot delay termination.
     started = time.monotonic()
-    result = {
-        "child_start_monotonic_seconds": started,
-        "child_start_wall_seconds": time.time(),
-        "child_started": False,
-        "remaining_processes": [],
-        "actions": [],
-        "stop_reason": None,
-    }
-    phased = preparation_timeout is not None
-    if phased:
-        result.update(
-            preparation_limit_seconds=preparation_timeout, inference_limit_seconds=timeout
-        )
-    child = watchdog = None
-    stopped = threading.Event()
-    read_fd = write_fd = None
-    ready_bytes = b""
-    deadline = started + (preparation_timeout if phased else timeout)
-    phase = "preparation" if phased else "child"
-
-    def observe_readiness():
-        nonlocal ready_bytes, deadline, phase
-        if not phased or phase != "preparation":
-            return
-        try:
-            ready_bytes += os.read(read_fd, 128)
-        except BlockingIOError:
-            return
-        if len(ready_bytes) > 64:
-            raise ValueError("invalid model readiness notification")
-        if b"\n" not in ready_bytes:
-            return
-        ready = float(ready_bytes.decode("ascii").strip())
-        if not started <= ready <= min(time.monotonic(), started + preparation_timeout):
-            raise ValueError("model readiness outside preparation budget")
-        result.update(ready_monotonic_seconds=ready, preparation_seconds=ready - started)
-        deadline = ready + timeout
-        phase = "inference"
-
-    def watch_deadline():
-        # The private nonblocking pipe avoids SDK/debugfs and SD reads. Sampling
-        # may block without delaying readiness detection or deadline enforcement.
-        while not stopped.is_set() and child.poll() is None:
-            try:
-                observe_readiness()
-                reason = phase + " deadline expired" if time.monotonic() >= deadline else None
-            except (ValueError, UnicodeError, OSError) as error:
-                reason = "invalid model readiness notification: " + str(error)
-            if reason:
-                result["stop_reason"] = reason
-                expired_at = time.monotonic()
-                terminate(child, result["actions"])
-                save(
-                    output / "watchdog.json",
-                    {"expired_at": expired_at, "child_pid": child.pid, "phase": phase},
-                )
-                return
-            stopped.wait(0.02)
-
+    result = dict(
+        child_start_monotonic_seconds=started,
+        child_start_wall_seconds=time.time(),
+        child_started=False,
+        remaining_processes=[],
+        actions=[],
+        stop_reason=None,
+    )
+    supervisor = None
+    initial = b""
     try:
-        environment = dict(environment)
-        if phased:
-            read_fd, write_fd = os.pipe()
-            os.set_blocking(read_fd, False)
-            environment["SPECFERRY_READY_FD"] = str(write_fd)
-        with (output / "native.log").open("w") as log:
-            child = subprocess.Popen(
-                command,
-                cwd=cwd,
+        with (output / "supervisor-native.log").open("wb") as log:
+            supervisor = subprocess.Popen(
+                [
+                    str(SUPERVISOR_BINARY),
+                    str(output),
+                    str(preparation_timeout if preparation_timeout is not None else -1),
+                    str(timeout),
+                    str(execution_limit),
+                    str(cwd),
+                    "--",
+                    *command,
+                ],
                 env=environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                pass_fds=(write_fd,) if phased else (),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=log,
             )
-            if write_fd is not None:
-                os.close(write_fd)
-                write_fd = None
-            result["child_started"] = True
-            result["child_pid"] = child.pid
-            watchdog = threading.Thread(target=watch_deadline, daemon=True)
-            watchdog.start()
-            save(output / "child.json", result)
-            while child.poll() is None:
-                if result["stop_reason"]:
-                    break
+            os.set_blocking(supervisor.stdout.fileno(), False)
+            os.set_blocking(supervisor.stdin.fileno(), False)
+            published = False
+            while supervisor.poll() is None:
+                if not published:
+                    try:
+                        initial += os.read(supervisor.stdout.fileno(), 4096)
+                    except BlockingIOError:
+                        pass
+                    if len(initial) > 4096:
+                        raise RuntimeError("oversized native supervisor startup record")
+                    if b"\n" in initial:
+                        result = json.loads(initial)
+                        save(output / "child-start.json", result)
+                        published = True
                 reason = monitor()
                 if reason:
-                    result["stop_reason"] = reason
+                    try:
+                        os.write(
+                            supervisor.stdin.fileno(),
+                            (str(reason)[:2000].replace("\n", " ") + "\n").encode(),
+                        )
+                    except (BrokenPipeError, BlockingIOError):
+                        pass
                     break
                 time.sleep(0.05)
     finally:
-        stopped.set()
-        if watchdog is not None:
-            watchdog.join()
-        if child is not None:
-            # A successful child can notify and exit before the watcher is scheduled.
-            if phased and phase == "preparation" and not result["stop_reason"]:
-                try:
-                    observe_readiness()
-                except (ValueError, UnicodeError, OSError) as error:
-                    result["stop_reason"] = "invalid model readiness notification: " + str(error)
-            terminate(child, result["actions"])
-            result["exit"] = child.poll()
-            if phased and phase == "preparation" and result["exit"] == 0:
-                result["stop_reason"] = result["stop_reason"] or "model readiness not reported"
-            result["remaining_processes"] = group_members(child.pid)
-        for descriptor in (read_fd, write_fd):
-            if descriptor is not None:
-                os.close(descriptor)
-        result["child_seconds"] = time.monotonic() - started
-        if "ready_monotonic_seconds" in result:
-            result["post_ready_child_seconds"] = max(
-                0, started + result["child_seconds"] - result["ready_monotonic_seconds"]
-            )
-        save(output / "child.json", result)
-    return result
+        if supervisor is not None:
+            # EOF is a fail-closed stop request, including exceptions and interrupted policy IO.
+            try:
+                supervisor.stdin.close()
+            except BrokenPipeError:
+                pass
+            try:
+                supervisor.wait(timeout=12)
+            except subprocess.TimeoutExpired:
+                # SIGTERM asks the native guard to terminate the owned process group. Never
+                # SIGKILL the guard here: an uninterruptible child must remain visible/gated.
+                supervisor.terminate()
+                raise RuntimeError("native supervisor did not finish bounded release")
+            finally:
+                supervisor.stdout.close()
+            if not (output / "child.json").is_file():
+                result["error"] = "native supervisor exited without child evidence"
+                save(output / "child.json", result)
+            final = read_json(output / "child.json")
+            if supervisor.returncode or "exit" not in final:
+                raise RuntimeError("native supervisor failed; retain incomplete execution evidence")
+        else:
+            save(output / "child.json", result)
+    return read_json(output / "child.json")
 
 
 def native_complete(output):

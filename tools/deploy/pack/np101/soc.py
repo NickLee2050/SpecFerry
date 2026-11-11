@@ -38,6 +38,11 @@ def stage_runtime(root, binary, deployment, sdk, executable):
         (root / name).mkdir()
     shutil.copy2(binary, root / "bin" / executable)
     (root / "bin" / executable).chmod(0o755)
+    supervisor = binary.with_name("specferry_supervise")
+    if not supervisor.is_file():
+        raise ValueError("build specferry_supervise beside the model executable before packaging")
+    shutil.copy2(supervisor, root / "bin/specferry_supervise")
+    (root / "bin/specferry_supervise").chmod(0o755)
     shutil.copyfile(board_runner.__file__, root / "board_runner.py")
     for name in ("weights.bin", "weights.index", "deployment-manifest.json"):
         shutil.copyfile(deployment / name, root / "weights" / name)
@@ -56,7 +61,7 @@ def finish_bundle(root, sdk_hashes, options, *, model_family="opt", **provenance
         path.relative_to(root).as_posix(): {
             "bytes": path.stat().st_size,
             "sha256": sha256(path),
-            "executable": path == root / "bin" / executable,
+            "executable": path in (root / "bin" / executable, root / "bin/specferry_supervise"),
         }
         for path in sorted(root.rglob("*"))
         if path.is_file()
@@ -79,6 +84,8 @@ def finish_bundle(root, sdk_hashes, options, *, model_family="opt", **provenance
         "fault_pattern": FAULT.pattern + r"|Out of memory|I/O error|kernel panic",
         **provenance,
     }
+    if (root / "bin/specferry_supervise").is_file():
+        manifest["supervisor_implementation"] = "cpp-process-v1"
     save(root / "bundle.json", manifest)
     verify_bundle(root, check_sdk=False)
     return manifest

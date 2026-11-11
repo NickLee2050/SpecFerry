@@ -44,3 +44,4 @@ specferry_cpu_test(np101_data_test unit/devices/np101/data_test.cpp np101_data_c
 specferry_cpu_test(generation_test unit/inference/generation_test.cpp autoregressive_generation_contract specferry_generation)
 specferry_cpu_test(diagnostics_test unit/devices/np101/diagnostics_test.cpp sdk_timing_contract specferry_generation)
 specferry_cpu_test(memory_budget_test unit/devices/np101/memory_budget_test.cpp segmented_memory_budget np101_data)
+specferry_cpu_test(request_test unit/inference/request_test.cpp native_execution_request_contract np101_opt_decoder np101_decoder)

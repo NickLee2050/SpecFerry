@@ -1,6 +1,7 @@
 # Configurable inference runtime plan
 
-Updated: 2026-11-11. Directory migration is complete; stages 1–4 below are planned, not implemented.
+Updated: 2026-11-11. Directory migration, initial configuration contracts and loading/runtime
+extraction are complete; native process supervision passed scoped SoC hardware acceptance.
 SoC OPT/Qwen whole-model regressions passed. EP acceptance for this migration is compilation-only
 at the user's request; hardware regression remains pending.
 
@@ -85,14 +86,15 @@ and resource ownership.
 | Package structure, ports, budgets, SDK compatibility | C++ authoritative at execution | Exporters retain independent checks at their own trust boundary; share formats and tests. |
 | Loading, generation, lifecycle | C++ | Reuse validated operators and ownership; unify orchestration. |
 | Tokenization and text decoding | Existing implementation initially | Token-ID input is sufficient for the first step; assess native tokenizer compatibility separately. |
-| Timeouts, kernel checks, recovery markers, release checks | Independent C++ supervisor, last | A stuck inference process must not supervise itself. |
+| Process groups, readiness, timeouts, termination | Independent C++ supervisor | A stuck inference process must not supervise itself; blocked policy IO cannot delay its deadline. |
+| Deployment identity, kernel sampling, recovery/release acceptance | Existing independent Python policy adapter | Preserve audited device semantics and failure records; host numerical acceptance still required. |
 | Checkpoint processing, model interchange/graph export, CPU reference | Python | Preserve existing tooling and the independent numerical oracle. |
 | SSH deployment and experiment orchestration | Thin Python tools | Organize calls without duplicating model execution policy. |
 
 The long-term aim is a board inference path without Python, while retaining Python offline.
 Do not introduce another primary language without a concrete capability/toolchain benefit.
-The current board supervisor uses Python 3.9 standard-library facilities; do not introduce host-only
-heavy dependencies before replacing it.
+The native watchdog is separate from the Python 3.9 standard-library policy adapter. Removing all
+board Python dependencies is a future scope, not a prerequisite for independent native supervision.
 
 ## Refactoring targets
 
@@ -112,10 +114,10 @@ heavy dependencies before replacing it.
 | Stage | Deliverable | Minimal acceptance |
 |---|---|---|
 | 0. Directory migration | ✅ Sources, tools, tests, imports, build, editor and documentation paths migrated; ignores updated | 142 Python tests, four C++ CPU tests, 18 command entries, both builds and SoC OPT/Qwen whole-model regressions passed. EP hardware pending. |
-| 1. Configuration/contracts | Named options/constants, shared IO and package-version rules | Existing packages and invalid-input cases cover parsing, defaults and rejection; normally no board run. |
-| 2. Loading/thin entries | Move execution parsing/results into C++; preserve CLI behavior | Stage 1 first; preserve SDK ordering and artifact contracts, run relevant CPU tests and both builds. |
-| 3. Shared runtime | Common load/generate/close flow; split large model modules | Stage 2 first; reuse one OPT and one Qwen request per batch, checking numerics, TTFT, output throughput, memory and release. |
-| 4. Supervisor/deployment | Separate board supervisor; document remaining runtime dependencies | Stable runtime first; fake-child tests for deadlines, exit, readiness and failure records, then minimal device acceptance. Native text support only as needed. |
+| 1. Configuration/contracts | ✅ OPT execution/artifact objects, shared Qwen preparation options and optional JSON recipe; ownership and version boundaries documented | Offline CLI equivalence/rejection tests and both builds. Native formats unchanged; extracting standalone IO waits for loader/supervisor work. |
+| 2. Loading/thin entries | ✅ Shared C++ token/options parsing and reports, model-specific validated requests, thin command entries; unchanged native command/package contracts | Five CPU tests, 48 Python compatibility tests and both builds passed. |
+| 3. Shared runtime | ✅ Model execution sessions reuse token scheduling/reporting; graph construction split from state/runtime; no universal state abstraction | Unchanged model bodies/storage order; one OPT and Qwen SoC request passed numerics, bitwise snapshot comparison, timing, memory and release. See status for scope. |
+| 4. Supervisor/deployment | ✅ Scoped SoC acceptance: native process supervision and verified companion deployment; Python device policy retained explicitly | 54 Python tests, five C++ tests and both builds pass. OPT/Qwen regressions preserve tokens/state bitwise and sampled pool peaks; no new faults. EP hardware pending. |
 
 Each stage must be independently reviewable and committable. Do not mix directory moves with
 operator/performance changes. Audit/configuration/IO work can proceed independently once interfaces

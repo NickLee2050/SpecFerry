@@ -22,7 +22,9 @@ compiled ahead of time by the vendor tools. OpenVX/ovxlib provides the graph and
 ```text
 src/
   cli/                 C++ command-line entry points
-  inference/           Shared generation loop and timing
+  inference/           Shared requests, generation loop and reports
+  supervision/         Independent process deadlines and termination
+  io/                  Binary file output
   models/              OPT and Qwen model implementations
   devices/np101/api/   NP101 graphs, tensors and SDK integration
     ep/                Host execution policy

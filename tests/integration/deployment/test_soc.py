@@ -24,6 +24,10 @@ class SocTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        supervisor = Path(__file__).resolve().parents[3] / "build/ep/bin/specferry_supervise"
+        patcher = patch.object(board, "SUPERVISOR_BINARY", supervisor)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_explicit_memory_reserve_for_smaller_linux_layout(self):
         self.assertEqual(board.memory_reserve_kib({}), 192 * 1024)
@@ -596,7 +600,7 @@ class SocTests(unittest.TestCase):
         original = board.save
 
         def slow_initial_write(path, value):
-            if path.name == "child.json" and "exit" not in value:
+            if path.name == "child-start.json":
                 time.sleep(0.4)
             original(path, value)
 
@@ -656,6 +660,107 @@ class SocTests(unittest.TestCase):
             self.supervise("pass", timeout=601, preparation_timeout=1, execution_limit=600)
         with self.assertRaises(ValueError):
             self.supervise("pass", timeout=600, execution_limit=600)
+
+    def test_repeated_readiness_does_not_restart_inference_budget(self):
+        result = self.supervise(
+            "import os,time; fd=int(os.environ['SPECFERRY_READY_FD']); "
+            "os.write(fd,(str(time.monotonic())+'\\n').encode()); time.sleep(0.08); "
+            "os.write(fd,(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.15,
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.22)
+
+    def test_native_guard_kills_descendants_after_leader_exits(self):
+        result = self.supervise(
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])"
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_reports_exec_failure(self):
+        result = board.supervise(
+            ["/specferry-nonexistent-command"],
+            self.root,
+            os.environ.copy(),
+            self.root,
+            1,
+            lambda: None,
+        )
+        self.assertFalse(result["child_started"])
+        self.assertEqual(result["exit"], 127)
+        self.assertIn("spawn_error", result)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_stops_a_suspended_model(self):
+        def stop():
+            time.sleep(0.08)
+            return "kernel fault"
+
+        result = self.supervise(
+            "import os,signal; os.kill(os.getpid(),signal.SIGSTOP)", monitor=stop
+        )
+        self.assertEqual(result["stop_reason"], "kernel fault")
+        self.assertLess(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_stops_if_policy_channel_disappears(self):
+        process = subprocess.Popen(
+            [
+                str(board.SUPERVISOR_BINARY),
+                str(self.root),
+                "-1",
+                "2",
+                "300",
+                str(self.root),
+                "--",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+            result = board.read_json(self.root / "child.json")
+            self.assertEqual(result["stop_reason"], "policy owner closed stop channel")
+            self.assertEqual(result["remaining_processes"], [])
+        finally:
+            process.stdout.close()
+            process.stderr.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=12)
+
+    def test_native_supervisor_must_be_in_verified_executable_inventory(self):
+        (self.root / "bin").mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        files = {}
+        for name in ("specferry_opt_graph_generate", "specferry_supervise"):
+            path = self.root / "bin" / name
+            path.write_bytes(header)
+            path.chmod(0o755)
+            files["bin/" + name] = dict(bytes=20, sha256=board.sha256(path), executable=True)
+        manifest = dict(
+            schema_version=1,
+            target="np101-soc-riscv64",
+            files=files,
+            supervisor_implementation="cpp-process-v1",
+        )
+        board.save(self.root / "bundle.json", manifest)
+        board.verify_bundle(self.root, check_sdk=False)
+        del files["bin/specferry_supervise"]
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(ValueError, "verified file inventory"):
+            board.verify_bundle(self.root, check_sdk=False)
 
     def test_sdk_success_does_not_replace_release_and_budget_checks(self):
         native = self.root / "native"

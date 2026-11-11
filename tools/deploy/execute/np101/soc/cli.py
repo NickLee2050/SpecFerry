@@ -12,12 +12,14 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     from tools.deploy.execute.np101.soc.remote import collect, deploy, run
+    from tools.deploy.pack.np101.config import resolve_preparation_arguments
     from tools.deploy.pack.np101.soc import prepare_bundle
 
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="offline: assemble a relocatable bundle")
-    prepare.add_argument("--model", choices=("opt", "qwen"), default="opt")
+    prepare.add_argument("--model", choices=("opt", "qwen"))
+    prepare.add_argument("--config", type=Path, help="JSON preparation inputs; CLI values override")
     prepare.add_argument(
         "--qwen-projections",
         choices=("shared-fcl", "matmul"),
@@ -47,7 +49,7 @@ def main():
     )
     prepare.add_argument("--deployment", type=Path)
     for name in ("package", "request", "sdk", "output"):
-        prepare.add_argument("--" + name, type=Path, required=True)
+        prepare.add_argument("--" + name, type=Path, required=name == "output")
     prepare.add_argument(
         "--prefill-package",
         type=Path,
@@ -81,11 +83,13 @@ def main():
             )
     args = parser.parse_args()
     if args.command == "prepare":
+        try:
+            resolve_preparation_arguments(args)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
         if args.model == "qwen":
             from tools.deploy.pack.np101.qwen import prepare_bundle as prepare_qwen
 
-            if args.prefill_package is not None:
-                parser.error("Qwen currently uses the existing single-token chain")
             result = prepare_qwen(
                 args.binary or ROOT / "build/soc/bin/specferry_qwen_generate",
                 args.deployment or ROOT / ".cache/np101/Qwen3.5-0.8B",
@@ -93,24 +97,9 @@ def main():
                 args.request,
                 args.sdk,
                 args.output,
-                projections=args.qwen_projections or "shared-fcl",
-                kv_write_mode=args.qwen_kv_write_mode or "copy-graph",
-                ffn_batch_tokens=args.qwen_ffn_batch or 1,
-                decoder_layout=args.qwen_decoder_layout or "separate",
-                state_commit=args.qwen_state_commit or "combined",
+                **args.execution_options.as_mapping(),
             )
         else:
-            if any(
-                value is not None
-                for value in (
-                    args.qwen_projections,
-                    args.qwen_kv_write_mode,
-                    args.qwen_ffn_batch,
-                    args.qwen_decoder_layout,
-                    args.qwen_state_commit,
-                )
-            ):
-                parser.error("Qwen execution options require --model qwen")
             result = prepare_bundle(
                 args.binary or ROOT / "build/soc/bin/specferry_opt_graph_generate",
                 args.deployment or ROOT / ".cache/np101/opt-350m",

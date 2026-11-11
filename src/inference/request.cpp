@@ -1,25 +1,13 @@
-#pragma once
-
-#include "inference/generation.hpp"
+#include "inference/request.hpp"
 
 #include <charconv>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <istream>
 #include <limits>
-#include <map>
-#include <ostream>
 #include <sstream>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 namespace specferry::inference {
-inline std::vector<std::int32_t> read_prompt(std::istream &input, unsigned vocabulary,
-                                             unsigned capacity) {
+std::vector<std::int32_t> read_prompt(std::istream &input, unsigned vocabulary, unsigned capacity) {
   std::vector<std::int32_t> tokens;
   std::int32_t token;
   while (input >> token) {
@@ -34,72 +22,70 @@ inline std::vector<std::int32_t> read_prompt(std::istream &input, unsigned vocab
   return tokens;
 }
 
-struct RunOptions {
-  unsigned maximum = 8, warmups = 0, repeats = 1, seed = 0;
-  unsigned block = 1, cache_first = 0, cache_last = 0;
-  bool sampling = false, benchmark = false, lifecycle = false;
-  std::string variant = "merged-kv", prefill_head = "every-token", readback = "none";
-  std::string readback_transport = "sdk";
-  std::string projection_backend = "auto";
-  std::string history_mode = "reset";
-  std::string kv_transfer = "device-copy";
-};
+std::vector<std::vector<std::int32_t>> read_requests(const std::filesystem::path &path,
+                                                     unsigned vocabulary, unsigned capacity) {
+  std::ifstream input(path);
+  std::vector<std::vector<std::int32_t>> requests;
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream stream(line);
+    requests.push_back(read_prompt(stream, vocabulary, capacity));
+  }
+  if (!input.eof() || requests.empty() || requests.size() > 64) {
+    throw std::invalid_argument("expected one to 64 request lines");
+  }
+  return requests;
+}
 
-// Each CLI consumes its own keys, then rejects leftovers before initializing the SDK.
-class RunSettings {
-public:
-  explicit RunSettings(const std::filesystem::path &directory) {
-    const auto path = directory / "run-options.txt";
-    if (std::filesystem::exists(path)) {
-      std::ifstream input(path);
-      std::string line;
-      while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string key, value, extra;
-        if (!(fields >> key)) {
-          continue;
-        }
-        if (!(fields >> value) || fields >> extra || !values_.emplace(key, value).second) {
-          throw std::invalid_argument("run-options.txt requires unique key/value lines");
-        }
+RunSettings::RunSettings(const std::filesystem::path &directory) {
+  const auto path = directory / "run-options.txt";
+  if (std::filesystem::exists(path)) {
+    std::ifstream input(path);
+    std::string line;
+    while (std::getline(input, line)) {
+      std::istringstream fields(line);
+      std::string key, value, extra;
+      if (!(fields >> key)) {
+        continue;
       }
-      if (!input.eof()) {
-        throw std::runtime_error("cannot read run-options.txt");
+      if (!(fields >> value) || fields >> extra || !values_.emplace(key, value).second) {
+        throw std::invalid_argument("run-options.txt requires unique key/value lines");
       }
     }
-  }
-
-  bool contains(const std::string &key) const { return values_.count(key); }
-
-  std::string text(const std::string &key, const std::string &fallback) {
-    const auto found = values_.find(key);
-    const auto value = found == values_.end() ? fallback : found->second;
-    values_.erase(key);
-    return value;
-  }
-
-  unsigned number(const std::string &key, unsigned fallback, unsigned minimum, unsigned maximum) {
-    const auto value = text(key, std::to_string(fallback));
-    unsigned result = 0;
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result < minimum ||
-        result > maximum) {
-      throw std::invalid_argument("invalid run option: " + key);
-    }
-    return result;
-  }
-
-  void finish() const {
-    if (!values_.empty()) {
-      throw std::invalid_argument("unknown run option: " + values_.begin()->first);
+    if (!input.eof()) {
+      throw std::runtime_error("cannot read run-options.txt");
     }
   }
+}
 
-private:
-  std::map<std::string, std::string> values_;
-};
+bool RunSettings::contains(const std::string &key) const { return values_.count(key); }
 
-inline RunOptions read_run_options(const std::filesystem::path &directory, bool graph) {
+std::string RunSettings::text(const std::string &key, const std::string &fallback) {
+  const auto found = values_.find(key);
+  const auto value = found == values_.end() ? fallback : found->second;
+  values_.erase(key);
+  return value;
+}
+
+unsigned RunSettings::number(const std::string &key, unsigned fallback, unsigned minimum,
+                             unsigned maximum) {
+  const auto value = text(key, std::to_string(fallback));
+  unsigned result = 0;
+  const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+  if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || result < minimum ||
+      result > maximum) {
+    throw std::invalid_argument("invalid run option: " + key);
+  }
+  return result;
+}
+
+void RunSettings::finish() const {
+  if (!values_.empty()) {
+    throw std::invalid_argument("unknown run option: " + values_.begin()->first);
+  }
+}
+
+RunOptions read_run_options(const std::filesystem::path &directory, bool graph) {
   RunSettings settings(directory);
   RunOptions result;
   // Context capacity and the external workload deadline bound graph generation.
@@ -162,23 +148,4 @@ inline RunOptions read_run_options(const std::filesystem::path &directory, bool 
   return result;
 }
 
-template <class T> void write_array(std::ostream &out, const std::vector<T> &values) {
-  out << '[';
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    out << (i ? "," : "") << values[i];
-  }
-  out << ']';
-}
-
-inline void write_generation(std::ostream &out, const Generation &result) {
-  out << std::setprecision(17) << "\"tokens\":";
-  write_array(out, result.tokens);
-  out << ",\"consumed\":" << result.consumed << ",\"stop_reason\":\"" << result.stop_reason
-      << "\",\"state_preparation_seconds\":" << result.state_preparation_seconds
-      << ",\"replayed_prompt_tokens\":" << result.replayed_prompt_tokens
-      << ",\"prefill_seconds\":" << result.prefill_seconds
-      << ",\"first_token_seconds\":" << result.first_token_seconds
-      << ",\"total_seconds\":" << result.total_seconds << ",\"token_seconds\":";
-  write_array(out, result.token_seconds);
-}
 } // namespace specferry::inference

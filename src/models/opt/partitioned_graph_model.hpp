@@ -19,6 +19,46 @@ struct ProjectionPolicy {
   bool compiled_query = false, compiled_output = false;
 };
 
+// Except full-model NBGs, variants retain shared mutable vocabulary blocks. Compiled decoders use
+// FP32 head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
+// candidates; the source-bound FFN finish package is available through an explicit CLI option.
+enum class GraphVariant {
+  MergedKv,
+  MergedKvFc1Split2,
+  MergedKvCompiledFfn,
+  CompiledDecoder,
+  CompiledFullModel
+};
+
+// Generation may skip unused prompt predictions; public step() always runs the head.
+// EveryToken runs the head for each consumed block's final column.
+enum class PrefillHeadPolicy { EveryToken, LastToken };
+
+// Independent of EP/SoC. MappedSlot keeps full-model ports in one graph and
+// copies only the current FP32 KV slot through a reusable host buffer.
+enum class KvTransfer { DeviceCopy, MappedSlot };
+
+// Execution choices are independent of artifact identities and runtime diagnostics.
+struct GraphOptions {
+  GraphVariant variant = GraphVariant::MergedKv;
+  PrefillHeadPolicy prefill_head = PrefillHeadPolicy::EveryToken;
+  unsigned prefill_block = 1;
+  ProjectionPolicy projections;
+  KvTransfer kv_transfer = KvTransfer::DeviceCopy;
+};
+
+// Source-validated artifact metadata, owned by the model after construction.
+// This contains paths and contracts, not another copy of device weight storage.
+struct CompiledArtifacts {
+  std::vector<CompiledFfn> feed_forward;
+  std::vector<CompiledDecoder> decoders;
+  std::vector<CompiledFfn> prefill_feed_forward;
+  CompiledHead head;
+  std::vector<CompiledProjections> projections;
+  CompiledFullModel full_model;
+  std::vector<CompiledPrefillLayer> prefill_layers;
+};
+
 // Fixed embedding/head graphs with device buffers between decoder stages. Compiled
 // FFNs use two or three graphs per layer; full decoder NBGs use one plus a shared KV copy graph.
 // Block prefill shares ordinary weights and KV. Compiled FFNs require separately
@@ -31,37 +71,13 @@ class PartitionedGraphModel {
 public:
   using PhaseObserver = std::function<void(const std::string &)>;
 
-  // Except full-model NBGs, variants retain shared mutable vocabulary blocks. Compiled decoders use
-  // FP32 head-major KV; handwritten decoders use merged FP16 KV. Compiled paths are explicit
-  // candidates; the source-bound FFN finish package is available through an explicit CLI option.
-  enum class Variant {
-    MergedKv,
-    MergedKvFc1Split2,
-    MergedKvCompiledFfn,
-    CompiledDecoder,
-    CompiledFullModel
-  };
-
-  // Generation may skip unused prompt predictions; public step() always runs the head.
-  // EveryToken runs the head for each consumed block's final column.
-  enum class PrefillHeadPolicy { EveryToken, LastToken };
-
-  // Independent of EP/SoC. MappedSlot keeps full-model ports in one graph and
-  // copies only the current FP32 KV slot through a reusable host buffer.
-  enum class KvTransfer { DeviceCopy, MappedSlot };
+  using Variant = GraphVariant;
+  using PrefillHeadPolicy = opt::PrefillHeadPolicy;
+  using KvTransfer = opt::KvTransfer;
 
   PartitionedGraphModel(np101::Context &context, const np101::WeightStore &weights,
-                        const ModelConfig &config, PhaseObserver phase = {},
-                        Variant variant = Variant::MergedKv,
-                        PrefillHeadPolicy prefill_head = PrefillHeadPolicy::EveryToken,
-                        unsigned prefill_block = 1, std::vector<CompiledFfn> compiled_ffn = {},
-                        std::vector<CompiledDecoder> compiled_decoders = {},
-                        std::vector<CompiledFfn> compiled_prefill_ffn = {},
-                        ProjectionPolicy projections = {}, CompiledHead compiled_head = {},
-                        std::vector<CompiledProjections> compiled_projections = {},
-                        CompiledFullModel compiled_full_model = {},
-                        KvTransfer kv_transfer = KvTransfer::DeviceCopy,
-                        std::vector<CompiledPrefillLayer> compiled_prefill_layers = {});
+                        const ModelConfig &config, const GraphOptions &options = {},
+                        CompiledArtifacts artifacts = {}, PhaseObserver phase = {});
   ~PartitionedGraphModel();
   PartitionedGraphModel(const PartitionedGraphModel &) = delete;
   PartitionedGraphModel &operator=(const PartitionedGraphModel &) = delete;

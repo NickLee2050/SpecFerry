@@ -1,12 +1,15 @@
 #include "inference/generation.hpp"
-#include "inference/generation_io.hpp"
+#include "inference/report.hpp"
+#include "inference/request.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -25,6 +28,45 @@ template <class Action> void rejects(Action action) {
     rejected = true;
   }
   require(rejected);
+}
+
+void report_contracts() {
+  using namespace specferry::inference;
+  Generation result;
+  result.tokens = {10, 11, 12};
+  result.prefill_seconds = 1.5;
+  result.first_token_seconds = 2;
+  result.total_seconds = 4;
+  result.token_seconds = {0.5, 1.5};
+  result.stop_reason = "limit";
+  const auto metrics = generation_metrics(result);
+  require(metrics.generated_tokens == 3 && metrics.decode_intervals == 2);
+  require(*metrics.output_tokens_per_second == 0.75);
+  require(*metrics.decode_tokens_per_second == 1);
+  std::ostringstream output;
+  write_generation(output, result);
+  require(output.str().find("\"output_tokens_per_second\":0.75") != std::string::npos);
+  require(output.str().find("\"tokens\":[10,11,12]") != std::string::npos);
+  auto invalid = result;
+  invalid.token_seconds.pop_back();
+  rejects([&] { generation_metrics(invalid); });
+  invalid = result;
+  invalid.token_seconds[0] = std::numeric_limits<double>::quiet_NaN();
+  rejects([&] { generation_metrics(invalid); });
+  invalid = result;
+  invalid.total_seconds = 3;
+  rejects([&] { generation_metrics(invalid); });
+  result.tokens.resize(1);
+  result.token_seconds.clear();
+  require(!generation_metrics(result).decode_tokens_per_second);
+  result = {};
+  require(!generation_metrics(result).output_tokens_per_second);
+  std::istringstream valid("2 7 1");
+  require(read_prompt(valid, 8, 3) == std::vector<std::int32_t>({2, 7, 1}));
+  for (const auto *text : {"", "-1", "8", "2 3 4 5", "2 word"}) {
+    std::istringstream invalid_prompt(text);
+    rejects([&] { read_prompt(invalid_prompt, 8, 3); });
+  }
 }
 
 void run_options_contracts() {
@@ -325,6 +367,7 @@ void contracts() {
 int main() {
   try {
     run_options_contracts();
+    report_contracts();
     contracts();
     conversation_contracts();
     prefill_replay_contracts();

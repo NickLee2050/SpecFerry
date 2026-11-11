@@ -49,7 +49,8 @@ add_library(np101_attention src/models/qwen3_5/attention.cpp)
 target_link_libraries(np101_attention PUBLIC np101_ops np101_kv_cache qwen_data)
 target_compile_options(np101_attention PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(np101_decoder src/models/qwen3_5/decoder.cpp src/models/qwen3_5/model.cpp)
+add_library(np101_decoder src/models/qwen3_5/decoder.cpp src/models/qwen3_5/model.cpp
+  src/models/qwen3_5/model_build.cpp src/models/qwen3_5/request.cpp src/models/qwen3_5/execution.cpp)
 target_link_libraries(np101_decoder PUBLIC np101_delta_net np101_attention)
 target_compile_options(np101_decoder PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -57,7 +58,8 @@ add_library(opt_data src/models/opt/config.cpp)
 target_link_libraries(opt_data PUBLIC np101_data)
 target_compile_options(opt_data PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(specferry_generation src/inference/generation.cpp)
+add_library(specferry_generation src/inference/generation.cpp
+  src/inference/request.cpp src/inference/report.cpp src/io/files.cpp)
 target_compile_features(specferry_generation PUBLIC cxx_std_17)
 target_include_directories(specferry_generation PUBLIC src)
 target_link_libraries(specferry_generation PUBLIC specferry_diagnostics)
@@ -71,7 +73,8 @@ set_target_properties(specferry_qwen_generate PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 
 add_library(np101_opt_decoder src/models/opt/decoder.cpp src/models/opt/model.cpp
   src/models/opt/layer.cpp src/models/opt/compiled_model.cpp
-  src/models/opt/partitioned_graph_model.cpp src/models/opt/block_prefill.cpp)
+  src/models/opt/partitioned_graph_model.cpp src/models/opt/partitioned_graph_build.cpp
+  src/models/opt/execution.cpp src/models/opt/graph_execution.cpp src/models/opt/request.cpp src/models/opt/block_prefill.cpp)
 target_link_libraries(np101_opt_decoder PUBLIC np101_ops np101_kv_cache opt_data specferry_generation)
 target_compile_options(np101_opt_decoder PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -85,3 +88,14 @@ target_link_libraries(specferry_opt_graph_generate PRIVATE np101_opt_decoder)
 target_compile_options(specferry_opt_graph_generate PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(specferry_opt_graph_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+
+# Independent process supervision has no SDK or model dependency.
+add_library(specferry_supervision src/supervision/process.cpp)
+target_compile_features(specferry_supervision PUBLIC cxx_std_17)
+target_include_directories(specferry_supervision PUBLIC src)
+target_link_libraries(specferry_supervision PUBLIC Threads::Threads)
+target_compile_options(specferry_supervision PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specferry_supervise src/cli/supervise.cpp)
+target_link_libraries(specferry_supervise PRIVATE specferry_supervision)
+target_compile_options(specferry_supervise PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(specferry_supervise PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

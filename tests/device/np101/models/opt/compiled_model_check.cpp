@@ -1,6 +1,6 @@
 #include "devices/np101/api/diagnostics.hpp"
 #include "devices/np101/api/ops/graph_builder.hpp"
-#include "inference/generation_io.hpp"
+#include "inference/report.hpp"
 #include "support/np101/binary_io.hpp"
 #include "vsi_nn_pub.h"
 

@@ -127,7 +127,7 @@ def host_health(output, name):
 def numerical_acceptance(bundle, board):
     manifest = read_json(bundle / "bundle.json")
     if manifest.get("model_family", "opt") == "qwen3_5":
-        from tools.deploy.pack.np101.qwen import DECODER_LAYOUTS
+        from tools.deploy.pack.np101.config import DECODER_LAYOUTS
         from tools.validate.qwen3_5.generation import evaluate_generation
 
         result = evaluate_generation(bundle / "request", board / "native")
