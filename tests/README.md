@@ -1,7 +1,7 @@
 # Tests and exporters
 
-Start with the [build instructions](../README.md) and [architecture](../docs/development.md).
-Accepted hardware scopes and measurements live in [status](../docs/np101-status.md), not this guide.
+Start with the [build instructions](../docs/getting-started.md) and [architecture](../docs/development.md).
+The build guide also defines graph, cache and batch terminology. Accepted hardware scopes and measurements live in [status](../docs/np101-status.md), not this guide.
 
 ## Layout
 

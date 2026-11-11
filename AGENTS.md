@@ -40,6 +40,8 @@
 
 ## Records and commits
 
+- Maintain project-authored documentation, code comments, CLI help and error messages in English. Explain unfamiliar terms at first use or link to a glossary. Preserve vendor originals and immutable historical evidence in their original language; provide an English summary/index instead of editing evidence. Do not maintain duplicate full-language editions without an explicit need.
+
 - The EP exploration phase is closed for the documented accepted OPT and Qwen configurations. Preserve those baselines; reopen optional investigations only for a concrete requirement or new evidence.
 
 - Use functional names in code, fixtures, CLI cases, outputs and published documents; never conversational task codes. Update imports/tests/docs together when renaming. Preserve immutable original evidence under ignored cache paths and refer to descriptive aliases.

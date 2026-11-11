@@ -1,256 +1,156 @@
-# 参数化推理运行时与代码规范化方案
+# Configurable inference runtime plan
 
-更新：2026-11-11。状态：阶段0目录迁移及本轮验收完成；阶段1—4尚未施工。
-EP本轮按用户要求只验编译，硬件回归待补；SoC的OPT/Qwen整模回归已通过。
-下文同时说明已采用的目录边界与后续职责改造，不能将迁移视作新功能已实现。
+Updated: 2026-11-11. Directory migration is complete; stages 1–4 below are planned, not implemented.
+SoC OPT/Qwen whole-model regressions passed. EP acceptance for this migration is compilation-only
+at the user's request; hardware regression remains pending.
 
-## 目标与范围
+## Scope
 
-在现有OPT和Qwen实现上整理出轻量C++推理运行时：模型通过明确的配置和部署包接入，
-共用加载、生成、计时和资源管理；模型计算与状态语义、NP101算子、EP/SoC平台差异各有归属。
-首版服务已有模型和已验证组合，不建设任意模型编译器，也不预先实现厂商尚未提供的IR后端。
+Build a lightweight C++ inference runtime around the existing OPT and Qwen implementations.
+Models supply explicit configuration and packages; shared code handles loading, generation,
+timing and resource ownership. Keep model state semantics, NP101 operators and execution-mode
+policies separate. This is not an arbitrary-model compiler.
 
-当前图构造、Setup/Verify、RunGraph和token循环已经主要在C++中。减少Python的主要收益是
-结构清晰、部署依赖减少和行为一致，不能直接推导为NPU吞吐提高。代码行数不作为验收指标。
+Graph construction, Setup/Verify, RunGraph and token loops already run mainly in C++. Moving more
+logic from Python improves structure, dependencies and consistency; it does not by itself improve
+NPU throughput. Readability and acceptance matter more than line count.
 
-## 目录迁移与命名原则
+## Organization and dependencies
 
-当前EP/SoC共用模型、算子和生成逻辑。CMake通过SPECFERRY_TARGET选择平台源文件、目标架构与SDK，
-不是两套模型实现，也不是靠EP/SoC宏复制计算路径。原platform文件已归入api下，仍包含卷积层数、
-embedding块大小等模型执行策略，后续需要移入具名执行方案；本次没有改动其行为。
+The [README](../README.md#repository-layout) shows the current tree and the
+[development guide](development.md) defines current responsibilities. Do not maintain a second
+copy of that tree here. The following rules govern further changes:
 
-迁移前native表示原生编译代码，python是可导入模块，scripts是命令入口，分类混用了语言与职责。
-这三个一级目录现已替换为按职责组织的src和tools；不保留旧导入路径或重复入口。
+- Root directories describe responsibilities: `src`, `tools`, `tests`, `docs`, `cmake`.
+  Siblings use one classification axis; file suffixes identify languages.
+- Product modules use nouns: `cli`, `inference`, `models`, `devices`; add `io` only for real
+  shared file/package code. Avoid an unbounded `utils` or `common` module.
+- Operational tools use short verbs: `deploy/{export,pack,execute}`, `benchmark`, `validate`,
+  `format`. Keep `reference` for independent CPU implementations. There is no extra
+  `specferry_tools` package layer or parallel `scripts` tree.
+- Tests use `unit`, `integration`, `device`, with responsibility-based subdivisions;
+  `fixtures` and `support` hold small data and test-only helpers. Unit/integration checks do not
+  open the board; hardware tests remain explicitly enabled. Product code must not depend on helpers.
+- `cmake/targets.cmake` defines build relationships; `cmake/devices/np101` owns SDK/target
+  selection, and `cmake/toolchains` selects cross compilers and system-library roots.
+  Build configuration need not mirror every source directory.
+- Keep small command entries beside their tools. Update imports, build targets, formatting,
+  editor settings, tests and examples together when moving code. Do not retain duplicate imports.
 
-- 一级目录统一表达工程职责：产品源码src、辅助工具tools、测试tests、文档docs、构建配置cmake。
-- 同级目录采用同一分类维度：models下按模型族，devices下按设备，设备内按API/IR实现路线划分。
-- 不把语言、运行位置和功能交叉作为同一级分类。语言通常由后缀与构建目标识别。
-- tools直接按工具职责划分，不增加specferry_tools目录；暂不以独立分发Python包为目标。
-- 操作型工具目录采用简短动词：deploy、export、pack、execute、benchmark、validate、format；reference保留参考实现的明确含义。
-- 不为追求形式一致增加无意义层级，不建立无边界的utils/common；共用模块必须有具体职责。
+EP and SoC share model/operator code. CMake selects source files through `SPECFERRY_TARGET`,
+without preprocessor branches duplicating computation. Current API-specific differences live in
+`src/devices/np101/api/{ep,soc}`; there is no separate `platform` directory. Runtime profiles still
+include model choices such as convolution coverage and embedding block size; move those into named
+execution plans later, without changing their behavior during a structural move.
 
-| 命名范围 | 决定 | 原因 |
-|---|---|---|
-| 操作型工具 | deploy/export/pack/execute/benchmark/validate/format | 使用短动词，直接说明要做什么 |
-| 参考实现 | reference | 保留独立CPU参考含义，不与执行、比较或验收混淆 |
-| 产品职责 | cli/inference/io/models/devices | 表达模块管理什么，不机械改成infer/model等动作名称 |
-| 测试范围与辅助内容 | unit/integration/device/fixtures/support | 保留范围、数据与辅助代码的准确含义 |
-| 构建配置 | devices/toolchains | 分别按设备和工具链归类，文件用具体对象名称 |
-
-动词原则适用于操作型工具，不要求整个仓库所有目录都是动词。同级保持分类逻辑一致，优先保证含义清楚。
-
-## 建议目录与依赖
-
-以下为采用的结构及预定扩展位置。未实现的组件不创建空目录占位；src/io、IR和无对应测试的
-测试子目录尚未创建。当前SDK相关IO仍在api模块内，模型内SDK建图的拆分留到后续阶段。
-
-```text
-src/
-  cli/                     命令行main入口；独立监督程序迁移时另定明确归属
-  inference/               配置、请求、生成循环、会话与结果契约
-  io/                      文件、部署包解析、通用序列化
-  models/
-    opt/                   OPT层序、权重名称、精度与KV语义
-    qwen3_5/               Qwen层序、DeltaNet/卷积历史/KV语义
-  devices/
-    np101/
-      api/                 当前OpenVX/vsi_nn建图、NBG导入及执行实现
-        ep/                API路线的EP环境适配
-        soc/               API路线的SoC环境适配
-      ir/                  未来独立IR实现，预计仅SoC；接口明确前不创建
-tools/
-  deploy/                  完整部署流程
-    export/                checkpoint/ONNX/NBG产物导出，内部按模型划分
-      opt/
-      qwen3_5/
-    pack/                  产物整理、manifest与部署包完整性检查
-    execute/               传输、环境检查、启动与结果收集
-      np101/
-        ep/
-        soc/
-  reference/               独立CPU参考及模型适配
-    opt/
-    qwen3_5/
-  benchmark/               测量与结果分析
-  validate/                共用数值与生成结果验收
-  format/                  C++与Python格式化
-cmake/
-  targets.cmake            产品库与可执行程序的构建关系
-  devices/
-    np101/
-      api.cmake            当前API路线的SDK依赖
-      ep.cmake             EP架构、SDK位置与链接设置
-      soc.cmake            SoC架构、SDK位置与链接设置
-  toolchains/
-    np101-riscv64.cmake     交叉编译器与sysroot
-tests/
-  unit/                    模块与契约测试
-    inference/
-    models/
-    devices/
-      np101/
-    tools/
-  integration/             模块组合与命令入口测试
-    cli/
-    deployment/
-  device/                  显式启用的板卡验收
-    np101/
-      operators/
-      models/
-        opt/
-        qwen3_5/
-  fixtures/                各类测试使用的必要小数据
-  support/                 测试专用辅助代码
-  CMakeLists.txt
-  README.md
-docs/
-  development.md
-  inference-runtime-plan.md
-  np101-status.md
-  np101-recovery-incidents.md
-  np101-sdk-driver-validation-report.md
-
-README.md                  用户入口
-AGENTS.md                  项目开发规则
-TODO.md                    当前待办与验收边界
-CMakeLists.txt
-environment.yml
-requirements-download.txt
-requirements-reference.txt
-ruff.toml
-.clang-format
-.gitignore
-.vscode/                   仅保留团队通用配置
-```
-
-tests的前三项按测试范围分类，fixtures是测试数据的明确例外。各测试范围内再对应inference、models、
-devices或tools等功能模块，避免再按cpp/python创建一套与产品职责无关的分层。
-integration/deployment表示被测部署功能，不是操作命令，所以保留名词。unit与integration默认不接触板卡，
-device测试必须显式启用；测试专用辅助实现归support，不反向成为产品代码依赖。
-小型可执行入口与工具实现相邻，可用模块入口，不再保留另一整套scripts树。
-依赖、import、格式化范围、编辑器配置、构建目标和文档示例必须一起更新。
-
-cmake描述如何构建，src/devices描述如何运行，两者职责不同，无需机械镜像全部目录。
-docs目前文件少，保持平铺；设备资料显著增多时再按设备归档。工具配置保留根目录，便于自动发现，
-不另建config目录。模型权重、原始日志和大型参考输出不放入tests/fixtures。
-
-部署流程按export→pack→execute推进。部署包公共格式与完整性规则归pack，设备恢复与监督归execute下对应设备，
-避免导出与执行各自重复实现。reference产生CPU参考，validate判断结果，benchmark负责测量统计。
-通用IO仅在出现实际共享需求时抽取具名模块，不预先创建空目录；不使用development泛收开发工具。
-
-| 现有位置 | 目标归属 | 注意事项 |
-|---|---|---|
-| native/cli、native/inference | src/cli、src/inference | 入口只解析/展示；共享运行规则归inference |
-| native/models | src/models及设备专有实现 | 模型定义网络语义；SDK建图归设备实现，不能搬完就宣称与SDK解耦 |
-| native/np101 | src/devices/np101/api | SDK Context/tensor/映射封装不预设为IR共享能力 |
-| native/platform | src/devices/np101/api/ep与soc；已有共用部分放api下具名模块 | 取消platform目录，模型选路策略移到模型执行方案；保留无宏平台选择 |
-| python/specferry与scripts | tools下对应职责模块；执行逻辑迁入src | 不复制成两套包，Python业务逻辑按前述阶段逐步下移 |
-| tests/native等 | tests按测试范围和被测职责组织 | 保留硬件显式开关，不因目录调整扩大上板范围 |
+Future NP101 intermediate representation (IR) support starts separately under
+`src/devices/np101/ir`, likely for SoC only. Do not create it before the vendor interface exists,
+assume it reuses API tensor ownership, or advertise every API/IR × EP/SoC combination. Existing
+Network Binary Graph (NBG) imports belong to the API implementation because they still execute
+through that SDK. Extract common code only after actual semantics and ownership agree.
 
 ```text
-CLI → 推理运行时 → 模型适配器 → NP101算子与资源 → 厂商SDK
-             ↘ 通用文件/部署包解析
-                      API路线内由构建系统选择ep或soc适配
+CLI → inference runtime → model adapter → NP101 operators/resources → vendor SDK
+                 ↘ file/package IO          API build selects EP or SoC
 
-独立监督程序 → 启动/监督推理子进程，不进入token计算循环
-Python离线工具 → 导出部署包；部署脚本 → 调用C++入口
+independent supervisor → inference child process
+Python offline tools → exported packages
+Python deployment tools → C++ command entries
 ```
 
-模型适配器负责结构差异，共享层接受显式维度、张量契约和精度策略。避免把OPT的KV和Qwen的
-递归状态压成一个万能状态类。inference组织推理流程，models定义网络语义，devices负责设备执行。
-API与IR初步独立组织：EP/SoC差异先收在api/ep和api/soc中，取消独立platform目录。
-现有API路线的共用代码留在api下具名模块，不为IR预设shared目录、统一资源层或通用设备接口。
-未来IR预计只支持SoC，具体内部结构等实际接口到位后再定；构建系统只开放实际支持的组合，
-不把API/IR与EP/SoC排列成全部可用的组合，也不要求IR调用api/soc。
-NBG由离线编译器生成，但现有NBG导入和执行仍调用SDK，因此归当前api实现，不等于未来的IR实现。
-IR实现形成后，再根据实际相同的语义与所有权抽取公共代码，不预设统一tensor句柄或生命周期。
+Models own network structure, weight names, precision and state semantics. Shared operators take
+explicit dimensions and tensor contracts. Do not force OPT attention KV and Qwen recurrent state
+into a universal state class. No empty directories or `.gitkeep` architecture placeholders.
 
-## 主分支文档与本地文件边界
+## Configuration boundaries
 
-明确决定：docs/、AGENTS.md和TODO.md都应进入主分支。合入前整理内容，不以删除整个文档类别代替整理。
-
-| 内容 | 主分支建议 | 整理要求 |
+| Category | Contents | Contract |
 |---|---|---|
-| README、构建/使用/开发文档 | 保留 | 面向新开发者，说明已支持配置、依赖和最小运行方法 |
-| AGENTS.md | 保留精简后的项目规则 | 编码、验收、设备安全规则可共享；个人授权、临时实验和机器细节逐步分离，不在本轮删除现有规则 |
-| TODO.md | 保留可维护的项目待办 | 记录未完成事项、依赖和验收，消除重复历史记录；不能把未实现设计写成现有能力 |
-| 本设计文档 | 可合入，标明待审阅/实施状态 | 完成后收敛到架构文档，避免永久维护两份相同说明 |
-| 状态总结与事故台账 | 保留必要结论、限制和可追溯依据 | 不把原始日志都发布；对外发布前检查个人路径、网络信息和厂商资料许可，事故证据不能直接丢弃 |
-| 模型权重、SDK、原始日志、部署缓存 | 不进入Git源码历史 | 继续保留在忽略路径，文档说明获取/生成方式与身份校验 |
-| 编辑器配置 | 只保留团队通用配置 | 当前.vscode两份文件已跟踪；审阅适用性，个人解释器偏好等不作为强制运行依赖 |
-| 凭据、个人代理/助手状态 | 不进入主分支 | 精确忽略本地目录；不能用忽略所有点文件掩盖必要工程配置 |
+| Model specification | Family, layers, dimensions, vocabulary, precision, generation defaults | Derived from checkpoint/model adapter; retain supported-range checks. |
+| Package | Weight/NBG identities, ports, layout, shapes, source and SDK | Bound to real artifacts; configuration cannot change a fixed graph's meaning. |
+| Execution plan | Context capacity, prefill width, operator choices, state commit | Only implemented combinations; distinguish valid configuration from hardware acceptance. |
+| Request | Input, output limit, end-of-sequence behavior, supported generation policy, reset | Cannot restart a workload deadline; reject unsupported settings explicitly. |
+| Runtime policy | Preparation/execution budgets, observation, retries, memory margins | Constrained by device policy and authorization, with no general bypass switch. |
 
-Git是否跟踪与是否适合发布是两件事。添加.gitignore不会移除已跟踪文件，也不会清除历史秘密；
-本轮只核对文件名和配置，不声称完成敏感信息或许可证审计。
+Reuse manifests/JSON with versioned structures and explicit defaults. Model dimensions, SDK
+constants and runtime-policy limits belong to their respective modules; equal numbers do not
+justify a shared constant. Avoid a giant constants file. Separate options, artifact references
+and resource ownership.
 
-已完成的工作区卫生整理：.cache、.ruff_cache、build、demo原已忽略；为.agents、.codex、.aws补充精确忽略，
-删除无引用的tests/repro空目录。.vscode/extensions.json和settings.json仍受版本控制。
-三个隐藏空目录是当前环境只读保护目录，不强行删除；未来若需要共享助手配置，再显式审阅并收窄忽略规则。
-Git本身不保存空目录，不使用.gitkeep为未来架构占位；构建、缓存及证据目录不纳入源码清空操作。
+## Python and C++ responsibilities
 
-## 参数化边界
-
-| 配置类别 | 内容 | 规则 |
+| Work | Destination | Boundary |
 |---|---|---|
-| 模型规格 | 模型类型、层数、维度、词表、精度及生成默认策略 | 来源于checkpoint和模型适配器，保留必要的支持范围检查 |
-| 部署包契约 | 权重/NBG身份、端口顺序、布局、形状、SDK身份和来源 | 与实际产物绑定，用户不能靠改配置改变固定NBG的语义 |
-| 执行方案 | 上下文容量、prefill块大小、算子组合、状态提交方式 | 只允许已实现组合；合法配置与硬件已验收分开标注 |
-| 请求参数 | 输入、输出上限、EOS、受支持的生成策略、reset行为 | 不得重启整轮执行预算；不支持的设置明确报错 |
-| 运行策略 | 准备/推理预算、观察期、重试条件、内存余量 | 由平台及既有授权约束，不开放任意绕过门禁的参数 |
+| Request parsing, execution options, results | C++ | Thin CLI; reusable validation in the runtime. |
+| Package structure, ports, budgets, SDK compatibility | C++ authoritative at execution | Exporters retain independent checks at their own trust boundary; share formats and tests. |
+| Loading, generation, lifecycle | C++ | Reuse validated operators and ownership; unify orchestration. |
+| Tokenization and text decoding | Existing implementation initially | Token-ID input is sufficient for the first step; assess native tokenizer compatibility separately. |
+| Timeouts, kernel checks, recovery markers, release checks | Independent C++ supervisor, last | A stuck inference process must not supervise itself. |
+| Checkpoint processing, model interchange/graph export, CPU reference | Python | Preserve existing tooling and the independent numerical oracle. |
+| SSH deployment and experiment orchestration | Thin Python tools | Organize calls without duplicating model execution policy. |
 
-优先沿用现有manifest/JSON，采用有版本的配置结构与明确的默认值规则。模型尺寸、容量、
-SDK常量、运行政策分别归属对应模块；不能因为数值相同就合并，也不建立巨型constants文件。
+The long-term aim is a board inference path without Python, while retaining Python offline.
+Do not introduce another primary language without a concrete capability/toolchain benefit.
+The current board supervisor uses Python 3.9 standard-library facilities; do not introduce host-only
+heavy dependencies before replacing it.
 
-## Python与C++分工
+## Refactoring targets
 
-| 内容 | 目标归属 | 迁移说明 |
-|---|---|---|
-| 请求解析、执行选项、结果输出 | C++ | CLI只负责解析和展示，业务校验在运行时复用 |
-| 部署包结构、端口、预算和SDK兼容性校验 | C++运行时为执行侧权威 | 导出端仍做独立检查；共享格式与测试，不能删除不同信任边界的验证 |
-| 模型加载、生成、资源生命周期 | C++ | 复用现有实现，统一入口，不重写已验证的算子 |
-| tokenizer与文本解码 | 首期沿用现有实现 | 首期可输入token ID；完整脱离Python前另行评估原生实现和兼容性 |
-| 超时、内核检查、恢复标记、释放检查 | 最后迁至独立C++监督程序 | 必须保留进程隔离，不能让挂死的推理进程监督自己 |
-| checkpoint处理、ONNX/NBG导出、CPU参考 | Python | 继续使用现有生态和独立正确性参考，不为迁移而重写 |
-| SSH部署、批量实验编排 | 少量Python脚本 | 仅组织调用，不再重复实现模型运行规则 |
-
-目标是日常板端推理逐步不依赖Python，离线工具保留Python。目前不引入第三种主语言；
-只有明确的功能收益与工具链支持才评估Rust等替代方案，避免同时维护多套封装和错误模型。
-
-## 代码规范化落点
-
-| 工作 | 现状与调整 |
+| Target | Change |
 |---|---|
-| 通用IO | 从设备验证模块分离原子JSON写入、文件摘要等通用函数；普通文件与禁止符号链接的部署文件保留不同安全语义 |
-| 配置对象 | 沿用Qwen的ModelOptions方向，替换OPT及层构造中的长位置参数列表；配置、产物引用和资源所有权分开 |
-| CLI瘦身 | 拆开解析、配置检查、准备、执行和结果处理；Python与C++入口调用同一执行契约 |
-| 部署包解析 | 共享形状、类型、端口排列等结构解析，模型适配器保留层序、张量名称和特有约束 |
-| 结果记录 | 共用计时定义、原子发布和释放结果结构，保留模型特有字段及现有消费端兼容性 |
-| 大模块拆分 | 按加载、prefill、decode、状态管理拆分OPT实现；模型执行策略不混入平台SDK配置 |
-| 构建与测试 | 无宏的平台实现选择，共用目标和明确的EP/SoC依赖；可独立的CPU契约测试逐步脱离SDK依赖 |
-| 注释与错误 | 注释解释SDK限制、状态提交和所有权等非显然原因；错误包含阶段和对象，明确失败后的可用状态 |
+| Shared IO | Extract named atomic-JSON and file-digest helpers; preserve different rules for ordinary files and deployment files that forbid symbolic links. |
+| Configuration | Follow Qwen `ModelOptions`; replace long positional OPT/layer arguments. |
+| Thin commands | Separate parsing, validation, preparation, execution and result handling; share execution contracts. |
+| Package loading | Reuse shape/type/port parsing; adapters retain layer order, tensor names and model-specific constraints. |
+| Results | Share timing definitions, atomic publication and release records; preserve model fields and consumer compatibility. |
+| Large modules | Separate OPT loading, prefill, decode and state management; keep model selection out of SDK profiles. |
+| Build/tests | Keep source-based EP/SoC selection and explicit dependencies; gradually free independent CPU contract tests from SDK dependencies. |
+| Comments/errors | Explain non-obvious SDK limits, commits and ownership. Errors identify stage/object and whether continued use is valid. |
 
-## 施工顺序与验收
+## Delivery order
 
-| 阶段 | 交付 | 依赖与最小验收 |
+| Stage | Deliverable | Minimal acceptance |
 |---|---|---|
-| 0：目录与发布边界 | ✅已迁移源码、工具、测试及构建配置，更新import、路径、编辑器与文档；补全忽略项 | 142项Python、4项C++ CPU测试、18个工具入口及双平台构建通过；SoC的OPT/Qwen整模通过。用户指定本轮EP只验编译，硬件运行待补 |
-| 1：配置与契约 | 明确模块边界、配置结构、命名常量、共用IO及部署包版本规则 | 依赖目录方案确定；用已有包和异常用例核对解析、默认值与拒绝行为，通常无需上板 |
-| 2：C++加载与薄入口 | 下移执行侧解析和结果逻辑，缩短Python及原生CLI；引入具名选项对象 | 依赖阶段1；保持调用顺序和产物契约，运行相关CPU测试及EP/SoC构建 |
-| 3：共用推理运行时 | 统一加载/生成/关闭入口，拆分大模块，明确模型与平台边界 | 依赖阶段2；批次末各复用一组OPT/Qwen请求，核对数值、TTFT、吞吐、内存与释放 |
-| 4：独立监督器与部署收尾 | 单独迁移板端监督程序，完成日常运行依赖和构建说明；需要时补齐原生文本接口 | 依赖稳定运行契约；先用假子进程测试超时、退出、ready与故障记录，再做最小设备验收 |
+| 0. Directory migration | ✅ Sources, tools, tests, imports, build, editor and documentation paths migrated; ignores updated | 142 Python tests, four C++ CPU tests, 18 command entries, both builds and SoC OPT/Qwen whole-model regressions passed. EP hardware pending. |
+| 1. Configuration/contracts | Named options/constants, shared IO and package-version rules | Existing packages and invalid-input cases cover parsing, defaults and rejection; normally no board run. |
+| 2. Loading/thin entries | Move execution parsing/results into C++; preserve CLI behavior | Stage 1 first; preserve SDK ordering and artifact contracts, run relevant CPU tests and both builds. |
+| 3. Shared runtime | Common load/generate/close flow; split large model modules | Stage 2 first; reuse one OPT and one Qwen request per batch, checking numerics, TTFT, output throughput, memory and release. |
+| 4. Supervisor/deployment | Separate board supervisor; document remaining runtime dependencies | Stable runtime first; fake-child tests for deadlines, exit, readiness and failure records, then minimal device acceptance. Native text support only as needed. |
 
-每阶段单独可审阅、可提交。目录移动不与算子/性能改动混在一起；源码路径影响产物身份时重新生成部署记录，
-不能为避免验证而修改冻结包。并行空间主要是阶段1中的模块审计、配置与IO整理；共享接口确定前，
-不并行修改其调用方。模型计算与状态拆分、监督器迁移不放在同一批，以便发现问题时定位。
+Each stage must be independently reviewable and committable. Do not mix directory moves with
+operator/performance changes. Audit/configuration/IO work can proceed independently once interfaces
+are settled; do not simultaneously refactor all callers of an unsettled interface. Keep model/state
+splits separate from supervisor migration to make regressions diagnosable.
 
-## 保留条件与待打磨项
+## Main-branch and documentation policy
 
-- 不改变已验收的算子选择、图构造顺序、tensor绑定、状态提交和SDK资源释放顺序。
-- 部署哈希、运行元数据检查、恢复门禁和超时策略保持现有语义；完整规则继续以AGENTS及事故台账为准。
-- 当前board_runner是板端Python 3.9标准库程序，迁移前不引入主机侧重依赖。
-- 不预先加入线程池、并行Verify、RPC、通用图DSL或模型插件加载机制。
-- 验收复用已有请求和参考数据；迁移产物身份变化需重新部署核验，不覆盖冻结证据。
-- 迁移初期保留现有模型入口行为，不同时强制合为单一CLI；命令调整需明确映射和使用说明。
-- 后续实现前细化配置对象粒度、原生tokenizer范围、部署包格式兼容策略与独立监督程序归属，不为这些待定点提前占位。
+Include `docs/`, `AGENTS.md` and `TODO.md` in the main branch. Maintain project-authored guidance
+in English; preserve vendor originals and immutable historical evidence in their original language.
 
-本方案的收益首先是清晰的代码边界和可维护性。性能优化仍需独立的整模证据，不能以语言替换或目录调整代替。
+| Material | Policy |
+|---|---|
+| README, usage, architecture, tests | Keep concise supported behavior, prerequisites and working entry points. |
+| AGENTS.md | Keep shared coding, acceptance and device-safety rules. Separating personal authorization/machine details is future work; this plan does not revoke existing rules. |
+| TODO.md | Keep unfinished deliverables, dependencies, acceptance and reopening conditions; do not present plans as capabilities. |
+| This plan | Mark implementation status; fold completed architectural decisions into the development guide rather than maintaining duplicates forever. |
+| Status and incident records | Keep decision-relevant conclusions, limits and traceable evidence. Original incident narratives may be archived unchanged with an English operational index. |
+| Weights, SDKs, raw logs, deployment cache | Keep outside source control; document production/acquisition and identity checks. |
+| Editor configuration | Team-shared settings only; local interpreter preferences are not runtime requirements. |
+| Credentials and local assistant/proxy state | Keep out of main; use precise ignores rather than ignoring all dotfiles. |
+
+`.cache`, `.ruff_cache`, `build` and `demo` are ignored; exact ignores were added for `.agents`,
+`.codex` and `.aws`. The unused `tests/repro` directory was removed. The three protected empty
+hidden directories were not forcibly deleted. Shared `.vscode` files remain tracked. Adding an
+ignore does not untrack files or remove secrets from history. No license or secrets audit is claimed;
+review personal paths, network details and vendor redistribution rights before external publication.
+
+## Preservation requirements
+
+- Keep accepted operator selection, construction order, tensor bindings, state commits and SDK release order.
+- Preserve deployment hashes, runtime metadata, recovery gates and deadlines; AGENTS and the ledger remain authoritative.
+- Rebuild deployment records when source/binary identities change; never edit frozen evidence to avoid verification.
+- Do not prebuild thread pools, parallel Verify, RPC, graph languages or plugin loaders.
+- Keep current model command behavior initially. Any CLI consolidation needs explicit migration instructions.
+- Before each later stage, settle option granularity, native tokenizer scope, package compatibility and supervisor ownership; do not create speculative scaffolding.
+
+The primary benefit is maintainability. Runtime speed claims still require separate whole-model evidence.

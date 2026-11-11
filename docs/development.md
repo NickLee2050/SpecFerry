@@ -1,5 +1,10 @@
 # Development guide
 
+See the [project overview](../README.md) and [terminology/build guide](getting-started.md)
+for the hardware, execution modes and graph terminology. Maintained documentation, comments and
+user-facing messages use English; original vendor material and archived evidence retain their
+source language. Keep status, plans and incident evidence separate rather than duplicating diaries.
+
 ## Read the code in this order
 
 ```text

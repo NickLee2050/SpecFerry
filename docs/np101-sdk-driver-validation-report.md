@@ -1,113 +1,127 @@
-# NP101 SDK 与驱动问题
+# NP101 SDK and driver findings
 
-本页保留失败契约、解释边界和证据索引；性能/已验配置见[实现总结](np101-status.md)，
-每次运行的约束及冷启动事故见[事件台账](np101-recovery-incidents.md)，命令见
-[测试手册](../tests/README.md)。以下是历史结果，不是自动复现清单；模型成功不关闭底层问题。
+This page records failed contracts, interpretation limits and evidence. See
+[status](np101-status.md) for accepted models/performance, the [recovery ledger](np101-recovery-incidents.md)
+for execution gates and [tests](../tests/README.md) for current commands. These are historical
+observations, not an automatic reproduction checklist. A model passing does not close a driver issue.
 
-10-14静态复核：v105 EDMA的SG分支会主动将timeout打印用dst字段设为全1，实际
-提交SG表；因此`dst=0xffffffffffffffff`不能单独证明非法访问或DMA映射失败。
-内部完成等待存在4ms/30s分支（HZ250），与应用900s期限不同；实际触发分支/根因未定。
-本轮4字节EDMA的独立时间线和反汇编证据见台账，不据此放行故障设备。
+`v105/v106` identify matching driver/SDK packages 1.0.5/1.0.6, not printed module version strings.
+Historical libraries are under `/usr/lib/ljmicro`; galcore source versions are
+`F53A3E6EFBB7D0FD7D4617C` / `8D46803809F15FA0FD98A92`. Evidence fixes boot, command, binary/library
+hashes and kernel window. Retired convolution and biased-FCL controls must not be rebuilt merely
+because their historical parameters appear here.
 
-`v105/v106` 指匹配的驱动与SDK安装包1.0.5/1.0.6，不是模块打印字符串。
-库位于 `/usr/lib/ljmicro`；galcore srcversion分别为 `F53A3E6EFBB7D0FD7D4617C` /
-`8D46803809F15FA0FD98A92`。每份证据固定boot、命令、binary/SDK哈希和内核窗口。
-表内参数是历史binary的接口，不作为当前运行命令。自写卷积及原带bias FCL诊断均已退役；
-保留原厂/旧改写身份与证据，不重建替代。
+Terms: FCL is a fully connected layer; NBG is an offline-compiled Network Binary Graph;
+EDMA is the logged direct-memory-access path; SG is scatter/gather; RSS is host resident memory.
+Application logical offsets are not device physical addresses.
 
-## 建图、验图与数据问题
+## Construction, verification and numerical failures
 
-| 操作与问题 | 预期 | 已记录实际结果 | CASE / ARGS；原始证据索引 |
+| Operation | Expected | Observed | Evidence alias / historical case |
 |---|---|---|---|
-| 卷积→ReLU→MaxPool 的 Verify | 原厂 demo 一轮输出误差 ≤0.1；旧改写控制历史两轮另存 | v106 `SIGFPE`，位于 `libNNArchPerf.so::NNTransposeCycleCount_V9` 整数除法，未执行卷积；v105 原厂及仓库版本通过，仓库 Verify 42.478 ms（冷启动 349.972 ms），最大误差 0.003234/0.003114 | `conv`；旧版验图对照、旧版驱动回归 的 `convolution-control/`、旧版冷启动 的 `control-conv/` |
-| 带 bias 的 FCL Verify | 输入 `[8,1]`、单位矩阵 `[8,8]`、bias 0.25；输出 1.25/-0.25 | 两版 `SIGSEGV`；相同计算 MatMul+Add 两轮精确通过。v105 空指针偏移 `0xb0` 读取，v106 栈含 `vxoGraphOptimization_getKernelType`；未证明 bias 单独致错或所有 FCL 均失败 | `projection --operator matmul-add` 对照，`projection --operator fcl` 复现；旧版验图对照、旧版驱动回归 的 `fcl-verification/` 与 `fcl-symbolication.txt` |
-| 单 SELECT Verify / 历史 selection GATHER | 完成验图，无驱动 hang；保留 FP16 位模式 | 同一 SELECT binary：v106 冷启动首测 Verify 28.982 s，NP hang/自动恢复后 16 值正确；v105 9.228 ms，无 hang。历史 GATHER 也曾 hang；无 GATHER 的单 SELECT 已复现，不能仅归因索引写入时机 | `fp16-preservation --operator select`，超时 30 s；旧版冷启动 的 `fp16-selection/`、新版冷启动。selection 为 `check_np101_model.py selection` |
-| 三维 TENSORSTACKCONCAT(axis=1) Setup | `[8,1,2]` 追加到预分配 `[8,8,2]`，容量不变 | v105 单节点在 Setup 报 `Cannot calculate the reshape tensor 16 to 32` 后 SIGSEGV；没有应用 RESHAPE。两版追加+attention 三维组合也崩溃，二维组合通过；v106 单节点待补。三维参数是否支持仍需厂商确认 | `cache-append --rank 2` 对照，`cache-append --rank 3` 复现，超时 30 s；报告复核 的 `cache-append-{2d,3d}/` |
-| 分块写入后的完整字节扫描 | 所有已成功写入张量的每个字节一致 | v106 上界 4096 MiB，保留/全扫 2840 MiB；F16/F32×const/nonconst 四种均在第 109 块三个范围损坏 24 B。v105 目标 1024、保留/全扫 1016 MiB，四种同位置损坏 24 B；不是超过 1 GiB 才出现 | 已退役的完整字节扫描实验；新版内存扫描、旧版内存扫描 的 `summary.json` / `readback-blocks.jsonl` |
-| RANDOM_MULTINOMIAL FP16 | 8 类输出索引 0–7，频率和 seed/counter 有效 | 两版七组×4096 样本全返回 8，含全零 logits；F32 或 F16→F32 后采样通过。进程正常退出不代表数值通过 | `sampling --dtype F16 --classes 8 --samples 4096`；对照 `F32` / `F16_TO_F32`；旧版验图对照、旧版驱动回归、报告复核 |
-| FP16 ADD 非正规数 | 与零相加保留输入位模式 | 两版同 binary 的 10 个正负非正规数全部变 `0x0000`，其余 6 值正确；SELECT 保留 16 值，但 v106 触发选择算子验图。输入字节及 CPU 对照正确，需确认置零规则/配置 | `fp16-preservation --operator add`，超时 30 s；旧版冷启动 的 `fp16-add/`、新版内存扫描 的 `fp16-add/` |
-| SDK 内存计数 | 明确计数与实际板上分配关系，释放后恢复 | 两版 8 MiB tensor 使 `gpu_memory.currentSize` 增加 `2×8,388,608+4,672` B；524,288→17,306,176→524,288，读回正确。不能据此证明双份物理分配、泄漏或越界 | 已退役的8 MiB计数实验；旧版驱动回归 的 `memory-accounting/`、内存计数 |
-| 固定/重绑 copy 图的主机 RSS | 固定与重绑成本可解释，数据正确且释放 | 两版 128 轮，fixed 增量 0，same/advance 约 16 MiB，读回/释放通过；统计为第 127 轮减第 0 轮。RSS 是主机占用，不能推断板上占用、通信成本或泄漏 | 已退役的fixed/same/advance重绑实验（128轮）；旧版驱动回归、重绑内存 |
+| Convolution → ReLU → MaxPool Verify | Vendor one-pass error ≤0.1; rewritten control had separate two-pass evidence | v106 SIGFPE in `libNNArchPerf.so::NNTransposeCycleCount_V9` integer division before convolution execution. v105 vendor/repository versions passed historically; repository Verify 42.478 ms (cold boot 349.972 ms), maximum error 0.003234/0.003114. | Verification comparison, v105 regression: `convolution-control/`; v105 cold boot: `control-conv/`. |
+| Biased FCL Verify | Input `[8,1]`, identity `[8,8]`, bias 0.25 → 1.25/−0.25 | Both versions SIGSEGV; equivalent MatMul+Add passed twice exactly. v105 null-offset `0xb0` read; v106 stack includes `vxoGraphOptimization_getKernelType`. Bias alone and universal FCL failure are not proven. | Verification comparison, v105 regression: `fcl-verification/`, `fcl-symbolication.txt`. |
+| Single SELECT Verify / historical selection GATHER | Successful Verify without hang; preserve FP16 bits | Same SELECT binary: v106 cold-boot Verify 28.982 s, then correct 16 values after NP hang/recovery; v105 9.228 ms without hang. SELECT alone reproduces the issue, so GATHER index-write timing is insufficient explanation. | v105/v106 cold boot: `fp16-selection/`; historical `fp16-preservation --operator select` (30 s). |
+| Rank-three TENSORSTACKCONCAT, axis=1 | Append `[8,1,2]` to preallocated `[8,8,2]` | v105 single node: Setup reports `Cannot calculate the reshape tensor 16 to 32`, then SIGSEGV, without an application RESHAPE. Rank-three append+attention crashed on both versions; rank-two passed. v106 isolated node untested. | Report review: `cache-append-{2d,3d}/` (30 s); rank-three support needs vendor confirmation. |
+| Full-byte scan after chunked writes | Every byte of every retained tensor matches | v106 4096 MiB probe limit, 2840 MiB retained/scanned: F16/F32 × const/nonconst all corrupt 24 B in three ranges of block 109. v105 1024 MiB target, 1016 MiB retained/scanned: same four combinations and locations. Not exclusive to allocations over 1 GiB. | v105/v106 memory scans: `summary.json`, `readback-blocks.jsonl`; probe retired. |
+| RANDOM_MULTINOMIAL FP16 | Eight-class indices 0–7; valid frequency/seed behavior | Both versions returned 8 for all seven groups ×4096 samples, including zero logits. F32 and F16→F32 passed. Normal process exit is not numerical acceptance. | Verification comparison, v105 regression, report review; historical F16/F32/F16_TO_F32 sampling cases. |
+| FP16 ADD subnormals | Adding zero preserves input bits | All ten positive/negative subnormals became `0x0000` on both versions; other six values correct. SELECT preserved 16 values but v106 triggered Verify hang. Input bytes/CPU reference were correct; flush rules need confirmation. | v105 cold boot and v106 memory scan: `fp16-add/` (30 s). |
+| SDK memory counters | Explain allocation/release accounting | An 8 MiB tensor increased `gpu_memory.currentSize` by `2×8,388,608+4,672` B: 524,288→17,306,176→524,288, with correct readback. This does not prove doubled physical allocation, leakage or overflow. | v105 regression: `memory-accounting/`; memory accounting alias. |
+| Fixed/rebound copy-graph RSS | Explain fixed/rebind costs and release | Across 128 iterations on both versions, fixed RSS increment was zero, same/advancing binding about 16 MiB (iteration 127 minus iteration 0); readback/release passed. Host RSS does not establish device allocation, traffic or leaks. | v105 regression and rebinding-memory aliases; retired fixed/same/advance experiment. |
 
+A full-window 1×1 convolution FFN candidate also crashed at first Verify: fixed OpenVX ELF
+`0x2db0c2` (`vxoGraphOptimization_getKernelType+0x5d2`), the same instruction as historical FCL.
+The FULLY_CONNECTED_RELU branch lacked required `enable_relu` scalar parameter[7], not bias.
+Its origin is unknown; the entry was retired. Evidence:
+`ffn-convolution-and-parallelism-20261004/ffn-linear-conv1x1/`. Convolution form alone does not
+promise a safe or fast neural-network execution path.
 
-全窗口1×1 CONV的FFN候选也在首次Verify崩溃：固定OpenVX ELF `0x2db0c2`
-（`vxoGraphOptimization_getKernelType+0x5d2`）与历史FCL同一指令；FULLY_CONNECTED_RELU
-分支缺必需 `enable_relu` scalar parameter[7]，不是bias。参数丢失来源未知，入口已退役。
-证据 `ffn-convolution-and-parallelism-20261004/ffn-linear-conv1x1/`。保留MatMul+Add，
-不把卷积形式视为安全或快速NN路径保证。
+Integrity probes used 8 MiB blocks and scanned all retained blocks after the next allocation was
+rejected, continuing after mismatches before release. Block 109 offsets were 1,340,216 / 1,340,280 /
+1,340,344, eight bytes each; historical v106 positions differed by 65,536 B. Cumulative logical offsets
+were about 873.278/873.216 MiB, not physical addresses. v106 FP32 nonconst passed two 1024 MiB runs
+but failed at 2840 MiB, so the format is not universally safe. Historical reproduction began with a
+64 MiB control. Ordinary/model allocations remain capped at 1 GiB per segment. The separately
+authorized v106 4096 MiB synthetic probe is retired and did not cover hidden SDK or unallocated memory.
 
-分块完整性使用8 MiB块，拒绝下一块后仍全扫所有已写块，遇错继续扫描后统一释放。
-第109块三个错误偏移为1,340,216/1,340,280/1,340,344，各8B；历史v106对应位置差
-65,536 B，累计逻辑偏移约873.278/873.216 MiB，**不是物理地址**。v106的1024 MiB
-FP32 nonconst两次通过、2840 MiB失败，不能认定该配置总是安全。历史复现先用64 MiB控制；
-v105及模型/普通检查保持各段1 GiB上限。历史v106合成完整性探针曾单独获准使用4096 MiB；该入口现已退役，不覆盖SDK隐藏空间或未申请的物理内存。
+## NBG public and internal port ordering
 
-## 多输出NBG的公开端口与内部端口
+The 10-15 partial Qwen head failure was traced to the project's exporter, not established SDK
+arithmetic or hardware failure. Generated `vnn_network.c` contained an original-kernel branch with
+16 outputs reversed and an `inference_with_nbg` branch/public graph with normal order. The saved
+`network_binary.nb` used the latter; the exporter read the former. Reference token 31759 (block 7,
+offset 3087) became 35855 (block 8, offset 3087), matching `15−7=8`; feedback then diverged.
 
-10-15 Qwen部分head初版数值失败来自项目导出器的端口映射，不是已证实的SDK算术或
-设备故障。生成`vnn_network.c`同时包含原始kernel分支和`inference_with_nbg`分支：
-前者16输出反序，后者及公开graph输出正序。实际保存的`network_binary.nb`使用后者，
-导出器却采用前者；参考首词31759（块7、块内3087）被解释为35855（块8、块内3087），
-符合`15−7=8`的块反序，后续反馈随之分歧。
+The fix used existing `compiled_ports(..., saved_public_graph=True)` and repackaged port metadata.
+NBG SHA256 `f7b15450bc2c0a4f17425b0e1a1a92d8ec3ff2b99eb51cfbf1d22ccea4ed249b` and the native binary
+were unchanged. Sixteen outputs/coarse state passed against CPU with before/after baseline controls;
+other accepted artifacts did not receive a global parser-mode change. Regression covers both generated
+C branches and semantic permutation checks. Initial release/budgets/kernel/45 s checks were clean;
+an explicit numerical-repair exception retained the marker until full corrected acceptance. It did
+not exempt kernel faults, incomplete execution, unreleased resources, excess budgets or compile-audit
+failures. Evidence: `qwen-head-prefix-20261015/port-order-diagnosis.json` and original/fixed runs.
+Wrong-output timing is not accepted performance.
 
-历史head导出修复显式采用已有`compiled_ports(..., saved_public_graph=True)`，重新打包端口元数据；
-NBG SHA256 `f7b15450bc2c0a4f17425b0e1a1a92d8ec3ff2b99eb51cfbf1d22ccea4ed249b`
-及native binary均未改变。修复后16输出及粗状态通过CPU比较，前后原实现对照通过；
-未全局改变其他已验产物的解析模式。回归覆盖生成C的两种分支及语义排列校验。
-首轮执行/释放、预算、完整内核和45秒检查均正常，按显式数值修复例外保留原标记，
-修复全验通过后归档；没有设备故障或断电事件。例外仍拒绝内核故障、未完成执行、
-未释放、超预算或编译审计失败。证据`qwen-head-prefix-20261015/`中的
-`port-order-diagnosis.json`、原失败与修复结果；错误数值轮不记有效性能。
+The same day's full shared FCL head passed C64/v105 model comparison. Embedding/head retained references
+to the same ordinary vocabulary tensor, read-only by application contract, without changing const
+classification. Isolated simulator checks covered 4096-row and 2560-row tail blocks. No bias/activation
+fusion was used; other FCL calls still require const weights. An ONNX candidate exposing weights as NBG
+inputs generated MatMul, not evidence for FCL speed. See `qwen-shared-head-20261015/summary.json`.
 
-同日完整共享FCL head另通过C64/v105整模对照：普通词表tensor在embedding/head间
-保留引用，应用承诺只读，不改变const标记；4,096行与2,560行尾块先经隔离模拟器检查。
-无bias/激活融合，SDK失败条件不能由此一概豁免；其他FCL调用仍要求const权重。
-本次将权重改为NBG输入的ONNX候选只生成MatMul，未将其当作FCL性能证据。
-固定源码、真实输入、预算与完整门禁见`qwen-shared-head-20261015/summary.json`。
+## Missing compiler entries and shared slots
 
-## 编译表缺项与共享槽位
+Per-head KV and const/mutable variants produced 1143 extensions: the first 1024 operations existed,
+the remaining 119 were missing. Execution tables subsequently emptied, tiling/command generation was
+skipped, Verify still succeeded, and decoders 23/24 produced zeros. Disassembly found 1024 slots in a
+user-shader wrapper path, NULL on exhaustion and an ignored failure code above it. The first live
+full-table/NULL event was not captured: this is not proven out-of-bounds writing. The budget is shared
+wrapper state, not 1024 nodes per graph or a universal operator limit; it does not explain every EDMA
+or chunk-corruption event.
 
-逐头KV及const/mutable变体共1143个extension，前1024个operation非空、后119个缺失；
-执行表随后清空、跳过Tiling/命令生成，Verify仍成功，第23/24 decoder全零。
-反汇编发现user shader包装路径的1024槽，满后返回NULL、上层忽略失败码；尚未捕获
-运行时首次满槽/NULL，不能称为已证明越界写。这是共享包装资源，不是每图1024节点，
-也不是所有算子的统一额度，不能解释全部EDMA或分块内存损坏。
+For fixed OpenVX SHA256 `2f7223e504b15886c1562889668a80af48b19d605461beac175d336d396ff108`,
+`vxCreateContext@0x50795` obtains process-level vxGlobalData; `0x507a5` writes Context+0xa8;
+`vxnneGetUserShaderExecutable@0x114410` reaches the slot table through it. Graph release did not return
+slots in the observed path; release of the final Context cleared the table. Concurrent Contexts share
+it. Verify has a visible graph+0x20 lock; no lock was found inside the slot routine, but outer locking
+and the vendor concurrency contract are incomplete. No race is proven; parallel Verify and
+cross-process graph/resource transfer remain unvalidated.
 
-固定OpenVX SHA256 `2f7223e504b15886c1562889668a80af48b19d605461beac175d336d396ff108`：
-`vxCreateContext@0x50795` 取进程级vxGlobalData，`0x507a5` 写Context+0xa8；
-`vxnneGetUserShaderExecutable@0x114410` 经它访问槽表。单图释放未见归还，最后Context
-释放才清零；并存Context共享预算。Verify可见锁在graph+0x20，槽函数内未见锁，
-完整外层锁路径及厂商并发合同仍缺失，不宣称已证实竞争、不实施并行Verify。
-多进程图移交/资源隔离也未验证。
+Merged KV reduced usage to 423 extensions, two graph sets 846. Rebuilding within the same Context hit
+`846+178=1024`, leaving 668 missing entries; compile checks rejected execution. Releasing the final old
+Context before rebuilding produced two complete 846-entry runs with matching output. This lifecycle is
+used; ordinary requests reuse the model. Detailed addresses/open questions:
+`decode-static-audit-20261009/verify-and-incidents.md`.
 
-合并KV降到423 extension、两套图846；同Context重建出现 `846+178=1024` 后缺668项，
-编译保护在Run前拒绝。释放最后旧Context后两次各846完整、输出一致，采用此重建策略；
-普通请求复用模型。详细地址与未闭环点在 `decode-static-audit-20261009/verify-and-incidents.md`。
-图规模/Verify成本及已关闭结构候选的结果集中在实现总结。
+## EDMA and interpretation limits
 
-## 原始证据索引
+The 10-14 static audit found that v105's scatter/gather EDMA branch deliberately sets the destination
+field used in timeout printing to all ones, while submitting an SG table. Therefore
+`dst=0xffffffffffffffff` alone proves neither illegal access nor DMA mapping failure. Internal waits
+include 4 ms / 30 s branches at HZ=250, distinct from a historical application 900 s limit; the actual
+branch and root cause remain unknown. Exact four-byte EDMA timelines/disassembly belong in the ledger,
+not permission to run a faulted device. `Waiting for HDMA Transfer...` alone supplies no duration.
 
-路径相对 `.cache/runs/`，别名映射为 `evidence-directory-aliases.json`。
-需复查时同时取result、sdk.log、execution身份/退出记录及内核窗口；仅有SDK成功不足以
-判定通过。`Waiting for HDMA Transfer...` 不提供等待时长。原始内容保持不变。
+## Evidence index
 
-| 索引 | 目录 / 文件 |
+Paths are relative to `.cache/runs/`; historical aliases are in `evidence-directory-aliases.json`.
+Read result, SDK log, execution identity/exit and kernel window together. Original evidence is unchanged.
+
+| Alias | Directory/files |
 |---|---|
-| 旧版验图对照 | `operator-verification-20260925/`、`demo-verify-20260925.log`、`driver-1.0.6-legacy-recheck-20260925/` |
-| 旧版驱动回归 | `driver-1.0.5-20260925/`：`summary.json`、`environment.json`、`kernel-review.json` |
-| 旧版冷启动 | `v105-coldboot-20260928/`：`summary.json`、`kernel-review.json`，selection 23 项通过，无 hang |
-| 新版冷启动 | `v106-coldboot-20260928/`：SELECT 计时、`kernel-test-window.log`、`completion.json`；首测 hang 后停测 |
-| 报告复核 | `report-review-20260928/`：`review.json`、单节点追加及采样/重绑复测 |
-| 新版内存扫描 | `v106-memory-integrity-20260928/`：完整四组合扫描、ADD 与前后内核观测，无新增 hang |
-| 旧版内存扫描 | `v105-memory-integrity-20260928/`：环境/四组合/内核摘要；旧大载荷见 `capacity-map-20260923/` |
-| 内存计数 | `memory-integrated-accounting/` |
-| 重绑内存 | `memory-integrated-{fixed,same,advance}/` |
-| 编译表完整性历史 | `incremental-model-checks-20260924/`、`incremental-model-warmboot-20260925/`、`incremental-cache-checks-v105-20260928/`、`weight-storage-and-cache-reshape-preparation-20260929/shader-limit/`、图规模/模型验收目录见状态文档 |
+| Verification comparison | `operator-verification-20260925/`, `demo-verify-20260925.log`, `driver-1.0.6-legacy-recheck-20260925/` |
+| v105 regression | `driver-1.0.5-20260925/`: `summary.json`, `environment.json`, `kernel-review.json` |
+| v105 cold boot | `v105-coldboot-20260928/`: summary/kernel review; 23 selection checks passed without hang. |
+| v106 cold boot | `v106-coldboot-20260928/`: SELECT timing, `kernel-test-window.log`, `completion.json`; stopped after first hang. |
+| Report review | `report-review-20260928/`: `review.json`, isolated append, sampling and rebinding checks. |
+| v106 memory scan | `v106-memory-integrity-20260928/`: four combinations, ADD and kernel checks; no new hang. |
+| v105 memory scan | `v105-memory-integrity-20260928/`; earlier large-payload evidence: `capacity-map-20260923/`. |
+| Memory accounting | `memory-integrated-accounting/` |
+| Rebinding memory | `memory-integrated-{fixed,same,advance}/` |
+| Compile-table integrity | `incremental-model-checks-20260924/`, `incremental-model-warmboot-20260925/`, `incremental-cache-checks-v105-20260928/`, `weight-storage-and-cache-reshape-preparation-20260929/shader-limit/` |
 
-
-三维追加的v106单节点及v106冷启动原selection仍未补测，不自动安排危险复现。
-退役结构需从历史归档独立恢复；当前固定图不能冒充旧实现。EDMA、控制hang与关机
-page fault的精确SDK/内核时间线由事故台账独立维护，根因均未因恢复检查通过而关闭。
-
-本次退役实验源码及身份见`.cache/runs/repository-compaction-20261016/`；
-上述历史参数与较大分配只描述既有证据，不是当前可执行命令或重试授权。
+Isolated rank-three append on v106 and the original v106 cold-boot selection case remain untested;
+do not automatically schedule risky reproduction. Retired structures need their original independent
+archives, not a current graph relabeled as historical. EDMA, control hangs and shutdown page faults
+remain open despite recovery-control success. Retired source identities:
+`.cache/runs/repository-compaction-20261016/`. Historical arguments/capacities are evidence, not current
+commands or retry authorization.

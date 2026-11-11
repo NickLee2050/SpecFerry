@@ -1,106 +1,110 @@
-# 后续工作
+# Remaining work
 
-更新：2026-11-11。运行与性能结论集中在[实现总结](docs/np101-status.md)，恢复依据见
-[事故台账](docs/np101-recovery-incidents.md)。本文件只列待办、验收边界及重开条件；
-任务编号仅用于沟通，不进入代码、CLI或产物名。
+Updated: 2026-11-11. Validated behavior and performance belong in
+[status](docs/np101-status.md); execution gates and incidents belong in the
+[recovery ledger](docs/np101-recovery-incidents.md). This file records deliverables,
+dependencies and acceptance boundaries. Task IDs are planning references, not code or artifact names.
 
-✅指定范围完成　🟡部分完成　🔜可推进　🧩依赖前项　🌐外部依赖　⏸暂缓
+✅ Complete within stated scope · 🟡 Partial · 🔜 Ready · 🧩 Dependency · 🌐 External · ⏸ Deferred
 
-## 代码结构改造
+## Code organization
 
-参数化C++推理运行时、Python职责收敛及代码规范化的目录、边界、目录迁移及四阶段交付与验收见
-[施工方案](docs/inference-runtime-plan.md)。目录迁移及本轮验收已完成；后续阶段尚未施工。
-方案采用src/devices/np101/api/{ep,soc}，取消platform目录；IR先独立实现，后续再提取公共代码。
-tools采用deploy/{export,pack,execute}、reference、benchmark、validate、format；同时明确测试、构建、
-文档与根目录配置的归属。docs/、AGENTS.md及TODO.md整理后进入主分支。
+The [runtime plan](docs/inference-runtime-plan.md) defines the remaining C++ configuration,
+loading, inference and supervision work. Directory migration is complete; responsibility
+refactoring is not. EP and SoC remain under `src/devices/np101/api/`; future vendor intermediate
+representation (IR) support starts independently, without a speculative common platform layer.
 
-| 顺序 | 状态 | 交付与验收 |
+| Order | Status | Deliverable and acceptance |
 |---|---|---|
-| 目录迁移 | ✅本轮验收完成 | 已同步源码、工具、测试、构建、import、格式化与文档路径；双平台编译、142项Python、4项C++ CPU测试、18入口及SoC的OPT/Qwen整模通过，性能见状态文档 |
-| EP硬件回归 | ⏸等待用户安排条件 | 2026-11-11按用户要求以编译通过作为本轮EP验收；尚未运行迁移后的EP模型，后续复用已验OPT/Qwen请求补测，不重开性能探索 |
-| 1．配置与契约 | 🔜 | 具名配置、常量归属、部署包格式和通用IO；保留不支持组合的拒绝行为 |
-| 2．C++加载与薄入口 | 🧩 | 下移执行侧解析和结果逻辑，保留现有命令行为 |
-| 3．共用推理运行时 | 🧩 | 拆分模型、运行流程与设备职责；批次末各复用一组OPT/Qwen整模回归 |
-| 4．独立监督与部署收尾 | 🧩 | 保留进程隔离与恢复门禁，先测假子进程再做最小板卡验收 |
+| Directory migration | ✅ | Sources, tools, tests, imports, build and documentation paths migrated. Both targets compile; 142 Python tests, four C++ CPU tests, 18 command entries and one SoC full-model request per model passed. |
+| EP hardware regression | ⏸ | The user accepted compilation-only for the 2026-11-11 migration. Reuse accepted OPT/Qwen requests when hardware becomes available; do not reopen performance exploration. |
+| 1. Configuration and contracts | 🔜 | Named configurations, constants with clear ownership, package formats and shared IO; preserve rejection of unsupported combinations. |
+| 2. C++ loading and thin entry points | 🧩 | Move execution-side parsing and result logic into C++; preserve command behavior. |
+| 3. Shared inference runtime | 🧩 | Separate model semantics, orchestration and device execution; reuse one OPT and one Qwen whole-model regression at each meaningful batch boundary. |
+| 4. Independent supervisor | 🧩 | Preserve process isolation and recovery gates; test fake children before minimal hardware acceptance. |
 
-## 当前优先顺序
+## Recommended execution order
 
-| 顺序 | 工作 | 验收与边界 |
+| Order | Work | Acceptance and boundary |
 |---|---|---|
-| 1🔜 | Qwen扩大Delta批量覆盖，并减少独立状态提交 | 聚焦prefill约50%的逐token Delta和约22%的独立提交。先评估共享输出投影＋FFN联合图，保留M1 decode/尾部及状态契约；集合有明确收益再测整模TTFT、数值与实际内存 |
-| 2🧩 | 有效候选进入正式入口 | 当前两层M8 Delta仅冻结候选包；需两轮清KV重放、尾块/reset及正式部署契约。不要把基线的多轮验收套到新候选 |
-| 3🔜 | 最小拒绝纠正协议与真实接受率 | 先离线/复用现有目标调用，不先搭RPC；与性能工作可并行。以实际接受长度和端到端成本决定是否值得板端联调 |
-| 4🌐 | TLM联调与厂商IR | 等接口就绪；不预先建设通用编译框架或树形服务 |
+| 1 🔜 | Extend batched Qwen DeltaNet coverage and reduce independent state commits | Target the roughly 50% token-by-token DeltaNet and 22% independent-copy shares of prefill. Evaluate shared output projection plus FFN composition first; preserve single-token decode, tails and state contracts. Require useful collection-level gains before whole-model TTFT, numerics and memory acceptance. |
+| 2 🧩 | Integrate a useful candidate into the formal entry | The two-layer M8 DeltaNet package is still experimental. Require two clear-and-replay turns, tails/reset and deployment contracts; baseline acceptance does not transfer to it. |
+| 3 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls, without first building a remote procedure call (RPC) service. Use accepted draft length and end-to-end cost to decide whether hardware integration is worthwhile. |
+| 4 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
 
-源码整理后的重建binary已通过Qwen 96→16及OPT 17→16的SoC整模回归，数值、
-释放与内核均通过；不扩大为其它配置的验收。每环节最多三个有依据候选，无明确收益即停；暂停head分组、
-CPU状态复制、固定行copy等零碎实验。一个候选首先必须完整运行，其次才评估性能。
+The migrated SoC binaries passed Qwen 96-input/16-output and OPT 17-input/16-output requests,
+including numerics, release and kernel checks. This does not validate other configurations.
+Try at most three evidence-based candidates per optimization step; stop if none is useful.
+Pause small head-grouping, CPU state-copy and fixed-row-copy experiments. Complete execution
+comes before performance.
 
-## S6：Qwen部署、会话与容量
+## S6: Qwen deployment, sessions and capacity
 
-| 编号 | 状态 | 下一步与验收 |
+| ID | Status | Next step and acceptance |
 |---|---|---|
-| S6.4.1 | 🟡文本对照已有 | 统一Qwen小/大模型的tokenizer、模板、EOS及实际生成策略；四轮独立回答相似性不代表推测接收率 |
-| S6.4.2 | ✅当前模型可容纳 | 768 MiB Linux/2048 MiB NPU池已完成M1与批量FFN有界验收；继续按权重、派生副本、KV、递归状态和SDK实际峰值核算，KV不是当前大头 |
-| 　S6.4.2.1—2 | ✅已有权重复用 | 不加载已内嵌到NBG的raw权重；embedding/head共享一份词表。保持各段1 GiB预算，不能改is_const绕过 |
-| 　S6.4.2.3 | ⏸必要时备选评估 | 当前模型不可部署或性能不足再评估其它小模型、MoE及已有量化版本；核对总权重、算子、精度、tokenizer/TLM配对，不自动下载或启动泛化量化研究 |
-| S6.4.3—4 | ✅有界整模与优化验收 | M1共享FCL、mapped KV、合并Delta读取、M8/M16 FFN、norm合图和FFN提交已有证据；不再重复局部验收。正式默认与显式选项见使用文档 |
-| 　Delta批量容量 | 🟡共享投影省内存但慢 | 单层SYSTEM约51.70→34.27 MiB，投影/提交合图仍比原M1慢13.7%，严格状态2元素超差保留。联合FFN之前不直接铺满18层；988 MiB const只是外推 |
-| 　整模归因 | ✅已找到大头 | 保留低开销off/on/off结果；不把FFN包装图全算成纯GEMM，不把完成等待全算成IO。当前内嵌状态提交已摊薄成本 |
-| 　自然多轮 | 🟡清KV两轮通过 | M8 norm合图＋FFN提交通过28→20、66→49且均EOS；覆盖尾块和reset。下一步评估保留KV续接与待消费末token边界，不能只看回答文字 |
-| S6.1 | 🟡上下文按模型区分 | OPT原布局C128/C256边界、满后拒绝与reset已有；C512短长有界通过，但四轮历史重放整组未通过。Qwen C128单请求及两轮、C512的96→16/241→16已验；C512满槽、边界/reset与更长输入未验 |
-| S6.2 | ⏸正式大测前再做 | 重复长短交替、长期常驻和稳定性；不以数小时压力测试阻塞当前优化 |
-| S6.3 | ⏸ | CLI服务化/轻量用户入口，仅联调或实际访问需要时建设 |
-| S6.5 | 🧩会话状态契约后 | 单端保留KV多轮；多请求batch/跨端并发暂缓 |
+| S6.4.1 | 🟡 Text comparisons available | Align draft/target tokenizers, templates, end-of-sequence (EOS) behavior and effective generation policy. Similarity of four independent answers is not speculative acceptance rate. |
+| S6.4.2 | ✅ Current model fits | Bounded M1 and batched-FFN runs passed with 768 MiB Linux / 2048 MiB NPU. Account separately for weights, derived copies, attention key/value (KV) cache, recurrent state and actual SDK peaks; KV is not currently dominant. |
+| ↳ S6.4.2.1–2 | ✅ Weight reuse | Do not load raw weights already embedded in compiled graphs. Embedding and output head share one vocabulary matrix. Keep each application const/nonconst segment within 1 GiB; do not change `is_const` to bypass limits. |
+| ↳ S6.4.2.3 | ⏸ Alternatives if needed | If deployment or performance remains inadequate, evaluate other small models, mixture-of-experts models or existing quantized checkpoints against weights, operators, precision and target-model/tokenizer compatibility. No automatic downloads or general quantization research. |
+| S6.4.3–4 | ✅ Bounded model acceptance | Shared fully connected layers (FCL), mapped KV, joint DeltaNet state reads, M8/M16 feed-forward networks (FFN), normalization fusion and FFN state commit have evidence. Do not repeat local acceptance without a new gap. |
+| ↳ Batched DeltaNet capacity | 🟡 Shared projections save memory but regress speed | Single-layer SYSTEM use fell 51.70→34.27 MiB; projection/commit fusion remains 13.7% slower than original M1. Preserve the two-element strict-state mismatch. Do not expand to all 18 layers before joint FFN evaluation; approximately 988 MiB const is only an extrapolation. |
+| ↳ Whole-model attribution | ✅ Main costs identified | Preserve low-overhead off/on/off evidence. FFN wrapper time includes state commit; completion waits do not establish an IO bottleneck. |
+| ↳ Natural conversation | 🟡 Two clear-and-replay turns passed | M8 normalization fusion plus FFN commit passed 28→20 and 66→49 tokens, both ending at EOS, with tails/reset. Next assess retained-KV continuation and the final unconsumed token boundary, not just answer text. |
+| S6.1 | 🟡 Context coverage differs by model | OPT original-layout C128/C256 boundaries, full-capacity rejection and reset passed. Bounded C512 short/long runs passed, but four-turn history replay did not. Qwen C128 single/two-turn and C512 96→16 / 241→16 passed; C512 full capacity, boundaries/reset and longer inputs remain untested. |
+| S6.2 | ⏸ Before large evaluations | Repeated long/short alternation, persistent operation and stability; do not block current optimization on hours of stress testing. |
+| S6.3 | ⏸ | Lightweight command-line service only when integration or user access needs it. |
+| S6.5 | 🧩 Session contract first | Retained-KV multi-turn use for one endpoint; cross-request batching and cross-endpoint concurrency remain deferred. |
 
-## S7：拒绝纠正、协同与树形候选
+## S7: Correction, collaboration and tree candidates
 
-| 编号 | 状态 | 下一步与验收 |
+| ID | Status | Next step and acceptance |
 |---|---|---|
-| S7.1 / S7.1.1 | 🔜协议先行 | 定义session/step、已接受前缀、候选、接受数、纠正及全接受额外token、EOS/容量/reset/失败语义；先复用现有调用，不要求RPC |
-| S7.2 | 🔜最小单分支闭环 | 零/部分/全部接受、EOS和容量边界，与清KV重放同一已接受前缀对照；接受位置与已提交位置分开 |
-| 　S7.2.1 | 🔜OPT经验 | 用固定短轨迹核对KV长度、未提交槽、纠正token写入及reset，无需自然语言质量通过 |
-| 　S7.2.2 | 🧩Qwen恢复 | 分别处理FP32递归矩阵、卷积历史、attention KV；比较检查点、重算和重放的内存/延迟，不能只截KV长度 |
-| S7.3.1 | 🔜真实TLM基线 | 核实目标模型、量化、后端、并发、输入输出长度及吞吐；量化改变后重新测接受情况，不沿用BF16假设 |
-| S7.3.2 / S7.3.2.1 | 🧩纠正闭环后 | 先固定4个候选，必要时再8个；统计平均接受长度、零接受比例及草稿/验证/通信/恢复成本，代入对应NP101模型速度算打平与加速门槛 |
-| S7.3.3 | 🌐TLM验证就绪 | 同请求/策略对比目标单跑和协同，含TTFT、decode及端到端；纳入DGX本地草稿对照 |
-| S7.4.1 | 🔜可离线设计 | 单模型树节点token/parent/depth/分数及有界预算，核对greedy head之外top-k能力和成本 |
-| S7.4.2 | 🧩依赖状态恢复 | 共享一套权重，逐路径复用前缀；核算分支递归/卷积/KV快照和临时峰值，不假设别名或并行可用 |
-| S7.4.3—4 | 🌐TLM支持树验证后 | 明确树mask、位置、接受路径和混合递归状态；固定候选预算对比单链/小树收益。逐路径验证不能称树并行 |
+| S7.1 / S7.1.1 | 🔜 Protocol first | Define session/step, accepted prefix, candidates, accepted count, correction and extra token after full acceptance, EOS/capacity/reset/failure semantics. Reuse existing calls; RPC is not required. |
+| S7.2 | 🔜 Minimal single-branch loop | Cover zero/partial/full acceptance, EOS and capacity against clear-and-replay of the same accepted prefix. Distinguish accepted and committed positions. |
+| ↳ S7.2.1 | 🔜 OPT reference | Fixed short traces for KV length, uncommitted slots, correction-token writes and reset; natural-language quality is not the acceptance criterion. |
+| ↳ S7.2.2 | 🧩 Qwen rollback | Handle FP32 recurrent matrices, convolution history and attention KV separately. Compare checkpoint, recompute and replay memory/latency; truncating KV alone is insufficient. |
+| S7.3.1 | 🔜 Real target-model baseline | Verify model, quantization, execution backend, concurrency, input/output lengths and throughput. Remeasure acceptance after quantization changes rather than carrying over BF16 assumptions. |
+| S7.3.2 / S7.3.2.1 | 🧩 Correction loop first | Begin with four draft candidates, then eight only if useful. Measure average accepted length, zero-acceptance rate and draft/verification/communication/rollback costs; derive break-even and speedup thresholds from the matching NP101 model. |
+| S7.3.3 | 🌐 Target verification ready | Compare target-only and collaborative execution under the same request/policy, including TTFT, decode and end-to-end time; include a DGX-local draft baseline. |
+| S7.4.1 | 🔜 Offline design | Define token/parent/depth/score and bounded node budgets for a single-model tree; check top-k capability/cost beyond the greedy head. |
+| S7.4.2 | 🧩 State rollback first | Share one set of weights and reuse prefixes path by path; budget recurrent/convolution/KV snapshots and temporary peaks. Do not assume aliasing or parallelism is supported. |
+| S7.4.3–4 | 🌐 Target tree verification ready | Define tree masks, positions, accepted paths and mixed recurrent state. Compare chains and small trees at a fixed candidate budget; sequential path verification is not parallel tree verification. |
 
-## S3、S4：容量与底层能力
+## S3–S4: Memory and lower-level interfaces
 
-| 编号 | 状态 | 重开或推进条件 |
+| ID | Status | Reopening or progression condition |
 |---|---|---|
-| S3.1 | 🟡账本已做，SDK空间不透明 | 新候选同时记录应用权重/副本/状态和实际SYSTEM峰值，不能只以文件大小估计 |
-| S3.2.1—3 | ⏸OPT外置FFN权重 | 公开filter端口未保留真实动态权重语义；MatMul绕过正确但慢。仅新共享契约/IR或不同模型证据重开 |
-| S3.3 | ✅OPT共享输出、FP16已验 | Qwen递归状态独立处理，不能直接降到FP16 |
-| S3.4 | 🟡按需求扩上下文 | OPT C1024未验，先测真实状态预算和负载收益，不预设KV占最大头 |
-| S4.1—2 | 🌐有效观测接口 | 区分提交、设备执行、完成等待、内部搬运；确认计数单位/时钟/覆盖/扰动。旧SoC VPD大幅失真，CPU perf不提供NPU流水 |
-| S4.3 | 持续记录 | 每次hang/EDMA/存储故障独立留证；无新假设不重复吸收态故障，不从静态Delay分支断言原因 |
-| S4.4 / S4.4.1 | 🌐等待厂商IR | 核实IR层级、导入导出、编译/执行、内存及观测契约；先原样往返单层，再做一个局部改动，按接口选框架 |
+| S3.1 | 🟡 Accounting available; SDK storage opaque | Record application weights/copies/state and actual SYSTEM peaks for each new candidate; file size alone is insufficient. |
+| S3.2.1–3 | ⏸ External OPT FFN weights | Public filter ports did not preserve dynamic-weight semantics; the MatMul workaround was correct but slow. Reopen only with a new sharing contract, IR or different-model evidence. |
+| S3.3 | ✅ OPT shared output / FP16 validated | Qwen recurrent state needs separate treatment; do not simply reduce it to FP16. |
+| S3.4 | 🟡 Extend context on demand | OPT C1024 remains untested. Measure state budgets and workload value first; do not assume KV dominates. |
+| S4.1–2 | 🌐 Useful observation interfaces | Separate submission, execution, completion wait and internal movement. Establish counter units, clocks, coverage and perturbation. Old SoC VPD profiling heavily distorts execution; CPU perf is not an NPU pipeline view. |
+| S4.3 | Ongoing | Record each hang, direct-memory-access timeout and storage fault independently. Do not repeat lockup experiments without a new hypothesis or infer root cause from a static Delay branch. |
+| S4.4 / S4.4.1 | 🌐 Vendor IR | Establish IR level, import/export, compilation/execution, memory and observability contracts. First round-trip one unchanged layer, then one local edit; choose infrastructure after seeing the interface. |
 
-## S8：环境与恢复
+## S8: Environment and recovery
 
-| 编号 | 状态 | 边界 |
+| ID | Status | Boundary |
 |---|---|---|
-| S8.1 | ✅11-10断电后控制通过 | 六张量及三输入decoder的数值、释放、内核/10秒检查通过；旧事故仍保留，不代表存储根因解决 |
-| S8.2.1—6 | 🟡布局对照完成，长请求故障未解 | 512 MiB Linux的2304/1792 MiB池长请求均失败；当前768 MiB/2048 MiB优先Qwen，不继续无区分度的相同集合 |
-| S8.3—4 | ⏸ | 全池/DLA覆盖、v106内部审计仅新需求或匹配SDK证据出现时安排 |
-| S8.5.1 | 🔜离线确认 | 核实第二DDR区间所有者/CPU和NPU可达性及普通tensor落池契约，排除MMIO、固件和保留区 |
-| S8.5.2—4 | 🧩区间明确且主池稳定后 | 保持当前主池不变，第二池先4 MiB读写释放，再小图跨池计算，最后16/64 MiB真实权重；不填满主池逼分配、不跨保留孔洞、不绕预算 |
-| S8.5.5 | 🌐更多DDR或新配置 | 现有3 GiB窗口即使Linux缩至512 MiB、未知尾部248 MiB全可用，最多约2.49 GiB；2.7 GiB需额外证据。单张量跨非连续区间首版不做 |
+| S8.1 | ✅ Controls passed after 11-10 power cycle | Six-tensor IO and three-input decoder controls passed numerics, release, full kernel and 10 s observation. Keep old incidents; storage root cause is unresolved. |
+| S8.2.1–6 | 🟡 Layout comparison complete; long-request fault unresolved | With 512 MiB Linux, long requests failed using both 2304 and 1792 MiB pools. Prioritize Qwen on 768 MiB / 2048 MiB; do not repeat comparisons that cannot distinguish hypotheses. |
+| S8.3–4 | ⏸ | Full-pool/DLA coverage and internal v106 audit require a new need or matching-SDK evidence. |
+| S8.5.1 | 🔜 Offline confirmation | Establish ownership, CPU/NPU reachability and ordinary-tensor allocation contracts for a second DDR region. Exclude memory-mapped IO, firmware and reserved ranges. |
+| S8.5.2–4 | 🧩 Region identified and main pool stable | Leave the main pool unchanged. Test 4 MiB allocation/read/write/release, then small cross-pool computation, then 16/64 MiB real weights. Do not force allocation by filling the main pool, cross reserved holes or bypass budgets. |
+| S8.5.5 | 🌐 More DDR or a new configuration | Within the visible 3 GiB window, even 512 MiB Linux plus all unknown 248 MiB tail space gives only about 2.49 GiB. Reaching 2.7 GiB requires additional evidence. No tensor spanning discontiguous regions in the first implementation. |
 
-恢复只复用约定控制；不恢复删除的卷积检查。SoC孤立NP hang按台账有界重试，三次同实验
-失败停止；SDHCI/EXT4/Oops/资源未释放立即停。准备和推理预算独立，运行中不得延长。
+Reuse agreed recovery controls; never restore deleted convolution checks. Follow the ledger's
+bounded isolated-SoC-hang retry rule, stopping after three consecutive failures of the same
+experiment. SDHCI/EXT4/Oops or unreleased resources stop board work. Preparation and inference
+budgets are separate and cannot be extended while running.
 
-## 历史项目重开条件
+## Closed or deferred investigations
 
-| 编号/方向 | 状态与决定 |
+| IDs / direction | Decision |
 |---|---|
-| S1.1—3 | batch卷积选路有收益；Verify缓存路线已退役，不继续增加卷积层数 |
-| S1.4 | 融合图初始化失败，等待新SDK/IR |
-| S2.1—4 | KV输出已优化；attention布局、选择性TTGT无稳健收益，历史性能回退不主动追查 |
-| S5.1—2 | embedding/读取组织已验；部署校验与启动元数据已用。预读/CPU重叠无稳健收益，不重开 |
-| S5.3 | 并行Verify未验证线程安全/共享预算，不能当默认解法 |
-| 多请求batch、泛化量化、训练 | 暂缓，保持单端单请求；具体备选或IR任务另定范围 |
+| S1.1–3 | Batched convolution selection helped; FFN Verify caching is retired. Do not keep increasing convolution coverage. |
+| S1.4 | Fused-graph initialization failed; wait for a new SDK/IR. |
+| S2.1–4 | KV output optimized. Attention layout and selective transpose–GEMM–transpose (TTGT) gave no robust gain; do not proactively investigate historical performance drift. |
+| S5.1–2 | Embedding/read organization, deployment checksums and startup metadata checks are in use. Prefetch/CPU overlap gave no robust gain. |
+| S5.3 | Parallel Verify lacks thread-safety and shared-budget validation; it is not a default solution. |
+| Multi-request batching, general quantization, training | Deferred; retain one endpoint/one request. Scope alternatives or IR work separately. |
