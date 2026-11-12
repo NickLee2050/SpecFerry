@@ -21,6 +21,7 @@ using namespace np101::ops;
 struct Model::Impl {
   Config config;
   inference::GenerationPolicy policy;
+  inference::GenerationHistory history;
   WeightBank bank;
   std::unique_ptr<Vocabulary> vocabulary;
   std::vector<std::unique_ptr<DecoderLayer>> layers;

@@ -161,7 +161,7 @@ void Model::Impl::close() {
 Model::~Model() = default;
 
 inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
-                                      TensorReadback token_readback) {
+                                      TensorReadback token_readback, HistoryMode history) {
   if (token_readback != TensorReadback::SdkCopy && token_readback != TensorReadback::MappedHost) {
     throw std::invalid_argument("unsupported Qwen token readback transport");
   }
@@ -169,13 +169,29 @@ inference::Generation Model::generate(const std::vector<std::int32_t> &prompt, u
     throw std::invalid_argument(
         "Qwen generation requires a live model and a nonempty rendered prompt");
   }
+  if (history != HistoryMode::Reset && history != HistoryMode::Retain) {
+    throw std::invalid_argument("unsupported Qwen history mode");
+  }
+  if (history == HistoryMode::Reset) {
+    impl_->history = {};
+  } else if (!impl_->history.valid || impl_->history.consumed != impl_->position) {
+    throw std::invalid_argument("Qwen history no longer matches model state");
+  }
   inference::GenerationExecutor executor{[&] { impl_->reset(); },
                                          [&](std::int32_t token) { impl_->consume(token); },
                                          [&] { return impl_->predict(token_readback); }};
   if (impl_->batch_tokens > 1) {
     executor.prefill = [&](const auto &tokens) { impl_->prefill(tokens); };
   }
-  return inference::generate_tokens(impl_->policy, executor, prompt, maximum);
+  // The model owns its history: callers cannot attach another model's cache position.
+  // Retained prompts include the complete exact prefix, including the last prediction
+  // that has not yet entered KV or the recurrent/convolution state.
+  if (!maximum && history == HistoryMode::Reset) {
+    impl_->history.valid = false;
+    return inference::generate_tokens(impl_->policy, executor, prompt, maximum);
+  }
+  return inference::generate_tokens(impl_->policy, executor, prompt, maximum, {}, {},
+                                    &impl_->history);
 }
 
 std::vector<std::uint8_t> Model::read(unsigned layer, const std::string &field) {

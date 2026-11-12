@@ -1,6 +1,6 @@
 # NP101 recovery gates and incident ledger
 
-Updated: 2026-11-11. Latest scoped checks: native-supervisor OPT/Qwen regressions.
+Updated: 2026-11-12. Latest scoped checks: updated SoC packages and bounded Qwen C512 coverage.
 Read this page before every board run. See [status](np101-status.md) for accepted workload scopes
 and [SDK findings](np101-sdk-driver-validation-report.md) for interface failures.
 Historical plans, permissions and successful windows do not override current gates or prove that
@@ -87,6 +87,27 @@ software-failure markers remain retained. This does not validate intentional har
 These are recorded windows, not a live health check or a storage-root-cause fix.
 
 Recent events that affect subsequent work:
+
+- **11-12 conversation fixture packaging error, no device fault.** On board boot
+  `1e21c890-d53a-49e5-a531-3e28415f0e6c` / host boot
+  `fb760029-11c8-4c36-a3d9-bd88642a8c20`, bundle
+  `879a81929dc1941252be67acf487579a1ebd919fb7e4761b15b3c6ab23cd81ca` omitted the
+  `expected-tokens.txt` files used by its diagnostic entry. After the first generation returned,
+  reference parsing raised `invalid prompt token`, before measured output was saved. Child
+  monotonic start/ready/exit were 124302.681/124448.690/124506.679 s; exit was 1, with no signal
+  or outstanding SDK call established. Owners/pools/GFP returned, full kernel and 10.066 s
+  observation were clean. Preserve the failed package and marker; do not count it as numerical
+  acceptance or an NP hang. Retry only the corrected, fully verified package under the authorized
+  conversation validation, retaining the exact software-failure marker and all health gates.
+  Evidence: `qwen-release-acceptance-20261112/conversation-test/run-1/`. The corrected package
+  includes both oracle files in its manifest; source/reference models and NBGs are unchanged.
+  The corrected run completed all four generations and released normally with no device fault.
+  Its first comparison incorrectly demanded physical zeroing after a logical long→short reset.
+  Reanalysis of unchanged saved data verified the written prefix, exact retained stale suffix and
+  zero never-written suffix, plus bitwise replay/continuation state; original tolerance checks
+  were unchanged. The initial report remains at `conversation-complete-test/initial-acceptance.json`.
+  Normal collection/acceptance then passed without another inference run; the exact earlier
+  software-failure marker remains retained, not cleared.
 
 - **Storage timeout before candidate launch (11-10).** Boot
   `ad5d4749-c7c0-4e6b-a6e2-79c4f96636ce`; deployment of bundle

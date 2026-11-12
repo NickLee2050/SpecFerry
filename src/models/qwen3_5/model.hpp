@@ -21,6 +21,7 @@ enum class DecoderLayout { Separate, FusedAttentionNorm };
 // Graph construction choices are explicit and fixed for the model lifetime.
 // Batch width and tensor contracts come from the source-bound NBG package.
 enum class StateCommit { PerLayer, Combined, FeedForward };
+enum class HistoryMode { Reset, Retain };
 
 struct ModelOptions {
   np101::ops::VocabularyLookup lookup = np101::ops::VocabularyLookup::Gather;
@@ -49,9 +50,13 @@ public:
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;
 
+  // Retain requires the complete, unchanged token prefix from the previous call,
+  // including its final prediction. KV and recurrent/convolution state stay owned here.
+  // Reset is the default; an executor failure invalidates retained history.
   inference::Generation
   generate(const std::vector<std::int32_t> &prompt, unsigned maximum,
-           np101::TensorReadback token_readback = np101::TensorReadback::SdkCopy);
+           np101::TensorReadback token_readback = np101::TensorReadback::SdkCopy,
+           HistoryMode history = HistoryMode::Reset);
   std::vector<std::uint8_t> read(unsigned layer, const std::string &field);
   std::size_t kv_revalidations() const;
   void close();

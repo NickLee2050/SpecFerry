@@ -1,6 +1,6 @@
 # NP101 implementation and validation status
 
-Updated: 2026-11-11. This page contains execution contracts, representative measurements and
+Updated: 2026-11-12. This page contains execution contracts, representative measurements and
 conclusions that affect engineering decisions. See [Build and run](getting-started.md),
 [code boundaries](development.md), [remaining work](../TODO.md) and the mandatory
 [recovery ledger](np101-recovery-incidents.md).
@@ -34,33 +34,30 @@ board CPU. SDK refers to the vendor software development kit.
 The PR follow-up shares the existing native process guard with EP and verifies the selected SoC
 manifest and runner files before launch. Blocking health sampling cannot extend the EP child
 execution deadline. New SoC packages include the shared supervisor adapter in their deployment
-inventory and require repackaging/redeployment; frozen packages remain unchanged. These changes
-have offline coverage only and do not extend the hardware acceptance below. Validation passed:
+inventory and require repackaging/redeployment; frozen packages remain unchanged. Offline validation passed:
 160 Python tests (159 in the full suite plus the added standalone import check), three SDK-free
-C++ tests, five EP CPU tests, EP/SoC compilation and formatting checks; no board run was performed.
+C++ tests, five EP CPU tests, EP/SoC compilation and formatting checks. The 11-12 SoC deployment
+acceptance below covers the new adapter/identity contract; EP remains compile-only.
 
 The SDK-free `host` build and local checks are described in the [test guide](../tests/README.md).
 
 ## Current delivery acceptance
 
-The 11-11 C++ loading/runtime extraction and subsequent independent native supervision both passed
-one SoC whole-model request per model, reusing the original NBGs, requests and CPU references.
-The supervisor change leaves both model executables byte-identical. Output tokens and collected
-KV/hidden/recurrent snapshots match the previous run bitwise. Resource release, complete kernel
-checks and 10 s observation passed with no new fault; historical markers remain retained.
+The 11-12 freshly packaged OPT/Qwen entries passed one SoC whole-model request per model, reusing
+the original NBGs, requests and CPU references. Both passed original numerical/state checks,
+resource release, complete kernel checks and 10 s observation with no new fault. Historical markers
+remain retained. This extends the earlier C++ runtime/supervision acceptance to the updated
+deployment identity and standalone supervisor adapter.
 
 | Configuration, input→output tokens | Preparation | TTFT | Actual output | Post-first-token decode | Sampled SYSTEM peak |
 |---|---:|---:|---:|---:|---:|
-| Qwen C128, M8 FFN + attention normalization fusion + FFN state commit, 96→16 | 145.665 s | 70.025 s | 0.184338 token/s | 0.894348 token/s | 1604.836 MiB |
-| OPT C256, four uncached convolution layers in M16 prefill, 17→16 | 147.197 s | 1.701 s | 2.964564 token/s | 4.058360 token/s | 1447.515 MiB |
+| Qwen C128, M8 FFN + attention normalization fusion + FFN state commit, 96→16 | 147.327 s | 69.813 s | 0.185003 token/s | 0.899712 token/s | 1604.836 MiB |
+| OPT C256, four uncached convolution layers in M16 prefill, 17→16 | 148.895 s | 1.720 s | 2.954269 token/s | 4.058464 token/s | 1447.515 MiB |
 
-Relative to the same requests before the supervisor change, actual output changed −0.56%/+0.06%
-and decode rate changed +0.09%/−0.11%; sampled SYSTEM peaks were identical. Minimum available
-Linux memory was 278.168/446.309 MiB. These are single regression samples, not evidence of a
-speedup or an established memory change. Both target builds, 54 Python compatibility/supervision
-tests, five C++ CPU tests and formatting passed. Native single-request rates agree with independent
-Python aggregation within floating-point rounding. Final SoC model and supervisor binaries match
-the tested deployments bytewise.
+Relative to the preceding accepted supervisor run, actual output changed +0.36%/−0.35%; sampled
+SYSTEM peaks were identical. Minimum available Linux memory was 291.797/445.574 MiB. These are
+single regression samples, not speedup claims. Native rates agree with independent Python
+aggregation. Evidence: `qwen-release-acceptance-20261112/acceptance.json`.
 
 The independent C++ guard owns process groups, readiness, fixed deadlines and termination. The
 Python policy adapter still owns deployment/SDK identity, health sampling and recovery/release
@@ -72,7 +69,7 @@ Evidence: `native-supervisor-20261111/acceptance.json`; prior comparison and run
 
 The subsequent PR review fixed rejection of an overflowing final prompt token and propagation of
 buffered binary-output close failures. Valid model requests, operators and tensor/state layouts are
-unchanged; hardware measurements above are reused, not rerun for these error-path fixes. Clean
+unchanged; error-path fixes do not imply an inference speedup. Clean
 tracked-source EP/SoC builds, 154 Python tests, five native CPU tests and 18 command help entries
 passed; evidence is in `.cache/maintenance/pr-readiness-20261111/`. The checks use the installed
 Conda environment and explicitly supplied SDK/toolchain, not a newly provisioned machine.
@@ -179,8 +176,20 @@ Token-by-token prefill dominates long requests. The 241→16 run consumes 256 po
 capacity. Evidence: `qwen-context-512-20261110/comparison.json`; the long CPU reference ran alongside
 the short board test.
 
-The two-turn output matched CPU, but the second answer omitted the rice question: numerical acceptance
-is not answer quality or speculative acceptance. Original pipeline tolerances remain; strict FP32
+On 11-12 the updated deployment passed two 241→16 requests in one process at C512. Mean TTFT
+was 176.494 s; 32 outputs over 386.315 s gave 0.082834 token/s, with 0.900147 token/s post-first-token
+decode. Both generations and all collected reset snapshots matched bitwise. A separate 512-input
+request filled every KV position, returned the matching first token and stopped with `capacity`
+before another consume; TTFT was 373.757 s. Hidden/recurrent state and full written KV matched
+the existing CPU tolerances. This boundary probe is not an ordinary output-throughput benchmark.
+Preparation took 145.653/146.470 s, sampled SYSTEM peaks were 1612.620/1612.617 MiB, and Linux
+availability stayed above 291 MiB. Both released pools/owners/GFP and passed complete kernel and
+10 s checks. This is bounded repetition and full-capacity coverage, not hours of stability testing.
+Evidence: `qwen-release-acceptance-20261112/acceptance.json`.
+
+In the earlier 11-09 two-turn test, output matched CPU but the second answer omitted the rice
+question: numerical acceptance is not answer quality or speculative acceptance. Original pipeline
+tolerances remain; strict FP32
 state differences in M4/M8 DeltaNet are recorded separately. M8 model SYSTEM peak is about
 1604.836 MiB; the two-layer DeltaNet candidate adds about 55.8 MiB during execution. Expanding to all
 18 layers is estimated at 1347.632 MiB const, exceeding the 1 GiB limit, and about 2043 MiB physical
@@ -191,6 +200,41 @@ produced Inf hidden values and zero token selection. Keeping the original two in
 fixed internal copy bindings passed. Ordering, lifetimes and port permutations are execution contracts,
 not cleanup details. Evidence: `qwen-ffn-state-diagnosis-20261110/`,
 `qwen-block-progress-20261110/`, `qwen-shared-state-output-20261110/`.
+
+### Retained conversation state
+
+The 11-12 C512 diagnostic used the formal M8 FFN combination and one model instance for
+reset/replay turn 1, reset/replay turn 2, reset turn 1, then retained turn 2. Both turns matched the
+CPU tokens and ended at EOS: 28→20 and 72→36. Each two-turn sequence generated 56 tokens.
+
+| Mode | Mean TTFT | Total generation time | Actual output | Decode |
+|---|---:|---:|---:|---:|
+| Clear and replay | 36.320 s | 132.501 s | 0.422639 token/s | 0.902105 token/s |
+| Retain exact history | 19.640 s | 98.943 s | 0.565982 token/s | 0.905067 token/s |
+
+Second-turn TTFT fell 52.021→18.495 s (64.45%); aggregate output throughput improved 33.92%.
+The gain avoids repeated prompt processing, not faster decode kernels. Preparation was 146.116 s,
+SYSTEM peak 1612.617 MiB, minimum Linux availability 291.387 MiB, application const/nonconst peaks
+930.435/623.907 MiB. No runtime KV Verify occurred. Collected layer-23 hidden/KV and layer-22
+recurrent snapshots matched CPU tolerances; retained versus replay snapshots matched bitwise.
+Release, full kernel and 10 s checks passed. This validates two turns, not arbitrary conversations
+or speculative rollback. No new hang or storage fault occurred.
+
+`Model::generate(..., HistoryMode::Retain)` reuses model-owned KV, recurrent and convolution state
+and requires the unchanged full token prefix. The next prompt includes the previous final output,
+which has not yet been consumed. Here 47 positions were committed after turn 1, so turn 2 processed
+25 additional tokens rather than replaying all 72. Preserve raw generated/template tokens; rendering
+the text history again can omit the empty non-thinking template prefix and invalidate reuse.
+Default generation still resets; the persistent CLI/protocol remains deferred.
+
+Attention reset is a **logical length reset**, not physical zeroing. The initial diagnostic oracle
+incorrectly required a zero stale suffix after the long→short reset. Saved evidence instead proves
+the written 47-position prefix matches the first turn, positions 47–106 retain exactly the previous
+request's masked bytes, and the never-written suffix is zero. No tolerance or model code was changed
+to resolve this oracle mismatch, and no board rerun was needed. The earlier missing-oracle-file
+packaging failure and initial comparison are preserved in the recovery ledger and evidence.
+Evidence: `qwen-release-acceptance-20261112/{acceptance.json,conversation-complete-test/}`; the
+diagnostic entry changes request sequencing only and is retained under ignored evidence paths.
 
 ## Current bottlenecks and candidate results
 
