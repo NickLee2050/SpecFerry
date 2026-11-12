@@ -14,6 +14,11 @@ from collections import Counter
 from concurrent import futures
 from pathlib import Path
 
+if __package__:
+    from tools.deploy.execute import supervision
+else:
+    import supervision
+
 SUPERVISOR_BINARY = Path(__file__).resolve().parent / "bin/specferry_supervise"
 
 STATE = Path("/root/specferry-soc")
@@ -235,107 +240,18 @@ def inference_timeout_limit(manifest):
     return 600 if manifest.get("model_family", "opt") == "qwen3_5" else 300
 
 
-def supervise(
-    command,
-    cwd,
-    environment,
-    output,
-    timeout,
-    monitor,
-    *,
-    preparation_timeout=None,
-    execution_limit=300,
-):
-    if execution_limit not in (300, 600) or (
-        execution_limit == 600 and preparation_timeout is None
-    ):
-        raise ValueError("extended execution requires a phased model workload")
-    if not 0 < timeout <= execution_limit:
-        raise ValueError(f"execution deadline must be in (0, {execution_limit}] seconds")
-    if preparation_timeout is not None and not 0 < preparation_timeout <= 240:
-        raise ValueError("preparation deadline must be in (0, 240] seconds")
-    # The native process owns fork/exec, process groups, the private ready pipe and deadlines.
-    # Python owns deployment/recovery policy; blocking this callback cannot delay termination.
-    started = time.monotonic()
-    result = dict(
-        child_start_monotonic_seconds=started,
-        child_start_wall_seconds=time.time(),
-        child_started=False,
-        remaining_processes=[],
-        actions=[],
-        stop_reason=None,
+def supervise(command, cwd, environment, output, timeout, monitor, **options):
+    return supervision.supervise(
+        command,
+        cwd,
+        environment,
+        output,
+        timeout,
+        monitor,
+        supervisor_binary=SUPERVISOR_BINARY,
+        save=save,
+        **options,
     )
-    supervisor = None
-    initial = b""
-    try:
-        with (output / "supervisor-native.log").open("wb") as log:
-            supervisor = subprocess.Popen(
-                [
-                    str(SUPERVISOR_BINARY),
-                    str(output),
-                    str(preparation_timeout if preparation_timeout is not None else -1),
-                    str(timeout),
-                    str(execution_limit),
-                    str(cwd),
-                    "--",
-                    *command,
-                ],
-                env=environment,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=log,
-            )
-            os.set_blocking(supervisor.stdout.fileno(), False)
-            os.set_blocking(supervisor.stdin.fileno(), False)
-            published = False
-            while supervisor.poll() is None:
-                if not published:
-                    try:
-                        initial += os.read(supervisor.stdout.fileno(), 4096)
-                    except BlockingIOError:
-                        pass
-                    if len(initial) > 4096:
-                        raise RuntimeError("oversized native supervisor startup record")
-                    if b"\n" in initial:
-                        result = json.loads(initial)
-                        save(output / "child-start.json", result)
-                        published = True
-                reason = monitor()
-                if reason:
-                    try:
-                        os.write(
-                            supervisor.stdin.fileno(),
-                            (str(reason)[:2000].replace("\n", " ") + "\n").encode(),
-                        )
-                    except (BrokenPipeError, BlockingIOError):
-                        pass
-                    break
-                time.sleep(0.05)
-    finally:
-        if supervisor is not None:
-            # EOF is a fail-closed stop request, including exceptions and interrupted policy IO.
-            try:
-                supervisor.stdin.close()
-            except BrokenPipeError:
-                pass
-            try:
-                supervisor.wait(timeout=12)
-            except subprocess.TimeoutExpired:
-                # SIGTERM asks the native guard to terminate the owned process group. Never
-                # SIGKILL the guard here: an uninterruptible child must remain visible/gated.
-                supervisor.terminate()
-                raise RuntimeError("native supervisor did not finish bounded release")
-            finally:
-                supervisor.stdout.close()
-            if not (output / "child.json").is_file():
-                result["error"] = "native supervisor exited without child evidence"
-                save(output / "child.json", result)
-            final = read_json(output / "child.json")
-            if supervisor.returncode or "exit" not in final:
-                raise RuntimeError("native supervisor failed; retain incomplete execution evidence")
-        else:
-            save(output / "child.json", result)
-    return read_json(output / "child.json")
 
 
 def native_complete(output):
@@ -466,7 +382,11 @@ def retain_diagnostic_marker(marker, output, diagnostic, boot_id):
     return result
 
 
-def run(root, output, timeout, diagnostic=None, *, preparation_timeout=240):
+def run(
+    root, output, timeout, diagnostic=None, *, preparation_timeout=240, expected_bundle_sha256=None
+):
+    if expected_bundle_sha256 is None or sha256(root / "bundle.json") != expected_bundle_sha256:
+        raise RuntimeError("selected bundle identity differs before board execution")
     execution_limit = inference_timeout_limit(read_json(root / "bundle.json"))
     if not 0 < timeout <= execution_limit:
         raise ValueError(f"inference deadline must be in (0, {execution_limit}] seconds")
@@ -751,6 +671,7 @@ def main():
                 float(sys.argv[4]),
                 json.loads(sys.argv[5]) if len(sys.argv) > 5 else None,
                 preparation_timeout=float(sys.argv[6]) if len(sys.argv) > 6 else 240,
+                expected_bundle_sha256=sys.argv[7] if len(sys.argv) > 7 else None,
             )
         elif command == "accept":
             accept(root, sys.argv[3])

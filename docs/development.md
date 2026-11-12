@@ -129,11 +129,11 @@ explicit diagnostic and must not be used to report ordinary throughput.
 
 ## Independent supervision
 
-`specferry_supervise` is a separate C++ process with no SDK link dependency. The SoC policy adapter
-starts it with fixed preparation/execution limits and the already-selected model command. The model
-runs in a new process group with a private readiness pipe and `/dev/null` standard input. One valid
+`specferry_supervise` is a separate C++ process with no SDK link dependency. EP and SoC share a
+Python adapter that starts it with fixed limits and the selected model command. The model runs in
+a new process group with `/dev/null` standard input. SoC uses a private readiness pipe: one valid
 monotonic timestamp changes the deadline from preparation to inference; subsequent notifications
-cannot restart it. The watchdog's active loop performs no SD or debugfs reads/writes.
+cannot restart it. EP retains one total-child deadline. The watchdog's active loop performs no SD or debugfs reads/writes.
 
 The Python adapter retains deployment receipts, SDK hashes, full kernel checks and streaming health
 samples, memory margins, delayed observation, release acceptance and recovery-marker authorization.
@@ -152,8 +152,12 @@ No process supervisor can recover an uninterruptible kernel/driver operation.
 Both builds produce the companion binary beside the model executables. SoC packaging requires it,
 records `supervisor_implementation: cpp-process-v1`, and checks its executable inventory entry,
 RISC-V ELF identity, digest and deployment metadata. Frozen older bundles keep their original runner;
-there is no silent fallback to Python process supervision. EP production runners are unchanged;
-EP builds exercise the native guard with fake children only.
+there is no silent fallback to Python process supervision. EP runners require the companion beside
+the selected executable (or in the sibling `bin/` for CMake device tests) and retain their single
+execution deadline and existing evidence fields. Host CPU usage now includes the native guard.
+The selected SoC bundle digest is checked both before remote launch and on entry to the board runner;
+a valid receipt for a different bundle cannot authorize the requested run. New bundles also include
+the shared `supervision.py` adapter in their verified inventory.
 
 Board Python 3.9 standard-library support remains necessary for policy, deployment and collection.
 This delivery moves process supervision, not all board utilities, into C++. No tokenizer, JSON parser,
@@ -182,6 +186,6 @@ experimental packages need their original binaries/runners, not compatibility br
 4. Keep temporary probes in ignored storage. Merge a candidate only after a useful whole-model result;
    leave stable conclusions in status and pending work in TODO. Device incidents go in their ledger.
 
-The repository does not ship model weights or vendor libraries. Native builds require a compatible
-SDK. Before running the complete Python suite, build EP as described in the test guide: supervision
-integration tests execute its native guard with fake children. CPU checks require no board access.
+The repository does not ship model weights or vendor libraries. Device builds require a compatible
+SDK. The `host` build needs no SDK and supplies the native guard used by the complete Python suite;
+see the [test guide](../tests/README.md). CPU checks require no board access.

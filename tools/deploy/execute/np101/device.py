@@ -5,13 +5,14 @@ import json
 import os
 import resource
 import shutil
-import signal
-import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from tools.deploy.execute.supervision import supervise
 from tools.deploy.export.checkpoint import sha256
+
+HEALTH_SAMPLE_SECONDS = 5
 
 RECOVERY_ROOT = Path(__file__).resolve().parents[4] / ".cache/runs"
 
@@ -48,14 +49,6 @@ def process_group_members(group: int) -> list[dict]:
         except (OSError, ValueError, IndexError):
             continue
     return members
-
-
-def terminate_group(group: int, request: signal.Signals) -> None:
-    try:
-        os.killpg(group, request)
-    except ProcessLookupError:
-        # The child may finish between the timeout and the signal delivery.
-        pass
 
 
 def host_boot_id() -> str:
@@ -141,6 +134,11 @@ def run_device(
     ):
         raise ValueError("Profiler capture requires a separate diagnostic without other timing")
     binary, output = binary.resolve(strict=True), output.resolve()
+    supervisor = binary.with_name("specferry_supervise")
+    if binary.parent.name == "tests":
+        supervisor = binary.parent.parent / "bin/specferry_supervise"
+    if not supervisor.is_file() or not os.access(supervisor, os.X_OK):
+        raise ValueError("build specferry_supervise beside the EP executable before running")
     binary_sha256 = sha256(binary)
     output.mkdir(parents=True, exist_ok=True)
     header = Path("/usr/inc/CL/cl_viv_vx_ext.h")
@@ -184,6 +182,7 @@ def run_device(
         "command": command,
         "boot_id": host_boot_id(),
         "binary_sha256": binary_sha256,
+        "supervisor_sha256": sha256(supervisor),
         "sdk_library_directory": str(sdk_lib.resolve()),
         "sdk_library_sha256": {
             name: sha256(sdk_lib / name)
@@ -213,47 +212,56 @@ def run_device(
     print(f"Running {binary.name}; timeout {timeout}s; log: {output / 'sdk.log'}", flush=True)
     started = time.monotonic()
     child_usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    with (output / "sdk.log").open("w") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=output,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    guard_output = output / "supervision"
+    guard_output.mkdir(exist_ok=True)
+    # Preserve the existing model-log path while the native guard owns its descriptors.
+    (output / "sdk.log").symlink_to("supervision/native.log")
+    last_sample = started
+
+    def monitor():
+        nonlocal last_sample
+        if abort_check is None or time.monotonic() - last_sample < HEALTH_SAMPLE_SECONDS:
+            return None
+        last_sample = time.monotonic()
         try:
-            deadline = time.monotonic() + timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
-                try:
-                    code = process.wait(timeout=min(5, remaining) if abort_check else remaining)
-                    break
-                except subprocess.TimeoutExpired:
-                    if not abort_check:
-                        raise
-                    try:
-                        failed = abort_check()
-                    except Exception as error:
-                        raise DeviceHealthFailure(f"Health monitor failed: {error}") from error
-                    if failed:
-                        raise DeviceHealthFailure("Health monitor detected a kernel fault")
-        except (subprocess.TimeoutExpired, KeyboardInterrupt, DeviceHealthFailure) as error:
-            evidence["timeout"] = isinstance(error, subprocess.TimeoutExpired)
-            if isinstance(error, DeviceHealthFailure):
-                evidence["health_monitor_failure"] = str(error)
-            evidence["interrupted_by_user"] = isinstance(error, KeyboardInterrupt)
-            code = None
-            for request in (signal.SIGTERM, signal.SIGKILL):
-                terminate_group(process.pid, request)
-                try:
-                    code = process.wait(timeout=5)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-    members = process_group_members(process.pid)
+            failed = abort_check()
+        except Exception as error:
+            raise DeviceHealthFailure(f"Health monitor failed: {error}") from error
+        if failed:
+            raise DeviceHealthFailure("Health monitor detected a kernel fault")
+        return None
+
+    failure = None
+    try:
+        child = supervise(
+            command,
+            output,
+            env,
+            guard_output,
+            timeout,
+            monitor,
+            supervisor_binary=supervisor,
+            save=write_json,
+        )
+    except (Exception, KeyboardInterrupt) as error:
+        # The independent guard attempts bounded group cleanup. An uninterruptible
+        # process or missing final evidence must still leave a recovery gate.
+        failure = error
+        record = guard_output / "child.json"
+        try:
+            child = json.loads(record.read_text()) if record.is_file() else {}
+        except (OSError, ValueError):
+            child = {}
+    code = child.get("exit")
+    group = child.get("child_pid")
+    members = process_group_members(group) if group is not None else []
+    evidence["timeout"] = child.get("stop_reason") == "child deadline expired"
+    evidence["interrupted_by_user"] = isinstance(failure, KeyboardInterrupt)
+    evidence["supervision"] = child
+    if isinstance(failure, DeviceHealthFailure):
+        evidence["health_monitor_failure"] = str(failure)
+    elif failure is not None:
+        evidence["supervisor_failure"] = str(failure)
     child_usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     recovery = (
         bool(members)
@@ -262,6 +270,9 @@ def run_device(
         or evidence["timeout"]
         or evidence.get("interrupted_by_user", False)
         or bool(evidence.get("health_monitor_failure"))
+        or failure is not None
+        or bool(child.get("stop_reason"))
+        or bool(child.get("remaining_processes"))
     )
     evidence.update(
         returncode=code,
@@ -282,7 +293,7 @@ def run_device(
             {
                 "reason": "SDK process terminated abnormally or retained children",
                 "boot_id": evidence["boot_id"],
-                "process_group": process.pid,
+                "process_group": group,
                 "pid_namespace": os.readlink("/proc/self/ns/pid"),
                 "members": members,
                 "evidence": str(output),

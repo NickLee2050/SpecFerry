@@ -29,6 +29,18 @@ layer; FFN means feed-forward network; KV is the attention key/value cache; QKV 
 projections; LN is layer normalization. EP runs host control through PCIe; SoC runs control on the
 board CPU. SDK refers to the vendor software development kit.
 
+## Offline integration checks
+
+The PR follow-up shares the existing native process guard with EP and verifies the selected SoC
+manifest and runner files before launch. Blocking health sampling cannot extend the EP child
+execution deadline. New SoC packages include the shared supervisor adapter in their deployment
+inventory and require repackaging/redeployment; frozen packages remain unchanged. These changes
+have offline coverage only and do not extend the hardware acceptance below. Validation passed:
+160 Python tests (159 in the full suite plus the added standalone import check), three SDK-free
+C++ tests, five EP CPU tests, EP/SoC compilation and formatting checks; no board run was performed.
+
+The SDK-free `host` build and local checks are described in the [test guide](../tests/README.md).
+
 ## Current delivery acceptance
 
 The 11-11 C++ loading/runtime extraction and subsequent independent native supervision both passed

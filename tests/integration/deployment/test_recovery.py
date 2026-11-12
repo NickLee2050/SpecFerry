@@ -1,17 +1,11 @@
 """Numerical regressions for the compact reporting and graph-cache checks."""
 
-import contextlib
-import io
-import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from tools.deploy.execute.np101 import device as device_runner
 from tools.deploy.execute.np101 import recovery_controls
 
 
@@ -41,32 +35,6 @@ class RecoveryControlTests(unittest.TestCase):
         direct = "2026-10-14T18:25:49.000000+0800 host kernel: NP[0] hang"
         log = f"{normal}\n{prefix} \n    {detail}\n{direct}\n"
         self.assertEqual(recovery_controls.kernel_faults(log), [prefix + " " + detail, direct])
-
-    def test_running_child_is_stopped_when_health_monitor_reports_fault(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            process = Mock(pid=12345)
-            process.wait.side_effect = [subprocess.TimeoutExpired("control", 5), -15]
-            with (
-                patch.object(device_runner, "RECOVERY_ROOT", root),
-                patch.object(device_runner.subprocess, "Popen", return_value=process),
-                patch.object(device_runner, "terminate_group") as terminate,
-                patch.object(device_runner, "process_group_members", return_value=[]),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                evidence = device_runner.run_device(
-                    Path(sys.executable),
-                    [],
-                    root / "device",
-                    root,
-                    60,
-                    abort_check=lambda: True,
-                )
-            terminate.assert_called_once()
-            self.assertFalse(evidence["timeout"])
-            self.assertTrue(evidence["device_recovery_required"])
-            self.assertIn("kernel fault", evidence["health_monitor_failure"])
-            self.assertTrue((root / "np101-recovery-required.json").exists())
 
     def test_kernel_page_fault_and_watchdog_are_fatal_but_hdma_wait_is_not(self):
         for line in (

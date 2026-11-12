@@ -5,6 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from tools.deploy.execute import supervision
 from tools.deploy.execute.np101.recovery_controls import FAULT
 from tools.deploy.execute.np101.soc import board_runner
 from tools.deploy.execute.np101.soc.board_runner import read_json, save, sha256, verify_bundle
@@ -44,6 +45,7 @@ def stage_runtime(root, binary, deployment, sdk, executable):
     shutil.copy2(supervisor, root / "bin/specferry_supervise")
     (root / "bin/specferry_supervise").chmod(0o755)
     shutil.copyfile(board_runner.__file__, root / "board_runner.py")
+    shutil.copyfile(supervision.__file__, root / "supervision.py")
     for name in ("weights.bin", "weights.index", "deployment-manifest.json"):
         shutil.copyfile(deployment / name, root / "weights" / name)
     shutil.copytree(sdk / "include/CL", root / "runtime/include/CL")

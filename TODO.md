@@ -32,6 +32,10 @@ Before public release, the owner must choose a repository license and confirm th
 redistribution rights. EP hardware regression remains deferred as above. Do not treat a targeted
 credential scan as a complete security or licensing audit.
 
+Review follow-up: EP now uses the independent native guard, and SoC launch binds the
+selected deployment identity before execution. Local offline regression and both device builds
+are covered; hardware revalidation is deferred.
+
 ## Recommended execution order
 
 | Order | Work | Acceptance and boundary |

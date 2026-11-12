@@ -11,22 +11,24 @@ The build guide also defines graph, cache and batch terminology. Accepted hardwa
 
 ## CPU checks
 
-Build the EP targets first, including the SDK-independent native process guard:
+For offline checks, build the shared libraries and native process guard without a vendor SDK:
 
 ```sh
-cmake --build build/ep
+cmake -G Ninja -S . -B build/host -DSPECFERRY_TARGET=host -DCMAKE_BUILD_TYPE=Release
+cmake --build build/host
 python -m unittest discover -s tests -t .
-ctest --test-dir build/ep -L cpu --output-on-failure
+ctest --test-dir build/host -L cpu --output-on-failure
 python tools/format/python.py --check
 python tools/format/cpp.py --check
 ```
 
 Python tests cover package/source/port integrity, generation policy and token counts, numerical
 acceptance, memory budgets and recovery policy. Supervision tests run the built
-`build/ep/bin/specferry_supervise` against fake children: blocked sampling/publication, independent
+`build/host/bin/specferry_supervise` against fake children: blocked sampling/publication, independent
 deadlines, invalid/repeated readiness, exec failure, stopped children, descendants and owner-channel
-closure. They do not access the board. The five native CTest cases cover data/request contracts,
-generation, public SDK timing and memory budgets; they never open NP101.
+closure. They do not access the board. The host build runs three native CTest cases for
+generation/request parsing, public SDK timing and memory budgets. EP/SoC builds retain two additional SDK-dependent data/model-request tests. Set
+`SPECFERRY_TEST_SUPERVISOR` to use a different host-built guard in Python tests. No CPU test opens NP101.
 Cross-builds produce CPU test binaries but do not register them for execution on the host.
 
 ## Explicit device checks

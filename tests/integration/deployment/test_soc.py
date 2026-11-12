@@ -3,6 +3,8 @@
 import ast
 import os
 import re
+import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -24,7 +26,9 @@ class SocTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        supervisor = Path(__file__).resolve().parents[3] / "build/ep/bin/specferry_supervise"
+        supervisor = Path(
+            os.environ.get("SPECFERRY_TEST_SUPERVISOR", "build/host/bin/specferry_supervise")
+        ).resolve()
         patcher = patch.object(board, "SUPERVISOR_BINARY", supervisor)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -77,9 +81,35 @@ class SocTests(unittest.TestCase):
         tree = ast.parse(Path(board.__file__).read_text(), feature_version=(3, 9))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                self.assertTrue(all(alias.name in sys.stdlib_module_names for alias in node.names))
+                self.assertTrue(
+                    all(
+                        alias.name in sys.stdlib_module_names or alias.name == "supervision"
+                        for alias in node.names
+                    )
+                )
             if isinstance(node, ast.ImportFrom):
-                self.assertIn(node.module, sys.stdlib_module_names)
+                self.assertIn(node.module, sys.stdlib_module_names | {"tools.deploy.execute"})
+
+    def test_deployed_policy_imports_its_shared_adapter_without_the_repository(self):
+        shutil.copyfile(board.__file__, self.root / "board_runner.py")
+        shutil.copyfile(board.supervision.__file__, self.root / "supervision.py")
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import runpy,sys; sys.path.insert(0,sys.argv[1]); "
+                "policy=runpy.run_path(sys.argv[1]+'/board_runner.py'); "
+                "assert callable(policy['supervise'])",
+                str(self.root),
+            ],
+            check=True,
+            timeout=5,
+        )
+        tree = ast.parse(Path(board.supervision.__file__).read_text(), feature_version=(3, 9))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(alias.name in sys.stdlib_module_names for alias in node.names))
 
     def test_diagnostic_only_acknowledges_exact_old_fault_occurrences(self):
         old = "[57512.756734] [galcore]: NP[0] hang, automatic recovery."
@@ -364,7 +394,13 @@ class SocTests(unittest.TestCase):
                 },
             ),
         ):
-            result = board.run(self.root, output, 180, diagnostic)
+            result = board.run(
+                self.root,
+                output,
+                180,
+                diagnostic,
+                expected_bundle_sha256=diagnostic["bundle_sha256"],
+            )
         self.assertTrue(result["child_started"])
         self.assertFalse(result["clean"])
         retained = output / "retained-prior-board-marker.json"
@@ -854,6 +890,62 @@ class SocTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertFalse(result["recovery_cleared"])
         self.assertEqual(gate.read_bytes(), retained.read_bytes())
+
+    def test_stale_remote_bundle_is_rejected_before_launch(self):
+        (self.root / "bundle.json").write_text('{"request":"selected"}')
+        (self.root / "board_runner.py").write_text("# identical runner")
+        stale = self.root / "stale"
+        stale.mkdir()
+        (stale / "bundle.json").write_text('{"request":"stale"}')
+        (stale / "board_runner.py").write_text("# identical runner")
+
+        def local_transport(host, command, **kwargs):
+            # Execute only the bootstrap locally. The mismatch must abort before any
+            # remote output, process launch, health query or model access can occur.
+            try:
+                exec(shlex.split(command)[2], {})
+            except SystemExit as error:
+                raise subprocess.CalledProcessError(error.code, command) from error
+            self.fail("stale deployment reached launch")
+
+        with (
+            patch.object(remote, "remote_path", side_effect=lambda value: value),
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle", return_value={}),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "ssh", side_effect=local_transport),
+            patch.object(remote.subprocess, "Popen") as spawn,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity rejected before launch"):
+                remote.run(self.root, "unused", str(stale), self.root / "run", 180)
+            spawn.assert_not_called()
+        self.assertTrue((self.root / "np101-recovery-required.json").exists())
+
+    def test_bootstrap_verifies_shared_adapter_as_well_as_matching_manifest(self):
+        for name in ("bundle.json", "board_runner.py", "supervision.py"):
+            (self.root / name).write_text("original")
+        code = remote.runtime_identity_check(self.root, str(self.root))
+        exec(code, {})
+        (self.root / "supervision.py").write_text("changed")
+        with self.assertRaises(SystemExit) as error:
+            exec(code, {})
+        self.assertEqual(error.exception.code, 78)
+
+    def test_board_rechecks_selected_identity_before_any_device_checks(self):
+        manifest = self.root / "bundle.json"
+        manifest.write_text('{"request":"selected"}')
+        expected = board.sha256(manifest)
+        manifest.write_text('{"request":"changed-after-bootstrap"}')
+        with (
+            patch.object(board, "verify_bundle") as verify,
+            patch.object(board, "kernel") as kernel,
+        ):
+            for identity in (expected, None):
+                with self.assertRaisesRegex(RuntimeError, "selected bundle identity"):
+                    board.run(self.root, self.root / "run", 180, expected_bundle_sha256=identity)
+            verify.assert_not_called()
+            kernel.assert_not_called()
+        self.assertFalse((self.root / "run").exists())
 
     def test_status_connection_loss_never_resubmits_child(self):
         (self.root / "bundle.json").write_text("{}")

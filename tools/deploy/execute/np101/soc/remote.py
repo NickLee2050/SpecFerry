@@ -62,6 +62,24 @@ def python_command(code):
     return shlex.join(["python3", "-c", code])
 
 
+def runtime_identity_check(bundle, destination):
+    """Verify the selected manifest and executable Python before importing remote code."""
+    names = ["bundle.json", "board_runner.py"]
+    if (bundle / "supervision.py").is_file():
+        names.append("supervision.py")
+    lines = ["import hashlib,pathlib,sys"]
+    for name in names:
+        path = str(PurePosixPath(destination) / name)
+        lines.extend(
+            [
+                f"if hashlib.sha256(pathlib.Path({path!r}).read_bytes()).hexdigest() != {sha256(bundle / name)!r}:",
+                f"    print('remote identity differs: {name}', file=sys.stderr)",
+                "    raise SystemExit(78)",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
 def deploy(bundle, host, destination):
     bundle = bundle.resolve()
     destination = remote_path(destination)
@@ -89,11 +107,11 @@ def deploy(bundle, host, destination):
         if archive.wait():
             raise RuntimeError("bundle archive failed; remote staging is incomplete")
     script = str(PurePosixPath(destination) / "board_runner.py")
-    expected = sha256(bundle / "board_runner.py")
-    bootstrap = (
-        "import hashlib,runpy,sys; "
-        f"p={script!r}; assert hashlib.sha256(open(p,'rb').read()).hexdigest()=={expected!r}; "
-        f"sys.argv=[p,'verify',{destination!r}]; runpy.run_path(p,run_name='__main__')"
+    bootstrap = runtime_identity_check(bundle, destination) + (
+        "import runpy,sys\n"
+        f"sys.path.insert(0, {destination!r})\n"
+        f"sys.argv=[{script!r},'verify',{destination!r}]\n"
+        f"runpy.run_path({script!r},run_name='__main__')"
     )
     verified = json.loads(
         ssh(host, python_command(bootstrap), capture_output=True, text=True, timeout=300).stdout
@@ -389,10 +407,9 @@ def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparat
         script = str(PurePosixPath(destination) / "board_runner.py")
         # The detached process owns its watchdog. Losing this SSH does not kill the monitor.
         command = ["python3", script, "run", destination, remote_output, str(timeout)]
-        command.extend([json.dumps(diagnostic), str(preparation_timeout)])
-        launch = (
-            "import subprocess,hashlib,pathlib; "
-            f"assert hashlib.sha256(pathlib.Path({script!r}).read_bytes()).hexdigest()=={sha256(bundle / 'board_runner.py')!r}; "
+        command.extend([json.dumps(diagnostic), str(preparation_timeout), session["bundle_sha256"]])
+        launch = runtime_identity_check(bundle, destination) + (
+            "import subprocess,pathlib; "
             f"p=pathlib.Path({remote_output!r}); p.parent.mkdir(parents=True,exist_ok=True); "
             "log=open(str(p)+'.supervisor.log','w'); "
             f"c=subprocess.Popen({command!r},stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True); print(c.pid)"
@@ -404,6 +421,8 @@ def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparat
                 ).stdout.strip()
                 save(output / "supervisor.json", {"remote_pid": int(pid)})
             except (subprocess.SubprocessError, OSError) as error:
+                if isinstance(error, subprocess.CalledProcessError) and error.returncode == 78:
+                    raise RuntimeError("remote bundle identity rejected before launch") from error
                 # Submission may have reached the board. Discover this run; never resubmit.
                 save(output / "launch-transport-error.json", {"error": str(error)})
             # Separate preparation and post-ready execution budgets. SDK identity
