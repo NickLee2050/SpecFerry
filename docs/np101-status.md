@@ -349,13 +349,55 @@ This is a historical comparison, not an interleaved trial or long-duration relia
 valid prefix to the CPU reference, preserved masked slots to their previous snapshot and
 never-written slots to zero. The original boundary oracle wrongly required physical clearing;
 corrected acceptance of saved evidence required no rerun or tolerance change. Retained-history
-conversation and C1024 remain unvalidated for this path.
+acceptance is recorded below; C1024 remains unvalidated.
 
 Evidence under `.cache/runs/`: `qwen-full-block-coverage-20261113/const-trial/`,
 `qwen-full-block-context-512-20261113/`, `qwen-full-block-long-20261113/`,
 `qwen-full-block-boundary-20261113/` (including `reset-review.json`),
 `qwen-release-acceptance-20261112/context-repeat-test/`, `qwen-block-prefill-formal-20261113/`
 and `qwen-block-prefill-soft-restart-20261114/` (`comparison.json`, `native-run/`).
+
+### Complete-block conversation and bounded repetition
+
+On 11-14, the same C512 all-18 M8 configuration passed two sequential processes using existing
+requests and CPU references. A cached diagnostic entry changed request sequencing only, reusing
+the committed model libraries. No operator, weight, default configuration or tolerance changed.
+
+| Request | Input → output tokens | Prefill | TTFT | Generation wall time | Actual output | Post-first-token decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Conversation turn 1, reset | 28→20 | 12.734 s | 13.066 s | 34.198 s | 0.584835 token/s | 0.899109 token/s |
+| Turn 2, retained history | 72→36, 25 new input | 10.513 s | 10.845 s | 49.933 s | 0.720967 token/s | 0.895415 token/s |
+| Turn 2, reset/replay | 72→36 | 29.230 s | 29.558 s | 68.550 s | 0.525164 token/s | 0.897616 token/s |
+| Long, reset | 241→16 | 97.964 s | 98.288 s | 114.840 s | 0.139324 token/s | 0.906238 token/s |
+| Short, reset | 96→16 | 38.904 s | 39.240 s | 55.872 s | 0.286367 token/s | 0.901879 token/s |
+| Long, reset again | 241→16 | 98.375 s | 98.695 s | 115.387 s | 0.138664 token/s | 0.898639 token/s |
+
+Conversation turns ended at EOS. Turn 2 reused 47 committed positions, correctly including the
+previous final unconsumed token in the remaining 25-token input. Retained/replay outputs were
+identical. Checked hidden/recurrent/KV snapshots passed the original CPU and comparison tolerances,
+but were not bitwise identical: maximum retained/replay absolute differences were
+0.007813/0.001802/0.026367/0.023438 for hidden/recurrent/K/V. No runtime KV revalidation occurred.
+
+The first turn was executed once and reused in both logical two-turn summaries. Each mode generated
+56 tokens: retained history took 84.131 s (0.665631 token/s), replay 102.748 s
+(0.545024 token/s). Mean TTFT was 11.955 versus 21.312 s; second-turn TTFT fell 63.3%.
+There were three physical generations, totaling 92 output tokens, not two independent pairs.
+The long/short/long process generated 48 tokens. Both long outputs and checked snapshots matched
+bitwise, reset prefix/stale-suffix checks passed, and long TTFT changed by only +0.41%.
+The 16-token long/short outputs were length-limited, not complete answers.
+
+Both processes peaked at application const/nonconst 1348.403/623.548 MiB and sampled
+SYSTEM/VIRTUAL 2026.689/23.008 MiB (simultaneous combined 2049.697 MiB).
+Minimum Linux availability was 251.516 MiB for conversation and 247.563 MiB for repetition.
+Preparation was 164.336/164.047 s; post-ready phases including release were 170.257/303.630 s,
+within separately preselected 300/360 s limits. Preparation, coarse snapshots and release are
+excluded from generation throughput. Both exited normally, released owners/pools and passed
+complete-kernel plus 10 s observation without new faults. Historical markers remain; this bounded
+acceptance does not establish hours of stability or recovery from future faults.
+
+Evidence: `.cache/runs/qwen-complete-block-sessions-20261114/`, with
+`conversation/comparison.json` and `stress/comparison.json` containing actual text, numerical
+checks, timings and memory; each `native-run/` preserves execution and full kernel evidence.
 
 ### Split-projection findings and limits
 
@@ -442,7 +484,7 @@ instruction set or kernel framework.
 | Dominant costs and memory | `qwen-performance-capacity-20261110/` |
 | Projection/copy/head/FFN comparisons | `qwen-shared-projection-resume-20261110/` |
 
-Remaining work includes retained-KV conversation acceptance for the complete-block Qwen path,
-rejection/correction, real draft–target acceptance rates and long-term reliability. Bounded C512
+Remaining work includes longer conversations, rejection/correction, real draft–target acceptance
+rates and long-term reliability. The complete-block two-turn retained/replay comparison passed. Bounded C512
 full-capacity/reset acceptance is recorded above; it does not establish sustained reliability.
 EP's accepted exploration remains closed; [TODO](../TODO.md) owns the implementation order.

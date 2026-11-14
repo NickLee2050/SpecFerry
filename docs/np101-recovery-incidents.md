@@ -110,6 +110,19 @@ This scoped success does not clear the gate or establish general SDHCI recovery.
 Evidence: `qwen-block-prefill-soft-restart-20261114/` under `.cache/runs/`: `comparison.json`,
 `native-run/`, `final-health.json`, deployment identities/audit and the exact authorization launcher.
 
+The user then authorized a two-turn retained/replay comparison followed, on success, by a
+long/short/long collection on the unchanged boot. Both all-18 M8 processes passed numerical,
+execution and release checks with no new kernel or filesystem faults. Preparation limits stayed
+240 s; execution limits were selected before launch as 300 s and 360 s, with actual post-ready
+phases of 170.257 s and 303.630 s. Delayed observations were 10.084 s and 10.042 s.
+Owners cleared and SYSTEM/VIRTUAL/GFP returned to 122976 B / 0 B / 5808 pages.
+The diagnostic authorization bound the exact boot, old marker, bundle and preceding accepted
+formal evidence. Both historical markers were preserved byte-for-byte; no gate was cleared and
+no power cycle was claimed. Full deployment verification refreshed the source receipt after
+hardlink creation changed inode metadata; source payloads were unchanged.
+Evidence: `.cache/runs/qwen-complete-block-sessions-20261114/`, including both case directories,
+full kernels, deployment identities and `conversation-final-health.json` / `stress-final-health.json`.
+
 ### 11-13 formal-entry deployment blocked by storage
 
 Board boot `b68f12c0-f75c-425a-a7bd-8f2ac3687f2f`, host boot

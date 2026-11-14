@@ -41,9 +41,9 @@ numerics, release and kernel checks. EP hardware revalidation remains deferred.
 
 | Order | Work | Acceptance and boundary |
 |---|---|---|
-| 1 🔜 | Measure sustained and retained-history behavior when needed | Reuse the accepted full/reset collection; do not repeat it without a specific gap. The all-18 path has not inherited the original model's natural two-turn retained-history acceptance. Wider capacity and persistent reliability remain unvalidated. |
-| 2 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls. Use accepted draft length and end-to-end cost to decide whether RPC/hardware integration is worthwhile. |
-| 3 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
+| Complete ✅ | Complete-block sessions and bounded repetition | All-18 M8 passed the C512 two-turn retained/replay comparison and a resident 241/96/241-input collection, each with 16 outputs. Reuse these results; longer sessions, C1024 and hours of stability require a concrete need. |
+| 1 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls. Use accepted draft length and end-to-end cost to decide whether RPC/hardware integration is worthwhile. |
+| 2 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
 
 Keep split/shared DeltaNet projections retired from the formal path: independent state, mapped
 handoffs, separate commits and M1-only recurrence did not eliminate hangs. Preserve evidence and
@@ -74,11 +74,11 @@ comes before performance.
 | S6.4.3–4 | ✅ Bounded model acceptance | Shared fully connected layers (FCL), mapped KV, joint DeltaNet state reads, M8/M16 feed-forward networks (FFN), normalization fusion and FFN state commit have evidence. Do not repeat local acceptance without a new gap. |
 | ↳ Batched DeltaNet capacity | ✅ Bounded complete-block coverage | All 18 layers pass C128/C512, long/full/reset requests with explicit 1408 MiB const and VIRTUAL spill. Long-term stability remains unmeasured; split projections remain rejected. |
 | ↳ Whole-model attribution | ✅ Main costs identified | Preserve low-overhead off/on/off evidence. FFN wrapper time includes state commit; completion waits do not establish an IO bottleneck. |
-| ↳ Natural conversation | ✅ Two-turn replay/retained comparison | Latest C512 M8 combination passed 28→20 and 72→36 tokens, both EOS, in reset/reset/reset/retain order. Retained versus replay snapshots matched bitwise; the final unconsumed token was included correctly. Preserve the exact template/token prefix. Broader conversation quality is unmeasured. |
+| ↳ Natural conversation | ✅ Two-turn replay/retained comparison | All-18 M8 passed 28→20, retained 72→36 and reset/replayed 72→36, both turns ending at EOS. Turn 2 reused 47 committed positions and processed 25 new tokens. Tokens matched exactly; snapshots passed unchanged tolerances but were not bitwise identical. Mean TTFT was 11.955 s retained versus 21.312 s replay. Preserve the exact template/token prefix; broader quality remains unmeasured. |
 | S6.1 | 🟡 Context coverage differs by model | OPT original-layout C128/C256 boundaries, full-capacity rejection and reset passed; bounded C512 short/long passed, four-turn replay did not. Qwen C128 and C512 96→16 / 241→16 passed. On 11-12, two C512 241→16 requests reproduced tokens/reset snapshots bitwise; 512 inputs filled all KV positions and stopped correctly at capacity. C1024 remains untested. |
-| S6.2 | 🟡 Bounded repetition passed | Two long requests in one initialized Qwen instance passed numerics, release and kernel checks. Longer long/short alternation and hours of persistent stability remain deferred; do not equate this acceptance with long-duration reliability. |
+| S6.2 | 🟡 Bounded repetition passed | All-18 M8 passed resident C512 241→16 / reset 96→16 / reset 241→16. Repeated long tokens and checked snapshots matched bitwise; TTFT changed by +0.41%. Numerics, release and kernel checks passed. More repetitions and hours of stability remain deferred; this is bounded acceptance. |
 | S6.3 | ⏸ | Lightweight command-line service only when integration or user access needs it. |
-| S6.5 | 🟡 C++ continuation accepted for two turns | Model-owned history and fail-closed exact-prefix checks are integrated; default generation still resets. Preserve attention KV plus recurrent/convolution state. A persistent CLI/protocol, longer conversations and rollback remain separate work; cross-request batching and concurrency stay deferred. |
+| S6.5 | 🟡 C++ continuation accepted for two turns | Model-owned history and fail-closed exact-prefix checks are integrated and accepted on all-18 M8; default generation still resets. Preserve attention KV plus recurrent/convolution state. A persistent CLI/protocol, longer conversations and rollback remain separate work; cross-request batching and concurrency stay deferred. |
 
 ## S7: Correction, collaboration and tree candidates
 
