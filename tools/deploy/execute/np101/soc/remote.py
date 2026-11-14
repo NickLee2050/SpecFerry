@@ -1,0 +1,496 @@
+"""SSH transport and host acceptance for the independent board supervisor."""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import tarfile
+import tempfile
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+
+from tools.benchmark.generation_metrics import summarize
+from tools.deploy.execute.np101.device import RECOVERY_ROOT, device_lock, host_boot_id
+from tools.deploy.execute.np101.recovery_controls import FAULT
+from tools.deploy.execute.np101.soc.board_runner import (
+    inference_timeout_limit,
+    read_json,
+    save,
+    sha256,
+    verify_bundle,
+)
+from tools.validate.opt.graphs import evaluate, evaluate_benchmark
+
+
+def ssh(host, command, **kwargs):
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", host) or host.startswith("-"):
+        raise ValueError("invalid SSH host alias")
+    return subprocess.run(
+        [
+            "ssh",
+            "-4",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "ProxyCommand=none",
+            host,
+            command,
+        ],
+        check=True,
+        timeout=kwargs.pop("timeout", 15),
+        **kwargs,
+    )
+
+
+def remote_path(value):
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or not path.is_relative_to("/root/specferry-soc")
+        or path == PurePosixPath("/root/specferry-soc")
+    ):
+        raise ValueError("remote paths must be below /root/specferry-soc")
+    return str(path)
+
+
+def python_command(code):
+    return shlex.join(["python3", "-c", code])
+
+
+def runtime_identity_check(bundle, destination):
+    """Verify the selected manifest and executable Python before importing remote code."""
+    names = ["bundle.json", "board_runner.py"]
+    if (bundle / "supervision.py").is_file():
+        names.append("supervision.py")
+    lines = ["import hashlib,pathlib,sys"]
+    for name in names:
+        path = str(PurePosixPath(destination) / name)
+        lines.extend(
+            [
+                f"if hashlib.sha256(pathlib.Path({path!r}).read_bytes()).hexdigest() != {sha256(bundle / name)!r}:",
+                f"    print('remote identity differs: {name}', file=sys.stderr)",
+                "    raise SystemExit(78)",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def deploy(bundle, host, destination):
+    bundle = bundle.resolve()
+    destination = remote_path(destination)
+    manifest = verify_bundle(bundle, check_sdk=False)
+    # Reserve staging space before writing; never merge into an existing deployment.
+    code = (
+        "from pathlib import Path; import shutil; "
+        f"p=Path({destination!r}); p.parent.mkdir(parents=True, exist_ok=True); "
+        f"assert shutil.disk_usage(p.parent).free > {manifest['payload_bytes'] + 64 * 1024**2}; "
+        "p.mkdir()"
+    )
+    ssh(host, python_command(code))
+    with subprocess.Popen(
+        ["tar", "--mtime=@0", "-C", str(bundle), "-cf", "-", "."], stdout=subprocess.PIPE
+    ) as archive:
+        try:
+            ssh(
+                host,
+                shlex.join(["tar", "-xf", "-", "-C", destination]),
+                stdin=archive.stdout,
+                timeout=300,
+            )
+        finally:
+            archive.stdout.close()
+        if archive.wait():
+            raise RuntimeError("bundle archive failed; remote staging is incomplete")
+    script = str(PurePosixPath(destination) / "board_runner.py")
+    bootstrap = runtime_identity_check(bundle, destination) + (
+        "import runpy,sys\n"
+        f"sys.path.insert(0, {destination!r})\n"
+        f"sys.argv=[{script!r},'verify',{destination!r}]\n"
+        f"runpy.run_path({script!r},run_name='__main__')"
+    )
+    verified = json.loads(
+        ssh(host, python_command(bootstrap), capture_output=True, text=True, timeout=300).stdout
+    )
+    if verified.get("bundle_sha256") != sha256(bundle / "bundle.json"):
+        raise RuntimeError("remote manifest differs after transfer")
+    record = dict(verified, host=host, remote=destination, payload_bytes=manifest["payload_bytes"])
+    save(bundle.with_name(bundle.name + "-deployment.json"), record)
+    return record
+
+
+def host_health(output, name):
+    observed = subprocess.run(
+        ["sudo", "-n", "journalctl", "-k", "-b", "--no-pager", "-o", "short-monotonic"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    (output / name).write_text(observed.stdout)
+    if "permission" in observed.stderr.lower() or "not seeing messages" in observed.stderr.lower():
+        raise RuntimeError("host kernel journal is inaccessible")
+    if (
+        FAULT.search(observed.stdout)
+        or Path("/dev/galcore").exists()
+        or Path("/sys/module/galcore").exists()
+    ):
+        raise RuntimeError("host kernel fault or EP isolation is not established")
+
+
+def numerical_acceptance(bundle, board):
+    manifest = read_json(bundle / "bundle.json")
+    if manifest.get("model_family", "opt") == "qwen3_5":
+        from tools.deploy.execute.np101.soc.board_runner import payload_limits
+        from tools.deploy.pack.np101.config import DECODER_LAYOUTS
+        from tools.validate.qwen3_5.generation import evaluate_generation
+
+        result = evaluate_generation(
+            bundle / "request", board / "native", payload_limits=payload_limits(manifest)
+        )
+        profile = read_json(board / "native/platform.json")
+        result["checks"]["platform"] = (
+            profile.get("target") == "soc"
+            and profile.get("architecture") == "riscv64"
+            and profile.get("sdk_identity") == "np101-soc-riscv64"
+        )
+        initialized = read_json(board / "native/initialization.json")
+        options = manifest["request_options"]
+        ffn_batch_tokens = options.get("ffn_batch_tokens", 1)
+        decoder_layout = options.get("decoder_layout", "separate")
+        layout_file = bundle / "request/decoder-layout.txt"
+        requested_layout = layout_file.read_text().strip() if layout_file.exists() else "separate"
+        request_metadata = read_json(bundle / "request/request.json")
+        state_commit = options["state_commit"]
+        result["checks"]["composition"] = (
+            initialized.get("compiled_mixers") == 18
+            and ffn_batch_tokens in (1, 8, 16)
+            and initialized.get("ffn_batch_tokens", 1) == ffn_batch_tokens
+            and decoder_layout in DECODER_LAYOUTS
+            and initialized.get("decoder_layout", "separate") == decoder_layout
+            and requested_layout == decoder_layout
+            and request_metadata.get("decoder_layout", "separate") == decoder_layout
+            and (decoder_layout == "separate" or ffn_batch_tokens in (8, 16))
+            and state_commit in ("combined", "ffn")
+            and (state_commit == "combined" or ffn_batch_tokens in (8, 16))
+            and (bundle / "request/state-commit.txt").read_text().strip() == state_commit
+            and request_metadata.get("state_commit", "combined") == state_commit
+            and (
+                ffn_batch_tokens == 1
+                or (
+                    options.get("capacity") in (128, 512)
+                    and options.get("head_backend") == "shared-fcl-split"
+                    and options.get("projections") == "shared-fcl"
+                    and options.get("kv_write_mode") == "mapped"
+                )
+            )
+            and initialized.get("compiled_feed_forward") == (23 if ffn_batch_tokens == 1 else 24)
+            and initialized.get("matmul_feed_forward_layer") == (9 if ffn_batch_tokens == 1 else -1)
+            and initialized.get("compiled_input_norm_layers") == 18
+            and initialized.get("embedding_lookup") == "gather-nd"
+            and initialized.get("capacity", 64) == options.get("capacity", 64)
+            and (
+                all(
+                    initialized.get(name) == options[name]
+                    for name in ("projections", "kv_write_mode")
+                    if name in options
+                )
+            )
+            and all(
+                initialized.get(name) == options[name]
+                for name in (
+                    "head_backend",
+                    "state_commit",
+                    "matmul_feed_forward_layer",
+                    "token_readback",
+                )
+            )
+        )
+        width = options.get("delta_batch_tokens", 1)
+        result["checks"]["delta_prefill"] = initialized.get(
+            "delta_batch_tokens", 1
+        ) == width and initialized.get("compiled_prefill_mixers", 0) == (18 if width == 8 else 0)
+        if options.get("kv_write_mode") == "mapped":
+            execution = read_json(board / "native/execution.json")
+            count = execution.get("kv_revalidations")
+            result["checks"]["kv_revalidations"] = type(count) is int and count == 0
+        result["passed"] = all(result["checks"].values())
+        if not result["passed"]:
+            result["performance"] = None
+        return result
+    options = manifest["request_options"]
+    metadata = read_json(bundle / "request/reference.json")
+    block = int(options["block"])
+    common = dict(
+        variant="compiled-fullgraph",
+        decoder_group_size=1,
+        prefill_head_policy=options["prefill_head"],
+        kv_transfer="mapped-slot",
+    )
+    if options.get("benchmark", "0") == "1":
+        checks, generations = evaluate_benchmark(
+            board / "native",
+            metadata,
+            block,
+            warmups=int(options.get("warmups", 0)),
+            repeats=int(options.get("repeats", 1)),
+            **common,
+        )
+    else:
+        readback = options.get("readback", "none")
+        checks, generations = evaluate(
+            bundle / "request",
+            board / "native",
+            metadata,
+            block,
+            cache_readback=readback,
+            cache_layer_range=[int(options["cache_first_layer"]), int(options["cache_last_layer"])]
+            if readback == "kv"
+            else None,
+            readback_transport=options.get("readback_transport", "sdk"),
+            **common,
+        )
+    profile = read_json(board / "native/platform.json")
+    checks["platform"] = (
+        profile.get("target") == "soc" and profile.get("sdk_identity") == "np101-soc-riscv64"
+    )
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "performance": summarize(generations) if all(checks.values()) else None,
+    }
+
+
+def collect(bundle, output):
+    """Resume evidence retrieval after an SSH interruption; never launches another child."""
+    session = read_json(output / "session.json")
+    if session["bundle_sha256"] != sha256(bundle / "bundle.json"):
+        raise ValueError("collection bundle differs from the launched run")
+    verify_bundle(bundle, check_sdk=False, verify_payload=False)
+    marker = RECOVERY_ROOT / "np101-recovery-required.json"
+    with device_lock(RECOVERY_ROOT, recovery_control=True):
+        if read_json(marker).get("evidence") != str(output.resolve()):
+            raise RuntimeError("collection cannot clear an unrelated recovery marker")
+        if not (output / "board").exists():
+            with tempfile.TemporaryFile() as archive:
+                ssh(
+                    session["host"],
+                    shlex.join(["tar", "-C", session["remote_output"], "-cf", "-", "."]),
+                    stdout=archive,
+                    timeout=90,
+                )
+                archive.seek(0)
+                with tempfile.TemporaryDirectory(dir=output, prefix=".collect-") as staging:
+                    with tarfile.open(fileobj=archive) as contents:
+                        contents.extractall(staging, filter="data")
+                    # An unfinished supervisor must remain collectible later.
+                    read_json(Path(staging) / "result.json")
+                    Path(staging).rename(output / "board")
+        board = read_json(output / "board/result.json")
+        passed = (
+            board.get("clean") is True and board.get("bundle_sha256") == session["bundle_sha256"]
+        )
+        numerical = numerical_acceptance(bundle, output / "board") if passed else {"passed": False}
+        host_health(output, "host-kernel-after.log")
+        manifest = read_json(bundle / "bundle.json")
+        capacity = manifest.get("request_options", {}).get("capacity")
+        qwen_scope = f"Qwen C{capacity}" if capacity is not None else "Qwen"
+        ffn_batch = manifest.get("request_options", {}).get("ffn_batch_tokens", 1)
+        summary = {
+            "passed": False,
+            "checks_passed": passed and numerical["passed"],
+            "board": board,
+            "numerical": numerical,
+            "host_boot_id": host_boot_id(),
+            "scope": (
+                f"{qwen_scope} hybrid, FFN batch {ffn_batch}, shared vocabulary and FP32 recurrent state"
+                if manifest.get("model_family", "opt") == "qwen3_5"
+                else "formal OPT fullgraph mapped-slot with explicit prefill policy"
+            ),
+        }
+        save(output / "summary.json", summary)
+        if summary["checks_passed"]:
+            script = str(PurePosixPath(session["remote_bundle"]) / "board_runner.py")
+            ssh(
+                session["host"],
+                shlex.join(
+                    [
+                        "python3",
+                        script,
+                        "accept",
+                        session["remote_output"],
+                        sha256(output / "board/result.json"),
+                    ]
+                ),
+            )
+            if session.get("diagnostic"):
+                retained = output / "retained-prior-host-marker.json"
+                if sha256(retained) != session["diagnostic"]["host_marker_sha256"]:
+                    raise RuntimeError("retained recovery evidence changed")
+            if session.get("diagnostic"):
+                (output / "accepted-host-marker.json").write_bytes(marker.read_bytes())
+                replacement = marker.with_suffix(".restore.tmp")
+                replacement.write_bytes(retained.read_bytes())
+                replacement.replace(marker)
+            else:
+                marker.rename(output / "accepted-host-marker.json")
+            summary["passed"] = True
+            summary["recovery_cleared"] = not bool(session.get("diagnostic"))
+            save(output / "summary.json", summary)
+        else:
+            record = read_json(marker)
+            record.update(
+                reason="SoC execution or acceptance failed",
+                board_boot_id=board.get("board_boot_id"),
+                kernel_faults=board.get("kernel_faults", []),
+                final_health=board,
+            )
+            save(marker, record)
+            save(
+                output / "incident.json",
+                {
+                    "observed": record,
+                    "established_cause": None,
+                    "next_action": "Stop board work and review SDK/kernel evidence; follow recovery ledger",
+                },
+            )
+        return summary
+
+
+def run(bundle, host, destination, output, timeout, diagnostic=None, *, preparation_timeout=240):
+    bundle, output = bundle.resolve(), output.resolve()
+    if not 0 < timeout <= 600:
+        raise ValueError("inference deadline must be in (0, 600] seconds")
+    if not 0 < preparation_timeout <= 240:
+        raise ValueError("preparation deadline must be in (0, 240] seconds")
+    destination = remote_path(destination)
+    manifest = verify_bundle(bundle, check_sdk=False, verify_payload=False)
+    with device_lock(RECOVERY_ROOT, recovery_control=diagnostic is not None):
+        execution_limit = inference_timeout_limit(manifest)
+        if timeout > execution_limit:
+            raise ValueError(f"inference deadline must be in (0, {execution_limit}] seconds")
+        marker = RECOVERY_ROOT / "np101-recovery-required.json"
+        if diagnostic is not None and (
+            sha256(marker) != diagnostic["host_marker_sha256"]
+            or sha256(bundle / "bundle.json") != diagnostic["bundle_sha256"]
+            or not diagnostic["authorization"]
+            or diagnostic["timeout"] != timeout
+            or diagnostic.get("preparation_timeout") != preparation_timeout
+        ):
+            raise RuntimeError("diagnostic authorization does not match the retained gate/bundle")
+        output.mkdir(parents=True, exist_ok=False)
+        host_health(output, "host-kernel-before.log")
+        remote_output = "/root/specferry-soc/runs/" + uuid.uuid4().hex
+        session = dict(
+            host=host,
+            remote_bundle=destination,
+            remote_output=remote_output,
+            bundle_sha256=sha256(bundle / "bundle.json"),
+            diagnostic=diagnostic,
+            preparation_timeout=preparation_timeout,
+            inference_timeout=timeout,
+        )
+        save(output / "session.json", session)
+        if diagnostic is not None:
+            (output / "retained-prior-host-marker.json").write_bytes(marker.read_bytes())
+        save(
+            marker,
+            {
+                "reason": "SoC remote run/acceptance incomplete",
+                "boot_id": host_boot_id(),
+                "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                "members": [],
+                "evidence": str(output),
+                "remote_output": remote_output,
+                "prior_marker": str(output / "retained-prior-host-marker.json")
+                if diagnostic
+                else None,
+            },
+        )
+        script = str(PurePosixPath(destination) / "board_runner.py")
+        # The detached process owns its watchdog. Losing this SSH does not kill the monitor.
+        command = ["python3", script, "run", destination, remote_output, str(timeout)]
+        command.extend([json.dumps(diagnostic), str(preparation_timeout), session["bundle_sha256"]])
+        launch = runtime_identity_check(bundle, destination) + (
+            "import subprocess,pathlib; "
+            f"p=pathlib.Path({remote_output!r}); p.parent.mkdir(parents=True,exist_ok=True); "
+            "log=open(str(p)+'.supervisor.log','w'); "
+            f"c=subprocess.Popen({command!r},stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True); print(c.pid)"
+        )
+        try:
+            try:
+                pid = ssh(
+                    host, python_command(launch), capture_output=True, text=True
+                ).stdout.strip()
+                save(output / "supervisor.json", {"remote_pid": int(pid)})
+            except (subprocess.SubprocessError, OSError) as error:
+                if isinstance(error, subprocess.CalledProcessError) and error.returncode == 78:
+                    raise RuntimeError("remote bundle identity rejected before launch") from error
+                # Submission may have reached the board. Discover this run; never resubmit.
+                save(output / "launch-transport-error.json", {"error": str(error)})
+            # Separate preparation and post-ready execution budgets. SDK identity
+            # checks, release observation and transport have their own outer margin.
+            deadline = time.monotonic() + 60 + preparation_timeout + timeout + 60
+            result_path = remote_output + "/result.json"
+            supervisor = output / "supervisor.json"
+            if supervisor.is_file():
+                process = f"/proc/{read_json(supervisor)['remote_pid']}/cmdline"
+                # Check the command before the result: the process can publish a
+                # result and exit between reads. Recycled PIDs must not count as alive.
+                code = f"""from pathlib import Path
+try:
+    command = Path({process!r}).read_bytes().split(bytes([0]))
+except (FileNotFoundError, ProcessLookupError):
+    command = ()
+ready = Path({result_path!r}).is_file()
+print('1' if ready else '0' if {remote_output.encode()!r} in command else 'exited')
+"""
+            else:
+                # An uncertain submission is discovered by its result, never resubmitted.
+                code = f"from pathlib import Path; print(int(Path({result_path!r}).is_file()))"
+            while time.monotonic() < deadline:
+                try:
+                    status = ssh(
+                        host, python_command(code), capture_output=True, text=True
+                    ).stdout.strip()
+                    if status == "1":
+                        break
+                    if status == "exited":
+                        save(
+                            output / "supervisor-exited.json",
+                            {
+                                "remote_output": remote_output,
+                                "remote_log": remote_output + ".supervisor.log",
+                            },
+                        )
+                        raise RuntimeError(
+                            "board supervisor exited without a result; "
+                            "preserve marker and inspect its supervisor log"
+                        )
+                except (subprocess.SubprocessError, OSError) as error:
+                    save(
+                        output / "transport-error.json",
+                        {"error": str(error), "remote_output": remote_output},
+                    )
+                    time.sleep(5)
+                    continue
+                time.sleep(5)
+            else:
+                raise RuntimeError(
+                    "supervisor result not available; preserve marker and collect evidence"
+                )
+        except BaseException as error:
+            save(output / "interrupted.json", {"error": str(error), "remote_output": remote_output})
+            raise
+    for attempt in range(3):
+        try:
+            return collect(bundle, output)
+        except (subprocess.SubprocessError, OSError) as error:
+            save(output / "collection-transport-error.json", {"error": str(error)})
+            if attempt == 2:
+                raise
+            time.sleep(5)

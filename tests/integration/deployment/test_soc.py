@@ -1,0 +1,1047 @@
+"""SoC packaging and fail-closed supervision, without SDK/device execution."""
+
+import ast
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from tools.deploy.execute.np101.soc import board_runner as board
+from tools.deploy.execute.np101.soc import remote
+from tools.deploy.pack.np101.soc import request_options
+
+
+class SocTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        supervisor = Path(
+            os.environ.get("SPECFERRY_TEST_SUPERVISOR", "build/host/bin/specferry_supervise")
+        ).resolve()
+        patcher = patch.object(board, "SUPERVISOR_BINARY", supervisor)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_explicit_memory_reserve_for_smaller_linux_layout(self):
+        self.assertEqual(board.memory_reserve_kib({}), 192 * 1024)
+        self.assertEqual(board.memory_reserve_kib({"linux_memory_reserve_mib": 64}), 64 * 1024)
+        self.assertEqual(board.memory_reserve_kib({"linux_memory_reserve_mib": 32}), 32 * 1024)
+        for reserve in (True, "32", 31, 513, None):
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                board.memory_reserve_kib({"linux_memory_reserve_mib": reserve})
+
+    def test_request_capacity_limits_long_prompt_and_rejects_unsupported_geometry(self):
+        (self.root / "run-options.txt").write_text(
+            "variant compiled-fullgraph\nkv_transfer mapped-slot\n"
+            "block 16\nprefill_head last-token\n"
+        )
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 97) + "\n")
+        (self.root / "expected.txt").write_text(" ".join(["8"] * 16) + "\n")
+        metadata = dict(
+            capacity=128,
+            layers=24,
+            heads=16,
+            width=64,
+            requests=[dict(tokens=[8] * 16, prompt_length=97, consumed=112)],
+        )
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        for capacity in (64, 96, 1024):
+            board.save(self.root / "reference.json", metadata | {"capacity": capacity})
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                request_options(self.root)
+
+        metadata.update(capacity=256)
+        metadata["requests"][0].update(prompt_length=241, consumed=256)
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 241) + "\n")
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        metadata.update(capacity=512)
+        metadata["requests"][0].update(prompt_length=497, consumed=512)
+        (self.root / "requests.txt").write_text(" ".join(["7"] * 497) + "\n")
+        board.save(self.root / "reference.json", metadata)
+        self.assertEqual(request_options(self.root)["block"], "16")
+        metadata["requests"][0]["consumed"] = 513
+        board.save(self.root / "reference.json", metadata)
+        with self.assertRaises(ValueError):
+            request_options(self.root)
+
+    def test_board_script_uses_python39_and_only_standard_library(self):
+        tree = ast.parse(Path(board.__file__).read_text(), feature_version=(3, 9))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(
+                    all(
+                        alias.name in sys.stdlib_module_names or alias.name == "supervision"
+                        for alias in node.names
+                    )
+                )
+            if isinstance(node, ast.ImportFrom):
+                self.assertIn(node.module, sys.stdlib_module_names | {"tools.deploy.execute"})
+
+    def test_deployed_policy_imports_its_shared_adapter_without_the_repository(self):
+        shutil.copyfile(board.__file__, self.root / "board_runner.py")
+        shutil.copyfile(board.supervision.__file__, self.root / "supervision.py")
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import runpy,sys; sys.path.insert(0,sys.argv[1]); "
+                "policy=runpy.run_path(sys.argv[1]+'/board_runner.py'); "
+                "assert callable(policy['supervise'])",
+                str(self.root),
+            ],
+            check=True,
+            timeout=5,
+        )
+        tree = ast.parse(Path(board.supervision.__file__).read_text(), feature_version=(3, 9))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(alias.name in sys.stdlib_module_names for alias in node.names))
+
+    def test_diagnostic_only_acknowledges_exact_old_fault_occurrences(self):
+        old = "[57512.756734] [galcore]: NP[0] hang, automatic recovery."
+        new = old.replace("57512", "60000")
+        pattern = re.compile("hang")
+        self.assertEqual(board.new_faults(old, pattern, [old]), [])
+        self.assertEqual(board.new_faults(old + "\n" + new, pattern, [old]), [new])
+        self.assertEqual(board.new_faults(old + "\n" + old, pattern, [old]), [old])
+        self.assertEqual(board.new_faults(old, pattern), [old])
+
+    def test_legacy_bundle_cannot_hide_storage_faults(self):
+        pattern = re.compile(board.fault_pattern({"fault_pattern": "NP.*hang"}), re.I)
+        line = "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt."
+        self.assertEqual(board.new_faults(line, pattern), [line])
+        previous = self.released_board_marker()
+        previous["kernel_faults"] = [line]
+        digest = "a" * 64
+        diagnostic = {
+            "authorization": "retry isolated NP hang only",
+            "kernel_faults": [line],
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with self.assertRaisesRegex(RuntimeError, "only accepts recorded NP hang"):
+            board.hang_retry_state(previous, diagnostic, digest, previous["board_boot_id"])
+
+    def released_board_marker(self):
+        return {
+            "board_boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "faults": [],
+            "kernel_faults": [],
+            "remaining_processes": [],
+            "owners_delayed": [],
+            "pool_released": True,
+            "gfp_released": True,
+            "delayed_seconds": 10.1,
+            "stop_reason": "Linux memory reserve breached",
+        }
+
+    def test_board_diagnostic_requires_exact_marker_and_complete_fault_free_release(self):
+        marker = self.root / "np101-recovery-required.json"
+        output = self.root / "run"
+        output.mkdir()
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        for authorization in (None, {}, {"board_marker_sha256": "stale"}):
+            with self.subTest(authorization=authorization), self.assertRaises(RuntimeError):
+                board.retain_diagnostic_marker(
+                    marker, output, authorization, previous["board_boot_id"]
+                )
+        for change in (
+            {"board_boot_id": "different-boot"},
+            {"faults": ["NP hang"]},
+            {"kernel_faults": ["EDMA timeout"]},
+            {"remaining_processes": [42]},
+            {"owners_delayed": [42]},
+            {"pool_released": False},
+            {"gfp_released": False},
+            {"delayed_seconds": 9.9},
+            {"delayed_seconds": None},
+            {"kernel_faults": None},
+            {"monitor_error": "lost records"},
+            {"final_check_error": "unreadable kernel"},
+        ):
+            board.save(marker, previous | change)
+            authorization = {"board_marker_sha256": board.sha256(marker)}
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                board.retain_diagnostic_marker(
+                    marker, output, authorization, previous["board_boot_id"]
+                )
+        self.assertFalse((output / "retained-prior-board-marker.json").exists())
+        marker.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            board.retain_diagnostic_marker(marker, output, authorization, previous["board_boot_id"])
+
+    def released_hang_marker(self):
+        # Same raw-kmsg/dmesg structure as the released SoC decoder incident.
+        older = "[236364.592740] [galcore]: NP[0] hang, automatic recovery."
+        current = "[242641.712739] [galcore]: NP[0] hang, automatic recovery."
+        previous = self.released_board_marker() | {
+            "diagnostic": {"kernel_faults": [older]},
+            "faults": ["4,439,242641712739,-;[galcore]: NP[0] hang, automatic recovery."],
+            "kernel_faults": [current],
+            "stop_reason": "kernel fault",
+        }
+        return previous, [older, current]
+
+    def test_bounded_hang_retry_requires_exact_events_and_complete_release(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "marker.json", self.root / "run"
+        output.mkdir()
+        board.save(marker, previous)
+        digest = board.sha256(marker)
+        diagnostic = {
+            "board_marker_sha256": digest,
+            "authorization": "bounded SoC NP hang retry",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with patch.object(board, "STATE", self.root):
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 1)
+            self.assertEqual(
+                (output / "retained-prior-board-marker.json").read_bytes(), marker.read_bytes()
+            )
+            for change in (
+                {"kernel_faults": baseline[:-1]},
+                {"kernel_faults": baseline + [baseline[-1]]},
+                {"authorization": ""},
+                {"soc_hang_retry": {"first_failed_marker_sha256": "0" * 64}},
+                {
+                    "soc_hang_retry": {
+                        "first_failed_marker_sha256": digest,
+                        "consecutive_hang_runs": 0,
+                    }
+                },
+            ):
+                with self.subTest(change=change), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, diagnostic | change, previous["board_boot_id"]
+                    )
+            for change in (
+                {"faults": ["4,439,242641712738,-;[galcore]: NP[0] hang, automatic recovery."]},
+                {"faults": ["4,439,242641712739,-;EDMA timeout"]},
+                {"kernel_faults": ["[242641.712739] BUG: invalid memory"]},
+                {"pool_released": False},
+                {"gfp_released": False},
+                {"owners_delayed": [7]},
+                {"remaining_processes": [7]},
+                {"delayed_seconds": 9.9},
+                {"delayed_faults": [baseline[-1]]},
+                {"monitor_error": "lost kernel events"},
+                {"final_check_error": "cannot read kernel"},
+                {"board_boot_id": "other"},
+            ):
+                altered = previous | change
+                board.save(marker, altered)
+                current_digest = board.sha256(marker)
+                authorization = diagnostic | {
+                    "board_marker_sha256": current_digest,
+                    "soc_hang_retry": {"first_failed_marker_sha256": current_digest},
+                    "kernel_faults": altered["diagnostic"]["kernel_faults"]
+                    + altered["kernel_faults"],
+                }
+                with self.subTest(change=change), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, authorization, previous["board_boot_id"]
+                    )
+
+    def test_hang_retry_counter_cannot_be_reset_by_renaming_or_retiming(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "marker.json", self.root / "run"
+        output.mkdir()
+        anchor = "a" * 64
+        previous["soc_hang_retry"] = {
+            "first_failed_marker_sha256": anchor,
+            "consecutive_hang_runs": 2,
+        }
+        diagnostic = {
+            "authorization": "bounded retry with changed benchmark labels/timing",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": anchor},
+            "bundle_sha256": "b" * 64,
+            "timeout": 120,
+        }
+        with patch.object(board, "STATE", self.root):
+            board.save(marker, previous)
+            diagnostic["board_marker_sha256"] = board.sha256(marker)
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 2)
+            for count in (3, 4, None, True, -1):
+                previous["soc_hang_retry"]["consecutive_hang_runs"] = count
+                board.save(marker, previous)
+                diagnostic["board_marker_sha256"] = board.sha256(marker)
+                with self.subTest(count=count), self.assertRaises(RuntimeError):
+                    board.retain_diagnostic_marker(
+                        marker, output, diagnostic, previous["board_boot_id"]
+                    )
+            previous["soc_hang_retry"]["consecutive_hang_runs"] = 2
+            board.save(marker, previous)
+            diagnostic["board_marker_sha256"] = board.sha256(marker)
+            diagnostic["soc_hang_retry"]["first_failed_marker_sha256"] = board.sha256(marker)
+            with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                board.retain_diagnostic_marker(
+                    marker, output, diagnostic, previous["board_boot_id"]
+                )
+
+    def test_accepted_hang_retry_resets_streak_without_clearing_prior_marker(self):
+        previous, baseline = self.released_hang_marker()
+        marker, output = self.root / "np101-recovery-required.json", self.root / "run"
+        output.mkdir()
+        board.save(marker, previous)
+        original, digest = marker.read_bytes(), board.sha256(marker)
+        diagnostic = {
+            "board_marker_sha256": digest,
+            "authorization": "bounded SoC retry",
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": digest},
+        }
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "kernel", return_value="\n".join(baseline)),
+        ):
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            result = {
+                "clean": True,
+                "board_boot_id": previous["board_boot_id"],
+                "fault_pattern": "hang",
+                "diagnostic": diagnostic,
+                "soc_hang_retry": retained["soc_hang_retry"],
+            }
+            board.save(output / "result.json", result)
+            board.save(marker, {"output": str(output)})
+            board.accept(output, board.sha256(output / "result.json"))
+            self.assertEqual(marker.read_bytes(), original)
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 0)
+            board.save(output / "result.json", result | {"clean": False})
+            with self.assertRaisesRegex(RuntimeError, "accepted NP hang retry evidence differs"):
+                board.retain_diagnostic_marker(
+                    marker, output, diagnostic, previous["board_boot_id"]
+                )
+
+    def test_new_trial_after_accepted_control_ignores_exhausted_historical_count(self):
+        previous, baseline = self.released_hang_marker()
+        anchor = "a" * 64
+        previous["soc_hang_retry"] = {
+            "first_failed_marker_sha256": anchor,
+            "consecutive_hang_runs": 4,
+        }
+        marker = self.root / "np101-recovery-required.json"
+        board.save(marker, previous)
+        original, digest = marker.read_bytes(), board.sha256(marker)
+        diagnostic = {
+            "authorization": "one changed trial after a completely accepted control",
+            "board_marker_sha256": digest,
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": anchor},
+            "bundle_sha256": "b" * 64,
+        }
+        accepted = self.root / "accepted-control.json"
+        board.save(
+            accepted,
+            {
+                "clean": True,
+                "board_boot_id": previous["board_boot_id"],
+                "diagnostic": diagnostic | {"bundle_sha256": "c" * 64},
+                "soc_hang_retry": previous["soc_hang_retry"],
+            },
+        )
+        with patch.object(board, "STATE", self.root):
+            with self.assertRaisesRegex(RuntimeError, "three consecutive"):
+                board.hang_retry_state(previous, diagnostic, digest, previous["board_boot_id"])
+            board.save(
+                self.root / "soc-hang-retry-accepted.json",
+                {
+                    "board_boot_id": previous["board_boot_id"],
+                    "first_failed_marker_sha256": anchor,
+                    "restored_marker_sha256": digest,
+                    "result_path": str(accepted),
+                    "result_sha256": board.sha256(accepted),
+                },
+            )
+            output = self.root / "new-trial"
+            output.mkdir()
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 0)
+            self.assertEqual(marker.read_bytes(), original)
+            self.assertEqual((output / "retained-prior-board-marker.json").read_bytes(), original)
+
+    def test_failed_board_diagnostic_preserves_previous_marker_and_evidence_chain(self):
+        marker = self.root / "np101-recovery-required.json"
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        original = marker.read_bytes()
+        (self.root / "bundle.json").write_text("{}")
+        diagnostic = {
+            "board_marker_sha256": board.sha256(marker),
+            "board_boot_id": previous["board_boot_id"],
+            "bundle_sha256": board.sha256(self.root / "bundle.json"),
+            "authorization": "bounded diagnostic",
+            "timeout": 180,
+            "preparation_timeout": 240,
+            "kernel_faults": [],
+        }
+        manifest = {"fault_pattern": "hang", "driver_parameters": {"contiguousSize": 1024}}
+        state = {
+            "mem_available_kib": board.RESERVE_KIB + 1,
+            "pool": "POOL SYSTEM: Total : 1024",
+            "pool_used": ["0"],
+            "gfp": "0",
+        }
+        original_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/sys/module/galcore/parameters/contiguousSize":
+                return "1024"
+            return original_read(path, *args, **kwargs)
+
+        stream = self.root / "fake-kmsg"
+        stream.write_bytes(b"")
+        descriptor = os.open(stream, os.O_RDONLY)
+        output = self.root / "run"
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "DELAY_SECONDS", 0),
+            patch.object(board, "verify_bundle", return_value=manifest),
+            patch.object(board, "require_verified_deployment"),
+            patch.object(board, "kernel", return_value=""),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "snapshot", return_value=state),
+            patch.object(Path, "read_text", read_text),
+            patch.object(board.os, "open", return_value=descriptor),
+            patch.object(
+                board,
+                "supervise",
+                return_value={
+                    "exit": -15,
+                    "remaining_processes": [],
+                    "stop_reason": "child deadline expired",
+                },
+            ),
+        ):
+            result = board.run(
+                self.root,
+                output,
+                180,
+                diagnostic,
+                expected_bundle_sha256=diagnostic["bundle_sha256"],
+            )
+        self.assertTrue(result["child_started"])
+        self.assertFalse(result["clean"])
+        retained = output / "retained-prior-board-marker.json"
+        self.assertEqual(retained.read_bytes(), original)
+        pending = board.read_json(marker)
+        self.assertEqual(pending["output"], str(output))
+        self.assertEqual(
+            pending["retained_prior_board_marker"],
+            {"path": str(retained), "sha256": diagnostic["board_marker_sha256"]},
+        )
+
+    def test_board_accept_restores_previous_gate_and_rejects_new_faults_or_tampering(self):
+        marker = self.root / "np101-recovery-required.json"
+        output = self.root / "run"
+        output.mkdir()
+        previous = self.released_board_marker()
+        board.save(marker, previous)
+        diagnostic = {"board_marker_sha256": board.sha256(marker)}
+        board.retain_diagnostic_marker(marker, output, diagnostic, previous["board_boot_id"])
+        original = marker.read_bytes()
+        result = {
+            "clean": True,
+            "board_boot_id": previous["board_boot_id"],
+            "fault_pattern": "hang",
+            "diagnostic": diagnostic,
+        }
+        board.save(output / "result.json", result)
+        board.save(marker, {"output": str(output)})
+        pending = marker.read_bytes()
+        digest = board.sha256(output / "result.json")
+        with (
+            patch.object(board, "STATE", self.root),
+            patch.object(board, "owners", return_value=[]),
+            patch.object(board, "kernel", return_value="[123.456] NP hang") as kernel,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "kernel fault"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
+            kernel.return_value = "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt."
+            with self.assertRaisesRegex(RuntimeError, "kernel fault"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
+            retained = output / "retained-prior-board-marker.json"
+            retained.write_bytes(original + b"\n")
+            with self.assertRaisesRegex(RuntimeError, "retained board marker differs"):
+                board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), pending)
+            retained.write_bytes(original)
+            kernel.return_value = ""
+            board.accept(output, digest)
+            self.assertEqual(marker.read_bytes(), original)
+            self.assertEqual((output / "accepted-marker.json").read_bytes(), pending)
+            board.accept(output, digest)  # Recollection cannot clear the restored gate.
+            self.assertEqual(marker.read_bytes(), original)
+
+    def test_bundle_rejects_corruption_wrong_architecture_and_missing_execution_bit(self):
+        binary = self.root / "bin/specferry_opt_graph_generate"
+        binary.parent.mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        binary.write_bytes(header)
+        binary.chmod(0o755)
+        record = {"bytes": 20, "sha256": board.sha256(binary), "executable": True}
+        manifest = {
+            "schema_version": 1,
+            "target": "np101-soc-riscv64",
+            "files": {"bin/specferry_opt_graph_generate": record},
+        }
+        board.save(self.root / "bundle.json", manifest)
+        board.verify_bundle(self.root, check_sdk=False)
+        manifest["files"]["model/verified-prefill-cache.txt"] = record
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(ValueError, "FFN Verify cache package is retired"):
+            board.verify_bundle(self.root, check_sdk=False)
+        del manifest["files"]["model/verified-prefill-cache.txt"]
+        sdk = self.root / "libexample.so"
+        sdk.write_bytes(b"test SDK")
+        manifest["sdk"] = {sdk.name: board.sha256(sdk)}
+        board.save(self.root / "bundle.json", manifest)
+        with patch.object(board, "SDK", self.root):
+            board.verify_bundle(self.root)
+            sdk.write_bytes(b"bad! SDK")
+            with self.assertRaisesRegex(ValueError, "board SDK identity"):
+                board.verify_bundle(self.root)
+            with self.assertRaisesRegex(ValueError, "board SDK identity"):
+                board.verify_bundle(self.root, verify_payload=False)
+        binary.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "permission"):
+            board.verify_bundle(self.root, check_sdk=False)
+        binary.chmod(0o755)
+        header[18] = 62  # x86-64 must not enter a board bundle.
+        binary.write_bytes(header)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            board.verify_bundle(self.root, check_sdk=False)
+        record["sha256"] = board.sha256(binary)
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(ValueError, "RISC-V"):
+            board.verify_bundle(self.root, check_sdk=False)
+
+    def test_verified_deployment_skips_payload_reads_and_rejects_changed_files(self):
+        binary = self.root / "bin/specferry_opt_graph_generate"
+        binary.parent.mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        binary.write_bytes(header)
+        binary.chmod(0o755)
+        payload = self.root / "model.nb"
+        payload.write_bytes(b"model data")
+        manifest = {
+            "schema_version": 1,
+            "target": "np101-soc-riscv64",
+            "sdk": {},
+            "files": {
+                str(path.relative_to(self.root)): {
+                    "bytes": path.stat().st_size,
+                    "sha256": board.sha256(path),
+                    "executable": path == binary,
+                }
+                for path in (binary, payload)
+            },
+        }
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(RuntimeError, "verification required"):
+            board.require_verified_deployment(self.root, manifest)
+        board.verify_deployment(self.root)
+        with patch.object(board, "sha256", wraps=board.sha256) as hashes:
+            board.verify_bundle(self.root, verify_payload=False)
+            board.require_verified_deployment(self.root, manifest)
+            self.assertNotIn(unittest.mock.call(payload), hashes.call_args_list)
+            self.assertNotIn(unittest.mock.call(binary), hashes.call_args_list)
+        state = payload.stat()
+        payload.write_bytes(b"damaged nb")
+        os.utime(payload, ns=(state.st_atime_ns, state.st_mtime_ns))
+        with self.assertRaisesRegex(RuntimeError, "deployment changed"):
+            board.require_verified_deployment(self.root, manifest)
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            board.verify_deployment(self.root)
+
+    def test_bundle_and_remote_paths_cannot_escape_their_roots(self):
+        for name in ("../weights.bin", "/tmp/weights.bin"):
+            with self.assertRaises(ValueError):
+                board.bundle_file(self.root, name)
+        (self.root / "outside").symlink_to("/tmp")
+        with self.assertRaises(ValueError):
+            board.bundle_file(self.root, "outside/file")
+        for name in ("/root", "/root/specferry-soc/../other", "relative"):
+            with self.assertRaises(ValueError):
+                remote.remote_path(name)
+
+    def supervise(
+        self, source, timeout=1, monitor=lambda: None, preparation_timeout=None, execution_limit=300
+    ):
+        return board.supervise(
+            [sys.executable, "-c", source],
+            self.root,
+            os.environ.copy(),
+            self.root,
+            timeout,
+            monitor,
+            preparation_timeout=preparation_timeout,
+            execution_limit=execution_limit,
+        )
+
+    def test_preparation_and_inference_have_independent_deadlines(self):
+        result = self.supervise(
+            "import os,time; time.sleep(0.15); "
+            "os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.12,
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        self.assertGreater(result["preparation_seconds"], 0.12)
+        self.assertEqual(result["remaining_processes"], [])
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertGreaterEqual(fired - result["ready_monotonic_seconds"], 0.12)
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.35)
+
+    def test_ready_before_clean_exit_is_collected(self):
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode())",
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertIsNone(result["stop_reason"])
+        self.assertIn("ready_monotonic_seconds", result)
+
+    def test_preparation_timeout_does_not_grant_inference_time_before_readiness(self):
+        result = self.supervise("import time; time.sleep(60)", preparation_timeout=0.12)
+        self.assertEqual(result["stop_reason"], "preparation deadline expired")
+        self.assertNotIn("ready_monotonic_seconds", result)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_ready_pipe_and_inference_deadline_work_when_sampling_blocks(self):
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.12,
+            preparation_timeout=1,
+            monitor=lambda: time.sleep(0.4),
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.35)
+
+    def test_missing_or_invalid_readiness_cannot_pass_or_extend_preparation(self):
+        result = self.supervise("pass", preparation_timeout=1)
+        self.assertEqual(result["stop_reason"], "model readiness not reported")
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), b'NaN\\n'); "
+            "time.sleep(60)",
+            preparation_timeout=1,
+        )
+        self.assertIn("invalid model readiness", result["stop_reason"])
+        for limit in (0, 241):
+            with self.assertRaises(ValueError):
+                self.supervise("pass", preparation_timeout=limit)
+
+    def test_deadline_stops_child_even_when_health_sampling_blocks(self):
+        result = self.supervise(
+            "import time; time.sleep(60)", timeout=0.15, monitor=lambda: time.sleep(0.4)
+        )
+        self.assertLess(result["exit"], 0)
+        self.assertEqual(result["stop_reason"], "child deadline expired")
+        self.assertEqual(result["remaining_processes"], [])
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["child_start_monotonic_seconds"], 0.35)
+
+    def test_deadline_is_armed_before_initial_record_write(self):
+        original = board.save
+
+        def slow_initial_write(path, value):
+            if path.name == "child-start.json":
+                time.sleep(0.4)
+            original(path, value)
+
+        with patch.object(board, "save", side_effect=slow_initial_write):
+            result = self.supervise("import time; time.sleep(60)", timeout=0.12)
+        self.assertEqual(result["stop_reason"], "child deadline expired")
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["child_start_monotonic_seconds"], 0.35)
+
+    def test_kernel_fault_stops_child_without_waiting_for_deadline(self):
+        result = self.supervise("import time; time.sleep(60)", monitor=lambda: "kernel fault")
+        self.assertEqual(result["stop_reason"], "kernel fault")
+        self.assertLess(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_monitor_error_still_terminates_and_records_owned_child(self):
+        def broken():
+            raise OSError("lost kernel records")
+
+        with self.assertRaises(OSError):
+            self.supervise("import time; time.sleep(60)", monitor=broken)
+        result = board.read_json(self.root / "child.json")
+        self.assertLess(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_spawn_failure_records_that_no_child_or_resources_were_created(self):
+        with patch.object(board.subprocess, "Popen", side_effect=FileNotFoundError("cwd")):
+            with self.assertRaises(FileNotFoundError):
+                self.supervise("pass")
+        result = board.read_json(self.root / "child.json")
+        self.assertFalse(result["child_started"])
+        self.assertEqual(result["remaining_processes"], [])
+        self.assertEqual(result["actions"], [])
+        self.assertNotIn("child_pid", result)
+
+    def test_clean_exit_and_deadline_limit(self):
+        self.assertEqual(self.supervise("print('finished')")["exit"], 0)
+        for limit in (0, 301):
+            with self.assertRaises(ValueError):
+                self.supervise("pass", timeout=limit)
+
+    def test_extended_qwen_budget_preserves_readiness_and_other_model_limits(self):
+        self.assertEqual(board.inference_timeout_limit({"model_family": "qwen3_5"}), 600)
+        self.assertEqual(board.inference_timeout_limit({}), 300)
+        self.assertEqual(board.inference_timeout_limit({"model_family": "opt"}), 300)
+        result = self.supervise(
+            "import os,time; os.write(int(os.environ['SPECFERRY_READY_FD']), "
+            "(str(time.monotonic())+'\\n').encode())",
+            timeout=600,
+            preparation_timeout=1,
+            execution_limit=600,
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertEqual(result["inference_limit_seconds"], 600)
+        self.assertIn("ready_monotonic_seconds", result)
+        with self.assertRaises(ValueError):
+            self.supervise("pass", timeout=601, preparation_timeout=1, execution_limit=600)
+        with self.assertRaises(ValueError):
+            self.supervise("pass", timeout=600, execution_limit=600)
+
+    def test_repeated_readiness_does_not_restart_inference_budget(self):
+        result = self.supervise(
+            "import os,time; fd=int(os.environ['SPECFERRY_READY_FD']); "
+            "os.write(fd,(str(time.monotonic())+'\\n').encode()); time.sleep(0.08); "
+            "os.write(fd,(str(time.monotonic())+'\\n').encode()); time.sleep(60)",
+            timeout=0.15,
+            preparation_timeout=1,
+        )
+        self.assertEqual(result["stop_reason"], "inference deadline expired")
+        fired = board.read_json(self.root / "watchdog.json")["expired_at"]
+        self.assertLess(fired - result["ready_monotonic_seconds"], 0.22)
+
+    def test_native_guard_kills_descendants_after_leader_exits(self):
+        result = self.supervise(
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])"
+        )
+        self.assertEqual(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_reports_exec_failure(self):
+        result = board.supervise(
+            ["/specferry-nonexistent-command"],
+            self.root,
+            os.environ.copy(),
+            self.root,
+            1,
+            lambda: None,
+        )
+        self.assertFalse(result["child_started"])
+        self.assertEqual(result["exit"], 127)
+        self.assertIn("spawn_error", result)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_stops_a_suspended_model(self):
+        def stop():
+            time.sleep(0.08)
+            return "kernel fault"
+
+        result = self.supervise(
+            "import os,signal; os.kill(os.getpid(),signal.SIGSTOP)", monitor=stop
+        )
+        self.assertEqual(result["stop_reason"], "kernel fault")
+        self.assertLess(result["exit"], 0)
+        self.assertEqual(result["remaining_processes"], [])
+
+    def test_native_guard_stops_if_policy_channel_disappears(self):
+        process = subprocess.Popen(
+            [
+                str(board.SUPERVISOR_BINARY),
+                str(self.root),
+                "-1",
+                "2",
+                "300",
+                str(self.root),
+                "--",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+            result = board.read_json(self.root / "child.json")
+            self.assertEqual(result["stop_reason"], "policy owner closed stop channel")
+            self.assertEqual(result["remaining_processes"], [])
+        finally:
+            process.stdout.close()
+            process.stderr.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=12)
+
+    def test_native_supervisor_must_be_in_verified_executable_inventory(self):
+        (self.root / "bin").mkdir()
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, 243)
+        files = {}
+        for name in ("specferry_opt_graph_generate", "specferry_supervise"):
+            path = self.root / "bin" / name
+            path.write_bytes(header)
+            path.chmod(0o755)
+            files["bin/" + name] = dict(bytes=20, sha256=board.sha256(path), executable=True)
+        manifest = dict(
+            schema_version=1,
+            target="np101-soc-riscv64",
+            files=files,
+            supervisor_implementation="cpp-process-v1",
+        )
+        board.save(self.root / "bundle.json", manifest)
+        board.verify_bundle(self.root, check_sdk=False)
+        del files["bin/specferry_supervise"]
+        board.save(self.root / "bundle.json", manifest)
+        with self.assertRaisesRegex(ValueError, "verified file inventory"):
+            board.verify_bundle(self.root, check_sdk=False)
+
+    def test_sdk_success_does_not_replace_release_and_budget_checks(self):
+        native = self.root / "native"
+        native.mkdir()
+        record = {
+            "status": "executed",
+            "released": True,
+            "const_live_bytes": 0,
+            "nonconst_live_bytes": 0,
+            "const_peak_bytes": 100,
+            "nonconst_peak_bytes": 100,
+        }
+        board.save(native / "execution.json", {"released": True})
+        board.save(native / "run.json", record)
+        self.assertTrue(board.native_complete(self.root))
+        for change in (
+            {"nonconst_live_bytes": 1},
+            {"const_peak_bytes": 2**30 + 1},
+            {"released": False},
+        ):
+            board.save(native / "run.json", record | change)
+            self.assertFalse(board.native_complete(self.root))
+
+    def test_existing_gate_prevents_any_ssh_launch(self):
+        gate = self.root / "np101-recovery-required.json"
+        board.save(gate, {"members": [], "pid_namespace": os.readlink("/proc/self/ns/pid")})
+        original = gate.read_bytes()
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "ssh") as ssh,
+        ):
+            with self.assertRaises(RuntimeError):
+                remote.run(self.root, "np101", "/root/specferry-soc/bundle", self.root / "run", 180)
+            ssh.assert_not_called()
+        self.assertEqual(gate.read_bytes(), original)
+
+    def test_collection_transport_failure_keeps_pending_marker(self):
+        output = self.root / "run"
+        output.mkdir()
+        gate = self.root / "np101-recovery-required.json"
+        board.save(gate, {"evidence": str(output)})
+        (self.root / "bundle.json").write_text("{}")
+        board.save(
+            output / "session.json",
+            {
+                "host": "np101",
+                "remote_output": "/root/specferry-soc/runs/test",
+                "bundle_sha256": board.sha256(self.root / "bundle.json"),
+            },
+        )
+        original = gate.read_bytes()
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "ssh", side_effect=subprocess.CalledProcessError(255, "ssh")),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                remote.collect(self.root, output)
+        self.assertEqual(gate.read_bytes(), original)
+
+    def test_successful_diagnostic_restores_old_gate_byte_for_byte(self):
+        output = self.root / "run"
+        output.mkdir()
+        (output / "board").mkdir()
+        (self.root / "bundle.json").write_text("{}")
+        digest = board.sha256(self.root / "bundle.json")
+        retained = output / "retained-prior-host-marker.json"
+        retained.write_bytes(b'{"reason": "old fault"}\n')
+        gate = self.root / "np101-recovery-required.json"
+        board.save(gate, {"evidence": str(output)})
+        board.save(
+            output / "session.json",
+            {
+                "host": "np101",
+                "remote_output": "/root/specferry-soc/runs/test",
+                "remote_bundle": "/root/specferry-soc/bundles/test",
+                "bundle_sha256": digest,
+                "diagnostic": {"host_marker_sha256": board.sha256(retained)},
+            },
+        )
+        board.save(output / "board/result.json", {"clean": True, "bundle_sha256": digest})
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "numerical_acceptance", return_value={"passed": True}),
+            patch.object(remote, "ssh"),
+        ):
+            result = remote.collect(self.root, output)
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["recovery_cleared"])
+        self.assertEqual(gate.read_bytes(), retained.read_bytes())
+
+    def test_stale_remote_bundle_is_rejected_before_launch(self):
+        (self.root / "bundle.json").write_text('{"request":"selected"}')
+        (self.root / "board_runner.py").write_text("# identical runner")
+        stale = self.root / "stale"
+        stale.mkdir()
+        (stale / "bundle.json").write_text('{"request":"stale"}')
+        (stale / "board_runner.py").write_text("# identical runner")
+
+        def local_transport(host, command, **kwargs):
+            # Execute only the bootstrap locally. The mismatch must abort before any
+            # remote output, process launch, health query or model access can occur.
+            try:
+                exec(shlex.split(command)[2], {})
+            except SystemExit as error:
+                raise subprocess.CalledProcessError(error.code, command) from error
+            self.fail("stale deployment reached launch")
+
+        with (
+            patch.object(remote, "remote_path", side_effect=lambda value: value),
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle", return_value={}),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "ssh", side_effect=local_transport),
+            patch.object(remote.subprocess, "Popen") as spawn,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity rejected before launch"):
+                remote.run(self.root, "unused", str(stale), self.root / "run", 180)
+            spawn.assert_not_called()
+        self.assertTrue((self.root / "np101-recovery-required.json").exists())
+
+    def test_bootstrap_verifies_shared_adapter_as_well_as_matching_manifest(self):
+        for name in ("bundle.json", "board_runner.py", "supervision.py"):
+            (self.root / name).write_text("original")
+        code = remote.runtime_identity_check(self.root, str(self.root))
+        exec(code, {})
+        (self.root / "supervision.py").write_text("changed")
+        with self.assertRaises(SystemExit) as error:
+            exec(code, {})
+        self.assertEqual(error.exception.code, 78)
+
+    def test_board_rechecks_selected_identity_before_any_device_checks(self):
+        manifest = self.root / "bundle.json"
+        manifest.write_text('{"request":"selected"}')
+        expected = board.sha256(manifest)
+        manifest.write_text('{"request":"changed-after-bootstrap"}')
+        with (
+            patch.object(board, "verify_bundle") as verify,
+            patch.object(board, "kernel") as kernel,
+        ):
+            for identity in (expected, None):
+                with self.assertRaisesRegex(RuntimeError, "selected bundle identity"):
+                    board.run(self.root, self.root / "run", 180, expected_bundle_sha256=identity)
+            verify.assert_not_called()
+            kernel.assert_not_called()
+        self.assertFalse((self.root / "run").exists())
+
+    def test_status_connection_loss_never_resubmits_child(self):
+        (self.root / "bundle.json").write_text("{}")
+        (self.root / "board_runner.py").write_text("# fixture")
+        responses = [
+            subprocess.CompletedProcess([], 0, stdout="123\n"),
+            subprocess.CalledProcessError(255, "ssh"),
+            subprocess.CompletedProcess([], 0, stdout="1\n"),
+        ]
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "collect", return_value={"passed": True}),
+            patch.object(remote.time, "sleep"),
+            patch.object(remote, "ssh", side_effect=responses) as transport,
+        ):
+            result = remote.run(
+                self.root, "np101", "/root/specferry-soc/bundles/test", self.root / "run", 180
+            )
+        self.assertTrue(result["passed"])
+        commands = [call.args[1] for call in transport.call_args_list]
+        self.assertEqual(sum("subprocess.Popen" in command for command in commands), 1)
+        self.assertEqual(sum("result.json" in command for command in commands), 2)
+
+    def test_supervisor_exit_without_result_stops_polling_and_preserves_gate(self):
+        (self.root / "bundle.json").write_text("{}")
+        (self.root / "board_runner.py").write_text("# fixture")
+        output = self.root / "run"
+        responses = [
+            subprocess.CompletedProcess([], 0, stdout="123\n"),
+            subprocess.CompletedProcess([], 0, stdout="exited\n"),
+        ]
+        with (
+            patch.object(remote, "RECOVERY_ROOT", self.root),
+            patch.object(remote, "verify_bundle"),
+            patch.object(remote, "host_health"),
+            patch.object(remote, "collect") as collect,
+            patch.object(remote.time, "sleep") as sleep,
+            patch.object(remote, "ssh", side_effect=responses) as transport,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "supervisor exited without a result"):
+                remote.run(self.root, "np101", "/root/specferry-soc/bundles/test", output, 180)
+        self.assertEqual(transport.call_count, 2)
+        collect.assert_not_called()
+        sleep.assert_not_called()
+        gate = board.read_json(self.root / "np101-recovery-required.json")
+        self.assertEqual(gate["evidence"], str(output.resolve()))
+        self.assertTrue((output / "supervisor-exited.json").is_file())
+        self.assertTrue((output / "interrupted.json").is_file())

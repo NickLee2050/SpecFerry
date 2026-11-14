@@ -1,0 +1,55 @@
+"""Numerical regressions for the compact reporting and graph-cache checks."""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from tools.deploy.execute.np101 import recovery_controls
+
+
+class RecoveryControlTests(unittest.TestCase):
+    def test_same_boot_power_cycle_only_acknowledges_recorded_fault_occurrences(self):
+        old = "2026-10-14T18:25:45.057746+0800 host kernel: EDMA timeout"
+        new = "2026-10-15T08:55:00.000000+0800 host kernel: EDMA timeout"
+        previous = dict(boot_id="same", kernel_gate=dict(faults=[old], owners=""))
+        preflight = dict(boot_id="same", faults=[old], owners="")
+        baseline, filtered = recovery_controls.power_cycle_baseline(previous, preflight)
+        self.assertTrue(recovery_controls.healthy(filtered))
+        self.assertEqual(filtered["historical_faults"], [old])
+        for faults in ([old, new], [old, old], ["EDMA timeout"]):
+            with self.subTest(faults=faults), self.assertRaises(RuntimeError):
+                recovery_controls.power_cycle_baseline(previous, preflight | dict(faults=faults))
+        self.assertEqual(
+            recovery_controls.apply_fault_baseline(preflight | dict(boot_id="new"), baseline)[
+                "faults"
+            ],
+            [old],
+        )
+
+    def test_multiline_edma_fault_keeps_its_journal_timestamp(self):
+        prefix = "2026-10-14T18:25:45.057746+0800 host kernel:"
+        detail = "--------gckEDMA_StartTransfer---timeout---len:0x4----"
+        normal = "2026-10-14T18:25:44.000000+0800 host kernel: Waiting for HDMA Transfer..."
+        direct = "2026-10-14T18:25:49.000000+0800 host kernel: NP[0] hang"
+        log = f"{normal}\n{prefix} \n    {detail}\n{direct}\n"
+        self.assertEqual(recovery_controls.kernel_faults(log), [prefix + " " + detail, direct])
+
+    def test_kernel_page_fault_and_watchdog_are_fatal_but_hdma_wait_is_not(self):
+        for line in (
+            "kernel: BUG: unable to handle page fault for address: 0000000100000008",
+            "kernel: Oops: 0000 [#1] SMP PTI",
+            "kernel: [galcore]: NP[0] hang, automatic recovery.",
+            "kernel: ***   GPU DRV CONFIG   ***",
+            "kernel: [galcore]: Stop driver to keep scene.",
+            "--------gckEDMA_StartTransfer---timeout---src:0x55c24e40",
+            "[428293.680670] mmc0: Timeout waiting for hardware interrupt.",
+            "[20055.063127] mmc0: Timeout waiting for hardware cmd interrupt.",
+            "mmc1: Timeout waiting for hardware data interrupt.",
+            "EXT4-fs error (device mmcblk0p2): failed to read inode",
+            "Buffer I/O error on dev mmcblk0p2, logical block 42",
+            "blk_update_request: I/O error, dev mmcblk0, sector 4096",
+        ):
+            self.assertIsNotNone(recovery_controls.FAULT.search(line), line)
+        self.assertIsNone(recovery_controls.FAULT.search("kernel: Waiting for HDMA Transfer..."))
