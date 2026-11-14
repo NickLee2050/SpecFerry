@@ -42,6 +42,8 @@ public:
   // pending until the caller completes the fixed copies and confirms success.
   TensorBinding output();
   std::vector<np101::TensorCopyBinding> state_copies();
+  // Called only after the synchronous M8 producer writes our next-state tensors.
+  void advance_external_pending(unsigned tokens);
   void confirm_state_commit();
   std::vector<std::uint8_t> read(const std::string &name,
                                  np101::TensorReadback method = np101::TensorReadback::SdkCopy);

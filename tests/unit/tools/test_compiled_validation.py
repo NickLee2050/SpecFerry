@@ -23,6 +23,32 @@ from tools.validate import compiled
 
 
 class CompiledValidationTests(unittest.TestCase):
+    def test_qwen_block_wrapper_uses_state_producer_names_without_changing_export(self):
+        from onnx import TensorProto, helper
+
+        from tools.deploy.export.qwen3_5.blocks import block_ports
+
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Add", ["a", "b"], ["present_recurrent"], name="step07.present_recurrent"
+                )
+            ],
+            "block",
+            [],
+            [helper.make_tensor_value_info("present_recurrent", TensorProto.FLOAT, [1])],
+        )
+        model = helper.make_model(graph)
+        with patch("tools.deploy.export.qwen3_5.blocks.compiled_ports") as parse:
+            block_ports(Path("unused"), model, batch_tokens=8)
+            self.assertEqual(
+                parse.call_args.args[1].graph.output[0].name, "step07.present_recurrent"
+            )
+        self.assertEqual(model.graph.output[0].name, "present_recurrent")
+        with patch("tools.deploy.export.qwen3_5.blocks.compiled_ports") as parse:
+            block_ports(Path("unused"), model, batch_tokens=1)
+            self.assertIs(parse.call_args.args[1], model)
+
     def test_qwen_ffn_batch_contract_preserves_ports_and_selected_width(self):
         from tools.deploy.pack.qwen3_5.compiled import validate_feed_forward_ports
 

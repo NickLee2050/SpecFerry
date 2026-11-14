@@ -161,6 +161,21 @@ omitted values keep the existing defaults. Both the file and resolved combinatio
 Unknown/duplicate keys, invalid types, unsupported combinations and a conflicting `--model` fail
 before packaging. Keep `--output` explicit so each deployment uses a new directory.
 
+For all 18 DeltaNet layers to prefill eight tokens at a time (M8), add
+`"prefill_package": "qwen-delta-m8-package"` alongside the paths and
+`"delta_batch_tokens": 8` inside the options above. The separate package must contain all 18
+source-bound complete-M8 NBGs. Export them with the existing block tool using `--part mixer
+--batch-tokens 8 --outer-product multiply --fuse-input-norm --joint-state-reads --all-layers`;
+keep the original M1 mixer package for decode and tails. This explicitly selects the validated
+SoC 1408 MiB const / 1024 MiB nonconst profile, with 768 MiB Linux and a 2048 MiB SYSTEM pool.
+C128/C512 are supported; C512 also uses some VIRTUAL memory. It is not an EP profile or a general
+memory-limit override. See [measured scope](np101-status.md#complete-block-qwen-prefill).
+
+To retain the original tokenwise DeltaNet fallback, omit `prefill_package` and leave
+`delta_batch_tokens` absent or set it to `1`. Keep its existing M8 FFN package and options;
+this restores the original graph composition and separate 1024 MiB budgets. Retain the old
+bundle instead of overwriting it. No extra runtime CLI arguments are required.
+
 OPT accepts `model_family: "opt"` with the same paths and optional `prefill_package`; its execution
 options remain owned by the existing validated request, so `request_options` must be absent or empty.
 `binary` is optional for both models. Config files cannot override SDK hashes, artifact dimensions,
@@ -171,7 +186,7 @@ SoC Qwen supports C64/C128; C512 has also passed bounded requests with the M8 FF
 With a complete M8 or M16 FFN package and a C128/C512 request, preparation
 may select `--qwen-ffn-batch 8 --qwen-decoder-layout fused-attention-norm
 --qwen-state-commit ffn`. These options require shared FCL projections and mapped KV. The M1
-fallback remains available; archived experimental Delta batch graphs are not a formal option.
+fallback remains available; retired split/shared-projection Delta graphs are not formal options.
 
 OPT uses the same SoC workflow with `--model opt`, a compiled model package and an OPT request;
 `--prefill-package` adds a source-bound M16 prefill package. Current OPT packaging pins a legacy

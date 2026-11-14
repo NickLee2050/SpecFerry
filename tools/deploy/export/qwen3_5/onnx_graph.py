@@ -1,5 +1,7 @@
 """Single-step DeltaNet export retaining the accepted FP32 recurrence contract."""
 
+import copy
+
 import numpy as np
 from onnx import TensorProto, helper
 
@@ -221,6 +223,60 @@ def delta_model(
     graph.port(output, TensorProto.FLOAT16, [1, hidden], True)
     graph.port(updated_state, TensorProto.FLOAT, [heads, key_dim, value_dim], True)
     graph.port(updated_history, TensorProto.FLOAT16, [channels, convolution], True)
+    return graph
+
+
+def delta_prefill_model(weights, layer, config):
+    """Eight-row projections with sequential FP32 recurrence and one output projection.
+
+    Weights/shape constants are shared inside this NBG. M1 remains a separate artifact
+    for decode and tails; this does not claim weight sharing between the two imports.
+    """
+    graph = delta_model(
+        weights,
+        layer,
+        config,
+        outer_product="multiply",
+        fuse_input_norm=True,
+        joint_state_reads=True,
+    )
+    nodes = graph.nodes
+    split = next(i for i, node in enumerate(nodes) if node.output[0] == "retained_history")
+    projections = [node.output[0] for node in nodes[:split] if node.op_type == "Gemm"]
+    if len(projections) != 4 or nodes[-1].op_type != "Gemm" or nodes[-1].input[0] != "flat_gated":
+        raise ValueError("single-step DeltaNet topology changed; review block export")
+    graph.inputs[0].type.tensor_type.shape.dim[0].dim_value = 8
+    graph.outputs[0].type.tensor_type.shape.dim[0].dim_value = 8
+    shared = {value.name for value in graph.constants}
+    block = list(nodes[:split])
+    recurrent, convolution = "past_recurrent", "past_convolution"
+    gated = []
+    for step in range(8):
+        prefix = f"step{step:02d}."
+        remap = {name: name for name in shared}
+        remap.update(past_recurrent=recurrent, past_convolution=convolution)
+        controls = [
+            graph.constant(f"block_slice_{step}_{name}", np.array([value], "i8"))
+            for name, value in (("start", step), ("end", step + 1), ("axis", 0), ("step", 1))
+        ]
+        for name in projections:
+            remap[name] = prefix + name
+            block.append(helper.make_node("Slice", [name, *controls], [remap[name]]))
+        for original in nodes[split:-1]:
+            node = copy.deepcopy(original)
+            node.name = prefix + original.name
+            node.input[:] = [remap[name] for name in original.input]
+            for name in original.output:
+                final = step == 7 and name in {"present_recurrent", "present_convolution"}
+                remap[name] = name if final else prefix + name
+            node.output[:] = [remap[name] for name in original.output]
+            block.append(node)
+        recurrent, convolution = remap["present_recurrent"], remap["present_convolution"]
+        gated.append(remap["flat_gated"])
+    block.append(helper.make_node("Concat", gated, ["block_gated"], axis=0))
+    projection = copy.deepcopy(nodes[-1])
+    projection.input[0] = "block_gated"
+    graph.nodes = [*block, projection]
     return graph
 
 

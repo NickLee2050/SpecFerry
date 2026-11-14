@@ -13,8 +13,9 @@ void check(vsi_status status, const char *operation) {
   }
 }
 
-Context::Context()
-    : handle_(sdk_call("vsi_nn_CreateContext", [] { return vsi_nn_CreateContext(); })) {
+Context::Context(MemoryBudget budget)
+    : memory_(std::move(budget)),
+      handle_(sdk_call("vsi_nn_CreateContext", [] { return vsi_nn_CreateContext(); })) {
   if (!handle_) {
     throw std::runtime_error("vsi_nn_CreateContext returned null");
   }

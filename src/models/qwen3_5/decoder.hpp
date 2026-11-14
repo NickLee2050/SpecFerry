@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,17 +34,20 @@ public:
                const CompiledBlock *compiled_feed_forward = nullptr,
                bool deferred_delta_commit = false,
                np101::KvWriteMode kv_write_mode = np101::KvWriteMode::CopyGraph,
-               bool fuse_attention_input_norm = false, bool commit_state_in_ffn = false);
+               bool fuse_attention_input_norm = false, bool commit_state_in_ffn = false,
+               std::optional<TensorBinding> residual_block = std::nullopt);
   ~DecoderLayer();
   DecoderLayer(const DecoderLayer &) = delete;
   DecoderLayer &operator=(const DecoderLayer &) = delete;
 
+  void enable_block_prefill(Context &context, const CompiledBlock &artifact);
+  TensorBinding block_output();
   void step();
   unsigned feed_forward_batch_tokens() const;
   // Packed FP16 [count, hidden] rows. Only real rows advance mixer state.
-  // Returns valid output rows and publishes the last row through output().
+  // Returns valid rows; optionally publishes the last row through output().
   std::vector<std::uint8_t> prefill_block(const std::vector<std::uint8_t> &packed_rows,
-                                          unsigned count);
+                                          unsigned count, bool publish_output = true);
   void reset();
   std::size_t length() const;
   std::size_t kv_revalidations() const;

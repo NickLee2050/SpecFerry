@@ -56,6 +56,24 @@ void aliases_and_temporary_backing() {
   require(budget.live(false) == 0, "last alias did not release storage");
 }
 
+void explicit_const_profile() {
+  const auto limit = std::size_t{1408} * 1024 * 1024;
+  auto budget = MemoryBudget::with_extended_constants(limit);
+  auto weights = budget.reserve(true, limit);
+  auto state = budget.reserve(false, segment_payload_limit);
+  expect_rejected(budget, true, 1);
+  expect_rejected(budget, false, 1);
+  weights.reset();
+  state.reset();
+  require(!budget.live(true) && !budget.live(false), "extended budget retained storage");
+  try {
+    MemoryBudget::with_extended_constants(limit + 1);
+  } catch (const std::invalid_argument &) {
+    return;
+  }
+  throw std::runtime_error("extended profile accepted an unvalidated larger cap");
+}
+
 void explicit_capacity_probe() {
   const auto target = 4 * segment_payload_limit;
   auto budget = MemoryBudget::for_capacity_probe(target);
@@ -77,6 +95,7 @@ int main() {
     independent_segments_and_boundaries();
     aliases_and_temporary_backing();
     explicit_capacity_probe();
+    explicit_const_profile();
     std::cout << "Segment limits, shared storage and temporary allocation accounting passed\n";
     return 0;
   } catch (const std::exception &error) {

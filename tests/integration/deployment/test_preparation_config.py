@@ -26,6 +26,7 @@ class PreparationConfigTests(unittest.TestCase):
             "ffn_batch_tokens": 8,
             "decoder_layout": "fused-attention-norm",
             "state_commit": "ffn",
+            "delta_batch_tokens": 1,
         }
 
     def write_config(self, family="qwen3_5", **fields):
@@ -76,13 +77,15 @@ class PreparationConfigTests(unittest.TestCase):
         self.write_config(request_options=self.options)
         configured, unused = self.invoke(["--config", str(self.config), *output])
         self.assertEqual(configured, explicit)
-        self.assertEqual(configured.kwargs, self.options)
+        self.assertEqual(configured.kwargs, self.options | {"prefill_package": None})
         self.assertIsNone(unused)
 
     def test_cli_override_and_qwen_defaults(self):
         output = ["--output", str(self.root / "out")]
         original, _ = self.invoke(["--model", "qwen", *self.source_args(), *output])
-        self.assertEqual(original.kwargs, QwenExecutionOptions().as_mapping())
+        self.assertEqual(
+            original.kwargs, QwenExecutionOptions().as_mapping() | {"prefill_package": None}
+        )
         self.write_config(request_options=self.options)
         replacement = self.root / "other-package"
         configured, _ = self.invoke(
@@ -97,7 +100,29 @@ class PreparationConfigTests(unittest.TestCase):
             ]
         )
         self.assertEqual(configured.args[2], replacement)
-        self.assertEqual(configured.kwargs, self.options | {"ffn_batch_tokens": 16})
+        self.assertEqual(
+            configured.kwargs, self.options | {"ffn_batch_tokens": 16, "prefill_package": None}
+        )
+
+    def test_block_prefill_is_explicit_and_requires_its_package(self):
+        options = self.options | {"delta_batch_tokens": 8}
+        self.write_config(request_options=options, prefill_package="prefill")
+        configured, _ = self.invoke(
+            ["--config", str(self.config), "--output", str(self.root / "out")]
+        )
+        self.assertEqual(configured.kwargs["delta_batch_tokens"], 8)
+        self.assertEqual(configured.kwargs["prefill_package"], self.root / "prefill")
+        self.write_config(request_options=options)
+        with self.assertRaises(SystemExit):
+            self.invoke(["--config", str(self.config), "--output", str(self.root / "out")])
+        for changed in (
+            {"delta_batch_tokens": True},
+            {"ffn_batch_tokens": 16},
+            {"state_commit": "combined"},
+            {"kv_write_mode": "copy-graph"},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                QwenExecutionOptions.from_mapping(options | changed)
 
     def test_opt_json_preserves_request_owned_options_and_prefill_path(self):
         output = ["--output", str(self.root / "out")]

@@ -1,6 +1,6 @@
 # NP101 implementation and validation status
 
-Updated: 2026-11-12. This page contains execution contracts, representative measurements and
+Updated: 2026-11-14. This page contains execution contracts, representative measurements and
 conclusions that affect engineering decisions. See [Build and run](getting-started.md),
 [code boundaries](development.md), [remaining work](../TODO.md) and the mandatory
 [recovery ledger](np101-recovery-incidents.md).
@@ -192,8 +192,9 @@ question: numerical acceptance is not answer quality or speculative acceptance. 
 tolerances remain; strict FP32
 state differences in M4/M8 DeltaNet are recorded separately. M8 model SYSTEM peak is about
 1604.836 MiB; the two-layer DeltaNet candidate adds about 55.8 MiB during execution. Expanding to all
-18 layers is estimated at 1347.632 MiB const, exceeding the 1 GiB limit, and about 2043 MiB physical
-runtime use, too tight. No full-18-layer capacity test was run. Shared state output is not shared weights.
+18 layers was initially estimated at 1347.632 MiB const and about 2043 MiB physical runtime use.
+The later authorized full-coverage trial below passed with a temporary const-policy exception,
+but only 6.265 MiB physical pool headroom. Shared state output is not shared weights.
 
 **Graph-boundary lesson:** adding state-copy source/destination as external ports of the FFN wrapper
 produced Inf hidden values and zero token selection. Keeping the original two inputs/one output with
@@ -304,6 +305,79 @@ Projection/commit fusion keeps original NBG ports and internal DATACONVERT bindi
 about 16.5% faster than separate submission, but 13.7% slower than original M1; this does not prove
 hardware parallelism.
 
+### Complete-block Qwen prefill
+
+The standard JSON/C++ entry offers complete eight-token (M8) DeltaNet graphs for all 18
+linear-attention layers; original M1 graphs remain resident for decode/tails and as the default
+fallback. All 24 FFNs use M8. Shared FCL projections/head, mapped KV, fused normalization,
+shared residual blocks and FFN state commits remain enabled; unnecessary intermediate outputs
+are not republished. M1/M8 sequentially write shared next-state tensors, distinct from their
+current-state inputs. FFN commits once per block; this is not in-place or parallel recurrence.
+
+The complete graphs embed projection weights again. Their explicit SoC profile permits
+1408 MiB const / 1024 MiB nonconst; other configurations retain separate 1024 MiB caps.
+Neither const flags nor driver pools change. The original tokenwise model remains available.
+
+EP/SoC builds and offline contracts pass. The 11-14 formal process passed two C512 241→16
+requests: CPU acceptance, bitwise diagnostic/state and reset comparisons, release and complete
+kernel/10 s observation. No runtime KV revalidation occurred. Historical fault markers remain
+under the [explicit soft-restart exception](np101-recovery-incidents.md#11-14-explicit-soft-restart-diagnostic-authorization).
+
+| Accepted complete-block workload | Preparation | Prefill | TTFT | Generation wall time | Actual output | Post-first-token decode |
+|---|---:|---:|---:|---:|---:|---:|
+| C128, 96→16 | 163.504 s | 39.274 s | 39.610 s | 56.326 s | 0.284059 token/s | 0.897342 token/s |
+| C512, 96→16 | 164.716 s | 39.022 s | 39.355 s | 56.134 s | 0.285030 token/s | 0.893927 token/s |
+| C512, 241→16 | 163.931 s | 98.611 s | 98.948 s | 115.656 s | 0.138342 token/s | 0.897772 token/s |
+| Formal C512, 2 × 241→16, mean | 165.098 s, once | 98.468 s | 98.800 s | 115.530 s | 0.138492 token/s | 0.896593 token/s |
+| C512, 496→16 | 164.296 s, shared process | 202.654 s | 202.982 s | 219.906 s | 0.072758 token/s | 0.886317 token/s |
+| ↳ reset, 512→1 capacity stop | same process | 209.008 s | 209.328 s | 209.328 s | 0.004777 token/s | Not applicable |
+| ↳ reset, 96→16 | same process | 39.294 s | 39.626 s | 56.454 s | 0.283417 token/s | 0.891378 token/s |
+
+Each workload was accepted once. The formal row aggregates 32 outputs over two generations;
+preparation/snapshots are excluded. The full post-ready phase including release was 248.549 s
+within 300 s. Application const/nonconst peaks were 1348.403/623.548 MiB. Sampled SYSTEM/VIRTUAL
+peaks were 2026.689/23.008 MiB (combined 2049.697 MiB); driver SYSTEM high-water was 2030.756 MiB.
+Linux availability stayed above 251.547 MiB. Aggregate timing reproduced the diagnostic within 0.2%.
+
+The last three rows form a separate resident boundary/reset collection: 503.561 s post-ready
+within an explicitly selected 600 s limit. Earlier tokenwise DeltaNet 241→16 measured TTFT
+176.494 s, output 0.082834 token/s and decode 0.900147 token/s. Complete-block prefill reduced
+TTFT by about 44%, increased actual output by 67%, and left decode essentially unchanged.
+This is a historical comparison, not an interleaved trial or long-duration reliability claim.
+
+**Reset contract:** reset changes visible length, not physical KV contents. Compare the new
+valid prefix to the CPU reference, preserved masked slots to their previous snapshot and
+never-written slots to zero. The original boundary oracle wrongly required physical clearing;
+corrected acceptance of saved evidence required no rerun or tolerance change. Retained-history
+conversation and C1024 remain unvalidated for this path.
+
+Evidence under `.cache/runs/`: `qwen-full-block-coverage-20261113/const-trial/`,
+`qwen-full-block-context-512-20261113/`, `qwen-full-block-long-20261113/`,
+`qwen-full-block-boundary-20261113/` (including `reset-review.json`),
+`qwen-release-acceptance-20261112/context-repeat-test/`, `qwen-block-prefill-formal-20261113/`
+and `qwen-block-prefill-soft-restart-20261114/` (`comparison.json`, `native-run/`).
+
+### Split-projection findings and limits
+
+Sharing projection graphs between M1/M8 recurrence saves duplicated embedded weights but did not
+provide a reliable whole-model path. The single-layer 96-row + 16-step collection improved
+3.644→2.453 s (32.7%); prefill improved 46.0% while continuation regressed 46.4%. Existing pipeline
+tolerances passed with recorded stricter-state outliers. Two/four/eight-layer model trials passed
+once, but the identical eight-layer package subsequently failed; coverage is not a safe threshold.
+All 18 layers initialized at 988.490 MiB const / 646.960 MiB nonconst and 1811.321 MiB SYSTEM,
+then failed inference. Do not report failed elapsed time as throughput.
+
+Private state/device copies, mapped handoffs, separate FFN commits and M1-only recurrence with
+or without resident M8 all still hung. The last failed after accepted cold-boot recovery, while
+complete-M8 graphs passed on the same boot. This rejects split projections as a reliable path,
+without proving an internal SDK cause. RunGraph is blocking and static audit found no established
+early free or missing wait. Some recurrence calls returned after about 24 s before a later hang;
+logging changes did not consistently repair it. Do not add arbitrary sleeps/fences or restore
+these variants without a discriminating hypothesis or new SDK/IR support.
+
+The [recovery ledger](np101-recovery-incidents.md#split-projection-investigation-11-12-13) retains
+each fault, exact SDK/kernel timeline, identities, evidence paths and retry boundaries.
+
 ### FFN marginal cost and head grouping
 
 The same collection was repeated 32 times, with uploads/readback/logging outside graph timing.
@@ -368,6 +442,7 @@ instruction set or kernel framework.
 | Dominant costs and memory | `qwen-performance-capacity-20261110/` |
 | Projection/copy/head/FFN comparisons | `qwen-shared-projection-resume-20261110/` |
 
-Remaining work includes formal batched-DeltaNet integration, retained-KV conversation/full-capacity
-Qwen acceptance, rejection/correction, real draft–target acceptance rates and long-term reliability.
+Remaining work includes retained-KV conversation acceptance for the complete-block Qwen path,
+rejection/correction, real draft–target acceptance rates and long-term reliability. Bounded C512
+full-capacity/reset acceptance is recorded above; it does not establish sustained reliability.
 EP's accepted exploration remains closed; [TODO](../TODO.md) owns the implementation order.

@@ -148,6 +148,16 @@ void DeltaNet::step() {
   impl_->failed = false;
 }
 
+void DeltaNet::advance_external_pending(unsigned tokens) {
+  if (!impl_ || impl_->failed || impl_->pending_commit || impl_->compiled.commit || tokens != 8 ||
+      impl_->completed_steps > impl_->config.kv.capacity ||
+      tokens > impl_->config.kv.capacity - impl_->completed_steps) {
+    throw std::logic_error("external prefill requires a fixed block and no pending state");
+  }
+  impl_->completed_steps += tokens;
+  impl_->pending_commit = true;
+}
+
 TensorBinding DeltaNet::output() {
   if (!impl_ || impl_->compiled.commit || impl_->failed) {
     throw std::logic_error("direct DeltaNet output requires compiled deferred state commit");

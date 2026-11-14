@@ -139,10 +139,21 @@ def package_blocks(directories, deployment, output, sdk, *, part="mixer"):
             or artifact["nbg_sha256"] != sha256(binary)
         ):
             raise ValueError("compiled Qwen mixer source/NBG identity differs")
-        batch_tokens = 1 if mixer else validate_feed_forward_ports(artifact)
+        batch_tokens = (
+            source.get("batch_tokens", 1) if mixer else validate_feed_forward_ports(artifact)
+        )
+        if mixer and (
+            type(batch_tokens) is not int
+            or batch_tokens not in (1, 8)
+            or (
+                batch_tokens == 8
+                and (not includes_input_norm or not source.get("joint_state_reads"))
+            )
+        ):
+            raise ValueError("compiled DeltaNet batch/normalization/state contract differs")
         if not mixer and source.get("batch_tokens", 1) != batch_tokens:
             raise ValueError("compiled Qwen feed-forward source batch differs")
-        shapes = [[1024, 1], [128, 128, 16], [4, 6144]]
+        shapes = [[1024, batch_tokens], [128, 128, 16], [4, 6144]]
         dtypes = ["F16", "F32", "F16"]
         for direction in ("input", "output"):
             order, ports = artifact[direction + "_order"], artifact[direction + "s"]
@@ -178,7 +189,7 @@ def package_blocks(directories, deployment, output, sdk, *, part="mixer"):
         )
     if not graphs or len({entry["layer"] for entry in graphs}) != len(graphs) or total > 2**30:
         raise ValueError("compiled Qwen mixer layer/budget aggregate differs")
-    if not mixer and len({entry["batch_tokens"] for entry in graphs}) != 1:
+    if len({entry["batch_tokens"] for entry in graphs}) != 1:
         raise ValueError("compiled Qwen feed-forward package mixes token batch widths")
     output.mkdir(parents=True, exist_ok=False)
     identity = dict(
@@ -214,6 +225,7 @@ def combine_packages(mixers, feed_forward, output):
     if (
         left["kind"] != "qwen-delta"
         or right["kind"] != "qwen-feed-forward"
+        or any(g.get("batch_tokens", 1) != 1 for g in left["graphs"])
         or len(left["graphs"]) != 18
         or len(right["graphs"]) != 24
         or left["sdk"] != right["sdk"]

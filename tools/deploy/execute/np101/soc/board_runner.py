@@ -254,7 +254,34 @@ def supervise(command, cwd, environment, output, timeout, monitor, **options):
     )
 
 
-def native_complete(output):
+def payload_limits(manifest):
+    """Only the explicit, validated Qwen M8 composition selects larger constants."""
+    options = manifest.get("request_options", {})
+    width = options.get("delta_batch_tokens", 1)
+    if type(width) is not int or width not in (1, 8):
+        raise ValueError("invalid DeltaNet memory profile")
+    if width == 8:
+        if (
+            manifest.get("model_family") != "qwen3_5"
+            or any(
+                options.get(name) != value
+                for name, value in {
+                    "ffn_batch_tokens": 8,
+                    "state_commit": "ffn",
+                    "decoder_layout": "fused-attention-norm",
+                    "projections": "shared-fcl",
+                    "kv_write_mode": "mapped",
+                    "head_backend": "shared-fcl-split",
+                }.items()
+            )
+            or options.get("capacity") not in (128, 512)
+        ):
+            raise ValueError("M8 constant profile requires the validated Qwen composition")
+    return {"const": 1408 * 2**20 if width == 8 else 2**30, "nonconst": 2**30}
+
+
+def native_complete(output, limits=None):
+    limits = limits or {"const": 2**30, "nonconst": 2**30}
     record = read_json(output / "native/run.json")
     execution = read_json(output / "native/execution.json")
     return (
@@ -264,7 +291,7 @@ def native_complete(output):
         and all(
             record.get(part + "_live_bytes") == 0
             and type(record.get(part + "_peak_bytes")) is int
-            and 0 <= record[part + "_peak_bytes"] <= 2**30
+            and 0 <= record[part + "_peak_bytes"] <= limits[part]
             for part in ("const", "nonconst")
         )
     )
@@ -415,6 +442,7 @@ def run(
             raise RuntimeError("board recovery marker remains; follow the incident ledger")
         # Installed libraries are checked before native loading. This does not load the driver.
         manifest = verify_bundle(root, verify_payload=False)
+        payload_limits(manifest)
         reserve_kib = memory_reserve_kib(manifest)
         result["linux_memory_reserve_mib"] = reserve_kib // 1024
         result["fault_pattern"] = fault_pattern(manifest)
@@ -566,7 +594,7 @@ def run(
                 and result["pool_released"]
                 and result["gfp_released"]
                 and result.get("delayed_seconds", 0) >= DELAY_SECONDS
-                and native_complete(output)
+                and native_complete(output, payload_limits(manifest))
             )
         except Exception as error:
             result["final_check_error"] = str(error)

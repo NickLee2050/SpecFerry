@@ -92,7 +92,9 @@ void Model::Impl::prefill(const std::vector<std::int32_t> &tokens) {
       }
       // Every mixer consumes real tokens in order and commits only its own
       // recurrence. Padding exists solely inside the independent FFN rows.
-      rows = layers[layer]->prefill_block(rows, count);
+      const bool publish =
+          !block_prefill || (layer + 1 == layers.size() && offset + count == tokens.size());
+      rows = layers[layer]->prefill_block(rows, count, publish);
       if (rows.size() != count * bytes_per_row || layers[layer]->length() != position + count) {
         throw std::logic_error("Qwen prefill returned an incomplete layer block");
       }

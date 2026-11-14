@@ -271,6 +271,59 @@ class QwenSocTests(unittest.TestCase):
         values.tofile(state)
         self.assertFalse(evaluate_generation(self.request, device)["passed"])
 
+    def test_logical_reset_preserves_only_previously_written_masked_bytes(self):
+        device = self.prepare_device()
+        previous = {}
+        for name in ("keys", "values"):
+            prior = np.zeros((1, 2, 64, 256), dtype="<f2")
+            prior[:, :, :10] = 1
+            previous[name] = prior
+            current = prior.copy()
+            current[:, :, :3] = 0  # Matches the existing short-request CPU oracle.
+            current.tofile(device / f"measured.0.{name}.bin")
+        self.assertFalse(evaluate_generation(self.request, device)["passed"])
+        self.assertTrue(
+            evaluate_generation(self.request, device, previous_kv=previous, previous_consumed=10)[
+                "passed"
+            ]
+        )
+        path = device / "measured.0.keys.bin"
+        actual = np.fromfile(path, dtype="<f2").reshape(1, 2, 64, 256)
+        for position in (1, 5, 12):  # Valid prefix, stale suffix, never-written suffix.
+            damaged = actual.copy()
+            damaged[:, :, position] = 2
+            damaged.tofile(path)
+            with self.subTest(position=position):
+                self.assertFalse(
+                    evaluate_generation(
+                        self.request, device, previous_kv=previous, previous_consumed=10
+                    )["passed"]
+                )
+
+    def test_extended_const_profile_never_enlarges_nonconst_or_m1(self):
+        options = dict(
+            delta_batch_tokens=8,
+            ffn_batch_tokens=8,
+            capacity=512,
+            state_commit="ffn",
+            decoder_layout="fused-attention-norm",
+            projections="shared-fcl",
+            kv_write_mode="mapped",
+            head_backend="shared-fcl-split",
+        )
+        manifest = dict(model_family="qwen3_5", request_options=options)
+        self.assertEqual(board.payload_limits(manifest), {"const": 1408 * 2**20, "nonconst": 2**30})
+        self.assertEqual(board.payload_limits({}), {"const": 2**30, "nonconst": 2**30})
+        for changed in (
+            {"delta_batch_tokens": True},
+            {"state_commit": "combined"},
+            {"capacity": 64},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                board.payload_limits(manifest | {"request_options": options | changed})
+        with self.assertRaises(ValueError):
+            board.payload_limits(manifest | {"model_family": "opt"})
+
     def test_soc_acceptance_requires_soc_identity_and_selected_composition(self):
         device = self.prepare_device()
         manifest = {"model_family": "qwen3_5", "request_options": self.validate()}

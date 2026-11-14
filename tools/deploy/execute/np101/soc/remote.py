@@ -145,10 +145,13 @@ def host_health(output, name):
 def numerical_acceptance(bundle, board):
     manifest = read_json(bundle / "bundle.json")
     if manifest.get("model_family", "opt") == "qwen3_5":
+        from tools.deploy.execute.np101.soc.board_runner import payload_limits
         from tools.deploy.pack.np101.config import DECODER_LAYOUTS
         from tools.validate.qwen3_5.generation import evaluate_generation
 
-        result = evaluate_generation(bundle / "request", board / "native")
+        result = evaluate_generation(
+            bundle / "request", board / "native", payload_limits=payload_limits(manifest)
+        )
         profile = read_json(board / "native/platform.json")
         result["checks"]["platform"] = (
             profile.get("target") == "soc"
@@ -207,6 +210,10 @@ def numerical_acceptance(bundle, board):
                 )
             )
         )
+        width = options.get("delta_batch_tokens", 1)
+        result["checks"]["delta_prefill"] = initialized.get(
+            "delta_batch_tokens", 1
+        ) == width and initialized.get("compiled_prefill_mixers", 0) == (18 if width == 8 else 0)
         if options.get("kv_write_mode") == "mapped":
             execution = read_json(board / "native/execution.json")
             count = execution.get("kv_revalidations")

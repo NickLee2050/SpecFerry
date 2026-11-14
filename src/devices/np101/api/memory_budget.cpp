@@ -8,7 +8,7 @@
 
 namespace specferry::np101 {
 struct MemoryBudget::State {
-  std::size_t limit;
+  std::array<std::size_t, 2> limit{};
   std::array<std::size_t, 2> live{}, peak{};
 };
 
@@ -16,7 +16,7 @@ MemoryBudget::MemoryBudget(std::size_t limit) : state_(std::make_shared<State>()
   if (!limit || limit > segment_payload_limit) {
     throw std::invalid_argument("segment payload limit must be in 1..1 GiB");
   }
-  state_->limit = limit;
+  state_->limit.fill(limit);
 }
 
 MemoryBudget MemoryBudget::for_capacity_probe(std::size_t limit) {
@@ -24,7 +24,16 @@ MemoryBudget MemoryBudget::for_capacity_probe(std::size_t limit) {
     throw std::invalid_argument("capacity probe limit must be in 1..4 GiB");
   }
   MemoryBudget budget;
-  budget.state_->limit = limit;
+  budget.state_->limit.fill(limit);
+  return budget;
+}
+
+MemoryBudget MemoryBudget::with_extended_constants(std::size_t limit) {
+  if (limit < segment_payload_limit || limit > std::size_t{1408} * 1024 * 1024) {
+    throw std::invalid_argument("extended constant limit must be in 1024..1408 MiB");
+  }
+  MemoryBudget budget;
+  budget.state_->limit[true] = limit;
   return budget;
 }
 
@@ -34,11 +43,11 @@ MemoryBudget::Allocation::Allocation(std::shared_ptr<State> state, bool constant
 MemoryBudget::Allocation::~Allocation() { state_->live[constant_] -= bytes_; }
 
 MemoryBudget::Lease MemoryBudget::reserve(bool constant, std::size_t bytes) {
-  if (bytes > state_->limit - state_->live[constant]) {
+  if (bytes > state_->limit[constant] - state_->live[constant]) {
     throw std::length_error(
         std::string("application payload budget exceeded: ") + (constant ? "const" : "non-const") +
         " live=" + std::to_string(state_->live[constant]) + " requested=" + std::to_string(bytes) +
-        " limit=" + std::to_string(state_->limit) + "; SDK allocation was not attempted");
+        " limit=" + std::to_string(state_->limit[constant]) + "; SDK allocation was not attempted");
   }
   // Construct the control block before charging: allocation failure must not
   // consume the budget, including when shared_ptr itself cannot allocate.

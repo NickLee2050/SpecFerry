@@ -29,6 +29,8 @@ public:
   explicit MemoryBudget(std::size_t limit = segment_payload_limit);
   // Explicit exception for synthetic capacity diagnostics; model defaults stay capped.
   static MemoryBudget for_capacity_probe(std::size_t limit);
+  // Explicit model profile; nonconst retains the default 1 GiB bound.
+  static MemoryBudget with_extended_constants(std::size_t limit);
   Lease reserve(bool constant, std::size_t bytes);
   std::size_t live(bool constant) const;
   std::size_t peak(bool constant) const;

@@ -12,7 +12,7 @@ void check(vsi_status status, const char *operation);
 // The graph must be released before its context. Neither handle is copyable.
 class Context {
 public:
-  Context();
+  explicit Context(MemoryBudget budget = MemoryBudget{});
 
   ~Context();
 

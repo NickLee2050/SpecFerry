@@ -32,6 +32,7 @@ struct Model::Impl {
   bool failed = false, prediction_ready = false;
   std::function<void(const std::string &)> progress;
   bool trace_steps = false;
+  bool block_prefill = false;
 
   Impl(Context &context, const WeightStore &weights, const Config &spec,
        const inference::GenerationPolicy &selection,

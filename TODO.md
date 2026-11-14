@@ -1,6 +1,6 @@
 # Remaining work
 
-Updated: 2026-11-12. Validated behavior and performance belong in
+Updated: 2026-11-14. Validated behavior and performance belong in
 [status](docs/np101-status.md); execution gates and incidents belong in the
 [recovery ledger](docs/np101-recovery-incidents.md). This file records deliverables,
 dependencies and acceptance boundaries. Task IDs are planning references, not code or artifact names.
@@ -41,10 +41,13 @@ numerics, release and kernel checks. EP hardware revalidation remains deferred.
 
 | Order | Work | Acceptance and boundary |
 |---|---|---|
-| 1 🔜 | Extend batched Qwen DeltaNet coverage and reduce independent state commits | Target the roughly 50% token-by-token DeltaNet and 22% independent-copy shares of prefill. Evaluate shared output projection plus FFN composition first; preserve single-token decode, tails and state contracts. Require useful collection-level gains before whole-model TTFT, numerics and memory acceptance. |
-| 2 🧩 | Integrate a useful candidate into the formal entry | The two-layer M8 DeltaNet package is still experimental. Require two clear-and-replay turns, tails/reset and deployment contracts; baseline acceptance does not transfer to it. |
-| 3 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls, without first building a remote procedure call (RPC) service. Use accepted draft length and end-to-end cost to decide whether hardware integration is worthwhile. |
-| 4 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
+| 1 🔜 | Measure sustained and retained-history behavior when needed | Reuse the accepted full/reset collection; do not repeat it without a specific gap. The all-18 path has not inherited the original model's natural two-turn retained-history acceptance. Wider capacity and persistent reliability remain unvalidated. |
+| 2 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls. Use accepted draft length and end-to-end cost to decide whether RPC/hardware integration is worthwhile. |
+| 3 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
+
+Keep split/shared DeltaNet projections retired from the formal path: independent state, mapped
+handoffs, separate commits and M1-only recurrence did not eliminate hangs. Preserve evidence and
+the original model; reopening requires a discriminating hypothesis or new SDK/IR support.
 
 The migrated SoC binaries passed Qwen 96-input/16-output and OPT 17-input/16-output requests,
 including numerics, release and kernel checks. This does not validate other configurations.
@@ -52,22 +55,13 @@ Try at most three evidence-based candidates per optimization step; stop if none 
 Pause small head-grouping, CPU state-copy and fixed-row-copy experiments. Complete execution
 comes before performance.
 
-### Qwen prefill follow-up (plan only)
+### Qwen prefill follow-up
 
-| Priority | Candidate | Decision gate |
+| Priority | Work | Decision gate |
 |---|---|---|
-| 1 | Combine shared DeltaNet projections with batched recurrence and the existing FFN block, to make broader coverage fit. | Compare against the formal M1 mixer under the same 96-row + 16-step collection. Existing sharing regressed against the duplicated-weight M8 prefill baseline and against M1 decode; neither establishes the net result of replacing token-by-token prefill across 18 layers. Report prefill and decode separately, then budget all layers and temporary peaks before integration. Preserve tails and state contracts. |
-| 2 | Compare the existing FFN-with-commit carrier at finer scheduling granularity against one FFN per block. | Reuse existing weights and the same collection. Each removed standalone copy is replaced by an extra FFN execution: total submission count need not fall. Extra computation may cancel savings, so this is a low-cost secondary candidate, not a predicted large gain. Never write a DeltaNet output into its own input inside that graph. |
-| 3 | Remove specific row/block host round trips where fixed device buffers can be reused. | Explicit IO was only about 0.56% of profiled prefill. Require measured hidden-copy or submission savings; fewer Map/Unmap calls alone do not justify this work. Avoid runtime rebinding/Verify. |
-
-Retained conversation history avoids replaying accepted prefixes; it does not accelerate cold
-prefill. Keep this separate from operator speedups. Initialization/Verify caching and blind increases
-from M8 to M16 are not priorities. Existing attribution used the experimental two-layer batched
-DeltaNet configuration; its percentages are guidance, not a fresh profile of the formal baseline.
-Directly copying a DeltaNet output back into its own input inside the same graph would create the
-feedback/alias dependency that the separate commit avoids. The successful FFN carrier is different:
-it does not read the old recurrent state. The 22.38% independent-copy share is an upper bound on
-savings in that profiled workload, not a promised speedup.
+| Deferred | Reduce duplicated M1/M8 embedded projection weights | Preserve complete-block numerics and decode speed. Previous split sharing failed; do not repeat it unchanged. Await better SDK/IR support or a new source-bound representation. |
+| Deferred | Remove measured hidden movement or redundant submissions | Explicit IO was about 0.56% of profiled prefill. Require collection-level gains; fewer Map/Unmap calls alone are insufficient. Keep fixed bindings and avoid runtime Verify. |
+| External | Lower-level performance attribution | Completion waits contain outstanding execution; they do not prove an IO bottleneck. Obtain actionable counters or IR before another broad optimization sweep. |
 
 ## S6: Qwen deployment, sessions and capacity
 
@@ -78,7 +72,7 @@ savings in that profiled workload, not a promised speedup.
 | ↳ S6.4.2.1–2 | ✅ Weight reuse | Do not load raw weights already embedded in compiled graphs. Embedding and output head share one vocabulary matrix. Keep each application const/nonconst segment within 1 GiB; do not change `is_const` to bypass limits. |
 | ↳ S6.4.2.3 | ⏸ Alternatives if needed | If deployment or performance remains inadequate, evaluate other small models, mixture-of-experts models or existing quantized checkpoints against weights, operators, precision and target-model/tokenizer compatibility. No automatic downloads or general quantization research. |
 | S6.4.3–4 | ✅ Bounded model acceptance | Shared fully connected layers (FCL), mapped KV, joint DeltaNet state reads, M8/M16 feed-forward networks (FFN), normalization fusion and FFN state commit have evidence. Do not repeat local acceptance without a new gap. |
-| ↳ Batched DeltaNet capacity | 🟡 Shared projections save memory but regress speed | Single-layer SYSTEM use fell 51.70→34.27 MiB; projection/commit fusion remains 13.7% slower than original M1. Preserve the two-element strict-state mismatch. Do not expand to all 18 layers before joint FFN evaluation; approximately 988 MiB const is only an extrapolation. |
+| ↳ Batched DeltaNet capacity | ✅ Bounded complete-block coverage | All 18 layers pass C128/C512, long/full/reset requests with explicit 1408 MiB const and VIRTUAL spill. Long-term stability remains unmeasured; split projections remain rejected. |
 | ↳ Whole-model attribution | ✅ Main costs identified | Preserve low-overhead off/on/off evidence. FFN wrapper time includes state commit; completion waits do not establish an IO bottleneck. |
 | ↳ Natural conversation | ✅ Two-turn replay/retained comparison | Latest C512 M8 combination passed 28→20 and 72→36 tokens, both EOS, in reset/reset/reset/retain order. Retained versus replay snapshots matched bitwise; the final unconsumed token was included correctly. Preserve the exact template/token prefix. Broader conversation quality is unmeasured. |
 | S6.1 | 🟡 Context coverage differs by model | OPT original-layout C128/C256 boundaries, full-capacity rejection and reset passed; bounded C512 short/long passed, four-turn replay did not. Qwen C128 and C512 96→16 / 241→16 passed. On 11-12, two C512 241→16 requests reproduced tokens/reset snapshots bitwise; 512 inputs filled all KV positions and stopped correctly at capacity. C1024 remains untested. |

@@ -26,10 +26,13 @@ unsigned compiled_feed_forward_batch_tokens(const CompiledBlock &artifact) {
 
 namespace {
 void validate_block(const CompiledBlock &artifact, const WeightStore &weights, const Config &config,
-                    unsigned layer, CompiledBlockKind kind) {
+                    unsigned layer, CompiledBlockKind kind, unsigned batch_tokens = 1) {
   const bool mixer = kind == CompiledBlockKind::DeltaNet;
   if (config.hidden != 1024 || config.epsilon != 1e-6f || layer >= config.layer_types.size() ||
       artifact.kind != kind || artifact.layer != layer ||
+      (mixer &&
+       (artifact.batch_tokens != batch_tokens || (batch_tokens != 1 && batch_tokens != 8) ||
+        (batch_tokens == 8 && !artifact.includes_input_norm))) ||
       (artifact.includes_input_norm && !mixer) ||
       artifact.weight_sha256.size() != (mixer ? 9u + artifact.includes_input_norm : 4u) ||
       (artifact.graph.graph_version != std::array<unsigned, 3>{1, 1, 34} &&
@@ -47,7 +50,8 @@ void validate_block(const CompiledBlock &artifact, const WeightStore &weights, c
     const auto &order = output ? artifact.output_order : artifact.input_order;
     const std::vector<TensorSpec> expected =
         mixer
-            ? std::vector<TensorSpec>{config.hidden_spec(), config.delta.recurrent(),
+            ? std::vector<TensorSpec>{{DataType::Float16, {config.hidden, batch_tokens}},
+                                      config.delta.recurrent(),
                                       config.delta.convolution()}
             : std::vector<TensorSpec>(
                   output ? 1 : 2, {DataType::Float16,
@@ -94,7 +98,7 @@ void validate_block(const CompiledBlock &artifact, const WeightStore &weights, c
 
 std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &package,
                                               const WeightStore &weights, const Config &config,
-                                              CompiledBlockKind kind) {
+                                              CompiledBlockKind kind, unsigned batch_tokens = 1) {
   const bool mixer = kind == CompiledBlockKind::DeltaNet;
   const auto label = mixer ? "delta" : "feed-forward";
   const auto root = std::filesystem::canonical(package);
@@ -116,6 +120,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
   for (unsigned entry = 0; entry < count; ++entry) {
     CompiledBlock artifact;
     artifact.kind = kind;
+    artifact.batch_tokens = batch_tokens;
     file >> artifact.layer >> std::quoted(name) >> digest >> artifact.graph.constant_bytes;
     for (auto &part : artifact.graph.graph_version) {
       file >> part;
@@ -169,7 +174,7 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
         throw std::invalid_argument("compiled Qwen block source declarations differ");
       }
     }
-    validate_block(artifact, weights, config, artifact.layer, kind);
+    validate_block(artifact, weights, config, artifact.layer, kind, batch_tokens);
     if (!result.emplace(artifact.layer, artifact).second) {
       throw std::invalid_argument("compiled Qwen block repeats a layer");
     }
@@ -184,6 +189,17 @@ std::map<unsigned, CompiledBlock> load_blocks(const std::filesystem::path &packa
 void validate_compiled_mixer(const CompiledBlock &artifact, const WeightStore &weights,
                              const Config &config, unsigned layer) {
   validate_block(artifact, weights, config, layer, CompiledBlockKind::DeltaNet);
+}
+
+void validate_compiled_prefill(const CompiledBlock &artifact, const WeightStore &weights,
+                               const Config &config, unsigned layer) {
+  validate_block(artifact, weights, config, layer, CompiledBlockKind::DeltaNet, 8);
+}
+
+std::map<unsigned, CompiledBlock> load_compiled_prefill(const std::filesystem::path &package,
+                                                        const WeightStore &weights,
+                                                        const Config &config) {
+  return load_blocks(package, weights, config, CompiledBlockKind::DeltaNet, 8);
 }
 
 void validate_compiled_feed_forward(const CompiledBlock &artifact, const WeightStore &weights,

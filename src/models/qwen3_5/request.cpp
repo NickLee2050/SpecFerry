@@ -121,7 +121,18 @@ ExecutionRequest read_execution_request(const fs::path &request, std::string_vie
                                kv_write_name != "mapped")) {
     throw std::invalid_argument("batched Qwen FFN requires a C128/C512 mapped shared FCL chain");
   }
+  const auto delta_batch = read_option(request, "delta-batch-tokens.txt", "1");
+  if (delta_batch != "1" && delta_batch != "8") {
+    throw std::invalid_argument("unsupported Qwen DeltaNet batch width");
+  }
+  if (delta_batch == "8" &&
+      (target != "soc" || ffn_batch_tokens != 8 || state_commit != "ffn" ||
+       layout != DecoderLayout::FusedAttentionNorm || !shared_fcl || kv_write_name != "mapped")) {
+    throw std::invalid_argument(
+        "block DeltaNet requires the SoC M8 fused FFN-commit configuration");
+  }
   models::qwen3_5::ModelOptions model_options;
+  model_options.delta_batch_tokens = std::stoul(delta_batch);
   model_options.lookup = lookup;
   model_options.head = head_backend;
   model_options.head_blocks_per_graph = head_backend_name == "shared-fcl-split" ? 8 : 0;

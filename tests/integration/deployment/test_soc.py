@@ -341,6 +341,55 @@ class SocTests(unittest.TestCase):
                     marker, output, diagnostic, previous["board_boot_id"]
                 )
 
+    def test_new_trial_after_accepted_control_ignores_exhausted_historical_count(self):
+        previous, baseline = self.released_hang_marker()
+        anchor = "a" * 64
+        previous["soc_hang_retry"] = {
+            "first_failed_marker_sha256": anchor,
+            "consecutive_hang_runs": 4,
+        }
+        marker = self.root / "np101-recovery-required.json"
+        board.save(marker, previous)
+        original, digest = marker.read_bytes(), board.sha256(marker)
+        diagnostic = {
+            "authorization": "one changed trial after a completely accepted control",
+            "board_marker_sha256": digest,
+            "kernel_faults": baseline,
+            "soc_hang_retry": {"first_failed_marker_sha256": anchor},
+            "bundle_sha256": "b" * 64,
+        }
+        accepted = self.root / "accepted-control.json"
+        board.save(
+            accepted,
+            {
+                "clean": True,
+                "board_boot_id": previous["board_boot_id"],
+                "diagnostic": diagnostic | {"bundle_sha256": "c" * 64},
+                "soc_hang_retry": previous["soc_hang_retry"],
+            },
+        )
+        with patch.object(board, "STATE", self.root):
+            with self.assertRaisesRegex(RuntimeError, "three consecutive"):
+                board.hang_retry_state(previous, diagnostic, digest, previous["board_boot_id"])
+            board.save(
+                self.root / "soc-hang-retry-accepted.json",
+                {
+                    "board_boot_id": previous["board_boot_id"],
+                    "first_failed_marker_sha256": anchor,
+                    "restored_marker_sha256": digest,
+                    "result_path": str(accepted),
+                    "result_sha256": board.sha256(accepted),
+                },
+            )
+            output = self.root / "new-trial"
+            output.mkdir()
+            retained = board.retain_diagnostic_marker(
+                marker, output, diagnostic, previous["board_boot_id"]
+            )
+            self.assertEqual(retained["soc_hang_retry"]["consecutive_hang_runs"], 0)
+            self.assertEqual(marker.read_bytes(), original)
+            self.assertEqual((output / "retained-prior-board-marker.json").read_bytes(), original)
+
     def test_failed_board_diagnostic_preserves_previous_marker_and_evidence_chain(self):
         marker = self.root / "np101-recovery-required.json"
         previous = self.released_board_marker()

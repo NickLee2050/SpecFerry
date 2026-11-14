@@ -12,6 +12,7 @@ QWEN_OPTION_ARGUMENTS = {
     "projections": "qwen_projections",
     "kv_write_mode": "qwen_kv_write_mode",
     "ffn_batch_tokens": "qwen_ffn_batch",
+    "delta_batch_tokens": "qwen_delta_batch",
     "decoder_layout": "qwen_decoder_layout",
     "state_commit": "qwen_state_commit",
 }
@@ -25,8 +26,19 @@ class QwenExecutionOptions:
     kv_write_mode: str = "copy-graph"
     ffn_batch_tokens: int = 1
     decoder_layout: str = "separate"
+    delta_batch_tokens: int = 1
 
     def validate(self):
+        if type(self.delta_batch_tokens) is not int or self.delta_batch_tokens not in (1, 8):
+            raise ValueError("unsupported Qwen DeltaNet batch width")
+        if self.delta_batch_tokens == 8 and (
+            self.ffn_batch_tokens != 8
+            or self.state_commit != "ffn"
+            or self.decoder_layout != "fused-attention-norm"
+            or self.projections != "shared-fcl"
+            or self.kv_write_mode != "mapped"
+        ):
+            raise ValueError("M8 DeltaNet requires the fused M8 FFN-commit configuration")
         if self.projections not in ("shared-fcl", "matmul"):
             raise ValueError("unsupported Qwen projection backend")
         if self.state_commit not in ("combined", "ffn"):
@@ -56,7 +68,7 @@ class QwenExecutionOptions:
         if unknown:
             raise ValueError("unknown Qwen preparation option: " + ", ".join(sorted(unknown)))
         for key, value in values.items():
-            expected = int if key == "ffn_batch_tokens" else str
+            expected = int if key in ("ffn_batch_tokens", "delta_batch_tokens") else str
             if type(value) is not expected:
                 raise ValueError("invalid type for Qwen preparation option: " + key)
         result = cls(**values)
@@ -110,8 +122,7 @@ def read_preparation_config(path):
     else:
         # Validate the file itself, even if CLI overrides would hide a bad value.
         QwenExecutionOptions.from_mapping(options)
-        if "prefill_package" in config:
-            raise ValueError("Qwen does not accept a separate OPT prefill package")
+
     return config
 
 
@@ -130,13 +141,13 @@ def resolve_preparation_arguments(args):
             raise ValueError("provide --" + name + " or its preparation configuration field")
     options = dict(config.get("request_options", {}))
     for key, argument in QWEN_OPTION_ARGUMENTS.items():
-        value = getattr(args, argument)
+        value = getattr(args, argument, None)
         if value is not None:
             options[key] = value
     if args.model == "qwen":
-        if args.prefill_package is not None:
-            raise ValueError("Qwen does not accept a separate OPT prefill package")
         args.execution_options = QwenExecutionOptions.from_mapping(options)
+        if (args.execution_options.delta_batch_tokens == 8) != (args.prefill_package is not None):
+            raise ValueError("M8 DeltaNet requires --prefill-package; M1 must omit it")
     elif options:
         raise ValueError("Qwen execution options require --model qwen")
     return args

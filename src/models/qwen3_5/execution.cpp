@@ -8,10 +8,12 @@
 #include "models/qwen3_5/request.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <iomanip>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -71,17 +73,25 @@ int execute(const inference::ExecutionPaths &paths, const std::filesystem::path 
   if (matmul_layer >= 0) {
     feed_forward.erase(unsigned(matmul_layer));
   }
+  const auto prefill = model_options.delta_batch_tokens == 8
+                           ? load_compiled_prefill(compiled / "prefill", weights, config)
+                           : std::map<unsigned, CompiledBlock>{};
   fs::create_directories(output);
   platform::write_runtime_profile(output);
   np101::SdkTimings timings(output);
   phase(output, "initialize");
   const auto start = std::chrono::steady_clock::now();
-  np101::Context context;
-  models::qwen3_5::Model model(context, weights, config, policy, artifacts, feed_forward,
-                               model_options, [&](const std::string &name) {
-                                 phase(output,
-                                       name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
-                               });
+  // Only the explicit M8 configuration selects the validated larger const profile.
+  np101::Context context(
+      model_options.delta_batch_tokens == 8
+          ? np101::MemoryBudget::with_extended_constants(std::size_t{1408} * 1024 * 1024)
+          : np101::MemoryBudget{});
+  models::qwen3_5::Model model(
+      context, weights, config, policy, artifacts, feed_forward, model_options,
+      [&](const std::string &name) {
+        phase(output, name.compare(0, 6, "token.") == 0 ? name : "setup." + name);
+      },
+      prefill);
   const auto initialize =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   {
@@ -105,7 +115,8 @@ int execute(const inference::ExecutionPaths &paths, const std::filesystem::path 
                 << ",\"compiled_input_norm_layers\":" << compiled_input_norm_layers
                 << ",\"ffn_batch_tokens\":" << ffn_batch_tokens << ",\"decoder_layout\":\""
                 << layout_name << '"' << ",\"compiled_feed_forward\":" << feed_forward.size()
-                << "}\n";
+                << ",\"delta_batch_tokens\":" << model_options.delta_batch_tokens
+                << ",\"compiled_prefill_mixers\":" << prefill.size() << "}\n";
     if (!initialized) {
       throw std::runtime_error("cannot save Qwen initialization evidence");
     }

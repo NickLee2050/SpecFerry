@@ -41,6 +41,12 @@ def main():
         choices=("separate", "fused-attention-norm"),
         help="Qwen batched FFN layout; optionally fuse attention input normalization",
     )
+    prepare.add_argument(
+        "--qwen-delta-batch",
+        type=int,
+        choices=(1, 8),
+        help="DeltaNet prefill width; M8 selects the 1408 MiB const profile",
+    )
     prepare.add_argument("--binary", type=Path)
     prepare.add_argument(
         "--qwen-state-commit",
@@ -53,7 +59,7 @@ def main():
     prepare.add_argument(
         "--prefill-package",
         type=Path,
-        help="source-bound compiled attention package for M16 prefill",
+        help="source-bound OPT attention or Qwen M8 DeltaNet prefill package",
     )
     for name in ("deploy", "run", "collect"):
         command = commands.add_parser(name)
@@ -97,6 +103,7 @@ def main():
                 args.request,
                 args.sdk,
                 args.output,
+                prefill_package=args.prefill_package,
                 **args.execution_options.as_mapping(),
             )
         else:

@@ -39,8 +39,12 @@ Model::Impl::Impl(Context &context, const WeightStore &weights, const Config &sp
           artifact == compiled.end() ? nullptr : &artifact->second,
           feed_forward == compiled_feed_forward.end() ? nullptr : &feed_forward->second,
           combined_state_commit, options.kv_write, options.layout != DecoderLayout::Separate,
-          commit_state_in_ffn));
+          commit_state_in_ffn,
+          options.delta_batch_tokens == 8 && !layers.empty()
+              ? std::optional<TensorBinding>(layers.back()->block_output())
+              : std::nullopt));
     }
+    block_prefill = options.delta_batch_tokens == 8;
     batch_tokens = layers.front()->feed_forward_batch_tokens();
     for (const auto &layer : layers) {
       if (layer->feed_forward_batch_tokens() != batch_tokens) {
@@ -93,7 +97,8 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
              const inference::GenerationPolicy &policy,
              const std::map<unsigned, CompiledBlock> &compiled,
              const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
-             const ModelOptions &options, const std::function<void(const std::string &)> &phase) {
+             const ModelOptions &options, const std::function<void(const std::string &)> &phase,
+             const std::map<unsigned, CompiledBlock> &compiled_prefill) {
   const auto head_backend = options.head;
   const auto projection_backend = options.projections;
   const auto kv_write_mode = options.kv_write;
@@ -188,6 +193,22 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
                               kv_write_mode != KvWriteMode::MappedHost)) {
     throw std::invalid_argument("FFN state commit requires deferred mapped batched execution");
   }
+  if ((options.delta_batch_tokens != 1 && options.delta_batch_tokens != 8) ||
+      (options.delta_batch_tokens == 1 && !compiled_prefill.empty()) ||
+      (options.delta_batch_tokens == 8 &&
+       (compiled_prefill.size() != 18 || common_batch != 8 || !commit_state_in_ffn ||
+        layout != DecoderLayout::FusedAttentionNorm))) {
+    throw std::invalid_argument(
+        "block DeltaNet requires all 18 M8 artifacts and the fused FFN-commit chain");
+  }
+  std::size_t prefill_constants = 0;
+  for (const auto &entry : compiled_prefill) {
+    validate_compiled_prefill(entry.second, weights, config, entry.first);
+    prefill_constants += entry.second.graph.constant_bytes;
+  }
+  if (constants + prefill_constants > std::size_t{1408} * 1024 * 1024) {
+    throw std::invalid_argument("Qwen block prefill exceeds the explicit constant profile");
+  }
   // The exact budget is charged during construction. Reject an impossible lower
   // bound before any tensor allocation; each bank remains independently capped.
   if (compiled.size() != 18 || constants > segment_payload_limit ||
@@ -199,6 +220,14 @@ Model::Model(Context &context, const WeightStore &weights, const Config &config,
   try {
     impl_ = std::make_unique<Impl>(context, weights, config, policy, compiled,
                                    compiled_feed_forward, options, phase);
+    // Match the accepted allocation order: build M1/FFN/head first, then M8.
+    // Each block borrows M1 state; its graph must be destroyed before that owner.
+    for (const auto &entry : compiled_prefill) {
+      if (phase) {
+        phase("delta-prefill.layer." + std::to_string(entry.first));
+      }
+      impl_->layers.at(entry.first)->enable_block_prefill(context, entry.second);
+    }
   } catch (const std::exception &error) {
     const auto &memory = context.memory();
     throw std::runtime_error(

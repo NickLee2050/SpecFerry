@@ -1,6 +1,7 @@
 # NP101 recovery gates and incident ledger
 
-Updated: 2026-11-12. Latest scoped checks: updated SoC packages and bounded Qwen C512 coverage.
+Updated: 2026-11-14. Scoped formal Qwen regression passed after an explicitly authorized soft restart;
+historical fault markers remain. This does not establish a general SDHCI recovery rule.
 Read this page before every board run. See [status](np101-status.md) for accepted workload scopes
 and [SDK findings](np101-sdk-driver-validation-report.md) for interface failures.
 Historical plans, permissions and successful windows do not override current gates or prove that
@@ -74,19 +75,140 @@ accepted performance just because a later revision passes.
 
 ## Latest recorded state and unresolved failures
 
-The latest documented recovery followed the 11-10 storage incident, after a user-confirmed board
+Earlier documented recovery followed the 11-10 storage incident, after a user-confirmed board
 power cycle to boot `1e21c890-d53a-49e5-a531-3e28415f0e6c`. On the unchanged 768 MiB Linux /
 2048 MiB NPU configuration, six-tensor IO and a three-input decoder passed numerics, release,
 complete kernel and 10 s observation; old markers were archived by identity. Evidence:
 `qwen-shared-projection-resume-20261110/recovery/` under `.cache/runs/`.
 The 11-11 OPT/Qwen migration, C++ runtime extraction and native-supervisor regressions also
 passed their scoped checks on this boot; see status and `native-supervisor-20261111/acceptance.json`.
-The latest run used unchanged model binaries, with bitwise tokens/state, released owners/pools/GFP
+Those regressions used unchanged model binaries, with bitwise tokens/state, released owners/pools/GFP
 and clean complete kernel/10 s observation. No new fault was recorded; exact historical
 software-failure markers remain retained. This does not validate intentional hardware-fault recovery.
 These are recorded windows, not a live health check or a storage-root-cause fix.
 
 Recent events that affect subsequent work:
+
+### 11-14 explicit soft-restart diagnostic authorization
+
+The user authorized one formal C512 241→16 / reset 241→16 process after a soft restart,
+acknowledging the old SDHCI incident only. Board boot became
+`7e2e98f0-6f89-4f97-b3c9-93927aea6068`; no power cycle was confirmed. Initial complete kernel,
+EXT4 and ownership checks were clean. Existing go.sh loaded the unchanged 768 MiB Linux /
+2048 MiB NPU layout, with stuckDump=1 restored.
+
+Full deployment verification caught four stale SDK identities in the packaging snapshot; all
+132 payload hashes matched. Correcting five SDK-bound descriptions and their inventory left
+weights, graphs, requests and board libraries unchanged. Verification then passed.
+An exact-boot/marker/bundle-bound diagnostic launcher retained the prior-boot gate; shipped
+supervision and all new-fault checks remained intact. The run passed numerical/reset acceptance,
+exit 0, preparation 165.098 s and post-ready execution/release 248.549 s, within 240/300 s limits.
+Owners cleared, SYSTEM/VIRTUAL returned to 122976/0 B and GFP to 5808 pages; complete kernel
+and 10.071 s observation were clean. Both old markers were restored byte-for-byte.
+This scoped success does not clear the gate or establish general SDHCI recovery.
+
+Evidence: `qwen-block-prefill-soft-restart-20261114/` under `.cache/runs/`: `comparison.json`,
+`native-run/`, `final-health.json`, deployment identities/audit and the exact authorization launcher.
+
+### 11-13 formal-entry deployment blocked by storage
+
+Board boot `b68f12c0-f75c-425a-a7bd-8f2ac3687f2f`, host boot
+`a57ec676-0192-462f-bd13-eb1fc801487c`. Preflight found only the recorded `[571.159097]` NP hang,
+baseline resources and zero EXT4 errors. During staging, at kernel `19788.055039`, SDHCI reported
+`Timeout waiting for hardware cmd interrupt`: command `0x00000d1a`, argument `0xaaaa0000`,
+interrupt `0x00000001`, ADMA error 0. No model child or Setup/Verify/RunGraph had started.
+The signature matches earlier storage failures; its cause is not established.
+
+Staging was terminated and board copy PID 1455 killed; subsequent inspection confirmed exit,
+empty owners, baseline pools/GFP and zero EXT4 errors. No repair or further board write followed.
+The host marker retained this event and the previous marker; the board marker stayed unchanged.
+A same-boot read-only recheck on 11-14 found no new fault, but did not establish recovery.
+The later explicitly authorized soft-restart acceptance is recorded separately above.
+
+Preserve incomplete-deployment evidence; require fresh full verification before execution and
+stop on new storage faults. Evidence under `.cache/runs/`: `qwen-block-prefill-formal-20261113/`
+(`storage-fault.json`, full kernels, `after-storage-stop.json`, identities and prior marker),
+`qwen-block-prefill-recheck-20261114/`. The isolated-NP-hang retry exception does not cover SDHCI.
+
+### Split-projection investigation, 11-12–13
+
+Every row below is a separate NP hang, not a merged incident. All used 96 inputs / 16 requested
+outputs. Every faulted child exited −15, with owners/pools/GFP returned and no additional fault
+in the stated delayed observation. Complete logs, source/binary/NBG/SDK/bundle identities,
+markers and supervisor records remain under `.cache/runs/<evidence>/`. Failed runs have no
+accepted throughput. Times are seconds; kernel and application monotonic clocks are not
+calibrated enough for sub-second causal ordering.
+
+Boot identities:
+
+- `1e21c890-d53a-49e5-a531-3e28415f0e6c`, host `fb760029-11c8-4c36-a3d9-bd88642a8c20`.
+- `7bda02b4-5af7-4208-b2ca-8e2c05c30323`, host `7871ff3a-841a-458d-ab1b-f4405434dd4d`.
+- `b68f12c0-f75c-425a-a7bd-8f2ac3687f2f`, host `a57ec676-0192-462f-bd13-eb1fc801487c`.
+
+| Board boot prefix; experiment | SDK/application interval | Kernel hang / recovery / release | Delayed check | Evidence |
+|---|---|---|---:|---|
+| `1e21c890`; all 18, attempt 1 | Ready 128272.366339; request unfinished, call unknown | 128302.103113 / 128302.134953 / 128302.410183 | 10.042 s | `qwen-shared-delta-all-20261112/all-model-test/run-1/` |
+| `1e21c890`; all 18, attempt 2 | Ready 128476.346302; request unfinished, call unknown | 128547.859113 / 128547.886869 / 128548.189672 | 10.066 s | Same root, `run-2/` |
+| `1e21c890`; all 18, attempt 3 | Ready 128725.802430; request unfinished, call unknown | 128773.143094 / 128773.170865 / 128773.484419 | 10.079 s | Same root, `run-3/` |
+| `1e21c890`; two layers, explicit one-shot exception after stop | Ready 137858.234358; request unfinished, call unknown | 137978.899131 / 137978.930925 / 137979.196989 | 10.046 s | `qwen-shared-delta-two-20261112/two-once-test/run-1/` |
+| `1e21c890`; second layer only | Ready 139274.878142; 12 M8 and first M1 calls returned; last marker before public upload/FFN | 139371.539104 / 139371.566873 / 139371.856168 | 10.055 s | `qwen-shared-delta-second-only-20261112/native-run/` |
+| `1e21c890`; unchanged two-layer replay | Ready 142871.214318; no per-call trace, request unfinished | 142976.019142 / 142976.046951 / 142976.289438 | 10.010 s | `qwen-shared-delta-two-replay-20261112/model/` |
+| `1e21c890`; sixteen layers | Position 0, layer 14 M8 recurrence 145717.554918→145740.799178 (23.244 s); output projection starts 145740.800088, no end | 145740.819126 / 145740.846869 / 145741.147220 | 10.051 s | `qwen-shared-delta-full-coverage-20261112/sixteen/` |
+| `1e21c890`; twelve layers | Prefill completed; decode position 102, layer 0 M1 recurrence starts 189412.958248, no end | 189445.139104 / 189445.170958 / 189445.442110 | 10.064 s | `qwen-shared-delta-twelve-20261113/twelve/` |
+| `1e21c890`; exact accepted eight-layer replay | Position 56, layer 9 M8 recurrence starts 189767.211248, no end | 189793.299113 / 189793.330930 / 189793.588066 | 10.062 s | `qwen-shared-delta-eight-replay-20261113/eight/` |
+| `7bda02b4`; independent state/device-copy handoffs | Prefill completed; decode position 97, layer 9 M1 recurrence starts 903.058341, no end | 937.491153 / 937.519003 / 937.767954 | 10.084 s | `qwen-independent-recurrence-20261113/bound-deployment/` |
+| `7bda02b4`; independent state/mapped handoffs | Prefill completed; decode position 109, layer 4 M1 recurrence starts 2436.942134, no end | 2463.251164 / 2463.286970 / 2463.552722 | 10.033 s | `qwen-mapped-state-handoff-20261113/` |
+| `7bda02b4`; separate FFN state commit | Position 56, layer 4 recurrence 3289.589363→3313.151034 (23.562 s); export interrupted before destination Unmap; no FFN/commit reached | 3313.171162 / 3313.198861 / 3313.491752 | 10.102 s | `qwen-separated-state-commit-20261113/` |
+| `7bda02b4`; M1-only recurrence, M8 resident | Position 8, layer 4 M1 recurrence starts 4493.974105, no end | 4521.491166 / 4521.522885 / 4521.794450 | 10.061 s | `qwen-single-recurrence-resident-block-20261113/` |
+| `b68f12c0`; M1-only, M8 removed, after cold recovery | Position 0, layer 6 recurrence 547.598879→571.139032 (23.540 s); output projection starts 571.139623, no end | 571.159097 / 571.186810 / 571.454809 | 10.103 s | `qwen-single-recurrence-minimal-20261113/` |
+
+**Retry and recovery boundaries.** The all-18 sequence stopped after three failures. The next
+two-layer run used explicit one-shot authorization, not a silently reset counter. A frozen
+one-layer control then passed; second-only failed, followed by accepted localization and three
+trace-ablation controls. Two-layer replay failed; bounded two/four/eight-layer controls passed.
+Sixteen/twelve/eight then reached another three-failure stop. After the next confirmed power
+cycle, agreed six-tensor IO and three-input decoder controls passed; independent-state failed,
+the frozen original passed, then mapped handoff/separate commit/M1-only-resident reached three.
+After the next confirmed power cycle and accepted controls, M1-only without M8 failed once.
+Complete-block two-layer and then all-18 controls passed on that boot. Accepted controls reset
+only the consecutive failure streak; all historical incidents and markers remain preserved.
+
+**Established facts versus hypotheses.** Initialization completed in all inference failures.
+All-18 split projections fit (SYSTEM 1811.321 MiB), while successful/failed eight-layer samples
+shared the same artifacts and SYSTEM peak 1696.371 MiB. No stable failing-layer threshold was
+found. Private state, mapped handoffs, removal of FFN copies and removal of resident M8 graphs
+did not eliminate failure. The cold-boot M1-only failure rules out a requirement for earlier
+same-boot hangs or M8 execution. Static audit found no established early free/missing blocking
+wait; it does not establish closed-SDK alias correctness. Long recurrence returns preceding
+later hang reports do not make the later outstanding API the initiating cause. No root cause
+is proven. Keep split-projection variants out of the formal entry; do not repeat them unchanged.
+
+**Non-device failures retained:** the combined projection/FFN wrapper first rejected mismatched
+versions (`qwen-shared-delta-ffn-20261112/combined-test`, 5.500 s), then matching 1.1.34 wrappers
+returned Verify −1 (`aligned-tail-test`, 5.741 s); release/kernel checks passed. Obsolete one-shot
+launchers also rejected pre-child authorization, and the first independent-state package had a
+frozen-path mismatch. Those were software gates, not allocation leaks or NP hangs. Their original
+reports remain; the accepted-result retry reconciliation regression is kept in the test suite.
+
+### Complete-block acceptance and current recovery boundary
+
+On boot `b68f12c0-f75c-425a-a7bd-8f2ac3687f2f`, complete-M8 graphs without split projections
+passed two-layer replay and all-18 C128/C512 short, long, full-capacity and reset requests.
+Each exited 0 with accepted CPU tolerances, owners/pools/GFP released, zero EXT4 errors and clean
+complete kernel/10 s observation. Only the explicitly authorized const cap changed to 1408 MiB;
+nonconst remained 1024 MiB. Identities and exact per-run timing remain in the evidence directories
+indexed by [status](np101-status.md#complete-block-qwen-prefill). This is bounded acceptance,
+not persistent reliability or a general recovery guarantee.
+
+The boundary run's initial host oracle incorrectly required physical clearing after logical KV
+reset. Saved data proves correct new prefix and unchanged masked suffix; only the oracle was
+corrected, with no rerun/tolerance relaxation. Initial reports and pending markers remain as
+`initial-*`; `reset-review.json` explains acceptance. The previous exact board fault marker
+`a9fb662da40f6c199c291579557849974005d5b4a64a277e442acb282af4093b` was restored. The host marker
+`692bb5def0fc12f8cd59f43b3db0a80d4634446121625c58b9249aca830d9d70` also remains. The accepted
+retry record points to the last complete acceptance; it does not erase `[571.159097]` or clear
+the recovery gate. Next run must read the complete kernel and reconcile that exact result and
+marker, with owners empty, SYSTEM/VIRTUAL 122976/0 B and GFP 5808 pages at baseline.
 
 - **11-12 conversation fixture packaging error, no device fault.** On board boot
   `1e21c890-d53a-49e5-a531-3e28415f0e6c` / host boot

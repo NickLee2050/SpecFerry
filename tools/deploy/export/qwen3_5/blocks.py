@@ -2,6 +2,7 @@
 """Compile cached Qwen DeltaNet or feed-forward blocks without opening NP101."""
 
 import argparse
+import copy
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -16,8 +17,27 @@ from tools.deploy.execute.np101.device import write_json
 from tools.deploy.export.checkpoint import sha256
 from tools.deploy.export.compiled import compile_model, compiled_ports
 from tools.deploy.export.qwen3_5.export import verify_export
-from tools.deploy.export.qwen3_5.onnx_graph import delta_model, feed_forward_model
+from tools.deploy.export.qwen3_5.onnx_graph import (
+    delta_model,
+    delta_prefill_model,
+    feed_forward_model,
+)
 from tools.deploy.pack.qwen3_5.compiled import combine_packages, package_blocks
+
+
+def block_ports(directory, model, *, batch_tokens):
+    # The wrapper names unrolled state ports after their producer nodes.
+    # Resolve those names only for matching; keep the exported ONNX intact.
+    public = copy.deepcopy(model) if batch_tokens == 8 else model
+    if batch_tokens == 8:
+        aliases = {
+            n.output[0]: n.name
+            for n in model.graph.node
+            if n.name in ("step07.present_recurrent", "step07.present_convolution")
+        }
+        for port in public.graph.output:
+            port.name = aliases.get(port.name, port.name)
+    return compiled_ports(directory, public)
 
 
 def main():
@@ -39,8 +59,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     changed_mixer = args.outer_product != "matmul" or args.fuse_input_norm or args.joint_state_reads
-    if args.batch_tokens != 1 and args.part != "feed-forward":
-        parser.error("--batch-tokens requires --part feed-forward")
+    if args.part == "mixer" and args.batch_tokens not in (1, 8):
+        parser.error("DeltaNet supports batch widths 1 and 8")
+    if args.part == "mixer" and args.batch_tokens == 8:
+        if (
+            args.outer_product != "multiply"
+            or not args.fuse_input_norm
+            or not args.joint_state_reads
+        ):
+            parser.error("M8 DeltaNet requires multiply, input normalization and joint state reads")
     if args.part != "mixer" and changed_mixer:
         parser.error("mixer implementation options require --part mixer")
     if args.reuse_first_layer and changed_mixer:
@@ -91,7 +118,9 @@ def main():
                         stream.read(record["bytes"]),
                         dtype={"F16": "<f2", "F32": "<f4"}[record["dtype"]],
                     ).reshape(record["shape"])
-        if args.part == "mixer":
+        if args.part == "mixer" and args.batch_tokens == 8:
+            graph = delta_prefill_model(weights, layer, manifest["text_config"])
+        elif args.part == "mixer":
             graph = delta_model(
                 weights,
                 layer,
@@ -131,7 +160,7 @@ def main():
             dict(
                 nbg_sha256=sha256(binary),
                 constant_bytes=max(binary.stat().st_size, (target / "model.data").stat().st_size),
-                **compiled_ports(target, model),
+                **block_ports(target, model, batch_tokens=args.batch_tokens),
             ),
         )
         return target

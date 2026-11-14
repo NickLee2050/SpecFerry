@@ -1,4 +1,4 @@
-"""Offline SoC adaptation of the existing single-token Qwen hybrid package."""
+"""Source-bound SoC deployment of Qwen M1 decode and optional block prefill."""
 
 import math
 import shutil
@@ -18,8 +18,15 @@ from tools.deploy.pack.qwen3_5.compiled import (
     validate_feed_forward_ports,
 )
 
+COMPILED_GROUPS = (
+    (True, "graphs", "compiled-mixers.txt", "native_manifest_sha256"),
+    (False, "feed_forward", "compiled-feed-forward.txt", "feed_forward_manifest_sha256"),
+)
 
-def validate_package(package, deployment, *, ffn_batch_tokens=1):
+
+def validate_package(
+    package, deployment, *, ffn_batch_tokens=1, delta_batch_tokens=1, prefill_only=False
+):
     """Verify the original EP package once while assembling a new deployment."""
     verify_export(deployment)
     weights = read_json(deployment / "deployment-manifest.json")
@@ -39,10 +46,7 @@ def validate_package(package, deployment, *, ffn_batch_tokens=1):
         if kind == "linear_attention"
     ]
     bound = 0
-    for mixer, key, native, digest_key in (
-        (True, "graphs", "compiled-mixers.txt", "native_manifest_sha256"),
-        (False, "feed_forward", "compiled-feed-forward.txt", "feed_forward_manifest_sha256"),
-    ):
+    for mixer, key, native, digest_key in COMPILED_GROUPS[:1] if prefill_only else COMPILED_GROUPS:
         graphs = manifest[key]
         if [g["layer"] for g in graphs] != (delta_layers if mixer else list(range(24))):
             raise ValueError("Qwen package requires all ordered DeltaNet/FFN layers")
@@ -77,10 +81,20 @@ def validate_package(package, deployment, *, ffn_batch_tokens=1):
                 or sha256(binary) != graph["nbg_sha256"]
             ):
                 raise ValueError("Qwen NBG source/path/hash/constant contract differs")
+            if mixer and (
+                graph.get("batch_tokens", 1) != delta_batch_tokens
+                or delta_batch_tokens not in (1, 8)
+                or (delta_batch_tokens == 8 and graph.get("joint_state_reads") is not True)
+            ):
+                raise ValueError("Qwen DeltaNet batch metadata differs")
             if not mixer:
                 validate_feed_forward_ports(graph, batch_tokens=ffn_batch_tokens)
             else:
-                expected = [("F16", [1024, 1]), ("F32", [128, 128, 16]), ("F16", [4, 6144])]
+                expected = [
+                    ("F16", [1024, delta_batch_tokens]),
+                    ("F32", [128, 128, 16]),
+                    ("F16", [4, 6144]),
+                ]
                 for direction in ("input", "output"):
                     order, ports = graph[direction + "_order"], graph[direction + "s"]
                     if (
@@ -264,6 +278,8 @@ def prepare_bundle(
     ffn_batch_tokens=QwenExecutionOptions.ffn_batch_tokens,
     decoder_layout=QwenExecutionOptions.decoder_layout,
     state_commit=QwenExecutionOptions.state_commit,
+    delta_batch_tokens=QwenExecutionOptions.delta_batch_tokens,
+    prefill_package=None,
 ):
     binary, deployment, package, request, sdk, output = map(
         lambda p: Path(p).resolve(), (binary, deployment, package, request, sdk, output)
@@ -276,10 +292,27 @@ def prepare_bundle(
         ffn_batch_tokens=ffn_batch_tokens,
         decoder_layout=decoder_layout,
         state_commit=state_commit,
+        delta_batch_tokens=delta_batch_tokens,
     )
     execution_options.validate()
     hashes = sdk_identity(sdk)
     manifest, weights = validate_package(package, deployment, ffn_batch_tokens=ffn_batch_tokens)
+    if (delta_batch_tokens == 8) != (prefill_package is not None):
+        raise ValueError("M8 DeltaNet requires a separate source-bound prefill package")
+    prefill_manifest = None
+    if prefill_package is not None:
+        prefill_package = Path(prefill_package).resolve()
+        prefill_manifest, _ = validate_package(
+            prefill_package, deployment, delta_batch_tokens=8, prefill_only=True
+        )
+        if prefill_manifest["sdk"] != manifest["sdk"]:
+            raise ValueError("Qwen M1/M8 source SDK identities differ")
+        constants = sum(
+            g["constant_bytes"]
+            for g in manifest["graphs"] + manifest["feed_forward"] + prefill_manifest["graphs"]
+        )
+        if constants > 1408 * 2**20:
+            raise ValueError("Qwen embedded constants exceed the M8 memory profile")
     options = validate_request(request, weights, manifest["deployment_sha256"])
     if ffn_batch_tokens > 1 and options["capacity"] not in (128, 512):
         raise ValueError("batched Qwen FFN requires C128 or C512")
@@ -288,24 +321,27 @@ def prepare_bundle(
         **execution_options.as_mapping(),
         matmul_feed_forward_layer=9 if ffn_batch_tokens == 1 else -1,
     )
-    source_sdk = manifest["sdk"]
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".qwen-soc-bundle-", dir=output.parent) as temporary:
         root = Path(temporary)
         stage_runtime(root, binary, deployment, sdk, "specferry_qwen_generate")
-        manifest["source_sdk"] = source_sdk
-        manifest["sdk"] = {"profile": "np101-soc-riscv64", "sha256": hashes}
-        for mixer, key, native, digest_key in (
-            (True, "graphs", "compiled-mixers.txt", "native_manifest_sha256"),
-            (False, "feed_forward", "compiled-feed-forward.txt", "feed_forward_manifest_sha256"),
-        ):
-            for graph in manifest[key]:
-                shutil.copyfile(package / graph["path"], root / "model" / graph["path"])
-            (root / "model" / native).write_text(
-                native_manifest(manifest[key], mixer=mixer, sdk=manifest["sdk"])
+        packages = [(package, root / "model", manifest, COMPILED_GROUPS)]
+        if prefill_manifest is not None:
+            packages.append(
+                (prefill_package, root / "model/prefill", prefill_manifest, COMPILED_GROUPS[:1])
             )
-            manifest[digest_key] = sha256(root / "model" / native)
-        save(root / "model/manifest.json", manifest)
+        for source, target, metadata, groups in packages:
+            target.mkdir(exist_ok=True)
+            metadata["source_sdk"] = metadata["sdk"]
+            metadata["sdk"] = {"profile": "np101-soc-riscv64", "sha256": hashes}
+            for mixer, key, native, digest_key in groups:
+                for graph in metadata[key]:
+                    shutil.copyfile(source / graph["path"], target / graph["path"])
+                (target / native).write_text(
+                    native_manifest(metadata[key], mixer=mixer, sdk=metadata["sdk"])
+                )
+                metadata[digest_key] = sha256(target / native)
+            save(target / "manifest.json", metadata)
         for name in (
             "request.json",
             "reference.json",
@@ -325,6 +361,7 @@ def prepare_bundle(
         (request_dir / "kv-write-mode.txt").write_text(kv_write_mode + "\n")
         (request_dir / "ffn-batch-tokens.txt").write_text(str(ffn_batch_tokens) + "\n")
         (request_dir / "decoder-layout.txt").write_text(decoder_layout + "\n")
+        (request_dir / "delta-batch-tokens.txt").write_text(str(delta_batch_tokens) + "\n")
         (request_dir / "state-commit.txt").write_text(state_commit + "\n")
         (request_dir / "matmul-feed-forward-layer.txt").write_text(
             str(options["matmul_feed_forward_layer"]) + "\n"
@@ -344,6 +381,9 @@ def prepare_bundle(
                 contiguousBase=0x70000000, contiguousSize=0x80000000, stuckDump=1
             ),
             source_package_manifest_sha256=sha256(package / "manifest.json"),
+            source_prefill_manifest_sha256=(
+                sha256(prefill_package / "manifest.json") if prefill_package is not None else None
+            ),
             source_native_manifest_sha256={
                 name: sha256(package / name)
                 for name in ("compiled-mixers.txt", "compiled-feed-forward.txt")

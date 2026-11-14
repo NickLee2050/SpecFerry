@@ -31,6 +31,7 @@ struct ModelOptions {
   np101::KvWriteMode kv_write = np101::KvWriteMode::CopyGraph;
   DecoderLayout layout = DecoderLayout::Separate;
   StateCommit state_commit = StateCommit::PerLayer;
+  unsigned delta_batch_tokens = 1;
 };
 
 // Complete text-only model: shared tied vocabulary, 18 compiled DeltaNet mixers,
@@ -45,7 +46,8 @@ public:
         const std::map<unsigned, CompiledBlock> &compiled,
         const std::map<unsigned, CompiledBlock> &compiled_feed_forward,
         const ModelOptions &options = {},
-        const std::function<void(const std::string &)> &phase = {});
+        const std::function<void(const std::string &)> &phase = {},
+        const std::map<unsigned, CompiledBlock> &compiled_prefill = {});
   ~Model();
   Model(const Model &) = delete;
   Model &operator=(const Model &) = delete;
