@@ -22,7 +22,7 @@ struct ExecutionRequest {
   std::string state_commit;
   unsigned ffn_batch_tokens;
   std::string layout_name;
-  int matmul_layer;
+  int handwritten_ffn_layer;
   std::string projections;
   std::string kv_write_name;
   np101::TensorReadback token_readback;

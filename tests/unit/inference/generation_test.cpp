@@ -104,7 +104,7 @@ void run_options_contracts() {
           benchmark.repeats == 3);
   require(parse("max_new_tokens 64\n").maximum == 64);
   rejects([&] { parse("max_new_tokens 0\n"); });
-  require(!parse("lifecycle 0\nreadback logits\n").lifecycle);
+  require(parse("lifecycle 0\nreadback logits\n").readback == "logits");
   bool lifecycle_rejected = false;
   try {
     parse("lifecycle 1\nreadback logits\n");

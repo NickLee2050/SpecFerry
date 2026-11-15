@@ -176,6 +176,9 @@ Generation Model::generate(const std::vector<std::int32_t> &prompt, unsigned max
 
 void Model::close() {
   if (impl_) {
+    // Partial release must not leave an executable model if a later close fails.
+    impl_->failed = true;
+    impl_->prediction_valid = false;
     impl_->head.graph.close();
     impl_->output.graph.close();
     impl_->decoder.close();

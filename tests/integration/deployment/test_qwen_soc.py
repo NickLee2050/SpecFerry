@@ -78,7 +78,7 @@ class QwenSocTests(unittest.TestCase):
         (self.request / "policy.txt").write_text("248320 64 0 248044 2 1\n")
         for name, value in {
             "embedding-lookup": "gather-nd",
-            "matmul-feed-forward-layer": "9",
+            "handwritten-ffn-layer": "9",
             "token-readback": "mapped",
             "head-backend": "shared-fcl",
             "state-commit": "combined",
@@ -96,6 +96,26 @@ class QwenSocTests(unittest.TestCase):
         (self.request / "head-backend.txt").write_text("shared-fcl-split\n")
         self.assertEqual(self.validate()["head_backend"], "shared-fcl-split")
         self.assertEqual(self.validate()["maximum"], 2)
+
+    def test_handwritten_ffn_accepts_frozen_names_and_rejects_conflicting_aliases(self):
+        canonical = self.request / "handwritten-ffn-layer.txt"
+        legacy = self.request / "matmul-feed-forward-layer.txt"
+        canonical.rename(legacy)
+        self.metadata["matmul_feed_forward_layer"] = 9
+        board.save(self.request / "request.json", self.metadata)
+        self.assertEqual(self.validate()["handwritten_ffn_layer"], 9)
+        canonical.write_text("9\n")
+        self.metadata["handwritten_ffn_layer"] = 9
+        board.save(self.request / "request.json", self.metadata)
+        self.assertEqual(self.validate()["handwritten_ffn_layer"], 9)
+        canonical.write_text("8\n")
+        with self.assertRaisesRegex(ValueError, "FFN layer option differs"):
+            self.validate()
+        canonical.write_text("9\n")
+        self.metadata["handwritten_ffn_layer"] = 8
+        board.save(self.request / "request.json", self.metadata)
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            self.validate()
 
     def test_batched_ffn_requires_complete_mapped_composition(self):
         self.assertEqual(self.validate()["ffn_batch_tokens"], 1)
@@ -121,13 +141,13 @@ class QwenSocTests(unittest.TestCase):
             "head-backend": "shared-fcl-split",
             "projections": "shared-fcl",
             "kv-write-mode": "mapped",
-            "matmul-feed-forward-layer": "-1",
+            "handwritten-ffn-layer": "-1",
         }.items():
             (self.request / (name + ".txt")).write_text(value + "\n")
         for width in (8, 16):
             (self.request / "ffn-batch-tokens.txt").write_text(str(width) + "\n")
             self.assertEqual(self.validate()["ffn_batch_tokens"], width)
-            self.assertEqual(self.validate()["matmul_feed_forward_layer"], -1)
+            self.assertEqual(self.validate()["handwritten_ffn_layer"], -1)
             for layout in ("separate", "fused-attention-norm"):
                 layout_file.write_text(layout + "\n")
                 self.metadata["decoder_layout"] = layout
@@ -159,10 +179,10 @@ class QwenSocTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "layout metadata/option"):
             self.validate()
         layout_file.write_text("fused-attention-norm\n")
-        (self.request / "matmul-feed-forward-layer.txt").write_text("9\n")
-        with self.assertRaisesRegex(ValueError, "execution option differs"):
+        (self.request / "handwritten-ffn-layer.txt").write_text("9\n")
+        with self.assertRaisesRegex(ValueError, "FFN layer option differs"):
             self.validate()
-        (self.request / "matmul-feed-forward-layer.txt").write_text("-1\n")
+        (self.request / "handwritten-ffn-layer.txt").write_text("-1\n")
         (self.request / "kv-write-mode.txt").write_text("copy-graph\n")
         with self.assertRaisesRegex(ValueError, "C128/C512 mapped"):
             self.validate()
@@ -339,11 +359,23 @@ class QwenSocTests(unittest.TestCase):
                 "embedding_lookup": "gather-nd",
                 "head_backend": "shared-fcl",
                 "state_commit": "combined",
-                "matmul_feed_forward_layer": 9,
+                "handwritten_ffn_layer": 9,
                 "token_readback": "mapped",
             },
         )
         self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        initialized = board.read_json(device / "initialization.json")
+        legacy = dict(initialized)
+        legacy["matmul_feed_forward_layer"] = legacy.pop("handwritten_ffn_layer")
+        board.save(device / "initialization.json", legacy)
+        self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        options = manifest["request_options"]
+        options["matmul_feed_forward_layer"] = options.pop("handwritten_ffn_layer")
+        board.save(self.root / "bundle.json", manifest)
+        self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        board.save(device / "initialization.json", initialized)
+        self.assertTrue(remote.numerical_acceptance(self.root, device.parent)["passed"])
+        options["handwritten_ffn_layer"] = options.pop("matmul_feed_forward_layer")
         manifest["request_options"]["projections"] = "shared-fcl"
         board.save(self.root / "bundle.json", manifest)
         self.assertFalse(remote.numerical_acceptance(self.root, device.parent)["passed"])
@@ -366,7 +398,7 @@ class QwenSocTests(unittest.TestCase):
         options = manifest["request_options"]
         options.update(
             ffn_batch_tokens=8,
-            matmul_feed_forward_layer=-1,
+            handwritten_ffn_layer=-1,
             capacity=128,
             head_backend="shared-fcl-split",
         )
@@ -375,7 +407,7 @@ class QwenSocTests(unittest.TestCase):
         initialized = board.read_json(device / "initialization.json")
         initialized.update(
             ffn_batch_tokens=8,
-            matmul_feed_forward_layer=-1,
+            handwritten_ffn_layer=-1,
             compiled_feed_forward=24,
             capacity=128,
             head_backend="shared-fcl-split",

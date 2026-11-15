@@ -9,7 +9,11 @@ from tools.deploy.execute.np101.soc.board_runner import bundle_file, read_json, 
 from tools.deploy.export.checkpoint import sha256
 from tools.deploy.export.qwen3_5.components import Components
 from tools.deploy.export.qwen3_5.export import verify_export
-from tools.deploy.pack.np101.config import DECODER_LAYOUTS, QwenExecutionOptions
+from tools.deploy.pack.np101.config import (
+    DECODER_LAYOUTS,
+    QwenExecutionOptions,
+    read_handwritten_ffn_layer,
+)
 from tools.deploy.pack.np101.soc import finish_bundle, sdk_identity, stage_runtime
 from tools.deploy.pack.qwen3_5.compiled import (
     DRIVER,
@@ -233,9 +237,20 @@ def validate_request(request, weights, deployment_digest):
     if metadata.get("state_commit", "combined") != state_commit:
         raise ValueError("Qwen state commit metadata/option differs")
     fallback_layer = 9 if ffn_batch_tokens == 1 else -1
+    layer_files = [
+        request / name
+        for name in ("handwritten-ffn-layer.txt", "matmul-feed-forward-layer.txt")
+        if (request / name).exists()
+    ]
+    if not layer_files or any(
+        path.read_text().strip() != str(fallback_layer) for path in layer_files
+    ):
+        raise ValueError("Qwen handwritten FFN layer option differs")
+    metadata_layer = read_handwritten_ffn_layer(metadata)
+    if metadata_layer is not None and metadata_layer != fallback_layer:
+        raise ValueError("Qwen handwritten FFN layer metadata/option differs")
     options = {
         "embedding-lookup.txt": "gather-nd",
-        "matmul-feed-forward-layer.txt": str(fallback_layer),
         "token-readback.txt": "mapped",
         "state-commit.txt": state_commit,
     }
@@ -258,7 +273,7 @@ def validate_request(request, weights, deployment_digest):
         repeats=repeats,
         head_backend=head,
         state_commit=state_commit,
-        matmul_feed_forward_layer=fallback_layer,
+        handwritten_ffn_layer=fallback_layer,
         ffn_batch_tokens=ffn_batch_tokens,
         decoder_layout=decoder_layout,
         token_readback="mapped",
@@ -319,7 +334,7 @@ def prepare_bundle(
     options.update(
         head_backend="shared-fcl-split",
         **execution_options.as_mapping(),
-        matmul_feed_forward_layer=9 if ffn_batch_tokens == 1 else -1,
+        handwritten_ffn_layer=9 if ffn_batch_tokens == 1 else -1,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".qwen-soc-bundle-", dir=output.parent) as temporary:
@@ -349,7 +364,6 @@ def prepare_bundle(
             "tokens.txt",
             "policy.txt",
             "embedding-lookup.txt",
-            "matmul-feed-forward-layer.txt",
             "token-readback.txt",
             "state-commit.txt",
             *(f"expected.{name}.bin" for name in ("hidden", "recurrent", "keys", "values")),
@@ -363,11 +377,13 @@ def prepare_bundle(
         (request_dir / "decoder-layout.txt").write_text(decoder_layout + "\n")
         (request_dir / "delta-batch-tokens.txt").write_text(str(delta_batch_tokens) + "\n")
         (request_dir / "state-commit.txt").write_text(state_commit + "\n")
-        (request_dir / "matmul-feed-forward-layer.txt").write_text(
-            str(options["matmul_feed_forward_layer"]) + "\n"
+        (request_dir / "handwritten-ffn-layer.txt").write_text(
+            str(options["handwritten_ffn_layer"]) + "\n"
         )
         metadata = read_json(request_dir / "request.json")
+        metadata.pop("matmul_feed_forward_layer", None)
         metadata.update(
+            handwritten_ffn_layer=options["handwritten_ffn_layer"],
             head_backend=options["head_backend"],
             **execution_options.as_mapping(),
         )

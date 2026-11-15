@@ -119,8 +119,7 @@ RunOptions read_run_options(const std::filesystem::path &directory, bool graph) 
     result.cache_first = settings.number("cache_first_layer", 0, 0, 32);
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
-    result.lifecycle = settings.number("lifecycle", 0, 0, 1);
-    if (result.lifecycle) {
+    if (settings.number("lifecycle", 0, 0, 1)) {
       // Same-process rebuilds relied on private Verify interposition, which is retired.
       // An inherited environment flag cannot establish compilation integrity.
       throw std::invalid_argument(
@@ -132,7 +131,7 @@ RunOptions read_run_options(const std::filesystem::path &directory, bool graph) 
       throw std::invalid_argument("mapped-slot KV requires compiled fullgraph with request reset");
     }
     if ((result.history_mode != "reset" && result.history_mode != "reuse") ||
-        (result.history_mode != "reset" && (result.benchmark || result.lifecycle)) ||
+        (result.history_mode != "reset" && result.benchmark) ||
         (result.projection_backend != "auto" && result.variant != "compiled-ffn-finish") ||
         (result.projection_backend != "auto" && result.projection_backend != "fcl" &&
          result.projection_backend != "nbg-qkv" && result.projection_backend != "nbg-output" &&
@@ -141,13 +140,12 @@ RunOptions read_run_options(const std::filesystem::path &directory, bool graph) 
         (result.variant != "merged-kv" && result.variant != "merged-kv-fc1-split2" &&
          result.variant != "compiled-ffn-finish" && result.variant != "compiled-decoder" &&
          result.variant != "compiled-fullgraph") ||
-        (result.variant == "compiled-ffn-finish" &&
-         ((result.block != 1 && result.block != 16) || result.lifecycle)) ||
-        (result.variant == "compiled-decoder" && (result.block != 1 || result.lifecycle)) ||
+        (result.variant == "compiled-ffn-finish" && (result.block != 1 && result.block != 16)) ||
+        (result.variant == "compiled-decoder" && result.block != 1) ||
         (result.variant == "compiled-fullgraph" &&
-         (result.lifecycle || !((result.block == 1 && result.prefill_head == "every-token") ||
-                                (result.block == 16 && result.prefill_head == "last-token" &&
-                                 result.kv_transfer == "mapped-slot")))) ||
+         !((result.block == 1 && result.prefill_head == "every-token") ||
+           (result.block == 16 && result.prefill_head == "last-token" &&
+            result.kv_transfer == "mapped-slot"))) ||
         (result.block != 1 && result.block != 4 && result.block != 8 && result.block != 16) ||
         (result.prefill_head != "every-token" && result.prefill_head != "last-token") ||
         (result.readback != "none" && result.readback != "logits" && result.readback != "kv") ||
@@ -155,9 +153,7 @@ RunOptions read_run_options(const std::filesystem::path &directory, bool graph) 
         (result.readback_transport == "mapped" && result.readback == "none") ||
         ((result.readback == "kv") != (result.cache_first && result.cache_last)) ||
         (result.readback != "kv" && (result.cache_first || result.cache_last)) ||
-        result.cache_first > result.cache_last ||
-        (result.benchmark && (result.lifecycle || result.readback != "none")) ||
-        (result.lifecycle && result.readback != "logits") ||
+        result.cache_first > result.cache_last || (result.benchmark && result.readback != "none") ||
         (!result.benchmark && (result.warmups || result.repeats != 1))) {
       throw std::invalid_argument("unsupported graph run options");
     }

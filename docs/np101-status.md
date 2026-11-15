@@ -1,6 +1,6 @@
 # NP101 implementation and validation status
 
-Updated: 2026-11-14. This page contains execution contracts, representative measurements and
+Updated: 2026-11-15. This page contains execution contracts, representative measurements and
 conclusions that affect engineering decisions. See [Build and run](getting-started.md),
 [code boundaries](development.md), [remaining work](../TODO.md) and the mandatory
 [recovery ledger](np101-recovery-incidents.md).
@@ -47,11 +47,22 @@ Qwen decoder diagnostics reject unpublished outputs and scalar mixer/normalizati
 skipped by block prefill. Validity follows the last successful execution, including M1 tails
 and decode; committed recurrent/convolution state remains available. This adds no graph,
 buffer or tensor transfer. Offline contract checks cover publication and M1/M8 transitions;
-the diagnostic guard has not been revalidated on hardware.
+the normal formal-entry path passed the 11-15 hardware regression below. Rejected stale reads
+remain covered offline, without intentional device-fault injection.
 
 The SDK-free `host` build and local checks are described in the [test guide](../tests/README.md).
 
 ## Current delivery acceptance
+
+The final planned core review added fail-closed partial release to the component OPT model and
+Qwen decoder. Seven CPU tests, 35 targeted Python tests and EP/SoC builds passed. The latest
+working-tree SoC entries passed OPT C256 17→16 and complete-M8 Qwen C512 241→16 twice with reset,
+using unchanged NBGs, weights and references. Checked snapshots matched prior accepted runs
+bitwise; owners/pools/GFP released and complete kernel/10 s checks found no new fault.
+OPT TTFT/actual output/decode were 1.747 s / 2.939 token/s / 4.058 token/s; Qwen averages were
+98.450 s / 0.138836 token/s / 0.893179 token/s. Preparation was 148.330/164.425 s, separately
+from inference. These are regression samples, not speedup claims or release-failure injection.
+EP hardware remains deferred. Evidence: `final-core-review-20261115/acceptance.json`.
 
 The 11-12 freshly packaged OPT/Qwen entries passed one SoC whole-model request per model, reusing
 the original NBGs, requests and CPU references. Both passed original numerical/state checks,

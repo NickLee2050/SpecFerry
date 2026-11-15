@@ -20,7 +20,7 @@ namespace specferry::models::qwen3_5 {
 // Configured Qwen attention mixer, excluding the decoder residual. Input norm may
 // be fused into the projection graph; otherwise the caller supplies normalized input.
 // A single sequence owns one fixed-capacity KV allocation. Context outlives it.
-// Calls are synchronous; reset/truncate change the valid prefix without clearing
+// Calls are synchronous; reset changes the valid prefix without clearing
 // storage. A failed SDK step invalidates the instance, which must be recreated.
 using np101::Context;
 using np101::TensorBinding;
@@ -41,7 +41,6 @@ public:
   void step(const std::vector<std::uint8_t> &hidden_fp16);
   void step();
   void reset();
-  void truncate(unsigned length);
   unsigned length() const;
   std::size_t kv_revalidations() const;
   std::vector<std::uint8_t> read(const std::string &name,

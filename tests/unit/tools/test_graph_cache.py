@@ -1,6 +1,5 @@
 """Numerical regressions for the compact reporting and graph-cache checks."""
 
-import json
 import sys
 from pathlib import Path
 
@@ -113,40 +112,6 @@ class GraphBlockPrefillTests(GraphEvidenceFixture):
         self.metadata["requests"][2]["repeat_of"] = 2
         with self.assertRaises(ValueError):
             self.evaluate(cache_readback="logits")
-
-    def test_fresh_context_rebuild_requires_release_and_exact_logits(self):
-        from tools.validate.opt.graphs import evaluate_rebuild
-
-        lifecycle = dict(cycles=2, reused_context=False, recreated_context=True, released=True)
-        (self.device / "lifecycle.json").write_text(json.dumps(lifecycle))
-        native = dict(
-            released=True,
-            status="executed",
-            closed_checks=1,
-            closed_rejections=1,
-            const_live_bytes=0,
-            nonconst_live_bytes=0,
-            const_peak_bytes=10,
-            nonconst_peak_bytes=100,
-        )
-        for cycle in range(2):
-            directory = self.device / f"cycle.{cycle}"
-            directory.mkdir()
-            (directory / "run.json").write_text(json.dumps(native))
-            for index in range(len(self.results)):
-                name = f"measured.{index}.logits.bin"
-                (directory / name).write_bytes((self.device / name).read_bytes())
-        self.assertTrue(all(evaluate_rebuild(self.device, self.metadata).values()))
-        native["nonconst_live_bytes"] = 4
-        (self.device / "cycle.1/run.json").write_text(json.dumps(native))
-        self.assertFalse(evaluate_rebuild(self.device, self.metadata)["lifecycle.1.nonconst"])
-        (self.device / "cycle.1/measured.0.logits.bin").write_bytes(b"wrong")
-        self.assertFalse(
-            evaluate_rebuild(self.device, self.metadata)["lifecycle.1.request.0.exact_logits"]
-        )
-        lifecycle["reused_context"] = True
-        (self.device / "lifecycle.json").write_text(json.dumps(lifecycle))
-        self.assertFalse(evaluate_rebuild(self.device, self.metadata)["lifecycle.completed"])
 
     def test_full_blocks_tail_decode_and_reset_require_independent_values(self):
         checks = self.evaluate()

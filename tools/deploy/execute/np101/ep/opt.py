@@ -70,30 +70,21 @@ def evaluate_generation(args, fixture, device, metadata, expected, evidence):
     elif metadata:
         from tools.validate.opt.graphs import evaluate
 
-        checks, runs = {}, []
-        cycle_count = 2 if args.lifecycle_check else 1
-        cycles = range(cycle_count)
-        for cycle in cycles:
-            observed = device / f"cycle.{cycle}" if args.lifecycle_check else device
-            cycle_checks, cycle_runs = evaluate(
-                fixture,
-                observed,
-                metadata,
-                args.block,
-                variant=args.variant,
-                decoder_group_size=1,
-                prefill_head_policy=args.prefill_head,
-                kv_transfer=args.kv_transfer,
-                cache_readback=args.cache_readback,
-                cache_layer_range=args.cache_layer_range,
-                readback_transport=args.readback_transport,
-            )
-            checks.update({f"cycle.{cycle}.{key}": value for key, value in cycle_checks.items()})
-            runs.extend(cycle_runs)
-        if args.lifecycle_check:
-            from tools.validate.opt.graphs import evaluate_rebuild
-
-            checks.update(evaluate_rebuild(device, metadata))
+        checks, runs = evaluate(
+            fixture,
+            device,
+            metadata,
+            args.block,
+            variant=args.variant,
+            decoder_group_size=1,
+            prefill_head_policy=args.prefill_head,
+            kv_transfer=args.kv_transfer,
+            cache_readback=args.cache_readback,
+            cache_layer_range=args.cache_layer_range,
+            readback_transport=args.readback_transport,
+        )
+        # Keep the existing single-run result keys compatible with saved reports.
+        checks = {f"cycle.0.{key}": value for key, value in checks.items()}
 
     else:
         runs = [
@@ -215,7 +206,6 @@ def main():
             or args.capacity not in (64, 128)
             or args.variant
             or args.graph_layers
-            or args.lifecycle_check
             or args.projection_backend
             or args.sdk_timing
             or args.sdk_summary
@@ -240,11 +230,10 @@ def main():
             or (args.capacity == 256 and args.block != 16)
             or args.block not in (1, 16)
             or args.graph_layers not in (None, 24)
-            or args.lifecycle_check
             or args.variant is not None
         ):
             parser.error(
-                "compiled FFN requires full OPT C64/C128 graph mode or C256 block16, without variant or lifecycle overrides"
+                "compiled FFN requires full OPT C64/C128 graph mode or C256 block16, without variant overrides"
             )
         if args.sdk_timing or args.sdk_summary:
             parser.error("compiled candidate entry currently uses untraced acceptance")
@@ -284,12 +273,10 @@ def main():
         )
     ):
         parser.error("graph variant, head and readback require --backend graph")
-    if args.backend != "graph" and (args.request_tokens_file or args.lifecycle_check):
-        parser.error("request matrix and lifecycle check require --backend graph")
+    if args.backend != "graph" and args.request_tokens_file:
+        parser.error("request matrix requires --backend graph")
     if args.benchmark and args.backend != "graph":
         parser.error("--benchmark requires --backend graph; component already supports repetitions")
-    if args.benchmark and args.lifecycle_check:
-        parser.error("benchmark and lifecycle diagnostics are mutually exclusive")
     args.prefill_head = args.prefill_head or "every-token"
     args.variant = args.variant or "merged-kv"
     args.kv_transfer = args.kv_transfer or "device-copy"
@@ -303,8 +290,6 @@ def main():
         parser.error("mapped transport requires logits or KV diagnostic readback")
     if args.benchmark and args.cache_readback != "none":
         parser.error("benchmark requires --cache-readback none")
-    if args.lifecycle_check and args.cache_readback != "logits":
-        parser.error("--lifecycle-check requires --cache-readback logits for exact rebuild checks")
     if (args.cache_readback == "kv") != (args.cache_layer_range is not None):
         parser.error("--cache-readback kv requires --cache-layer-range FIRST LAST")
     if args.cache_layer_range is not None and not (
@@ -401,7 +386,6 @@ def main():
             readback=args.cache_readback,
             readback_transport=args.readback_transport,
             benchmark=int(args.benchmark),
-            lifecycle=int(args.lifecycle_check),
             kv_transfer=args.kv_transfer,
         )
         if args.cache_layer_range is not None:
@@ -515,7 +499,7 @@ def main():
             else summarize(runs)
         )
     graph_metrics = None
-    if args.sdk_summary and passed and not args.lifecycle_check:
+    if args.sdk_summary and passed:
         graph_metrics = summarize_graph_metrics(
             device, runs, request, metadata, benchmark=args.benchmark, expected=expected
         )
@@ -532,7 +516,6 @@ def main():
         "graph_metrics_scope": (
             "Measured outer SDK graph calls with completion waits; separately timed Verify, "
             "Setup, reset and IO are excluded. These spans are not pure NPU compute time. "
-            "Lifecycle diagnostics reuse timing labels and do not provide per-cycle metrics."
         ),
         "execution": execution,
         "graph_variant": args.variant if args.backend == "graph" else None,

@@ -50,7 +50,7 @@ int execute(const inference::ExecutionPaths &paths, const std::filesystem::path 
   const auto &state_commit = settings.state_commit;
   const auto &ffn_batch_tokens = settings.ffn_batch_tokens;
   const auto &layout_name = settings.layout_name;
-  const auto &matmul_layer = settings.matmul_layer;
+  const auto &handwritten_ffn_layer = settings.handwritten_ffn_layer;
   const auto &projections = settings.projections;
   const auto &kv_write_name = settings.kv_write_name;
   const auto &token_readback = settings.token_readback;
@@ -70,8 +70,8 @@ int execute(const inference::ExecutionPaths &paths, const std::filesystem::path 
     throw std::invalid_argument("batched Qwen FFN requires all decoder artifacts");
   }
   // The default M1 chain retains its validated shared FCL replacement at layer 9.
-  if (matmul_layer >= 0) {
-    feed_forward.erase(unsigned(matmul_layer));
+  if (handwritten_ffn_layer >= 0) {
+    feed_forward.erase(unsigned(handwritten_ffn_layer));
   }
   const auto prefill = model_options.delta_batch_tokens == 8
                            ? load_compiled_prefill(compiled / "prefill", weights, config)
@@ -107,7 +107,7 @@ int execute(const inference::ExecutionPaths &paths, const std::filesystem::path 
                 << ",\"const_peak_bytes\":" << memory.peak(true)
                 << ",\"nonconst_peak_bytes\":" << memory.peak(false)
                 << ",\"compiled_mixers\":" << artifacts.size() << ",\"embedding_lookup\":\""
-                << lookup_name << '"' << ",\"matmul_feed_forward_layer\":" << matmul_layer
+                << lookup_name << '"' << ",\"handwritten_ffn_layer\":" << handwritten_ffn_layer
                 << ",\"token_readback\":\"" << token_readback_name << '"' << ",\"head_backend\":\""
                 << head_backend_name << '"' << ",\"state_commit\":\"" << state_commit << '"'
                 << ",\"projections\":\"" << projections << '"' << ",\"kv_write_mode\":\""

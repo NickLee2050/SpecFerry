@@ -151,3 +151,11 @@ def resolve_preparation_arguments(args):
     elif options:
         raise ValueError("Qwen execution options require --model qwen")
     return args
+
+
+def read_handwritten_ffn_layer(record):
+    """Read current or frozen Qwen metadata without silently resolving conflicting aliases."""
+    name, legacy = "handwritten_ffn_layer", "matmul_feed_forward_layer"
+    if name in record and legacy in record and record[name] != record[legacy]:
+        raise ValueError("conflicting Qwen handwritten FFN layer metadata")
+    return record.get(name, record.get(legacy))

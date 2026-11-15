@@ -2,6 +2,7 @@
 #include "models/qwen3_5/request.hpp"
 
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
 
 namespace specferry::models::qwen3_5 {
@@ -84,16 +85,25 @@ ExecutionRequest read_execution_request(const fs::path &request, std::string_vie
   if (layout != DecoderLayout::Separate && ffn_batch_tokens == 1) {
     throw std::invalid_argument("optimized Qwen decoder layout requires batched FFN");
   }
-  int matmul_layer = ffn_batch_tokens == 1 ? 9 : -1;
-  if (fs::exists(request / "matmul-feed-forward-layer.txt")) {
-    std::ifstream fallback(request / "matmul-feed-forward-layer.txt");
-    if (!(fallback >> matmul_layer) || fallback >> extra) {
-      throw std::invalid_argument("invalid Qwen MatMul feed-forward layer");
+  int handwritten_ffn_layer = ffn_batch_tokens == 1 ? 9 : -1;
+  bool found_ffn_layer = false;
+  // Accept frozen requests, but never silently choose between conflicting aliases.
+  for (const auto *name : {"handwritten-ffn-layer.txt", "matmul-feed-forward-layer.txt"}) {
+    if (!fs::exists(request / name)) {
+      continue;
     }
+    std::ifstream fallback(request / name);
+    int selected;
+    if (!(fallback >> selected) || fallback >> extra ||
+        (found_ffn_layer && selected != handwritten_ffn_layer)) {
+      throw std::invalid_argument("invalid or conflicting Qwen handwritten FFN layer");
+    }
+    handwritten_ffn_layer = selected;
+    found_ffn_layer = true;
   }
-  if ((ffn_batch_tokens == 1 &&
-       (matmul_layer < 0 || unsigned(matmul_layer) >= config.layer_types.size())) ||
-      (ffn_batch_tokens > 1 && matmul_layer != -1)) {
+  if ((ffn_batch_tokens == 1 && (handwritten_ffn_layer < 0 ||
+                                 unsigned(handwritten_ffn_layer) >= config.layer_types.size())) ||
+      (ffn_batch_tokens > 1 && handwritten_ffn_layer != -1)) {
     throw std::invalid_argument("Qwen FFN batch/fallback layer contract differs");
   }
   const auto projections = read_option(request, "projections.txt", "matmul");
@@ -103,7 +113,7 @@ ExecutionRequest read_execution_request(const fs::path &request, std::string_vie
   }
   if (shared_fcl && (target != "soc" ||
                      (policy.capacity != 64 && policy.capacity != 128 && policy.capacity != 512) ||
-                     matmul_layer != (ffn_batch_tokens == 1 ? 9 : -1) ||
+                     handwritten_ffn_layer != (ffn_batch_tokens == 1 ? 9 : -1) ||
                      head_backend_name != "shared-fcl-split" || state_commit == "per-layer" ||
                      lookup_name != "gather-nd" || token_readback_name != "mapped")) {
     throw std::invalid_argument("Qwen shared FCL requires the validated SoC M1 composition");
@@ -155,7 +165,7 @@ ExecutionRequest read_execution_request(const fs::path &request, std::string_vie
           state_commit,
           ffn_batch_tokens,
           layout_name,
-          matmul_layer,
+          handwritten_ffn_layer,
           projections,
           kv_write_name,
           token_readback,

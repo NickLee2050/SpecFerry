@@ -21,6 +21,7 @@ from tools.deploy.execute.np101.soc.board_runner import (
     sha256,
     verify_bundle,
 )
+from tools.deploy.pack.np101.config import read_handwritten_ffn_layer
 from tools.validate.opt.graphs import evaluate, evaluate_benchmark
 
 
@@ -189,7 +190,8 @@ def numerical_acceptance(bundle, board):
                 )
             )
             and initialized.get("compiled_feed_forward") == (23 if ffn_batch_tokens == 1 else 24)
-            and initialized.get("matmul_feed_forward_layer") == (9 if ffn_batch_tokens == 1 else -1)
+            and read_handwritten_ffn_layer(initialized) == (9 if ffn_batch_tokens == 1 else -1)
+            and read_handwritten_ffn_layer(initialized) == read_handwritten_ffn_layer(options)
             and initialized.get("compiled_input_norm_layers") == 18
             and initialized.get("embedding_lookup") == "gather-nd"
             and initialized.get("capacity", 64) == options.get("capacity", 64)
@@ -205,7 +207,6 @@ def numerical_acceptance(bundle, board):
                 for name in (
                     "head_backend",
                     "state_commit",
-                    "matmul_feed_forward_layer",
                     "token_readback",
                 )
             )

@@ -485,6 +485,9 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorRead
 
 void DecoderLayer::close() {
   if (impl_) {
+    // Keep inference and diagnostics disabled even if release stops partway through.
+    impl_->failed = true;
+    impl_->readback = {};
     impl_->delta_prefill.reset();
     if (impl_->local_commit) {
       impl_->local_commit->graph.close();

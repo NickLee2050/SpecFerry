@@ -27,7 +27,15 @@ def parse_arguments():
     parser.add_argument("--state-commit", choices=("per-layer", "combined"), default="per-layer")
     parser.add_argument("--capacity", type=int, choices=(64, 128, 512), default=64)
     parser.add_argument("--embedding-lookup", choices=("gather", "gather-nd"), default="gather-nd")
-    parser.add_argument("--matmul-feed-forward-layer", type=int, choices=range(24), default=9)
+    parser.add_argument(
+        "--handwritten-ffn-layer",
+        "--matmul-feed-forward-layer",
+        dest="handwritten_ffn_layer",
+        type=int,
+        choices=range(24),
+        default=9,
+        help="layer using handwritten FFN with the selected projection backend",
+    )
     parser.add_argument("--token-readback", choices=("sdk", "mapped"), default="mapped")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=2)
@@ -84,7 +92,7 @@ def main():
         args.max_new_tokens,
         args.repeats,
         args.embedding_lookup,
-        args.matmul_feed_forward_layer,
+        args.handwritten_ffn_layer,
         args.token_readback,
     )
     (fixture / "head-backend.txt").write_text(args.head_backend + "\n")

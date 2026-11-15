@@ -406,9 +406,17 @@ class CompiledValidationTests(unittest.TestCase):
             ):
                 args = runpy.run_path(str(script))["parse_arguments"]()
             self.assertEqual(args.head_backend, "matmul")
+            for flag in ("--handwritten-ffn-layer", "--matmul-feed-forward-layer"):
+                with patch.object(
+                    sys,
+                    "argv",
+                    [str(script), "--compiled-mixers", str(root), "--output", str(root), flag, "8"],
+                ):
+                    selected = runpy.run_path(str(script))["parse_arguments"]()
+                self.assertEqual(selected.handwritten_ffn_layer, 8)
             cli_options = {
                 "embedding_lookup": args.embedding_lookup,
-                "matmul_feed_forward_layer": args.matmul_feed_forward_layer,
+                "handwritten_ffn_layer": args.handwritten_ffn_layer,
                 "token_readback": args.token_readback,
             }
             for name, options in (("api", {}), ("cli", cli_options)):
@@ -424,21 +432,19 @@ class CompiledValidationTests(unittest.TestCase):
                     )
                 for key, value, filename in (
                     ("embedding_lookup", "gather-nd", "embedding-lookup.txt"),
-                    ("matmul_feed_forward_layer", 9, "matmul-feed-forward-layer.txt"),
+                    ("handwritten_ffn_layer", 9, "handwritten-ffn-layer.txt"),
                     ("token_readback", "mapped", "token-readback.txt"),
                 ):
                     self.assertEqual(request[key], value)
                     self.assertEqual((root / name / filename).read_text().strip(), str(value))
 
-    def test_qwen_matmul_fallback_rejects_invalid_layers_before_loading_files(self):
+    def test_qwen_handwritten_ffn_rejects_invalid_layers_before_loading_files(self):
         from tools.deploy.execute.np101.qwen3_5.request import prepare_request
 
         with patch("tools.deploy.execute.np101.qwen3_5.request.verify_export") as verify:
             for layer in (None, -1, 24, True, "9"):
                 with self.subTest(layer=layer), self.assertRaisesRegex(ValueError, "0..23"):
-                    prepare_request(
-                        None, None, None, "Hi", 64, 1, 1, matmul_feed_forward_layer=layer
-                    )
+                    prepare_request(None, None, None, "Hi", 64, 1, 1, handwritten_ffn_layer=layer)
             verify.assert_not_called()
 
     def test_qwen_token_transport_rejects_unknown_policy_before_loading_files(self):

@@ -1,6 +1,6 @@
 # NP101 recovery gates and incident ledger
 
-Updated: 2026-11-14. Scoped formal Qwen regression passed after an explicitly authorized soft restart;
+Updated: 2026-11-15. Scoped formal OPT/Qwen regressions passed on the previously accepted soft restart;
 historical fault markers remain. This does not establish a general SDHCI recovery rule.
 Read this page before every board run. See [status](np101-status.md) for accepted workload scopes
 and [SDK findings](np101-sdk-driver-validation-report.md) for interface failures.
@@ -131,6 +131,15 @@ zero EXT4 errors, full kernel and 10.032 s observation passed. No retry or new f
 Exact historical host/board markers remain; the scoped launcher bound the existing accepted
 same-boot proof and new bundle identity. Evidence: `.cache/runs/qwen-local-correction-20261114/`,
 including `trial/native-run/`, `trial/comparison.json`, deployment audit and final health record.
+
+The 11-15 final-review regressions passed on the same boot: OPT C256 17→16 and complete-M8 Qwen
+C512 241→16 twice with reset, using rebuilt entries and unchanged payloads/oracles. Both exited 0,
+passed numerics and released owners/SYSTEM/VIRTUAL/GFP to the same baseline. Full kernels and
+10.056/10.040 s observations were clean. The exact prior-boot markers were retained, not cleared;
+the scoped launchers reused the accepted same-boot proof and current user regression authorization.
+No intentional release failure or new device fault occurred. Evidence:
+`.cache/runs/final-core-review-20261115/acceptance.json`, per-model `trial/`, deployment audits
+and final health records. This is bounded regression acceptance, not general storage recovery.
 
 ### 11-13 formal-entry deployment blocked by storage
 

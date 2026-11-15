@@ -260,14 +260,6 @@ void Attention::reset() {
   impl_->has_output = false;
 }
 
-void Attention::truncate(unsigned length) {
-  if (!impl_ || impl_->failed || length > impl_->length) {
-    throw std::out_of_range("cannot extend or truncate an invalid attention cache");
-  }
-  impl_->length = length;
-  impl_->has_output = false;
-}
-
 unsigned Attention::length() const { return impl_ ? impl_->length : 0; }
 
 std::size_t Attention::kv_revalidations() const { return impl_ ? impl_->cache.revalidations() : 0; }

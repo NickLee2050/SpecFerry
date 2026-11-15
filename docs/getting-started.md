@@ -179,14 +179,21 @@ bundle instead of overwriting it. No extra runtime CLI arguments are required.
 OPT accepts `model_family: "opt"` with the same paths and optional `prefill_package`; its execution
 options remain owned by the existing validated request, so `request_options` must be absent or empty.
 `binary` is optional for both models. Config files cannot override SDK hashes, artifact dimensions,
-driver parameters, deadlines or recovery gates. Existing commands and generated native request
-formats are unchanged; no YAML dependency or native JSON parser was added.
+driver parameters, deadlines or recovery gates. Existing commands and native request contracts
+remain supported; no YAML dependency or native JSON parser was added.
 
 SoC Qwen supports C64/C128; C512 has also passed bounded requests with the M8 FFN combination.
 With a complete M8 or M16 FFN package and a C128/C512 request, preparation
 may select `--qwen-ffn-batch 8 --qwen-decoder-layout fused-attention-norm
 --qwen-state-commit ffn`. These options require shared FCL projections and mapped KV. The M1
 fallback remains available; retired split/shared-projection Delta graphs are not formal options.
+
+The Qwen request field `handwritten_ffn_layer` selects the layer built through SDK operators,
+independently of its MatMul or fully connected implementation. It is `9` (zero-based) in the M1
+fallback and `-1` when all FFNs use compiled batch graphs. New requests write
+`handwritten-ffn-layer.txt`; the old `matmul-feed-forward-layer.txt`, metadata field
+`matmul_feed_forward_layer`, and EP CLI flag `--matmul-feed-forward-layer` remain accepted.
+Conflicting request files or metadata aliases are rejected.
 
 OPT uses the same SoC workflow with `--model opt`, a compiled model package and an OPT request;
 `--prefill-package` adds a source-bound M16 prefill package. Current OPT packaging pins a legacy
