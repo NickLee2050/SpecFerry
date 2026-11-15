@@ -67,7 +67,6 @@ def run_guarded(
     """
     if not 0 < timeout <= 300:
         raise ValueError("NP101 device runs require a timeout in (0, 300] seconds")
-    (ROOT / "docs/np101-recovery-incidents.md").read_text()
     output.mkdir(parents=True, exist_ok=True)
     device = output / "device"
     marker = RECOVERY_ROOT / "np101-recovery-required.json"

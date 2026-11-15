@@ -83,8 +83,6 @@ class EpExecutionGateTests(unittest.TestCase):
             with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 recovery = root / ".cache/runs"
-                (root / "docs").mkdir()
-                (root / "docs/np101-recovery-incidents.md").write_text("fixture ledger")
                 output = root / "output"
                 events = []
 
@@ -148,8 +146,6 @@ class EpExecutionGateTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "docs").mkdir()
-            (root / "docs/np101-recovery-incidents.md").write_text("fixture ledger")
             with (
                 patch.object(runner, "ROOT", root),
                 patch.object(runner, "RECOVERY_ROOT", root / ".cache/runs"),

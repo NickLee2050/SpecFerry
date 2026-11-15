@@ -41,7 +41,7 @@ cmake --build build/ep
 ```
 
 Use the same option with an existing SoC cross-build if a specific device control is required.
-Before every run follow the [recovery ledger](../docs/np101-recovery-incidents.md). Bare native
+Before every run follow the [recovery guide](../docs/np101-recovery.md). Bare native
 checks have no watchdog; use the existing bounded runner and full resource/kernel checks.
 Do not run a historical diagnostic merely because its executable is available.
 
