@@ -14,6 +14,36 @@ from tests.support.validation_fixtures import GraphEvidenceFixture
 
 
 class GenerationCommandTests(GraphEvidenceFixture):
+    def test_retired_lifecycle_check_fails_before_preparing_or_running(self):
+        path = Path(__file__).resolve().parents[3] / "tools/deploy/execute/np101/ep/opt.py"
+        main = runpy.run_path(str(path))["main"]
+        errors = io.StringIO()
+        prepare, execute = Mock(), Mock()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    str(path),
+                    "--backend",
+                    "graph",
+                    "--lifecycle-check",
+                    "--cache-readback",
+                    "logits",
+                    "--output",
+                    str(self.root),
+                ],
+            ),
+            patch.dict(main.__globals__, prepare_request=prepare, run_guarded=execute),
+            contextlib.redirect_stderr(errors),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("compilation guard was retired", errors.getvalue())
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
     def test_mapped_slot_is_explicit_and_limited_to_fullgraph_c64(self):
         path = Path(__file__).resolve().parents[3] / "tools/deploy/execute/np101/ep/opt.py"
         main = runpy.run_path(str(path))["main"]
@@ -48,7 +78,7 @@ class GenerationCommandTests(GraphEvidenceFixture):
                 self.subTest(kind=kind, capacity=capacity),
                 patch.object(sys, "argv", arguments),
                 patch.dict(
-                    main.__globals__, prepare_request=prepare_request, run_device=Mock()
+                    main.__globals__, prepare_request=prepare_request, run_guarded=Mock()
                 ) as globals_,
                 patch(
                     "tools.deploy.pack.opt.compiled_model.load_model_package",
@@ -68,7 +98,7 @@ class GenerationCommandTests(GraphEvidenceFixture):
                     with self.assertRaises(SystemExit) as raised:
                         main()
                     self.assertEqual(raised.exception.code, 2)
-                globals_["run_device"].assert_not_called()
+                globals_["run_guarded"].assert_not_called()
 
     def test_compiled_prefill_defaults_to_packaged_nbg_projections_without_device_access(self):
         self.check_compiled_prefill_preparation(64)
@@ -116,11 +146,11 @@ class GenerationCommandTests(GraphEvidenceFixture):
                 },
             ),
             patch("tools.validate.opt.graphs.prepare", return_value={}),
-            patch.dict(main.__globals__, run_device=Mock()) as globals_,
+            patch.dict(main.__globals__, run_guarded=Mock()) as globals_,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(main(), 0)
-            globals_["run_device"].assert_not_called()
+            globals_["run_guarded"].assert_not_called()
         options = dict(
             line.split() for line in (output / "request/run-options.txt").read_text().splitlines()
         )
@@ -159,6 +189,7 @@ class GenerationCommandTests(GraphEvidenceFixture):
                 "--block",
                 "4",
                 "--benchmark",
+                "--sudo-read-only",
                 "--warmups",
                 "1",
                 "--repeats",
@@ -170,15 +201,19 @@ class GenerationCommandTests(GraphEvidenceFixture):
             ]
             if prepare_only:
                 arguments.append("--prepare-only")
-            runner = Mock(return_value={})
+
+            def guarded(*args, **kwargs):
+                self.assertTrue(kwargs["sudo_read_only"])
+                return dict(kwargs["evaluate_result"]({}), execution={})
+
+            runner = Mock(side_effect=guarded)
             with (
                 self.subTest(prepare_only=prepare_only),
                 patch.object(sys, "argv", arguments),
                 patch.dict(
                     main.__globals__,
                     prepare_request=prepare_request,
-                    device_lock=Mock(return_value=contextlib.nullcontext()),
-                    run_device=runner,
+                    run_guarded=runner,
                     lifecycle=Mock(return_value=True),
                 ),
                 patch("tools.validate.opt.graphs.prepare", return_value=metadata),

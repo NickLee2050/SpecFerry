@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tools.benchmark.generation_metrics import summarize
+from tools.deploy.execute.np101 import runner
 from tools.deploy.export.checkpoint import sha256
 from tools.deploy.export.compiled import compiled_ports, public_port_order
 from tools.deploy.pack.opt.compiled import DRIVER, PARTS, SDK_FILES, load_ffn_package
@@ -479,9 +480,11 @@ class CompiledValidationTests(unittest.TestCase):
                         patch.object(Path, "read_text", read_text),
                         patch.object(compiled, "ROOT", root),
                         patch.object(compiled, "RECOVERY_ROOT", root),
-                        patch.object(compiled, "device_lock", return_value=nullcontext()),
+                        patch.object(runner, "RECOVERY_ROOT", root),
+                        patch.object(runner, "ROOT", root),
+                        patch.object(runner, "device_lock", return_value=nullcontext()),
                         patch.object(
-                            compiled,
+                            runner,
                             "snapshot",
                             side_effect=[
                                 clean | {"faults": preflight_faults},
@@ -489,9 +492,9 @@ class CompiledValidationTests(unittest.TestCase):
                                 clean | {"faults": delayed_faults},
                             ],
                         ),
-                        patch.object(compiled, "run_device", return_value={}) as run,
-                        patch.object(compiled, "clean_execution", return_value=True),
-                        patch.object(compiled.time, "sleep") as sleep,
+                        patch.object(runner, "run_device", return_value={}) as run,
+                        patch.object(runner, "clean_execution", return_value=True),
+                        patch.object(runner.time, "sleep") as sleep,
                     ):
                         arguments = (
                             dict(binary=sys.executable, arguments=[]),
@@ -767,8 +770,8 @@ class CompiledValidationTests(unittest.TestCase):
             path = root / "plan.json"
             path.write_text(json.dumps(plan))
             with (
-                patch.object(compiled, "snapshot") as kernel,
-                patch.object(compiled, "run_device") as device,
+                patch.object(runner, "snapshot") as kernel,
+                patch.object(runner, "run_device") as device,
             ):
                 compiled.load_case(path, "model")
                 kernel.assert_not_called()

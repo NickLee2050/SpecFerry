@@ -104,6 +104,16 @@ void run_options_contracts() {
           benchmark.repeats == 3);
   require(parse("max_new_tokens 64\n").maximum == 64);
   rejects([&] { parse("max_new_tokens 0\n"); });
+  require(!parse("lifecycle 0\nreadback logits\n").lifecycle);
+  bool lifecycle_rejected = false;
+  try {
+    parse("lifecycle 1\nreadback logits\n");
+  } catch (const std::invalid_argument &error) {
+    lifecycle_rejected =
+        std::string(error.what()) ==
+        "lifecycle checks are unavailable because the pinned compilation guard was retired";
+  }
+  require(lifecycle_rejected);
   const auto head_skip = parse("block 4\nprefill_head last-token\n");
   require(head_skip.block == 4 && head_skip.prefill_head == "last-token");
   for (unsigned block : {8, 16}) {

@@ -120,6 +120,12 @@ RunOptions read_run_options(const std::filesystem::path &directory, bool graph) 
     result.cache_last = settings.number("cache_last_layer", 0, 0, 32);
     result.benchmark = settings.number("benchmark", 0, 0, 1);
     result.lifecycle = settings.number("lifecycle", 0, 0, 1);
+    if (result.lifecycle) {
+      // Same-process rebuilds relied on private Verify interposition, which is retired.
+      // An inherited environment flag cannot establish compilation integrity.
+      throw std::invalid_argument(
+          "lifecycle checks are unavailable because the pinned compilation guard was retired");
+    }
     if ((result.kv_transfer != "device-copy" && result.kv_transfer != "mapped-slot") ||
         (result.kv_transfer == "mapped-slot" &&
          (result.variant != "compiled-fullgraph" || result.history_mode != "reset"))) {

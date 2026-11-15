@@ -1,8 +1,12 @@
 """Numerical regressions for the compact reporting and graph-cache checks."""
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -53,3 +57,114 @@ class RecoveryControlTests(unittest.TestCase):
         ):
             self.assertIsNotNone(recovery_controls.FAULT.search(line), line)
         self.assertIsNone(recovery_controls.FAULT.search("kernel: Waiting for HDMA Transfer..."))
+
+
+class EpExecutionGateTests(unittest.TestCase):
+    def test_operator_acceptance_keeps_lock_until_health_and_numbers_pass(self):
+        from tools.deploy.execute.np101 import runner
+
+        clean = dict(boot_id="test-boot", faults=[], owners="")
+        evidence = dict(
+            returncode=0,
+            timeout=False,
+            process_group_exited=True,
+            remaining_processes=[],
+            device_recovery_required=False,
+        )
+        cases = (
+            ("healthy", clean, clean, True),
+            ("immediate-fault", clean | {"faults": ["NP hang"]}, clean, True),
+            ("delayed-fault", clean, clean | {"faults": ["Oops"]}, True),
+            ("unreleased", clean, clean | {"owners": "123"}, True),
+            ("numerical-failure", clean, clean, False),
+            ("observation-interrupted", clean, clean, True),
+        )
+        for name, immediate, postflight, numbers_pass in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                recovery = root / ".cache/runs"
+                (root / "docs").mkdir()
+                (root / "docs/np101-recovery-incidents.md").write_text("fixture ledger")
+                output = root / "output"
+                events = []
+
+                def require_lock():
+                    with self.assertRaisesRegex(RuntimeError, "another SpecFerry"):
+                        with runner.device_lock(recovery, recovery_control=True):
+                            pass
+
+                def observe(seconds):
+                    self.assertEqual(seconds, 45)
+                    require_lock()
+                    events.append("observe")
+                    if name == "observation-interrupted":
+                        raise KeyboardInterrupt("interrupted observation")
+
+                def evaluate(observed):
+                    self.assertEqual(observed, evidence)
+                    require_lock()
+                    events.append("evaluate")
+                    return {"status": "numerical_pass" if numbers_pass else "numerical_mismatch"}
+
+                def execute(*args, **kwargs):
+                    require_lock()
+                    self.assertTrue(callable(kwargs["abort_check"]))
+                    self.assertTrue((recovery / "np101-recovery-required.json").is_file())
+                    events.append("execute")
+                    return evidence
+
+                with (
+                    patch.object(runner, "ROOT", root),
+                    patch.object(runner, "RECOVERY_ROOT", recovery),
+                    patch.object(runner, "snapshot", side_effect=[clean, immediate, postflight]),
+                    patch.object(runner, "run_device", side_effect=execute),
+                    patch.object(runner.time, "sleep", side_effect=observe),
+                ):
+                    status = runner.run_check(
+                        Path("unused"),
+                        [],
+                        output,
+                        SimpleNamespace(
+                            timeout=None, sdk_timing=False, trace_driver=False, sudo_read_only=True
+                        ),
+                        evaluate=evaluate,
+                    )
+                    self.assertEqual(status, int(name != "healthy"))
+                    marker = recovery / "np101-recovery-required.json"
+                    self.assertEqual(marker.exists(), name != "healthy")
+                    report = json.loads((output / "result.json").read_text())
+                    self.assertEqual(report["passed"], name == "healthy")
+                    self.assertEqual(events[:2], ["execute", "observe"])
+                    if name == "healthy":
+                        self.assertTrue((output / "completed-run-marker.json").is_file())
+                    else:
+                        # Process success, including automatic driver recovery, never opens the gate.
+                        with self.assertRaises(RuntimeError):
+                            with runner.device_lock(recovery):
+                                self.fail("faulted device admitted another run")
+
+    def test_preflight_failure_prevents_launch(self):
+        from tools.deploy.execute.np101 import runner
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "docs").mkdir()
+            (root / "docs/np101-recovery-incidents.md").write_text("fixture ledger")
+            with (
+                patch.object(runner, "ROOT", root),
+                patch.object(runner, "RECOVERY_ROOT", root / ".cache/runs"),
+                patch.object(
+                    runner, "snapshot", return_value={"faults": ["EDMA timeout"], "owners": ""}
+                ),
+                patch.object(runner, "run_device") as execute,
+                self.assertRaisesRegex(RuntimeError, "preflight failed"),
+            ):
+                runner.run_guarded(
+                    Path("unused"),
+                    [],
+                    root / "output",
+                    root,
+                    120,
+                    evaluate_result=lambda evidence: {"passed": True},
+                )
+            execute.assert_not_called()

@@ -10,8 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from tools.benchmark.generation_metrics import summarize
 from tools.benchmark.performance import read_summary, summarize_request, summarize_runs
-from tools.deploy.execute.np101.device import device_lock, run_device, write_json
+from tools.deploy.execute.np101.device import write_json
 from tools.deploy.execute.np101.opt.request import lifecycle, prepare_request
+from tools.deploy.execute.np101.runner import run_guarded
 
 ROOT = Path(__file__).resolve().parents[5]
 
@@ -41,6 +42,71 @@ def summarize_graph_metrics(
         )
         grouped.setdefault(index, []).append(sample)
     return {f"request.{index}": summarize_runs(samples) for index, samples in grouped.items()}
+
+
+def evaluate_generation(args, fixture, device, metadata, expected, evidence):
+    execution = (
+        json.loads((device / "execution.json").read_text())
+        if (device / "execution.json").is_file()
+        else {}
+    )
+    if not lifecycle(evidence, execution):
+        raise RuntimeError(f"native inference failed; see {device / 'sdk.log'}")
+    checks = {}
+    if metadata and args.benchmark:
+        from tools.validate.opt.graphs import evaluate_benchmark
+
+        checks, runs = evaluate_benchmark(
+            device,
+            metadata,
+            args.block,
+            warmups=args.warmups,
+            repeats=args.repeats,
+            variant=args.variant,
+            decoder_group_size=1,
+            prefill_head_policy=args.prefill_head,
+            kv_transfer=args.kv_transfer,
+        )
+    elif metadata:
+        from tools.validate.opt.graphs import evaluate
+
+        checks, runs = {}, []
+        cycle_count = 2 if args.lifecycle_check else 1
+        cycles = range(cycle_count)
+        for cycle in cycles:
+            observed = device / f"cycle.{cycle}" if args.lifecycle_check else device
+            cycle_checks, cycle_runs = evaluate(
+                fixture,
+                observed,
+                metadata,
+                args.block,
+                variant=args.variant,
+                decoder_group_size=1,
+                prefill_head_policy=args.prefill_head,
+                kv_transfer=args.kv_transfer,
+                cache_readback=args.cache_readback,
+                cache_layer_range=args.cache_layer_range,
+                readback_transport=args.readback_transport,
+            )
+            checks.update({f"cycle.{cycle}.{key}": value for key, value in cycle_checks.items()})
+            runs.extend(cycle_runs)
+        if args.lifecycle_check:
+            from tools.validate.opt.graphs import evaluate_rebuild
+
+            checks.update(evaluate_rebuild(device, metadata))
+
+    else:
+        runs = [
+            json.loads((device / f"measured.{i}.json").read_text()) for i in range(args.repeats)
+        ]
+        if expected is not None:
+            for kind, count in (("warmup", args.warmups), ("measured", args.repeats)):
+                for i in range(count):
+                    name = f"{kind}.{i}"
+                    checks[name] = (
+                        json.loads((device / f"{name}.json").read_text())["tokens"] == expected
+                    )
+    return dict(passed=all(checks.values()), checks=checks, runs=runs, native=execution)
 
 
 def main():
@@ -98,7 +164,7 @@ def main():
     parser.add_argument(
         "--lifecycle-check",
         action="store_true",
-        help="graph acceptance: build and release two fresh SDK Context instances",
+        help="unavailable: the pinned lifecycle compilation guard was retired",
     )
     parser.add_argument("--prefill-head", choices=("every-token", "last-token"))
     parser.add_argument(
@@ -129,13 +195,17 @@ def main():
     parser.add_argument(
         "--sudo-read-only",
         action="store_true",
-        help="authorized journalctl checks for the compiled candidate",
+        help="use sudo for read-only kernel journal checks",
     )
     parser.add_argument("--checkpoint", type=Path, default=ROOT / ".cache/models/facebook/opt-350m")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare-cpu", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    if args.lifecycle_check:
+        parser.error(
+            "lifecycle checks are unavailable because the pinned compilation guard was retired"
+        )
     compiled_package = None
     if args.compiled_model is not None:
         if (
@@ -200,9 +270,7 @@ def main():
         args.variant = "compiled-ffn-finish"
         if args.projection_backend not in (None, "fcl") and "projections" not in compiled_package:
             parser.error("NBG projection selection requires packaged projection artifacts")
-    elif not compiled_package and (
-        args.sudo_read_only or args.projection_backend or args.numerical_diagnostic
-    ):
+    elif not compiled_package and (args.projection_backend or args.numerical_diagnostic):
         parser.error("compiled candidate options require --compiled-ffn or --compiled-model")
     if args.backend != "graph" and any(
         option is not None
@@ -414,78 +482,26 @@ def main():
             raise RuntimeError("compiled candidate acceptance failed; inspect guarded/result.json")
         evidence = guarded["execution"]
     else:
-        with device_lock(ROOT / ".cache/runs"):
-            evidence = run_device(
-                binary,
-                arguments,
-                device,
-                Path("/usr/lib/ljmicro"),
-                args.timeout,
-                sdk_timing=args.sdk_timing,
-                sdk_summary=args.sdk_summary,
-            )
-    execution = (
-        json.loads((device / "execution.json").read_text())
-        if (device / "execution.json").is_file()
-        else {}
-    )
-    if not lifecycle(evidence, execution):
-        raise RuntimeError(f"native inference failed; see {device / 'sdk.log'}")
-    checks = {}
-    if metadata and args.benchmark:
-        from tools.validate.opt.graphs import evaluate_benchmark
-
-        checks, runs = evaluate_benchmark(
-            device,
-            metadata,
-            args.block,
-            warmups=args.warmups,
-            repeats=args.repeats,
-            variant=args.variant,
-            decoder_group_size=1,
-            prefill_head_policy=args.prefill_head,
-            kv_transfer=args.kv_transfer,
+        evaluated = run_guarded(
+            binary,
+            arguments,
+            output,
+            Path("/usr/lib/ljmicro"),
+            args.timeout,
+            evaluate_result=lambda evidence: evaluate_generation(
+                args, fixture, device, metadata, expected, evidence
+            ),
+            sudo_read_only=args.sudo_read_only,
+            sdk_timing=args.sdk_timing,
+            sdk_summary=args.sdk_summary,
         )
-    elif metadata:
-        from tools.validate.opt.graphs import evaluate
-
-        checks, runs = {}, []
-        cycle_count = 2 if args.lifecycle_check else 1
-        cycles = range(cycle_count)
-        for cycle in cycles:
-            observed = device / f"cycle.{cycle}" if args.lifecycle_check else device
-            cycle_checks, cycle_runs = evaluate(
-                fixture,
-                observed,
-                metadata,
-                args.block,
-                variant=args.variant,
-                decoder_group_size=1,
-                prefill_head_policy=args.prefill_head,
-                kv_transfer=args.kv_transfer,
-                cache_readback=args.cache_readback,
-                cache_layer_range=args.cache_layer_range,
-                readback_transport=args.readback_transport,
-            )
-            checks.update({f"cycle.{cycle}.{key}": value for key, value in cycle_checks.items()})
-            runs.extend(cycle_runs)
-        if args.lifecycle_check:
-            from tools.validate.opt.graphs import evaluate_rebuild
-
-            checks.update(evaluate_rebuild(device, metadata))
-
-    else:
-        runs = [
-            json.loads((device / f"measured.{i}.json").read_text()) for i in range(args.repeats)
-        ]
-        if expected is not None:
-            for kind, count in (("warmup", args.warmups), ("measured", args.repeats)):
-                for i in range(count):
-                    name = f"{kind}.{i}"
-                    checks[name] = (
-                        json.loads((device / f"{name}.json").read_text())["tokens"] == expected
-                    )
-    passed = all(checks.values())
+        if not evaluated["passed"]:
+            raise RuntimeError("EP acceptance failed; inspect health.json and incident.json")
+        evidence = evaluated["execution"]
+    if compiled_package:
+        evaluated = evaluate_generation(args, fixture, device, metadata, expected, evidence)
+    checks, runs, execution = evaluated["checks"], evaluated["runs"], evaluated["native"]
+    passed = evaluated["passed"]
     metrics = None
     if passed and not args.sdk_timing:
         metrics = (

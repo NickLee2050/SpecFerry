@@ -2,21 +2,16 @@
 
 import json
 import math
-import os
-import shutil
-import time
 from pathlib import Path
 
 import numpy as np
 
 from tools.deploy.execute.np101.device import (
     RECOVERY_ROOT,
-    clean_execution,
-    device_lock,
-    run_device,
     write_json,
 )
-from tools.deploy.execute.np101.recovery_controls import healthy, power_cycle_baseline, snapshot
+from tools.deploy.execute.np101.recovery_controls import healthy
+from tools.deploy.execute.np101.runner import run_guarded
 from tools.deploy.export.checkpoint import sha256
 from tools.deploy.export.opt.config import TOLERANCES
 from tools.validate.arrays import compare_arrays
@@ -252,7 +247,6 @@ def run_case(
             raise ValueError(f"compiled validation requires the pinned SDK: {name}")
     if Path("/sys/module/galcore/srcversion").read_text().strip() != identity["module_srcversion"]:
         raise ValueError("compiled validation requires the pinned loaded driver")
-    (ROOT / "docs/np101-recovery-incidents.md").read_text()
     output.mkdir(parents=True, exist_ok=False)
     device = output / "device"
     arguments = [
@@ -276,92 +270,17 @@ def run_case(
         previous = read_json(marker)
         validate_numerical_failure(previous)
         write_json(output / "previous-numerical-marker.json", previous)
-    with device_lock(RECOVERY_ROOT, recovery_control=numerical_diagnostic or board_power_cycled):
-        baseline = None
-        preflight = snapshot(
-            output / "preflight", sudo_read_only, fault_baseline={} if board_power_cycled else None
-        )
-        if board_power_cycled:
-            previous = read_json(marker) if marker.exists() else {}
-            baseline, preflight = power_cycle_baseline(previous, preflight)
-            baseline.update(confirmed_at=preflight.get("checked_at"), evidence=str(output))
-            write_json(output / "preflight.json", preflight)
-            write_json(output / "board-power-cycle.json", baseline)
-            # Preserve the old incident until this agreed workload passes every gate.
-            write_json(output / "previous-recovery-marker.json", previous)
-        if not healthy(preflight):
-            raise RuntimeError("compiled validation preflight failed; board not started")
-        write_json(
-            marker,
-            dict(
-                boot_id=preflight["boot_id"],
-                members=[],
-                evidence=str(output),
-                pid_namespace=os.readlink("/proc/self/ns/pid"),
-                reason="Compiled validation and delayed checks are incomplete",
-            ),
-        )
-        report = dict(passed=False)
-        try:
-            evidence = run_device(
-                binary,
-                arguments,
-                device,
-                sdk,
-                timeout,
-                recovery_control=True,
-                sdk_timing=sdk_timing,
-                abort_check=lambda: bool(
-                    snapshot(output / "monitor", sudo_read_only, fault_baseline=baseline)["faults"]
-                ),
-            )
-            report["execution"] = evidence
-            immediate = snapshot(output / "immediate", sudo_read_only, fault_baseline=baseline)
-            print("Process exited; waiting 45 seconds for delayed kernel checks", flush=True)
-            time.sleep(45)
-            postflight = snapshot(output / "postflight", sudo_read_only, fault_baseline=baseline)
-            report.update(immediate=immediate, postflight=postflight)
-            if clean_execution(evidence):
-                report.update(evaluate_result(case, device))
-            report["passed"] = report["passed"] and healthy(immediate) and healthy(postflight)
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            AttributeError,
-            KeyError,
-            RuntimeError,
-            KeyboardInterrupt,
-        ) as error:
-            report["error"] = str(error)
-        write_json(output / "result.json", report)
-        if report["passed"]:
-            if baseline is not None:
-                # Publish only after numerical, release and delayed checks all pass.
-                write_json(RECOVERY_ROOT / "np101-recovery-epoch.json", baseline)
-            shutil.copy2(marker, output / "completed-run-marker.json")
-            marker.unlink()
-        else:
-            phase = next(
-                (
-                    path
-                    for path in [device / "phase.json", device / "execution.json"]
-                    if path.exists()
-                ),
-                None,
-            )
-            incident = dict(
-                boot_id=preflight["boot_id"],
-                evidence=str(output),
-                reason="Compiled validation failed or did not complete health checks",
-                execution=report.get("execution"),
-                kernel_gate=report.get("postflight"),
-                phase=read_json(phase) if phase else None,
-                pid_namespace=os.readlink("/proc/self/ns/pid"),
-                members=report.get("execution", {}).get("remaining_processes", []),
-                established_cause="Not established; inspect phase/API and kernel timestamps",
-                next_run_rule="Stop board work and preserve marker; review the incident ledger",
-            )
-            write_json(output / "incident.json", incident)
-            write_json(marker, incident)
+    report = run_guarded(
+        binary,
+        arguments,
+        output,
+        sdk,
+        timeout,
+        evaluate_result=lambda evidence: evaluate_result(case, device),
+        sudo_read_only=sudo_read_only,
+        sdk_timing=sdk_timing,
+        numerical_diagnostic=numerical_diagnostic,
+        board_power_cycled=board_power_cycled,
+    )
+    write_json(output / "result.json", report)
     return report

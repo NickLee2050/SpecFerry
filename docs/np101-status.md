@@ -39,6 +39,10 @@ inventory and require repackaging/redeployment; frozen packages remain unchanged
 C++ tests, five EP CPU tests, EP/SoC compilation and formatting checks. The 11-12 SoC deployment
 acceptance below covers the new adapter/identity contract; EP remains compile-only.
 
+All EP entry points now share preflight, runtime kernel monitoring, numerical/release checks
+and the 45-second delayed gate under one device lock. Offline tests cover recovered kernel faults,
+retained owners and interrupted observation; this wrapper change has not been retested on EP.
+
 The SDK-free `host` build and local checks are described in the [test guide](../tests/README.md).
 
 ## Current delivery acceptance
@@ -502,7 +506,7 @@ and archived `diagnostic-sources.tar.gz`; attribution/initial offline artifacts:
 | Dynamic external FFN weights | Public Conv/FCL filter ports do not establish dynamic-weight semantics. NaN occurred; MatMul workaround correct but slow. Wait for a new contract/IR. |
 | CPU copy, fixed-row copy, more small graphs | No useful gain; some numerical differences. Evidence retained, no formal experimental modes. |
 | Parallel Verify | Thread safety unvalidated; v105 Contexts share a process shader-slot table, so separate Contexts do not isolate its 1024-slot budget. |
-| Private Verify instrumentation | Tied to x86 library offsets; retired. Public-API timing and independent numerical/lifecycle acceptance remain. |
+| Private Verify instrumentation | Tied to x86 library offsets; retired. Public-API timing and numerical/release acceptance remain; the dependent `--lifecycle-check` option is explicitly unavailable. |
 | Vendor profiler / VPD output | Collection works on SoC, but old full-model overhead was approximately 127–148×. Pipeline timing and counter units/meaning remain untrustworthy. |
 
 Public/internal NBG port permutations must agree; ONNX order alone is insufficient. MatMul and FCL

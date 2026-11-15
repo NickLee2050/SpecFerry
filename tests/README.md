@@ -47,13 +47,18 @@ Do not run a historical diagnostic merely because its executable is available.
 
 | Command | Maintained purpose |
 |---|---|
-| `tools/deploy/execute/np101/ep/opt.py` | Complete OPT inference, component baseline or graph backend, request/lifecycle acceptance |
+| `tools/deploy/execute/np101/ep/opt.py` | Complete OPT inference, component baseline or graph backend, request, numerical and release acceptance |
 | `tools/deploy/execute/np101/ep/qwen.py` | Complete Qwen request preparation/CPU reference and local EP inference |
 | `tools/deploy/execute/np101/soc/cli.py` | Offline prepare, deploy, bounded remote run and evidence collection |
 | `tools/validate/np101/compiled.py --plan PLAN --case CASE` | Source-bound compiled model acceptance |
 | `tools/validate/np101/model.py` | OPT decoder, selection and IO contract checks |
 | `tools/validate/np101/operators.py` | Lookup, projections, sampling, KV append and FP16 preservation contracts |
 | `tools/benchmark/opt_conversation.py` | Existing OPT reuse/reset conversation comparison, separate processes |
+
+EP commands hold the device lock through preflight, runtime kernel monitoring, numerical/release
+checks and a 45-second post-exit observation. Use `--sudo-read-only` when journal access requires
+permission. The legacy `--lifecycle-check` is unavailable: its private compilation guard was
+retired; the option is rejected before loading a model or opening NP101.
 
 Use `--help` for supported inputs and `--prepare-only` where available. Diagnostics are not supported
 model configurations. Raw native checks require frozen fixtures and agreed recovery controls.

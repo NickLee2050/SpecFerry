@@ -32,11 +32,6 @@ GraphRequest read_graph_request(const fs::path &request) {
     throw std::invalid_argument("the weight preload diagnostic is retired");
   }
   const auto options = inference::read_run_options(request, true);
-  const auto lifecycle_check = options.lifecycle;
-  const auto *guard = std::getenv("SPECFERRY_VERIFY_REQUIRE_OPERATIONS");
-  if (lifecycle_check && (!guard || std::string(guard) != "1")) {
-    throw std::invalid_argument("lifecycle diagnostics require the pinned compilation guard");
-  }
   const auto block = options.block, maximum = options.maximum;
   const auto readback_method = options.readback_transport == "mapped"
                                    ? np101::TensorReadback::MappedHost
