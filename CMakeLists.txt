@@ -1,34 +1,38 @@
 cmake_minimum_required(VERSION 3.18)
+
+set(SPECFERRY_TARGET "" CACHE STRING "Execution platform: host, ep or soc")
+set_property(CACHE SPECFERRY_TARGET PROPERTY STRINGS host ep soc)
+if(NOT SPECFERRY_TARGET MATCHES "^(host|ep|soc)$")
+  message(FATAL_ERROR "Select -DSPECFERRY_TARGET=host, ep or soc and a separate build directory")
+endif()
+if(DEFINED SPECFERRY_CONFIGURED_TARGET AND
+   NOT SPECFERRY_CONFIGURED_TARGET STREQUAL SPECFERRY_TARGET)
+  message(FATAL_ERROR "Do not change platforms in an existing build directory; use build/host, build/ep or build/soc")
+endif()
+set(SPECFERRY_CONFIGURED_TARGET "${SPECFERRY_TARGET}" CACHE INTERNAL "Platform bound to this build")
+
 project(SpecFerry LANGUAGES CXX)
 
 # Export compiler flags and include paths for clangd.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(LJMICRO_SDK_INCLUDE_DIR "/usr/inc" CACHE PATH "NP101 SDK header root")
-set(LJMICRO_SDK_LIBRARY_DIR "/usr/lib/ljmicro" CACHE PATH "NP101 SDK library directory")
+if(NOT SPECFERRY_TARGET STREQUAL "host")
+  include(cmake/devices/np101/${SPECFERRY_TARGET}.cmake)
+endif()
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+include(cmake/common.cmake)
+message(STATUS "SpecFerry target: ${SPECFERRY_TARGET} (${CMAKE_SYSTEM_PROCESSOR})")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER}")
+if(NOT SPECFERRY_TARGET STREQUAL "host")
+  include(cmake/devices/np101/api.cmake)
+  message(STATUS "Platform implementation: ${SPECFERRY_PLATFORM_SOURCE}")
+  message(STATUS "SDK headers: ${LJMICRO_SDK_INCLUDE_DIR}")
+  message(STATUS "SDK libraries: ${LJMICRO_SDK_LIBRARY_DIR}")
+  include(cmake/targets.cmake)
+endif()
 
-add_library(np101_context native/np101/context.cpp)
-target_compile_features(np101_context PUBLIC cxx_std_17)
-target_compile_definitions(np101_context PUBLIC LINUX)
-target_include_directories(np101_context PUBLIC native)
-target_include_directories(np101_context SYSTEM PUBLIC
-  "${LJMICRO_SDK_INCLUDE_DIR}"
-  "${LJMICRO_SDK_INCLUDE_DIR}/HAL"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/utils"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/client"
-  "${LJMICRO_SDK_INCLUDE_DIR}/acuity-ovxlib-dev/ops")
-foreach(name ovxlib OpenVX OpenVXU CLC VSC GAL ArchModelSw NNArchPerf)
-  find_library(SDK_${name} NAMES ${name} PATHS "${LJMICRO_SDK_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
-  target_link_libraries(np101_context PUBLIC "${SDK_${name}}")
-endforeach()
-target_link_libraries(np101_context PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
-target_link_options(np101_context PUBLIC "-Wl,-rpath-link,${LJMICRO_SDK_LIBRARY_DIR}")
-set(CMAKE_BUILD_RPATH "${LJMICRO_SDK_LIBRARY_DIR}")
-
-add_executable(np101_smoke native/np101/smoke.cpp)
-target_link_libraries(np101_smoke PRIVATE np101_context)
-foreach(target np101_context np101_smoke)
-  target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-endforeach()
+include(CTest)
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
