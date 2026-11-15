@@ -1,0 +1,99 @@
+#include "devices/np101/api/context.hpp"
+#include "devices/np101/api/diagnostics.hpp"
+#include "devices/np101/api/ops/vocabulary.hpp"
+#include "devices/np101/api/tensor.hpp"
+#include "devices/np101/api/weights.hpp"
+#include "models/opt/config.hpp"
+#include "models/opt/model.hpp"
+#include "support/np101/binary_io.hpp"
+
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+int main(int argc, char **argv) {
+  if (argc != 4) {
+    std::cerr << "usage: np101_opt_io_check DEPLOYMENT FIXTURE OUTPUT\n";
+    return 2;
+  }
+  namespace fs = std::filesystem;
+  using namespace specferry::np101;
+  using namespace specferry::np101::ops;
+  using namespace specferry::models::opt;
+  using specferry::testing::read_bytes;
+  using specferry::testing::write_bytes;
+  const fs::path fixture(argv[2]), output(argv[3]);
+  try {
+    fs::create_directories(output);
+    SdkTimings timings(output);
+    auto config = read_model_config(fixture);
+    WeightStore weights(argv[1]);
+    weights.verify();
+    Context context;
+    Vocabulary table(context, weights, weights.find("decoder.embed_tokens.weight"),
+                     config.block_rows);
+    InputEmbedding input(context, weights, config, table);
+    Graph hidden(context, 1, 0);
+    auto hidden_id = add_tensor(hidden, config.decoder.hidden_spec(), false,
+                                std::vector<std::uint8_t>(config.decoder.hidden_spec().bytes()));
+    OutputProjection projection(context, weights, config, {hidden, hidden_id});
+    VocabularyHead head(context, table, projection.binding());
+    std::ifstream cases(fixture / "cases.txt");
+    std::ofstream tokens(output / "tokens.txt");
+    std::int32_t token;
+    unsigned position, index = 0;
+    while (cases >> token >> position) {
+
+      input.run(token, position);
+      write_bytes(output / ("embedding." + std::to_string(index) + ".bin"), input.read());
+      upload_tensor(hidden, hidden_id,
+                    read_bytes(fixture, "hidden." + std::to_string(index) + ".bin",
+                               config.decoder.hidden_spec().bytes()));
+      projection.run();
+      tokens << head.select() << '\n';
+      auto projected = projection.binding();
+      write_bytes(output / ("projected." + std::to_string(index) + ".bin"),
+                  read_tensor(projected.owner, projected.id));
+      write_bytes(output / ("logits." + std::to_string(index) + ".bin"), head.read_logits());
+      ++index;
+    }
+    if (!cases.eof() || !index || !tokens) {
+      throw std::runtime_error("invalid IO cases or token output");
+    }
+    unsigned rejected = 0;
+    for (auto invalid : {-1, static_cast<int>(config.vocabulary)}) {
+      try {
+        input.run(invalid, 0);
+      } catch (const std::invalid_argument &) {
+        ++rejected;
+      }
+    }
+    try {
+      input.run(0, config.decoder.capacity);
+    } catch (const std::out_of_range &) {
+      ++rejected;
+    }
+    if (rejected != 3) {
+      throw std::runtime_error("IO accepted an invalid token/position");
+    }
+
+    head.graph.close();
+    projection.graph.close();
+    hidden.close();
+    input.graph.close();
+    table.close();
+    context.close();
+    std::ofstream(output / "execution.json")
+        << "{\"status\":\"executed\",\"released\":true,\"bounds_rejected\":true,\"cases\":" << index
+        << "}\n";
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}

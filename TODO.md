@@ -1,0 +1,140 @@
+# Remaining work
+
+Updated: 2026-11-15. Validated behavior and performance belong in
+[status](docs/np101-status.md); execution gates and incidents belong in the
+[recovery ledger](docs/np101-recovery-incidents.md). This file records deliverables,
+dependencies and acceptance boundaries. Task IDs are planning references, not code or artifact names.
+
+✅ Complete within stated scope · 🟡 Partial · 🔜 Ready · 🧩 Dependency · 🌐 External · ⏸ Deferred
+
+## Code organization
+
+The [runtime plan](docs/inference-runtime-plan.md) records the C++ configuration,
+loading, inference and supervision work. Directory migration and C++ loading/runtime extraction
+are accepted for the scoped SoC regressions. Native process supervision is accepted for the same requests; the Python
+adapter retains deployment and recovery policy. EP and SoC remain under
+`src/devices/np101/api/`; future vendor intermediate
+representation (IR) support starts independently, without a speculative common platform layer.
+
+| Order | Status | Deliverable and acceptance |
+|---|---|---|
+| Directory migration | ✅ | Sources, tools, tests, imports, build and documentation paths migrated. Both targets compile; 142 Python tests, four C++ CPU tests, 18 command entries and one SoC full-model request per model passed. |
+| EP hardware regression | ⏸ | The user accepted compilation-only for the 2026-11-11 migration. Reuse accepted OPT/Qwen requests when hardware becomes available; do not reopen performance exploration. |
+| 1. Configuration and contracts | ✅ Offline scope | OPT named execution/artifact objects, shared Qwen preparation validation, optional JSON inputs and documented ownership/default/override rules. Native formats, artifact checks and execution policy unchanged; standalone IO extraction stays with loader/supervisor work. |
+| 2. C++ loading and thin entry points | ✅ | Shared native request/report modules and typed model request loaders; thin commands retain existing arguments. Five CPU tests, 48 Python tests and both builds pass. |
+| 3. Shared inference runtime | ✅ Scoped SoC acceptance | Shared scheduling/reporting and model execution sessions; graph construction separated from state/runtime. OPT 17→16 and Qwen 96→16 passed with unchanged token/state outputs and NPU pool peaks. |
+| 4. Independent supervisor | ✅ Scoped SoC acceptance | Native process groups/readiness/deadlines/termination and verified companion deployment; 54 Python tests, five C++ tests and both builds pass. OPT/Qwen tokens/state and pool peaks match the prior run. Deployment, health sampling and recovery policy remain Python. |
+
+PR review: tracked-source-only EP/SoC builds (including explicit device-check binaries), 154 Python
+tests, five C++ CPU tests and 18 command help entries passed. Fixed malformed final-token parsing
+and buffered output-close error reporting; no model/operator changes or new hardware runs.
+Before public release, the owner must choose a repository license and confirm third-party material
+redistribution rights. EP hardware regression remains deferred as above. Do not treat a targeted
+credential scan as a complete security or licensing audit.
+
+Review follow-up: EP now uses the independent native guard, and SoC launch binds the
+selected deployment identity before execution. Local offline regression and both device builds
+are covered. Newly packaged OPT 17→16 and Qwen 96→16 passed SoC revalidation on 11-12, including
+numerics, release and kernel checks. EP hardware revalidation remains deferred.
+
+## Recommended execution order
+
+Current user priority: endpoint-only state correction and local validation. Target-model calls,
+RPC, collaborative inference, tree candidates, wider contexts and new performance experiments
+are deferred. A supplied decision is a test input, not a measured target-model acceptance result.
+
+| Order | Work | Acceptance and boundary |
+|---|---|---|
+| Complete ✅ | Complete-block sessions and bounded repetition | All-18 M8 passed the C512 two-turn retained/replay comparison and a resident 241/96/241-input collection, each with 16 outputs. Reuse these results; longer sessions, C1024 and hours of stability require a concrete need. |
+| 1 ✅ | Endpoint correction protocol | C++ revision-bound decisions, accepted versus consumed history, EOS/capacity and fail-closed execution are implemented and CPU-tested. See [contract](docs/endpoint-correction.md). |
+| 2 ✅ Scoped Qwen acceptance | All-18 M8 passed one zero/partial/full-acceptance sequence and fresh replay, with CPU token/state acceptance, released resources and clean kernel. EOS/capacity and invalid/stale decisions are CPU-tested. No target model or transport. |
+| Deferred ⏸ | Target-model integration, tree candidates and further optimization | Wait for an explicit new scope or useful vendor IR. Do not prebuild a universal compiler framework or tree-serving system. |
+
+Keep split/shared DeltaNet projections retired from the formal path: independent state, mapped
+handoffs, separate commits and M1-only recurrence did not eliminate hangs. Preserve evidence and
+the original model; reopening requires a discriminating hypothesis or new SDK/IR support.
+
+The migrated SoC binaries passed Qwen 96-input/16-output and OPT 17-input/16-output requests,
+including numerics, release and kernel checks. This does not validate other configurations.
+Try at most three evidence-based candidates per optimization step; stop if none is useful.
+Pause small head-grouping, CPU state-copy and fixed-row-copy experiments. Complete execution
+comes before performance.
+
+### Qwen prefill follow-up
+
+| Priority | Work | Decision gate |
+|---|---|---|
+| Deferred | Reduce duplicated M1/M8 embedded projection weights | Preserve complete-block numerics and decode speed. Previous split sharing failed; do not repeat it unchanged. Await better SDK/IR support or a new source-bound representation. |
+| Deferred | Remove measured hidden movement or redundant submissions | Explicit IO was about 0.56% of profiled prefill. Require collection-level gains; fewer Map/Unmap calls alone are insufficient. Keep fixed bindings and avoid runtime Verify. |
+| External | Lower-level performance attribution | Completion waits contain outstanding execution; they do not prove an IO bottleneck. Obtain actionable counters or IR before another broad optimization sweep. |
+
+## S6: Qwen deployment, sessions and capacity
+
+| ID | Status | Next step and acceptance |
+|---|---|---|
+| S6.4.1 | 🟡 Text comparisons available | Align draft/target tokenizers, templates, end-of-sequence (EOS) behavior and effective generation policy. Similarity of four independent answers is not speculative acceptance rate. |
+| S6.4.2 | ✅ Current model fits | Bounded M1 and batched-FFN runs passed with 768 MiB Linux / 2048 MiB NPU. Account separately for weights, derived copies, attention key/value (KV) cache, recurrent state and actual SDK peaks; KV is not currently dominant. |
+| ↳ S6.4.2.1–2 | ✅ Weight reuse | Do not load raw weights already embedded in compiled graphs. Embedding and output head share one vocabulary matrix. Keep each application const/nonconst segment within 1 GiB; do not change `is_const` to bypass limits. |
+| ↳ S6.4.2.3 | ⏸ Alternatives if needed | If deployment or performance remains inadequate, evaluate other small models, mixture-of-experts models or existing quantized checkpoints against weights, operators, precision and target-model/tokenizer compatibility. No automatic downloads or general quantization research. |
+| S6.4.3–4 | ✅ Bounded model acceptance | Shared fully connected layers (FCL), mapped KV, joint DeltaNet state reads, M8/M16 feed-forward networks (FFN), normalization fusion and FFN state commit have evidence. Do not repeat local acceptance without a new gap. |
+| ↳ Batched DeltaNet capacity | ✅ Bounded complete-block coverage | All 18 layers pass C128/C512, long/full/reset requests with explicit 1408 MiB const and VIRTUAL spill. Long-term stability remains unmeasured; split projections remain rejected. |
+| ↳ Whole-model attribution | ✅ Main costs identified | Preserve low-overhead off/on/off evidence. FFN wrapper time includes state commit; completion waits do not establish an IO bottleneck. |
+| ↳ Natural conversation | ✅ Two-turn replay/retained comparison | All-18 M8 passed 28→20, retained 72→36 and reset/replayed 72→36, both turns ending at EOS. Turn 2 reused 47 committed positions and processed 25 new tokens. Tokens matched exactly; snapshots passed unchanged tolerances but were not bitwise identical. Mean TTFT was 11.955 s retained versus 21.312 s replay. Preserve the exact template/token prefix; broader quality remains unmeasured. |
+| S6.1 | 🟡 Context coverage differs by model | OPT original-layout C128/C256 boundaries, full-capacity rejection and reset passed; bounded C512 short/long passed, four-turn replay did not. Qwen C128 and C512 96→16 / 241→16 passed. On 11-12, two C512 241→16 requests reproduced tokens/reset snapshots bitwise; 512 inputs filled all KV positions and stopped correctly at capacity. C1024 remains untested. |
+| S6.2 | 🟡 Bounded repetition passed | All-18 M8 passed resident C512 241→16 / reset 96→16 / reset 241→16. Repeated long tokens and checked snapshots matched bitwise; TTFT changed by +0.41%. Numerics, release and kernel checks passed. More repetitions and hours of stability remain deferred; this is bounded acceptance. |
+| S6.3 | ⏸ | Lightweight command-line service only when integration or user access needs it. |
+| S6.5 | 🟡 C++ continuation accepted for two turns | Model-owned history and fail-closed exact-prefix checks are integrated and accepted on all-18 M8; default generation still resets. Preserve attention KV plus recurrent/convolution state. The local correction/replay baseline is accepted below. A persistent CLI/network protocol, longer conversations and faster rollback remain separate work; cross-request batching and concurrency stay deferred. |
+
+## S7: Correction, collaboration and tree candidates
+
+| ID | Status | Next step and acceptance |
+|---|---|---|
+| S7.1 / S7.1.1 | ✅ Local C++ contract | Session-local revisions, pending/accepted/consumed distinction, replacement/bonus tokens, EOS/capacity/reset and failure semantics are implemented. No network protocol or target inference. |
+| S7.2 | ✅ Local loop; bounded Qwen acceptance | One C512 all-18 M8 process passed draft, zero acceptance, partial acceptance, full acceptance and fresh replay (12 generated tokens). CPU tests cover EOS/capacity, stale decisions and failure invalidation. No measured speculative acceptance rate. |
+| ↳ S7.2.1 | ⏸ Separate OPT hardware coverage | Shared CPU contract covers fixed short traces and unconsumed final tokens. OPT device-specific correction remains unvalidated; mapped-slot continuation stays disabled. |
+| ↳ S7.2.2 | ✅ Bounded reset/replay baseline | Existing reset reconstructs state from the corrected prefix without device snapshots or extra graphs. Checked hidden/recurrent/KV snapshots pass unchanged tolerances; retained versus fresh replay tokens match but state is not bitwise identical. Checkpoint/partial-recompute alternatives remain deferred. |
+| S7.3.1 | ⏸ Target-model baseline | Verify model, quantization, execution backend, concurrency, input/output lengths and throughput. Remeasure acceptance after quantization changes rather than carrying over BF16 assumptions. |
+| S7.3.2 / S7.3.2.1 | 🧩 Correction loop first | Begin with four draft candidates, then eight only if useful. Measure average accepted length, zero-acceptance rate and draft/verification/communication/rollback costs; derive break-even and speedup thresholds from the matching NP101 model. |
+| S7.3.3 | 🌐 Target verification ready | Compare target-only and collaborative execution under the same request/policy, including TTFT, decode and end-to-end time; include a DGX-local draft baseline. |
+| S7.4.1 | ⏸ Tree design | Define token/parent/depth/score and bounded node budgets for a single-model tree; check top-k capability/cost beyond the greedy head. |
+| S7.4.2 | 🧩 State rollback first | Share one set of weights and reuse prefixes path by path; budget recurrent/convolution/KV snapshots and temporary peaks. Do not assume aliasing or parallelism is supported. |
+| S7.4.3–4 | 🌐 Target tree verification ready | Define tree masks, positions, accepted paths and mixed recurrent state. Compare chains and small trees at a fixed candidate budget; sequential path verification is not parallel tree verification. |
+
+## S3–S4: Memory and lower-level interfaces
+
+| ID | Status | Reopening or progression condition |
+|---|---|---|
+| S3.1 | 🟡 Accounting available; SDK storage opaque | Record application weights/copies/state and actual SYSTEM peaks for each new candidate; file size alone is insufficient. |
+| S3.2.1–3 | ⏸ External OPT FFN weights | Public filter ports did not preserve dynamic-weight semantics; the MatMul workaround was correct but slow. Reopen only with a new sharing contract, IR or different-model evidence. |
+| S3.3 | ✅ OPT shared output / FP16 validated | Qwen recurrent state needs separate treatment; do not simply reduce it to FP16. |
+| S3.4 | 🟡 Extend context on demand | OPT C1024 remains untested. Measure state budgets and workload value first; do not assume KV dominates. |
+| S4.1–2 | 🌐 Useful observation interfaces | Separate submission, execution, completion wait and internal movement. Establish counter units, clocks, coverage and perturbation. Old SoC VPD profiling heavily distorts execution; CPU perf is not an NPU pipeline view. |
+| S4.3 | Ongoing | Record each hang, direct-memory-access timeout and storage fault independently. Do not repeat lockup experiments without a new hypothesis or infer root cause from a static Delay branch. |
+| S4.4 / S4.4.1 | 🌐 Vendor IR | Establish IR level, import/export, compilation/execution, memory and observability contracts. First round-trip one unchanged layer, then one local edit; choose infrastructure after seeing the interface. |
+
+## S8: Environment and recovery
+
+| ID | Status | Boundary |
+|---|---|---|
+| S8.1 | ✅ Controls passed after 11-10 power cycle | Six-tensor IO and three-input decoder controls passed numerics, release, full kernel and 10 s observation. Keep old incidents; storage root cause is unresolved. |
+| S8.2.1–6 | 🟡 Layout comparison complete; long-request fault unresolved | With 512 MiB Linux, long requests failed using both 2304 and 1792 MiB pools. Prioritize Qwen on 768 MiB / 2048 MiB; do not repeat comparisons that cannot distinguish hypotheses. |
+| S8.3–4 | ⏸ | Full-pool/DLA coverage and internal v106 audit require a new need or matching-SDK evidence. |
+| S8.5.1 | 🔜 Offline confirmation | Establish ownership, CPU/NPU reachability and ordinary-tensor allocation contracts for a second DDR region. Exclude memory-mapped IO, firmware and reserved ranges. |
+| S8.5.2–4 | 🧩 Region identified and main pool stable | Leave the main pool unchanged. Test 4 MiB allocation/read/write/release, then small cross-pool computation, then 16/64 MiB real weights. Do not force allocation by filling the main pool, cross reserved holes or bypass budgets. |
+| S8.5.5 | 🌐 More DDR or a new configuration | Within the visible 3 GiB window, even 512 MiB Linux plus all unknown 248 MiB tail space gives only about 2.49 GiB. Reaching 2.7 GiB requires additional evidence. No tensor spanning discontiguous regions in the first implementation. |
+
+Reuse agreed recovery controls; never restore deleted convolution checks. Follow the ledger's
+bounded isolated-SoC-hang retry rule, stopping after three consecutive failures of the same
+experiment. SDHCI/EXT4/Oops or unreleased resources stop board work. Preparation and inference
+budgets are separate and cannot be extended while running.
+
+## Closed or deferred investigations
+
+| IDs / direction | Decision |
+|---|---|
+| S1.1–3 | Batched convolution selection helped; FFN Verify caching is retired. Do not keep increasing convolution coverage. |
+| S1.4 | Fused-graph initialization failed; wait for a new SDK/IR. |
+| S2.1–4 | KV output optimized. Attention layout and selective transpose–GEMM–transpose (TTGT) gave no robust gain; do not proactively investigate historical performance drift. |
+| S5.1–2 | Embedding/read organization, deployment checksums and startup metadata checks are in use. Prefetch/CPU overlap gave no robust gain. |
+| S5.3 | Parallel Verify lacks thread-safety and shared-budget validation; it is not a default solution. |
+| Multi-request batching, general quantization, training | Deferred; retain one endpoint/one request. Scope alternatives or IR work separately. |
