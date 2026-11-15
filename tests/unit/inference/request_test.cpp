@@ -1,5 +1,6 @@
 #include "io/files.hpp"
 #include "models/opt/request.hpp"
+#include "models/qwen3_5/decoder_readback.hpp"
 #include "models/qwen3_5/request.hpp"
 
 #include <chrono>
@@ -101,6 +102,38 @@ void qwen_request() {
   rejects([&] { read_execution_request(directory.path, "soc"); });
 }
 
+void decoder_readback() {
+  using specferry::models::qwen3_5::DecoderReadbackState;
+  DecoderReadbackState state;
+  const auto available = [&](const char *name) {
+    try {
+      state.require_available(name);
+      return true;
+    } catch (const std::logic_error &) {
+      return false;
+    }
+  };
+
+  // A completed M1 step does not make retained scalar tensors valid after M8.
+  state = {true, true};
+  require(available("output") && available("mixer") && available("normalized"));
+  state = {false, false};
+  require(!available("output") && !available("mixer") && !available("normalized"));
+  require(available("recurrent") && available("convolution"));
+
+  // Publishing the final layer enables its hidden output, not the skipped mixer.
+  state = {false, true};
+  require(available("output") && !available("mixer") && !available("normalized"));
+
+  // A partial block runs M1 mixers but may still omit the public output copy.
+  state = {true, false};
+  require(!available("output") && available("mixer") && available("normalized"));
+  state = {true, true};
+  require(available("output") && available("mixer"));
+  state = {};
+  require(!available("output") && !available("mixer"));
+}
+
 void binary_output() {
   Directory directory;
   const std::vector<std::uint8_t> bytes{0, 1, 127, 255};
@@ -124,6 +157,7 @@ int main() {
   try {
     opt_request();
     qwen_request();
+    decoder_readback();
     binary_output();
     std::cout << "Native request and output contracts passed without opening a Context.\n";
     return 0;

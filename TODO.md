@@ -37,11 +37,6 @@ selected deployment identity before execution. Local offline regression and both
 are covered. Newly packaged OPT 17→16 and Qwen 96→16 passed SoC revalidation on 11-12, including
 numerics, release and kernel checks. EP hardware revalidation remains deferred.
 
-Core review follow-up: Qwen block prefill can leave intermediate `read("output")` and
-`read("mixer")` diagnostics stale. Track field validity and read the last executed block row or
-reject unavailable fields. Cover a block-aligned prompt with one output (no decode refresh);
-the formal final-hidden/recurrent checks are unaffected. No operator change is required.
-
 ## Recommended execution order
 
 Current user priority: endpoint-only state correction and local validation. Target-model calls,

@@ -5,6 +5,7 @@
 #include "devices/np101/api/weight_bank.hpp"
 #include "models/qwen3_5/attention.hpp"
 #include "models/qwen3_5/decoder.hpp"
+#include "models/qwen3_5/decoder_readback.hpp"
 #include "models/qwen3_5/delta_net.hpp"
 #include "vsi_nn_pub.h"
 
@@ -107,6 +108,7 @@ struct DecoderLayer::Impl {
   std::vector<std::uint8_t> residual_bytes, mixer_bytes, row_bytes;
   std::size_t completed = 0;
   bool failed = false;
+  DecoderReadbackState readback;
 
   Impl(Context &context, const WeightStore &weights, const Config &configuration, unsigned layer,
        TensorBinding input, WeightBank *bank, LinearBackend backend, const CompiledBlock *compiled,
@@ -333,6 +335,7 @@ void DecoderLayer::step() {
           "decoder residual and MLP");
   }
   ++state.completed;
+  state.readback = {true, true};
   state.failed = false;
 }
 
@@ -366,7 +369,8 @@ std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uin
   }
   std::fill(state.mixer_bytes.begin(), state.mixer_bytes.end(), 0);
   unsigned first_row = 0;
-  if (state.delta_prefill && count == 8) {
+  const bool block_mixer = state.delta_prefill && count == 8;
+  if (block_mixer) {
     const auto mixed = state.delta_prefill->run(packed_rows);
     if (mixed.size() != packed_rows.size()) {
       throw std::runtime_error("Delta block output length mismatch");
@@ -396,6 +400,7 @@ std::vector<std::uint8_t> DecoderLayer::prefill_block(const std::vector<std::uin
     ++state.completed;
   }
   auto output = state.run_batch_ffn(count, publish_output);
+  state.readback = {!block_mixer, publish_output};
   state.failed = false;
   return output;
 }
@@ -411,6 +416,7 @@ void DecoderLayer::reset() {
     impl_->attention->reset();
   }
   impl_->completed = 0;
+  impl_->readback = {};
   impl_->failed = false;
 }
 
@@ -453,6 +459,7 @@ std::vector<std::uint8_t> DecoderLayer::read(const std::string &name, TensorRead
   if (!impl_ || impl_->failed || !impl_->completed) {
     throw std::logic_error("decoder layer has no completed output");
   }
+  impl_->readback.require_available(name);
   if (name == "normalized") {
     if (!impl_->normalization) {
       throw std::invalid_argument("fused input normalization has no separate diagnostic output");

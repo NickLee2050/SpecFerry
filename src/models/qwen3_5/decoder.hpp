@@ -54,6 +54,9 @@ public:
   TensorBinding output();
   std::vector<np101::TensorCopyBinding> state_copies();
   void confirm_state_commit();
+  // Diagnostics describe the latest successful execution. Block prefill can
+  // omit scalar mixer outputs or output publication; those reads are rejected.
+  // Recurrent/convolution state remains readable after its commit completes.
   std::vector<std::uint8_t> read(const std::string &name,
                                  np101::TensorReadback method = np101::TensorReadback::SdkCopy);
   void close();

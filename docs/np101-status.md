@@ -43,6 +43,12 @@ All EP entry points now share preflight, runtime kernel monitoring, numerical/re
 and the 45-second delayed gate under one device lock. Offline tests cover recovered kernel faults,
 retained owners and interrupted observation; this wrapper change has not been retested on EP.
 
+Qwen decoder diagnostics reject unpublished outputs and scalar mixer/normalization fields
+skipped by block prefill. Validity follows the last successful execution, including M1 tails
+and decode; committed recurrent/convolution state remains available. This adds no graph,
+buffer or tensor transfer. Offline contract checks cover publication and M1/M8 transitions;
+the diagnostic guard has not been revalidated on hardware.
+
 The SDK-free `host` build and local checks are described in the [test guide](../tests/README.md).
 
 ## Current delivery acceptance
