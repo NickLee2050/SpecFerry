@@ -1,0 +1,585 @@
+#include "devices/np101/api/diagnostics.hpp"
+#include "devices/np101/api/memory_budget.hpp"
+#include "devices/np101/api/ops/graph_builder.hpp"
+#include "devices/np101/api/weight_bank.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+namespace specferry::np101::ops {
+namespace {
+constexpr auto f16 = DataType::Float16;
+constexpr auto f32 = DataType::Float32;
+} // namespace
+
+GraphBuilder::GraphBuilder(Context &context, unsigned tensors, unsigned nodes, WeightBank *weights)
+    : weights_(weights), graph(context, tensors, nodes) {}
+
+Tensor GraphBuilder::tensor(TensorSpec spec) { return {add_tensor(graph, spec), std::move(spec)}; }
+
+Tensor GraphBuilder::constant(TensorSpec spec, const std::vector<std::uint8_t> &bytes) {
+  return {add_tensor(graph, spec, true, bytes), std::move(spec)};
+}
+
+Tensor GraphBuilder::constant_weight(const WeightStore &store, const WeightRecord &record) {
+  if (record.bytes > segment_payload_limit) {
+    throw std::invalid_argument("constant weight exceeds the tensor payload limit");
+  }
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(record.bytes);
+  for (std::size_t first = 0; first < record.bytes; first += 8 * 1024 * 1024) {
+    const auto chunk =
+        store.read(record, first, std::min(std::size_t{8 * 1024 * 1024}, record.bytes - first));
+    bytes.insert(bytes.end(), chunk.begin(), chunk.end());
+  }
+  try {
+    return constant(record.spec, bytes);
+  } catch (const std::exception &error) {
+    throw std::runtime_error("constant weight load failed: " + record.name + ": " + error.what());
+  }
+}
+
+Tensor GraphBuilder::floats(const std::vector<float> &values, Shape shape, DataType type) {
+  if (type != f16 && type != f32) {
+    throw std::invalid_argument("floating constants require FP16 or FP32");
+  }
+  TensorSpec spec{type, std::move(shape)};
+  if (values.size() != spec.elements()) {
+    throw std::invalid_argument("constant size mismatch");
+  }
+  vsi_nn_dtype_t dtype{};
+  dtype.vx_type = type == f16 ? VSI_NN_TYPE_FLOAT16 : VSI_NN_TYPE_FLOAT32;
+  dtype.qnt_type = VSI_NN_QNT_TYPE_NONE;
+  std::vector<std::uint8_t> bytes(spec.bytes());
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    check(vsi_nn_Float32ToDtype(values[index], bytes.data() + index * dtype_bytes(type), &dtype),
+          "encode constant");
+  }
+  return constant(spec, bytes);
+}
+
+Tensor GraphBuilder::scalar(float value, DataType type) { return floats({value}, {1}, type); }
+
+Tensor GraphBuilder::weight(const WeightStore &store, const WeightRecord &record,
+                            TensorSpec expected) {
+  if (record.spec.type != expected.type || record.spec.shape != expected.shape) {
+    throw std::invalid_argument("unexpected weight contract: " + record.name);
+  }
+  return weight_chunk(store, record, expected, 0);
+}
+
+Tensor GraphBuilder::weight_chunk(const WeightStore &store, const WeightRecord &record,
+                                  TensorSpec spec, std::size_t offset) {
+  vsi_nn_tensor_id_t id;
+  if (weights_) {
+    id = weights_->bind(graph, store, record, spec, offset);
+    mutable_weight_inputs_.push_back(id);
+  } else {
+    id = add_tensor(graph, spec, true, prepare_weight_chunk(store, record, spec, offset));
+  }
+  return {id, std::move(spec)};
+}
+
+Tensor GraphBuilder::share(GraphBuilder &owner, Tensor source) {
+  return {retain_tensor(owner.graph, source.id, graph), source.spec};
+}
+
+Tensor GraphBuilder::bind(TensorBinding source, TensorSpec expected) {
+  return {bind_tensor(source, graph, expected), std::move(expected)};
+}
+
+vsi_nn_node_t *GraphBuilder::node(vsi_nn_op_t op, std::initializer_list<Tensor> inputs,
+                                  Tensor output) {
+  auto *result =
+      sdk_call("vsi_nn_AddNode", [&] { return vsi_nn_AddNode(graph.get(), op, 0, 0, nullptr); });
+  if (!result || !result->input.tensors || !result->output.tensors ||
+      result->input.num < inputs.size() || result->output.num < 1) {
+    throw std::runtime_error("AddNode failed");
+  }
+  std::fill_n(result->input.tensors, result->input.num, VSI_NN_TENSOR_ID_NA);
+  unsigned slot = 0;
+  for (const auto &input : inputs) {
+    result->input.tensors[slot++] = input.id;
+  }
+  result->output.tensors[0] = output.id;
+  if (op == VSI_NN_OP_MULTIPLY) {
+    result->nn_param.multiply.scale = 1;
+  } else if (op == VSI_NN_OP_SWISH) {
+    result->nn_param.swish.beta = 1;
+    result->nn_param.swish.type = VSI_NN_SWISH;
+  }
+  return result;
+}
+
+Tensor GraphBuilder::unary(vsi_nn_op_t op, Tensor input, DataType type) {
+  auto output = tensor({type, input.spec.shape});
+  node(op, {input}, output);
+  return output;
+}
+
+Tensor GraphBuilder::convert(Tensor input, DataType type) {
+  return unary(VSI_NN_OP_DATACONVERT, input, type);
+}
+
+Tensor GraphBuilder::binary(vsi_nn_op_t op, Tensor left, Tensor right) {
+  if (right.spec.shape.size() > left.spec.shape.size()) {
+    throw std::invalid_argument("binary operand rank exceeds output rank");
+  }
+  for (std::size_t axis = 0; axis < right.spec.shape.size(); ++axis) {
+    if (right.spec.shape[axis] != 1 && right.spec.shape[axis] != left.spec.shape[axis]) {
+      throw std::invalid_argument("invalid binary broadcast");
+    }
+  }
+  auto output = tensor(left.spec);
+  node(op, {left, right}, output);
+  return output;
+}
+
+Tensor GraphBuilder::reshape(Tensor input, Shape shape) {
+  TensorSpec spec{input.spec.type, shape};
+  if (spec.elements() != input.spec.elements()) {
+    throw std::invalid_argument("reshape changes element count");
+  }
+  auto output = tensor(spec);
+  parameters_.push_back(std::move(shape));
+  auto *operation = node(VSI_NN_OP_RESHAPE, {input}, output);
+  operation->nn_param.reshape.size = parameters_.back().data();
+  operation->nn_param.reshape.dim_num = parameters_.back().size();
+  return output;
+}
+
+Tensor GraphBuilder::permute(Tensor input, Shape order) {
+  if (order.empty() || order.size() > VSI_NN_MAX_DIM_NUM ||
+      order.size() != input.spec.shape.size()) {
+    throw std::invalid_argument("permutation rank differs from input");
+  }
+  Shape shape(order.size());
+  std::vector<bool> seen(order.size(), false);
+  for (std::size_t axis = 0; axis < order.size(); ++axis) {
+    if (order[axis] >= order.size() || seen[order[axis]]) {
+      throw std::invalid_argument("permutation must contain each input axis exactly once");
+    }
+    seen[order[axis]] = true;
+    shape[axis] = input.spec.shape[order[axis]];
+  }
+  auto output = tensor({input.spec.type, std::move(shape)});
+  parameters_.push_back(std::move(order));
+  auto *operation = node(VSI_NN_OP_PERMUTE, {input}, output);
+  operation->nn_param.permute.perm = parameters_.back().data();
+  operation->nn_param.permute.dim_num = parameters_.back().size();
+  return output;
+}
+
+Tensor GraphBuilder::slice(Tensor input, Shape start, Shape length) {
+  if (start.size() != input.spec.shape.size() || length.size() != start.size()) {
+    throw std::invalid_argument("slice rank mismatch");
+  }
+  for (std::size_t axis = 0; axis < start.size(); ++axis) {
+    if (start[axis] > input.spec.shape[axis] ||
+        length[axis] > input.spec.shape[axis] - start[axis]) {
+      throw std::out_of_range("slice exceeds input");
+    }
+  }
+  auto output = tensor({input.spec.type, length});
+  auto *operation = node(VSI_NN_OP_SLICE, {input}, output);
+  operation->nn_param.slice.dims = start.size();
+  parameters_.push_back(std::move(start));
+  operation->nn_param.slice.start = parameters_.back().data();
+  parameters_.push_back(std::move(length));
+  operation->nn_param.slice.length = parameters_.back().data();
+  return output;
+}
+
+Tensor GraphBuilder::concat(Tensor left, Tensor right, unsigned axis) {
+  auto shape = left.spec.shape;
+  if (left.spec.type != right.spec.type || shape.size() != right.spec.shape.size() ||
+      axis >= shape.size() ||
+      right.spec.shape[axis] > std::numeric_limits<std::uint32_t>::max() - shape[axis]) {
+    throw std::invalid_argument("concat shape/type mismatch");
+  }
+  for (std::size_t dimension = 0; dimension < shape.size(); ++dimension) {
+    if (dimension != axis && shape[dimension] != right.spec.shape[dimension]) {
+      throw std::invalid_argument("concat non-axis dimensions differ");
+    }
+  }
+  shape[axis] += right.spec.shape[axis];
+  auto output = tensor({left.spec.type, shape});
+  node(VSI_NN_OP_CONCAT, {left, right}, output)->nn_param.concat.axis = axis;
+  return output;
+}
+
+Tensor GraphBuilder::reduce(Tensor input, bool mean, unsigned axis) {
+  auto shape = input.spec.shape;
+  if (axis >= shape.size()) {
+    throw std::invalid_argument("reduction axis exceeds rank");
+  }
+  shape[axis] = 1;
+  auto output = tensor({input.spec.type, shape});
+  parameters_.push_back({axis});
+  auto *operation = node(VSI_NN_OP_REDUCE, {input}, output);
+  operation->nn_param.reduce.type = mean ? VSI_NN_REDUCE_MEAN : VSI_NN_REDUCE_SUM;
+  operation->nn_param.reduce.axis = reinterpret_cast<const int32_t *>(parameters_.back().data());
+  operation->nn_param.reduce.axis_num = 1;
+  operation->nn_param.reduce.keep_dim = TRUE;
+  return output;
+}
+
+Tensor GraphBuilder::matmul(Tensor left, Tensor right, Shape shape, bool transpose_left,
+                            bool transpose_right) {
+  if (left.spec.shape.size() < 2 || right.spec.shape.size() < 2 ||
+      left.spec.type != right.spec.type ||
+      left.spec.shape[transpose_left ? 1 : 0] != right.spec.shape[transpose_right ? 0 : 1]) {
+    throw std::invalid_argument("matmul reduction dimensions disagree");
+  }
+  // SDK axis zero is contiguous: [K,M] x [N,K] produces [N,M].
+  const auto rank = std::max(left.spec.shape.size(), right.spec.shape.size());
+  Shape expected(rank, 1);
+  expected[0] = right.spec.shape[transpose_right ? 1 : 0];
+  expected[1] = left.spec.shape[transpose_left ? 0 : 1];
+  for (std::size_t axis = 2; axis < rank; ++axis) {
+    const auto a = axis < left.spec.shape.size() ? left.spec.shape[axis] : 1;
+    const auto b = axis < right.spec.shape.size() ? right.spec.shape[axis] : 1;
+    if (a != b && a != 1 && b != 1) {
+      throw std::invalid_argument("matmul batch dimensions disagree");
+    }
+    expected[axis] = std::max(a, b);
+  }
+  if (shape != expected) {
+    throw std::invalid_argument("matmul output shape disagrees with operands");
+  }
+  auto output = tensor({left.spec.type, std::move(shape)});
+  auto *operation = node(VSI_NN_OP_MATRIXMUL, {left, right}, output);
+  operation->nn_param.matrixmul.transpose[0] = transpose_left;
+  operation->nn_param.matrixmul.transpose[1] = transpose_right;
+  return output;
+}
+
+Tensor GraphBuilder::fully_connected(Tensor input, Tensor weights, bool immutable_shared_weights,
+                                     std::optional<Tensor> destination) {
+  const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
+  if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
+      weights.spec.shape.size() != 2 || input.spec.shape[0] != weights.spec.shape[0] ||
+      !weight_tensor || weight_tensor->attr.vtl ||
+      (!weight_tensor->attr.is_const && !immutable_shared_weights)) {
+    throw std::invalid_argument("FCL candidate requires FP16 [K,M] and static [K,N] weights");
+  }
+  const TensorSpec spec{f16, {weights.spec.shape[1], input.spec.shape[1]}};
+  if (destination &&
+      (destination->spec.type != spec.type || destination->spec.shape != spec.shape)) {
+    throw std::invalid_argument("FCL destination must match its FP16 projection output");
+  }
+  auto output = destination ? *destination : tensor(spec);
+  auto *operation = node(VSI_NN_OP_FCL, {input, weights}, output);
+  operation->nn_param.fcl.weights = weights.spec.shape[1];
+  operation->vx_param.overflow_policy = VX_CONVERT_POLICY_SATURATE;
+  operation->vx_param.rounding_policy = VX_ROUND_POLICY_TO_NEAREST_EVEN;
+  operation->vx_param.down_scale_size_rounding = VX_CONVOLUTIONAL_NETWORK_DS_SIZE_ROUNDING_FLOOR;
+  return output;
+}
+
+Tensor GraphBuilder::batch_pointwise_projection(Tensor input, Tensor weights) {
+  const auto *weight_tensor = vsi_nn_GetTensor(graph.get(), weights.id);
+  if (input.spec.type != f16 || weights.spec.type != f16 || input.spec.shape.size() != 2 ||
+      input.spec.shape[1] != 16 || weights.spec.shape.size() != 4 || weights.spec.shape[0] != 1 ||
+      weights.spec.shape[1] != 1 || weights.spec.shape[2] != input.spec.shape[0] ||
+      !weights.spec.shape[3] || !weight_tensor || weight_tensor->attr.vtl ||
+      weight_tensor->attr.is_const) {
+    throw std::invalid_argument(
+        "batch pointwise projection requires FP16 [K,16] and ordinary [1,1,K,N] weights");
+  }
+  const auto channels = input.spec.shape[0], rows = weights.spec.shape[3];
+  const auto data = reshape(input, {1, 1, channels, 16});
+  const auto output = tensor({f16, {1, 1, rows, 16}});
+  auto *operation = sdk_call("vsi_nn_AddNode", [&] {
+    return vsi_nn_AddNode(graph.get(), VSI_NN_OP_CONV2D, 3, 1, nullptr);
+  });
+  if (!operation || !operation->input.tensors || operation->input.num != 3 ||
+      !operation->output.tensors || operation->output.num != 1) {
+    throw std::runtime_error("AddNode failed for batch pointwise projection");
+  }
+  operation->input.tensors[0] = data.id;
+  operation->input.tensors[1] = weights.id;
+  operation->input.tensors[2] = VSI_NN_TENSOR_ID_NA;
+  operation->output.tensors[0] = output.id;
+  operation->nn_param.conv2d.ksize[0] = 1;
+  operation->nn_param.conv2d.ksize[1] = 1;
+  operation->nn_param.conv2d.stride[0] = 1;
+  operation->nn_param.conv2d.stride[1] = 1;
+  for (auto &padding : operation->nn_param.conv2d.pad) {
+    padding = 0;
+  }
+  operation->nn_param.conv2d.pad_type = VSI_NN_PAD_VALID;
+  operation->nn_param.conv2d.weights = rows;
+  operation->nn_param.conv2d.group = 1;
+  operation->nn_param.conv2d.dilation[0] = 1;
+  operation->nn_param.conv2d.dilation[1] = 1;
+  operation->nn_param.conv2d.multiplier = 0;
+  operation->vx_param.overflow_policy = VX_CONVERT_POLICY_SATURATE;
+  operation->vx_param.rounding_policy = VX_ROUND_POLICY_TO_NEAREST_EVEN;
+  operation->vx_param.down_scale_size_rounding = VX_CONVOLUTIONAL_NETWORK_DS_SIZE_ROUNDING_FLOOR;
+  return reshape(output, {rows, 16});
+}
+
+Tensor GraphBuilder::project(Tensor input, const WeightStore &store, const WeightRecord &record,
+                             LinearBackend backend) {
+  if (input.spec.shape.size() != 2 || !input.spec.shape[1] || record.spec.shape.size() != 2 ||
+      record.spec.shape[0] != input.spec.shape[0] || input.spec.type != f16 ||
+      record.spec.type != f16) {
+    throw std::invalid_argument("projection requires FP16 [K,tokens] and [K,N]");
+  }
+  const auto columns = input.spec.shape[0], rows = record.spec.shape[1];
+  if (backend == LinearBackend::FullyConnected) {
+    return fully_connected(input, constant_weight(store, record));
+  }
+  if (backend == LinearBackend::SharedFullyConnected && weights_) {
+    return fully_connected(input, weight(store, record, record.spec), true);
+  }
+  if (backend != LinearBackend::MatMul) {
+    throw std::invalid_argument("unknown projection backend");
+  }
+  // Preserve the validated at-most-two-block projection strategy and bounded IO.
+  constexpr unsigned block_rows = 4096;
+  if (rows > 2 * block_rows) {
+    throw std::invalid_argument("projection exceeds validated two-block width");
+  }
+  if (rows <= block_rows) {
+    return matmul(input, weight(store, record, record.spec), {rows, input.spec.shape[1]}, false,
+                  true);
+  }
+  const auto first_bytes = std::size_t(block_rows) * columns * dtype_bytes(f16);
+  auto first = weight_chunk(store, record, {f16, {columns, block_rows}}, 0);
+  auto second = weight_chunk(store, record, {f16, {columns, rows - block_rows}}, first_bytes);
+  auto first_output = matmul(input, first, {block_rows, input.spec.shape[1]}, false, true);
+  auto second_output = matmul(input, second, {rows - block_rows, input.spec.shape[1]}, false, true);
+  return concat(first_output, second_output);
+}
+
+Tensor GraphBuilder::gather(Tensor input, Tensor indices, unsigned axis) {
+  if (axis >= input.spec.shape.size() || indices.spec.type != DataType::Int32 ||
+      indices.spec.shape.size() != 1) {
+    throw std::invalid_argument("gather requires a valid axis and an INT32 index vector");
+  }
+  auto shape = input.spec.shape;
+  shape[axis] = indices.spec.shape[0];
+  auto output = tensor({input.spec.type, shape});
+  node(VSI_NN_OP_GATHER, {input, indices}, output)->nn_param.gather.axis = axis;
+  return output;
+}
+
+Tensor GraphBuilder::argmax(Tensor input, unsigned axis) {
+  auto shape = input.spec.shape;
+  if (axis >= shape.size()) {
+    throw std::invalid_argument("argmax axis exceeds rank");
+  }
+  shape.erase(shape.begin() + axis);
+  if (shape.empty()) {
+    shape.push_back(1);
+  }
+  auto output = tensor({DataType::Int32, shape});
+  node(VSI_NN_OP_ARGMAX, {input}, output)->nn_param.argmax.axis = axis;
+  return output;
+}
+
+Tensor GraphBuilder::integer(std::int32_t value) {
+  std::vector<std::uint8_t> bytes(sizeof(value));
+  std::memcpy(bytes.data(), &value, sizeof(value));
+  return constant({DataType::Int32, {1}}, bytes);
+}
+
+Tensor GraphBuilder::normalize(Tensor input, bool mean, float epsilon, unsigned axis) {
+  if (input.spec.type != f32 || !std::isfinite(epsilon) || epsilon <= 0) {
+    throw std::invalid_argument("normalization requires FP32 and positive finite epsilon");
+  }
+  auto squares = binary(VSI_NN_OP_MULTIPLY, input, input);
+  auto reduced = reduce(squares, mean, axis);
+  auto inverse = unary(VSI_NN_OP_RSQRT, binary(VSI_NN_OP_ADD, reduced, scalar(epsilon)), f32);
+  return binary(VSI_NN_OP_MULTIPLY, input, inverse);
+}
+
+Tensor GraphBuilder::linear(Tensor input, const WeightStore &store, const WeightRecord &matrix,
+                            const WeightRecord &bias, unsigned output_parts,
+                            LinearBackend backend) {
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
+      matrix.spec.type != f16 || matrix.spec.shape.size() != 2 ||
+      matrix.spec.shape[0] != input.spec.shape[0] || bias.spec.type != f16 ||
+      bias.spec.shape != Shape{matrix.spec.shape[1]}) {
+    throw std::invalid_argument("linear requires FP16 [K,tokens], weight [K,N], bias [N]");
+  }
+  if (!output_parts || !matrix.spec.shape[1] || matrix.spec.shape[1] % output_parts) {
+    throw std::invalid_argument("linear output parts must evenly divide the positive output width");
+  }
+  const auto projected = [&] {
+    if (backend == LinearBackend::FullyConnected) {
+      if (output_parts != 1 || matrix.bytes > 8 * 1024 * 1024) {
+        throw std::invalid_argument("FCL linear candidate requires a bounded complete matrix");
+      }
+      return fully_connected(input, constant_weight(store, matrix));
+    }
+    if (backend != LinearBackend::MatMul) {
+      throw std::invalid_argument("unknown linear backend");
+    }
+    if (output_parts == 1) {
+      return project(input, store, matrix);
+    }
+    const auto rows = matrix.spec.shape[1] / output_parts;
+    const TensorSpec chunk_spec{f16, {matrix.spec.shape[0], rows}};
+    const Shape output{rows, input.spec.shape[1]};
+    // SDK axis zero is contiguous: these chunks cover consecutive output channels.
+    auto projected = matmul(input, weight_chunk(store, matrix, chunk_spec, 0), output, false, true);
+    for (unsigned part = 1; part < output_parts; ++part) {
+      const auto chunk = weight_chunk(store, matrix, chunk_spec, part * chunk_spec.bytes());
+      projected = concat(projected, matmul(input, chunk, output, false, true));
+    }
+    return projected;
+  }();
+  return binary(VSI_NN_OP_ADD, projected, weight(store, bias, bias.spec));
+}
+
+std::vector<Tensor> GraphBuilder::compiled(const CompiledGraphSpec &spec,
+                                           const std::vector<Tensor> &inputs,
+                                           const std::vector<Tensor> &output_bindings) {
+  if (spec.path.empty() || spec.path.find('\0') != std::string::npos ||
+      !std::filesystem::is_regular_file(spec.path) || !std::filesystem::file_size(spec.path)) {
+    throw std::invalid_argument("compiled graph requires a nonempty regular model file");
+  }
+  if (inputs.empty() || inputs.size() != spec.inputs.size() || spec.outputs.empty() ||
+      inputs.size() > std::numeric_limits<std::uint32_t>::max() ||
+      spec.outputs.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("compiled graph port counts disagree");
+  }
+  if (!spec.graph_version[0] || (compiled_version_[0] && compiled_version_ != spec.graph_version)) {
+    throw std::invalid_argument("compiled graph requires one explicit compatible graph version");
+  }
+  for (std::size_t index = 0; index < inputs.size(); ++index) {
+    const auto &expected = spec.inputs[index];
+    expected.bytes();
+    if (inputs[index].spec.type != expected.type || inputs[index].spec.shape != expected.shape ||
+        !vsi_nn_GetTensor(graph.get(), inputs[index].id)) {
+      throw std::invalid_argument("compiled graph input contract mismatch");
+    }
+  }
+  for (const auto &output : spec.outputs) {
+    output.bytes();
+  }
+  if (!output_bindings.empty()) {
+    if (output_bindings.size() != spec.outputs.size()) {
+      throw std::invalid_argument("compiled graph output bindings must cover every port");
+    }
+    const auto aliases = [&](Tensor left, Tensor right) {
+      const auto *a = vsi_nn_GetTensor(graph.get(), left.id);
+      const auto *b = vsi_nn_GetTensor(graph.get(), right.id);
+      return left.id == right.id || (a && b && a->t && a->t == b->t);
+    };
+    for (std::size_t index = 0; index < output_bindings.size(); ++index) {
+      const auto &output = output_bindings[index];
+      const auto &expected = spec.outputs[index];
+      const auto *storage = vsi_nn_GetTensor(graph.get(), output.id);
+      if (!storage || storage->attr.is_const || output.spec.type != expected.type ||
+          output.spec.shape != expected.shape) {
+        throw std::invalid_argument("compiled graph output binding contract mismatch");
+      }
+      for (const auto &input : inputs) {
+        if (aliases(input, output)) {
+          throw std::invalid_argument("compiled graph input/output aliases are unsupported");
+        }
+      }
+      for (std::size_t previous = 0; previous < index; ++previous) {
+        if (aliases(output_bindings[previous], output)) {
+          throw std::invalid_argument("compiled graph output bindings must be distinct");
+        }
+      }
+    }
+  }
+
+  if (!compiled_version_[0]) {
+    check(vsi_nn_SetGraphVersion(graph.get(), spec.graph_version[0], spec.graph_version[1],
+                                 spec.graph_version[2]),
+          "set compiled graph version");
+    compiled_version_ = spec.graph_version;
+  }
+
+  // Charge known embedded constants before the SDK imports the model. A second
+  // node is charged separately because sharing its internal backing is unproven.
+  graph.reserve_compiled_constants(spec.constant_bytes);
+  compiled_paths_.push_back(std::filesystem::absolute(spec.path).string());
+  std::vector<Tensor> outputs = output_bindings;
+  if (outputs.empty()) {
+    outputs.reserve(spec.outputs.size());
+    for (const auto &output : spec.outputs) {
+      outputs.push_back(tensor(output));
+    }
+  }
+  auto *operation = sdk_call("vsi_nn_AddNode", [&] {
+    return vsi_nn_AddNode(graph.get(), VSI_NN_OP_NBG, inputs.size(), outputs.size(), nullptr);
+  });
+  if (!operation || !operation->input.tensors || operation->input.num != inputs.size() ||
+      !operation->output.tensors || operation->output.num != outputs.size()) {
+    throw std::runtime_error("compiled graph node construction failed");
+  }
+  for (std::size_t index = 0; index < inputs.size(); ++index) {
+    operation->input.tensors[index] = inputs[index].id;
+  }
+  for (std::size_t index = 0; index < outputs.size(); ++index) {
+    operation->output.tensors[index] = outputs[index].id;
+  }
+  operation->nn_param.nbg.type = VSI_NN_NBG_FILE;
+  operation->nn_param.nbg.url = compiled_paths_.back().c_str();
+  return outputs;
+}
+
+Tensor GraphBuilder::layer_norm(Tensor input, Tensor scale, Tensor bias, float epsilon) {
+  if (input.spec.type != f16 || input.spec.shape.size() != 2 || !input.spec.shape[1] ||
+      scale.spec.type != f32 || bias.spec.type != f32 ||
+      scale.spec.shape != Shape{input.spec.shape[0], 1} || bias.spec.shape != scale.spec.shape) {
+    throw std::invalid_argument("layer norm requires FP16 [width,tokens], FP32 [width,1] affine");
+  }
+  auto values = convert(input, f32);
+  auto centered = binary(VSI_NN_OP_SUBTRACT, values, reduce(values, true));
+  auto normalized = normalize(centered, true, epsilon);
+  return convert(binary(VSI_NN_OP_ADD, binary(VSI_NN_OP_MULTIPLY, normalized, scale), bias), f16);
+}
+
+Tensor GraphBuilder::rms_norm(Tensor input, Tensor scale, float epsilon, float scale_offset,
+                              DataType output_type) {
+  auto normalized = normalize(convert(input, f32), true, epsilon);
+  auto multiplier = convert(scale, f32);
+  multiplier = binary(VSI_NN_OP_ADD, multiplier, scalar(scale_offset));
+  Shape shape(input.spec.shape.size(), 1);
+  shape[0] = input.spec.shape[0];
+  return convert(binary(VSI_NN_OP_MULTIPLY, normalized, reshape(multiplier, shape)), output_type);
+}
+
+void GraphBuilder::setup(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
+  input_ids_.clear();
+  output_ids_.clear();
+  for (const auto &input : inputs) {
+    input_ids_.push_back(input.id);
+  }
+  input_ids_.insert(input_ids_.end(), mutable_weight_inputs_.begin(), mutable_weight_inputs_.end());
+  for (const auto &output : outputs) {
+    output_ids_.push_back(output.id);
+  }
+  if (!vsi_nn_SetGraphInputs(graph.get(), input_ids_.data(), input_ids_.size()) ||
+      !vsi_nn_SetGraphOutputs(graph.get(), output_ids_.data(), output_ids_.size())) {
+    throw std::runtime_error("graph IO declaration failed");
+  }
+  check(sdk_call("vsi_nn_SetupGraph", [&] { return vsi_nn_SetupGraph(graph.get(), FALSE); }),
+        "SetupGraph");
+}
+
+void GraphBuilder::verify() {
+  check(sdk_call("vsi_nn_VerifyGraph", [&] { return vsi_nn_VerifyGraph(graph.get()); }),
+        "VerifyGraph");
+}
+
+void GraphBuilder::compile(const std::vector<Tensor> &inputs, const std::vector<Tensor> &outputs) {
+  setup(inputs, outputs);
+  verify();
+}
+} // namespace specferry::np101::ops
