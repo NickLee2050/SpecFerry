@@ -123,6 +123,15 @@ hardlink creation changed inode metadata; source payloads were unchanged.
 Evidence: `.cache/runs/qwen-complete-block-sessions-20261114/`, including both case directories,
 full kernels, deployment identities and `conversation-final-health.json` / `stress-final-health.json`.
 
+The subsequent endpoint-only correction collection also passed on this same boot: one process,
+five generations, preset zero/partial/full acceptance and fresh replay. New C++ control code used
+unchanged model graphs, weights and SDK. Preparation/post-ready phases were 163.754/83.046 s
+within fixed 240/300 s budgets; exit 0, empty owners, SYSTEM/VIRTUAL 122976/0 B and GFP 5808 pages,
+zero EXT4 errors, full kernel and 10.032 s observation passed. No retry or new fault occurred.
+Exact historical host/board markers remain; the scoped launcher bound the existing accepted
+same-boot proof and new bundle identity. Evidence: `.cache/runs/qwen-local-correction-20261114/`,
+including `trial/native-run/`, `trial/comparison.json`, deployment audit and final health record.
+
 ### 11-13 formal-entry deployment blocked by storage
 
 Board boot `b68f12c0-f75c-425a-a7bd-8f2ac3687f2f`, host boot

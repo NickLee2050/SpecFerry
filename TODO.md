@@ -39,11 +39,16 @@ numerics, release and kernel checks. EP hardware revalidation remains deferred.
 
 ## Recommended execution order
 
+Current user priority: endpoint-only state correction and local validation. Target-model calls,
+RPC, collaborative inference, tree candidates, wider contexts and new performance experiments
+are deferred. A supplied decision is a test input, not a measured target-model acceptance result.
+
 | Order | Work | Acceptance and boundary |
 |---|---|---|
 | Complete ✅ | Complete-block sessions and bounded repetition | All-18 M8 passed the C512 two-turn retained/replay comparison and a resident 241/96/241-input collection, each with 16 outputs. Reuse these results; longer sessions, C1024 and hours of stability require a concrete need. |
-| 1 🔜 | Minimal rejection/correction protocol and measured acceptance | Start offline or reuse existing target-model calls. Use accepted draft length and end-to-end cost to decide whether RPC/hardware integration is worthwhile. |
-| 2 🌐 | Target-model integration and vendor IR | Wait for interfaces. Do not prebuild a universal compiler framework or tree-serving system. |
+| 1 ✅ | Endpoint correction protocol | C++ revision-bound decisions, accepted versus consumed history, EOS/capacity and fail-closed execution are implemented and CPU-tested. See [contract](docs/endpoint-correction.md). |
+| 2 ✅ Scoped Qwen acceptance | All-18 M8 passed one zero/partial/full-acceptance sequence and fresh replay, with CPU token/state acceptance, released resources and clean kernel. EOS/capacity and invalid/stale decisions are CPU-tested. No target model or transport. |
+| Deferred ⏸ | Target-model integration, tree candidates and further optimization | Wait for an explicit new scope or useful vendor IR. Do not prebuild a universal compiler framework or tree-serving system. |
 
 Keep split/shared DeltaNet projections retired from the formal path: independent state, mapped
 handoffs, separate commits and M1-only recurrence did not eliminate hangs. Preserve evidence and
@@ -78,20 +83,20 @@ comes before performance.
 | S6.1 | 🟡 Context coverage differs by model | OPT original-layout C128/C256 boundaries, full-capacity rejection and reset passed; bounded C512 short/long passed, four-turn replay did not. Qwen C128 and C512 96→16 / 241→16 passed. On 11-12, two C512 241→16 requests reproduced tokens/reset snapshots bitwise; 512 inputs filled all KV positions and stopped correctly at capacity. C1024 remains untested. |
 | S6.2 | 🟡 Bounded repetition passed | All-18 M8 passed resident C512 241→16 / reset 96→16 / reset 241→16. Repeated long tokens and checked snapshots matched bitwise; TTFT changed by +0.41%. Numerics, release and kernel checks passed. More repetitions and hours of stability remain deferred; this is bounded acceptance. |
 | S6.3 | ⏸ | Lightweight command-line service only when integration or user access needs it. |
-| S6.5 | 🟡 C++ continuation accepted for two turns | Model-owned history and fail-closed exact-prefix checks are integrated and accepted on all-18 M8; default generation still resets. Preserve attention KV plus recurrent/convolution state. A persistent CLI/protocol, longer conversations and rollback remain separate work; cross-request batching and concurrency stay deferred. |
+| S6.5 | 🟡 C++ continuation accepted for two turns | Model-owned history and fail-closed exact-prefix checks are integrated and accepted on all-18 M8; default generation still resets. Preserve attention KV plus recurrent/convolution state. The local correction/replay baseline is accepted below. A persistent CLI/network protocol, longer conversations and faster rollback remain separate work; cross-request batching and concurrency stay deferred. |
 
 ## S7: Correction, collaboration and tree candidates
 
 | ID | Status | Next step and acceptance |
 |---|---|---|
-| S7.1 / S7.1.1 | 🔜 Protocol first | Define session/step, accepted prefix, candidates, accepted count, correction and extra token after full acceptance, EOS/capacity/reset/failure semantics. Reuse existing calls; RPC is not required. |
-| S7.2 | 🔜 Minimal single-branch loop | Cover zero/partial/full acceptance, EOS and capacity against clear-and-replay of the same accepted prefix. Distinguish accepted and committed positions. |
-| ↳ S7.2.1 | 🔜 OPT reference | Fixed short traces for KV length, uncommitted slots, correction-token writes and reset; natural-language quality is not the acceptance criterion. |
-| ↳ S7.2.2 | 🧩 Qwen rollback | Handle FP32 recurrent matrices, convolution history and attention KV separately. Compare checkpoint, recompute and replay memory/latency; truncating KV alone is insufficient. |
-| S7.3.1 | 🔜 Real target-model baseline | Verify model, quantization, execution backend, concurrency, input/output lengths and throughput. Remeasure acceptance after quantization changes rather than carrying over BF16 assumptions. |
+| S7.1 / S7.1.1 | ✅ Local C++ contract | Session-local revisions, pending/accepted/consumed distinction, replacement/bonus tokens, EOS/capacity/reset and failure semantics are implemented. No network protocol or target inference. |
+| S7.2 | ✅ Local loop; bounded Qwen acceptance | One C512 all-18 M8 process passed draft, zero acceptance, partial acceptance, full acceptance and fresh replay (12 generated tokens). CPU tests cover EOS/capacity, stale decisions and failure invalidation. No measured speculative acceptance rate. |
+| ↳ S7.2.1 | ⏸ Separate OPT hardware coverage | Shared CPU contract covers fixed short traces and unconsumed final tokens. OPT device-specific correction remains unvalidated; mapped-slot continuation stays disabled. |
+| ↳ S7.2.2 | ✅ Bounded reset/replay baseline | Existing reset reconstructs state from the corrected prefix without device snapshots or extra graphs. Checked hidden/recurrent/KV snapshots pass unchanged tolerances; retained versus fresh replay tokens match but state is not bitwise identical. Checkpoint/partial-recompute alternatives remain deferred. |
+| S7.3.1 | ⏸ Target-model baseline | Verify model, quantization, execution backend, concurrency, input/output lengths and throughput. Remeasure acceptance after quantization changes rather than carrying over BF16 assumptions. |
 | S7.3.2 / S7.3.2.1 | 🧩 Correction loop first | Begin with four draft candidates, then eight only if useful. Measure average accepted length, zero-acceptance rate and draft/verification/communication/rollback costs; derive break-even and speedup thresholds from the matching NP101 model. |
 | S7.3.3 | 🌐 Target verification ready | Compare target-only and collaborative execution under the same request/policy, including TTFT, decode and end-to-end time; include a DGX-local draft baseline. |
-| S7.4.1 | 🔜 Offline design | Define token/parent/depth/score and bounded node budgets for a single-model tree; check top-k capability/cost beyond the greedy head. |
+| S7.4.1 | ⏸ Tree design | Define token/parent/depth/score and bounded node budgets for a single-model tree; check top-k capability/cost beyond the greedy head. |
 | S7.4.2 | 🧩 State rollback first | Share one set of weights and reuse prefixes path by path; budget recurrent/convolution/KV snapshots and temporary peaks. Do not assume aliasing or parallelism is supported. |
 | S7.4.3–4 | 🌐 Target tree verification ready | Define tree masks, positions, accepted paths and mixed recurrent state. Compare chains and small trees at a fixed candidate budget; sequential path verification is not parallel tree verification. |
 

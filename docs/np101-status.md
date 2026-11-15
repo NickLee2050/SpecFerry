@@ -399,6 +399,47 @@ Evidence: `.cache/runs/qwen-complete-block-sessions-20261114/`, with
 `conversation/comparison.json` and `stress/comparison.json` containing actual text, numerical
 checks, timings and memory; each `native-run/` preserves execution and full kernel evidence.
 
+### Local endpoint correction
+
+The [C++ correction interface](endpoint-correction.md) separates accepted logical history from
+consumed device state. A revision-bound decision retains an accepted prefix and optionally inserts
+a replacement/bonus token. Full-history continuation retains state; changed history resets and
+replays the corrected prefix. No model graph, default generation behavior, SDK binding, weight
+copy or device snapshot was added. No target model or communication service participates.
+
+On 11-14, one C512 all-18 M8 model instance passed the following serial collection using the
+existing 28-token rice-and-eggs prompt and new CPU references for the corrected prefixes:
+
+| Step | Input → generated tokens | New text | Prefill | TTFT | Generation | Response including reset | Actual output |
+|---|---:|---|---:|---:|---:|---:|---:|
+| Initial proposal | 28→4 | `Combine the rice and` | 12.607 s | 12.939 s | 16.311 s | 16.311 s | 0.245230 token/s |
+| Reject all; insert `Try` | 29→2 | ` making a` | 13.524 s | 13.853 s | 14.985 s | 15.124 s | 0.133470 token/s |
+| Accept ` making`; replace ` a` with ` rice` | 31→2 | ` and eggs` | 14.862 s | 15.190 s | 16.318 s | 16.459 s | 0.122561 token/s |
+| Accept both; retain 32 consumed positions | 33→2 | ` together in` | 0.776 s | 1.117 s | 2.213 s | 2.213 s | 0.903931 token/s |
+| Fresh reset/replay of the same prefix | 33→2 | ` together in` | 13.859 s | 14.195 s | 15.292 s | 15.422 s | 0.130791 token/s |
+
+There were 12 physical output tokens; inserted correction tokens are not generated output.
+Generation throughput excludes reset, preparation and coarse snapshots; the response column
+includes reset. The final fresh-replay response is the sum of reset and generation timers.
+Post-first-token decode was 0.912407/0.912331 token/s for the matched final pair, but each has only
+one decode interval: these short correctness fixtures do not establish a new throughput baseline.
+The main measured difference is avoided prefix replay, not a faster decode kernel.
+
+All tokens match the CPU reference. Checked hidden/recurrent/visible-KV snapshots pass original
+tolerances; retained versus fresh-replay maximum absolute differences are
+0.002075/0.001293/0.013672/0.015625 for hidden/recurrent/K/V, not bitwise equality. Masked stale
+KV slots and never-written regions obey the existing reset contract. No runtime KV revalidation
+occurred. CPU tests additionally cover EOS, capacity, replacements/bonus tokens, stale/invalid
+requests, poisoned sessions after callback failure, and recurrence-aware replay equivalence.
+
+Preparation was 163.754 s and the complete post-ready phase 83.046 s, within 240/300 s budgets.
+Application const/nonconst peaks stayed 1348.403/623.548 MiB; sampled SYSTEM/VIRTUAL peaks stayed
+2026.689/23.008 MiB. Linux availability stayed above 244.020 MiB. Exit 0, released owners/pools
+and complete kernel/10.032 s observation passed without faults. No automatic retry was used.
+Host CPU tests and EP/SoC builds pass; OPT device correction and long correction sessions remain
+unvalidated. Evidence: `.cache/runs/qwen-local-correction-20261114/trial/comparison.json`,
+`native-run/`, CPU fixtures, deployment audit and final health record in the parent directory.
+
 ### Split-projection findings and limits
 
 Sharing projection graphs between M1/M8 recurrence saves duplicated embedded weights but did not
@@ -484,7 +525,7 @@ instruction set or kernel framework.
 | Dominant costs and memory | `qwen-performance-capacity-20261110/` |
 | Projection/copy/head/FFN comparisons | `qwen-shared-projection-resume-20261110/` |
 
-Remaining work includes longer conversations, rejection/correction, real draft–target acceptance
-rates and long-term reliability. The complete-block two-turn retained/replay comparison passed. Bounded C512
+Remaining work includes longer conversations, faster state rollback, real draft–target acceptance
+rates and long-term reliability. Local correction/reset-replay has bounded Qwen acceptance. The complete-block two-turn retained/replay comparison passed. Bounded C512
 full-capacity/reset acceptance is recorded above; it does not establish sustained reliability.
 EP's accepted exploration remains closed; [TODO](../TODO.md) owns the implementation order.

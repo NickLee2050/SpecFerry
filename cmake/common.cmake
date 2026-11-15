@@ -19,7 +19,8 @@ add_library(opt_data src/models/opt/config.cpp)
 target_link_libraries(opt_data PUBLIC np101_data)
 target_compile_options(opt_data PRIVATE -Wall -Wextra -Wpedantic)
 
-add_library(specferry_generation src/inference/generation.cpp
+add_library(specferry_generation
+  src/inference/generation.cpp src/inference/correction.cpp src/inference/correction_execution.cpp
   src/inference/request.cpp src/inference/report.cpp src/io/files.cpp)
 target_compile_features(specferry_generation PUBLIC cxx_std_17)
 target_include_directories(specferry_generation PUBLIC src)

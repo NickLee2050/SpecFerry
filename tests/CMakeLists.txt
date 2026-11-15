@@ -47,6 +47,10 @@ if(NOT SPECFERRY_TARGET STREQUAL "host")
   specferry_cpu_test(np101_data_test unit/devices/np101/data_test.cpp np101_data_contract np101_context opt_data qwen_data)
 endif()
 specferry_cpu_test(generation_test unit/inference/generation_test.cpp autoregressive_generation_contract specferry_generation)
+specferry_cpu_test(correction_test unit/inference/correction_test.cpp
+  endpoint_correction_contract specferry_generation)
+specferry_cpu_test(correction_execution_test unit/inference/correction_execution_test.cpp
+  endpoint_correction_execution_contract specferry_generation)
 specferry_cpu_test(diagnostics_test unit/devices/np101/diagnostics_test.cpp sdk_timing_contract specferry_generation)
 specferry_cpu_test(memory_budget_test unit/devices/np101/memory_budget_test.cpp segmented_memory_budget np101_data)
 if(NOT SPECFERRY_TARGET STREQUAL "host")
