@@ -3,7 +3,7 @@
 Updated: 2026-11-15. This page contains execution contracts, representative measurements and
 conclusions that affect engineering decisions. See [Build and run](getting-started.md),
 [code boundaries](development.md), [remaining work](../TODO.md) and the mandatory
-[recovery ledger](np101-recovery-incidents.md).
+[recovery guide](np101-recovery.md).
 
 Evidence paths below are relative to ignored `.cache/runs/`. Logs, weights and binaries are not
 distributed with the source; a local path alone does not make an experiment reproducible elsewhere.
@@ -254,7 +254,7 @@ incorrectly required a zero stale suffix after the long→short reset. Saved evi
 the written 47-position prefix matches the first turn, positions 47–106 retain exactly the previous
 request's masked bytes, and the never-written suffix is zero. No tolerance or model code was changed
 to resolve this oracle mismatch, and no board rerun was needed. The earlier missing-oracle-file
-packaging failure and initial comparison are preserved in the recovery ledger and evidence.
+packaging failure and initial comparison are preserved in local incident records and evidence.
 Evidence: `qwen-release-acceptance-20261112/{acceptance.json,conversation-complete-test/}`; the
 diagnostic entry changes request sequencing only and is retained under ignored evidence paths.
 
@@ -342,7 +342,8 @@ Neither const flags nor driver pools change. The original tokenwise model remain
 EP/SoC builds and offline contracts pass. The 11-14 formal process passed two C512 241→16
 requests: CPU acceptance, bitwise diagnostic/state and reset comparisons, release and complete
 kernel/10 s observation. No runtime KV revalidation occurred. Historical fault markers remain
-under the [explicit soft-restart exception](np101-recovery-incidents.md#11-14-explicit-soft-restart-diagnostic-authorization).
+under an explicitly authorized soft-restart diagnostic exception; this does not establish
+general storage recovery or waive new-fault checks.
 
 | Accepted complete-block workload | Preparation | Prefill | TTFT | Generation wall time | Actual output | Post-first-token decode |
 |---|---:|---:|---:|---:|---:|---:|
@@ -479,8 +480,8 @@ early free or missing wait. Some recurrence calls returned after about 24 s befo
 logging changes did not consistently repair it. Do not add arbitrary sleeps/fences or restore
 these variants without a discriminating hypothesis or new SDK/IR support.
 
-The [recovery ledger](np101-recovery-incidents.md#split-projection-investigation-11-12-13) retains
-each fault, exact SDK/kernel timeline, identities, evidence paths and retry boundaries.
+Local incident records retain each fault, exact SDK/kernel timeline, identities, evidence paths
+and retry boundaries. Apply the [recovery guide](np101-recovery.md) before another experiment.
 
 ### FFN marginal cost and head grouping
 

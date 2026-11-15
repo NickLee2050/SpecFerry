@@ -63,5 +63,5 @@ existing checkpoint, the original model weights and configuration.
 - [Development guide](docs/development.md): code boundaries and contribution workflow.
 - [Tests and exporters](tests/README.md): local checks and model-package generation.
 - [Status and performance](docs/np101-status.md): validated configurations and measurement scope.
-- [Device recovery](docs/np101-recovery-incidents.md): required checks before board execution.
+- [Device recovery](docs/np101-recovery.md): required checks before board execution.
 - [TODO](TODO.md): remaining work and dependencies.

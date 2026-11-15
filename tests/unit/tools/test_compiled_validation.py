@@ -475,8 +475,6 @@ class CompiledValidationTests(unittest.TestCase):
             with self.subTest(boot=boot, preflight=preflight_faults, delayed=delayed_faults):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    (root / "docs").mkdir()
-                    (root / "docs/np101-recovery-incidents.md").write_text("test ledger")
                     marker = root / "np101-recovery-required.json"
                     previous = {"boot_id": "old", "reason": "previous device fault"}
                     marker.write_text(json.dumps(previous))

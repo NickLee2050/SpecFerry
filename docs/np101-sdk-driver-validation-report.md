@@ -1,7 +1,7 @@
 # NP101 SDK and driver findings
 
 This page records failed contracts, interpretation limits and evidence. See
-[status](np101-status.md) for accepted models/performance, the [recovery ledger](np101-recovery-incidents.md)
+[status](np101-status.md) for accepted models/performance, the [recovery guide](np101-recovery.md)
 for execution gates and [tests](../tests/README.md) for current commands. These are historical
 observations, not an automatic reproduction checklist. A model passing does not close a driver issue.
 

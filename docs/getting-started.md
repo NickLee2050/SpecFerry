@@ -116,7 +116,7 @@ python tools/deploy/execute/np101/soc/cli.py run .cache/deploy/qwen --host np101
 on the board: it uses `/root/specferry-soc`, `/dev/kmsg` and the driver's debugfs memory counters.
 The host account also needs permission to run noninteractive, read-only `sudo -n journalctl`
 for kernel checks; the runner does not grant permissions or configure sudo. Read the
-[recovery ledger](np101-recovery-incidents.md) and ensure the board's loaded driver, memory layout
+[recovery guide](np101-recovery.md) and ensure the board's loaded driver, memory layout
 and SDK match the bundle before running. The board still requires Python 3.9 standard-library
 support for deployment and recovery policy; deadlines and child-process control run in C++. Commands do not
 load/reset drivers or change board networking. Preparation and deployment do not open the NPU.

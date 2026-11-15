@@ -1,9 +1,10 @@
 # Remaining work
 
 Updated: 2026-11-15. Validated behavior and performance belong in
-[status](docs/np101-status.md); execution gates and incidents belong in the
-[recovery ledger](docs/np101-recovery-incidents.md). This file records deliverables,
-dependencies and acceptance boundaries. Task IDs are planning references, not code or artifact names.
+[status](docs/np101-status.md); execution rules belong in the
+[recovery guide](docs/np101-recovery.md). Per-run incidents remain in the local diagnostic archive.
+This file records deliverables, dependencies and acceptance boundaries. Task IDs are planning
+references, not code or artifact names.
 
 ✅ Complete within stated scope · 🟡 Partial · 🔜 Ready · 🧩 Dependency · 🌐 External · ⏸ Deferred
 
