@@ -43,6 +43,12 @@ different platform implementations; no platform-selection macros are needed. Whe
 existing Make build, remove its build directory before configuring Ninja. Generated build files
 are disposable; model packages and accepted evidence belong under `.cache/`.
 
+For C++ completion in VS Code, install the recommended **clangd** extension and open the
+repository root. Configuring `build/host`, `build/ep` or `build/soc` generates a compilation
+database and selects it via `build/compile_commands.json`. To switch editor targets, rerun
+`cmake -S . -B build/<target>` for an already configured target. For a custom build directory,
+point clangd's `--compile-commands-dir` option at that directory.
+
 ### EP
 
 ```sh

@@ -36,3 +36,11 @@ include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
+
+# clangd searches build/ from the source tree. Select the last configured platform.
+if(CMAKE_BINARY_DIR STREQUAL "${CMAKE_SOURCE_DIR}/build/${SPECFERRY_TARGET}")
+  set(clangd_database "${CMAKE_SOURCE_DIR}/build/compile_commands.json")
+  if(IS_SYMLINK "${clangd_database}" OR NOT EXISTS "${clangd_database}")
+    file(CREATE_LINK "${SPECFERRY_TARGET}/compile_commands.json" "${clangd_database}" SYMBOLIC)
+  endif()
+endif()
