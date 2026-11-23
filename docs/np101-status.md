@@ -132,10 +132,15 @@ The fastest EP Qwen also uses `qwen-deltanet-optimization-20261015/outer-normali
 
 ## SoC deployment and memory
 
-Current Qwen configuration reserves 768 MiB for Linux and 2048 MiB for SYSTEM. Linux System RAM is
+The standard Qwen package targets 768 MiB for Linux and 2048 MiB for SYSTEM. Linux System RAM is
 `0x40200000–0x6fffffff`; driver `contiguousBase=0x70000000`, `contiguousSize=0x80000000`, ending at
 `0xefffffff`. Actual Linux MemTotal is about 672.4 MiB, not the full configured window.
 `/np101_driver/go.sh` is loaded explicitly, not automatically; reboot does not imply it ran.
+
+The scaled DeltaNet experiment uses 640 MiB for Linux (546.15 MiB MemTotal). System RAM ends at
+`0x67ffffff`; the loaded driver reports a 2176 MiB SYSTEM pool at `0x68000000–0xefffffff`.
+Both layouts include the device tree's 256 MiB `dla_dma` reservation at `0xd0000000–0xdfffffff`
+inside the driver range. Concurrent use with another DLA consumer has not been validated.
 
 | Pool/limit | Meaning |
 |---|---|
@@ -145,7 +150,7 @@ Current Qwen configuration reserves 768 MiB for Linux and 2048 MiB for SYSTEM. L
 | Application const/nonconst | Each capped at 1 GiB, counting shared backing once. Both consume physical pools; they are not separate physical regions. |
 | Reserved/unregistered addresses | Require ownership evidence before allocation. Logical corruption offsets are not physical addresses. |
 
-New Qwen bundles match this layout. OPT packaging still pins the historical 512 MiB Linux /
+Standard Qwen bundles pin the 768 MiB Linux layout. OPT packaging still pins the historical 512 MiB Linux /
 2304 MiB pool by default and cannot be deployed unchanged onto the Qwen layout. Keep accepted
 bundles immutable; do not edit a manifest to pretend compatibility. C512 long requests failed with
 512 MiB Linux and both 2304/1792 MiB pools; neither Linux capacity nor address layout is proven causal.
@@ -325,6 +330,77 @@ without relaxed thresholds. CPU copy also passed strict tolerance. Shared consta
 Projection/commit fusion keeps original NBG ports and internal DATACONVERT bindings. Its M1 is
 about 16.5% faster than separate submission, but 13.7% slower than original M1; this does not prove
 hardware parallelism.
+
+An isolated layer-zero DeltaNet test used identical projected inputs and a nonzero initial state,
+two eight-row blocks, then one unchanged FP32-recurrence M1 step. Over 12 timed M8 calls per
+configuration, FP32 controls averaged 105.81/104.90 ms and agreed bitwise. Lowering the recurrence
+math to FP16 with FP32 state ports took 29.29 ms. The compiler also changed the GEMM implementation.
+State passed the pipeline tolerance but pre-projection gated activations failed (maximum absolute
+difference 0.3035 from the device control). Broad FP16 compilation took 28.90 ms and produced
+nonfinite activations. Both candidates remain diagnostic. Times cover only recurrence RunGraph;
+host transfers, projections, and full-model inference are outside the measurement.
+
+Lowering only the joint recurrent-state read MatMul to FP16 kept the state update and gate
+calculation in FP32. It averaged 69.74 ms per eight rows (1.51× the FP32 rate). Against the same
+device control, both block-end states and the M1 continuation passed pipeline tolerances, but
+8 and 15 of 16,384 gated values in the two blocks exceeded tolerance. This variant remains
+diagnostic.
+
+Intermediate outputs reproduced both blocks' original gated activations, recurrent state and
+convolution history bitwise. At all 23 gated outliers, the FP16 joint MatMul already returned
+signed zero on the query read. Across 32,768 query reads the FP32 control had 14,008 nonzero
+values below the FP16 normal threshold (2⁻¹⁴); the candidate had no nonzero values below it.
+RMS normalization amplified the pre-normalization differences at the outliers by 729–998×,
+with identical gate factors. This is consistent with subnormal flushing on the compiled read
+path; the measurement does not distinguish accumulation, conversion, or result storage.
+
+Scaling the joint query/key operand by 256 before the FP16 MatMul and multiplying the widened
+result by 1/256 cleared all 23 gated outliers on those two blocks. No new pipeline outliers
+appeared; both block-end states and the subsequent original M1 step passed pipeline tolerance.
+Strict fixed-input checks still had isolated differences. Without intermediate taps, the scaled
+graph averaged 70.22 ms over 12 eight-row calls versus 69.74 ms unscaled and 105.36 ms for FP32.
+This covers only the first layer and the two tested blocks.
+
+With input normalization and both projection stages restored to the first-layer M8 graph, the
+same two blocks took 109.45 ms per block with FP32 reads and 73.06 ms with scaled FP16 reads
+(12 timed calls each). Both block outputs, recurrent states and the continuation through the
+original complete M1 passed pipeline tolerances against the CPU and device controls. Maximum
+hidden-output differences from the device control were 0.00178, 0.00253 and 0.00049 at steps
+8, 16 and 17.
+
+On the 96-input/16-output C128 request, replacing only the first complete M8 DeltaNet reduced
+prefill from 38.74 to 38.34 s and TTFT from 39.08 to 38.67 s. Twelve blocks predict a saving of
+0.44 s from the layer timings, close to the observed 0.40 s. Actual output rates were 0.2874 and
+0.2888 token/s. Both runs matched all 16 reference tokens and passed hidden, recurrent and KV
+checks. The sampled SYSTEM pool peak increased from 2041.16 to 2041.98 MiB out of 2048 MiB.
+These are single-request observations per variant. The original deployment remains the fallback.
+
+With 640 MiB Linux and a 2176 MiB SYSTEM pool, the same 96/16 request passed all original CPU
+checks with zero, two and four scaled M8 layers. Four reduced TTFT from 39.31 to 37.80 s and
+increased actual output from 0.2856 to 0.2941 token/s. With eight, TTFT reached 36.05 s and all
+16 tokens still matched, but one of 56,832 visible keys and one of 56,832 visible values in the
+last attention layer exceeded tolerance. Its driver-recorded SYSTEM peak was 2052.48 MiB.
+
+Scaling all 18 DeltaNet prefill layers on this request reduced TTFT from 39.31 to 31.84 s and
+generation time from 56.02 to 48.51 s (0.2856 to 0.3298 output token/s). M1 decode remained
+near 0.90 token/s. The SYSTEM high-water mark rose from 2045.98 to 2060.61 MiB. All 16 greedy
+tokens matched the CPU reference. Against the original tolerances, 3 of 262,144 recurrent-state
+elements and 8 of 56,832 visible keys failed, reaching 1.38 and 1.29 times their elementwise
+limits. Final hidden and visible values passed. This single-request diagnostic does not establish
+long-context or multi-turn accuracy.
+
+At capacity 512 with a 64-token output cap, the original and all-18 scaled variants produced
+identical dinner invitations for a 96-token prompt. With 250 input tokens, outputs first differed
+at token 37 ("the perfect way" versus "a great way") and matched again from token 39 through 64.
+All four runs reached the cap. TTFT fell from 39.01 to 32.13 s and from 102.13 to 82.73 s,
+respectively. Actual output rates rose from 0.590 to 0.628 and from 0.373 to 0.420 token/s.
+Both variants missed the exact dinner start time in both prompts. Scaled state snapshots exceeded
+the original numerical tolerances in both runs.
+
+Retain both deployments. Use the original FP32 state reads as the numerical baseline and fallback.
+Use the 18-layer scaled FP16 state reads for lower prefill latency. Both use the same M1 decode
+path. The observed rounding and wording differences are an accepted trade-off for the scaled
+deployment; keep reporting them against the original tolerances.
 
 ### Complete-block Qwen prefill
 
@@ -513,10 +589,78 @@ and 48 MiB extra initialization peak; not adopted. Evidence:
 and archived `diagnostic-sources.tar.gz`; attribution/initial offline artifacts:
 `qwen-performance-capacity-20261110/`. Temporary tools are retired, their measurement sources retained.
 
+### Sustained SoC FP16 and device-copy measurements
+
+Alternating two independent source/destination pairs in serial device copy graphs sustained
+0.79, 3.36 and 4.13 GB/s of logical read-plus-write traffic at 4, 16 and 64 MiB per copy.
+On a subsequent boot, 64, 128 and 256 MiB copies took 32.46, 60.49 and 120.47 ms
+(median of five collections of eight synchronous copies). Logical read-plus-write rates were
+4.135, 4.437 and 4.456 GB/s; payload rates were 2.067, 2.219 and 2.228 GB/s. Doubling the
+block beyond 128 MiB improved bandwidth by only 0.43%. At 256 MiB the two buffer pairs used
+1 GiB of mutable tensor storage. Initialization discarded private zero-filled host pages before
+tensor upload; timing excluded initialization and validation. Full destination contents matched
+after changing the source, and allocations were released. These SDK copy rates describe one
+outstanding copy. The physical memory bandwidth and concurrent copy rate remain unmeasured.
+
+The four SoC Linux CPUs streamed a fixed 128 MiB array at 0.145, 0.289 and 0.568 GB/s
+with one, two and four pinned threads reading disjoint ranges. Each collection checked the
+sum of three passes using unrolled scalar 64-bit loads. These rates measure application reads.
+
+Splitting the real layer-10 Qwen gate projection (1024 inputs, 3584 outputs, 7 MiB of FP16
+weights total) across one, two, four and eight concurrent FCL graphs increased M1 latency
+from 10.31 to 18.87, 39.64 and 77.53 ms. The corresponding M8 times were 10.58, 19.58,
+39.23 and 76.22 ms. Every projection waited for all shards. Input upload, output readback
+and joining were outside these timings; a separate eight-shard measurement timed readback
+and joining at 0.24 ms for M1 and 1.16 ms for M8. All outputs matched the unsharded run
+bitwise and passed the CPU tolerance. All eight IRQ lines advanced in the eight-shard case.
+This establishes completion routing; hardware overlap and physical memory traffic remain unknown.
+Keep the unsharded FCL for these shapes. Evidence: `soc-read-and-shard-20261121/`.
+
+With Setup, Verify, warmup and explicit host transfers outside timing, a graph containing eight
+independent fixed-weight FP16 GEMMs sustained 125.26 GFLOP/s at M/K/N = 64/1024/4096 and
+15.97 GFLOP/s at 1024/1024/1024 (median of five timed collections). A separately compiled single GEMM
+at the former shape reached 51.22 GFLOP/s; two and four independently pinned workers reached
+52.08 and 53.70 GFLOP/s in aggregate. All sampled rows matched FP32 references within tolerance.
+The standalone Qwen layer-10 gate/up FCL projections (1024 to 3584), alternating two fixed
+weights, delivered 0.68, 5.60 and 12.15 GFLOP/s at one, eight and sixteen rows respectively;
+one submission took about 10 ms in each case. All projection outputs passed their original tolerance.
+These rates describe the tested graphs and public SDK. They do not measure physical engine
+occupancy or establish model decode throughput. Local timings and contracts: `soc-sustained-limits-20261120/`.
+
+A broader SoC sweep found a higher sustained FP16 rate with spatial reuse: a single submission
+of 1, 4, 8 and 16 dependent 56×56, 256-channel 3×3 convolutions with ReLU reached 318, 653,
+734 and 784 GFLOP/s. These figures count two FLOPs per in-bounds multiply-add, excluding ReLU
+and zero padding. The 16-layer graph took 73.74 ms (five collections, 761–794 GFLOP/s).
+On identical 64×1024 by 1024×4096 inputs and weights, single-graph ordinary GEMM, transposed
+GEMM and equivalent 1×1 convolution reached 18.61, 48.22 and 45.65 GFLOP/s. Supplying the
+convolution with prepacked input and consuming packed output gave 45.76 GFLOP/s.
+
+With independent contexts and one graph per thread, increasing workers from one to twelve
+reduced aggregate throughput from 54.57 to 37.82 GFLOP/s for 64×4096 by 4096×1024 GEMM and
+from 169.34 to 133.43 GFLOP/s for a 28×28, 256-to-512-channel 3×3 convolution. The heavier
+16-layer convolution graph scaled from 0.806 to 1.524 and 2.640 TFLOP/s at 1/2/4 workers.
+Across five four-worker collections only galcore IRQ lines 0–3 advanced: 28/25/27/35 for the
+heavy graph and 30/37/31/42 for GEMM. IRQ distribution shows completion traffic; it cannot
+give per-engine busy cycles. OpenVX
+reported one logical device and graph device index zero. A separate four-process GEMM run
+encountered a driver hang and contributed no accepted multi-process rate. Per-worker output
+samples were checked against CPU references. Shape definitions, per-collection timings and
+diagnostic source are archived under `soc-fp16-saturation-20261120/`.
+
+Keeping eight 16-layer convolution graphs, weights and IO buffers resident throughout, each
+collection executed all eight graphs three times. Median aggregate FP16 throughput was
+0.838, 2.820 and 4.563 TFLOP/s with 1, 4 and 8 simultaneous submissions (five collections per
+level). Each engine's IRQ count increased by 15 at every level. All 257 sampled outputs per
+graph matched the reference tolerance at each level; the observed SYSTEM pool peak was
+196.6 MiB, and the pool and GFP allocations returned to baseline. The harness enabled SDK
+multithreading once and reused a thread per graph. This run establishes scaling at fixed
+residency; it does not isolate the cause of earlier network losses.
+
 ## Retired paths and interface limits
 
 | Path | Conclusion / reopening condition |
 |---|---|
+| SoC Qwen single-token INT8 MatMul | The three layer-10 FFN projections took 12.70 ms in FP16, 76.71 ms with prequantized INT8 inputs and FP16 outputs, and 76.74 ms with explicit input conversion. The INT8 outputs matched each other bitwise. In the tested SDK, the VX GEMM-to-convolution path admits UINT8 or FP16 as its first input and rejects signed INT8 during Setup. The next eligible EVIS kernel is `gemm_I8I8toF16`; the SoC run did not capture its selected kernel. Re-encoding both operands as asymmetric UINT8 with zero point 128 preserves the quantized values. Its device dispatch and speed remain unverified. |
 | FFN Verify cache | Saves preparation only; alternating long/short requests and historical-success reruns were unstable. Retired; old bundles require original runner/binary. |
 | Shared residual blocks / omitted intermediate publication | About 0.17% model change, no useful gain; SDHCI during release prevented health acceptance. Removed from source/CLI. |
 | Transpose–GEMM–transpose (TTGT) | Shape/path dependent. Qwen hand-written matrix multiplication was much slower than shared FCL; the compiler can eliminate equivalent transposes. No broad shape sweep. |

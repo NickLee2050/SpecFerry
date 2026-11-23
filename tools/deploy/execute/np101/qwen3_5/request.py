@@ -75,7 +75,7 @@ def prepare_request(
     components = Components.from_text_config(manifest["text_config"], capacity=capacity)
     tokenizer = load_tokenizer(checkpoint)
     rendered, ids = encode(tokenizer, prompt)
-    if not 1 <= ids.shape[1] <= capacity or not 1 <= maximum <= 32 or not 1 <= repeats <= 3:
+    if not 1 <= ids.shape[1] <= capacity or not 1 <= maximum <= 64 or not 1 <= repeats <= 3:
         raise ValueError("Qwen prompt/output/repeat count exceeds the bounded entry")
     directory.mkdir(parents=True, exist_ok=False)
     components.write(directory)

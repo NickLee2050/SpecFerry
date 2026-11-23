@@ -31,7 +31,7 @@ ExecutionRequest read_execution_request(const fs::path &request, std::string_vie
   unsigned maximum = 0, repeats = 0;
   policy_file >> policy.vocabulary >> policy.capacity >> policy.bos >> policy.eos >> maximum >>
       repeats;
-  if (!policy_file || policy_file >> extra || maximum == 0 || maximum > 32 || repeats == 0 ||
+  if (!policy_file || policy_file >> extra || maximum == 0 || maximum > 64 || repeats == 0 ||
       repeats > 3) {
     throw std::invalid_argument("invalid Qwen generation policy");
   }

@@ -165,7 +165,7 @@ def validate_request(request, weights, deployment_digest):
         or metadata["maximum"] != maximum
         or effective.get("max_new_tokens") != maximum
         or metadata["repeats"] != repeats
-        or not 1 <= maximum <= 32
+        or not 1 <= maximum <= 64
         or not 1 <= repeats <= 3
         or not tokens
         or tokens != metadata["tokens"]
